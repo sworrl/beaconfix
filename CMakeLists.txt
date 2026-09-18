@@ -11,7 +11,7 @@ add_executable(beaconfix
     src/main.cpp
     src/wifiscanner.cpp
     src/locator.cpp
-    src/tilemap.cpp
+    src/beaconview.cpp
     src/tray.cpp
     src/mainwindow.cpp
 )
@@ -21,3 +21,4 @@ target_link_libraries(beaconfix PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Net
 install(TARGETS beaconfix RUNTIME DESTINATION bin)
 install(FILES data/beaconfix.desktop DESTINATION share/applications)
 install(FILES data/org.sworrl.BeaconFix.service DESTINATION share/dbus-1/services)
+install(FILES data/beaconfix.svg DESTINATION share/icons/hicolor/scalable/apps)

@@ -5,10 +5,32 @@
 #include <QClipboard>
 #include <QDesktopServices>
 #include <QUrl>
+#include <QPainter>
+#include <QRadialGradient>
+
+// Theme-independent beacon icon: dark disc, rings, a dot coloured by source
+static QIcon beaconIcon(const QColor &dot, bool busy)
+{
+    QIcon icon;
+    for (int sz : {16, 22, 24, 32, 48, 64}) {
+        QPixmap px(sz, sz); px.fill(Qt::transparent);
+        QPainter p(&px); p.setRenderHint(QPainter::Antialiasing);
+        const QPointF c(sz / 2.0, sz / 2.0); const double R = sz / 2.0;
+        p.setPen(Qt::NoPen); p.setBrush(QColor(11, 16, 26)); p.drawEllipse(c, R, R);
+        QRadialGradient g(c, R * 0.9); QColor t = dot; t.setAlpha(130); g.setColorAt(0, t); t.setAlpha(0); g.setColorAt(1, t);
+        p.setBrush(g); p.drawEllipse(c, R * 0.9, R * 0.9);
+        p.setBrush(Qt::NoBrush);
+        QColor ring = dot; ring.setAlpha(busy ? 70 : 150); p.setPen(QPen(ring, qMax(1.0, sz / 20.0)));
+        p.drawEllipse(c, R * 0.68, R * 0.68); p.drawEllipse(c, R * 0.42, R * 0.42);
+        p.setPen(QPen(Qt::white, qMax(1.0, sz / 24.0))); p.setBrush(dot); p.drawEllipse(c, R * 0.2, R * 0.2);
+        icon.addPixmap(px);
+    }
+    return icon;
+}
 
 Tray::Tray(Locator *loc, QObject *parent) : QObject(parent), m_loc(loc)
 {
-    m_icon.setIcon(QIcon::fromTheme(QStringLiteral("mark-location"), QIcon::fromTheme(QStringLiteral("find-location"))));
+    m_icon.setIcon(beaconIcon(QColor(0x35, 0xd6, 0xff), false));
 
     m_placeAct = m_menu.addAction(QString());
     QFont bold = m_placeAct->font(); bold.setBold(true); m_placeAct->setFont(bold);
@@ -90,11 +112,10 @@ void Tray::rebuild()
     m_refreshAct->setEnabled(!m_loc->busy());
     for (QAction *a : m_intervalMenu->actions()) a->setChecked(a->data().toInt() == m_loc->intervalMinutes());
 
-    const QString icon = f.source == QLatin1String("starlink") ? QStringLiteral("gps")
-                       : f.source == QLatin1String("wifi")     ? QStringLiteral("mark-location")
-                       : f.source == QLatin1String("ip")       ? QStringLiteral("network-server")
-                       : QStringLiteral("dialog-warning");
-    m_icon.setIcon(QIcon::fromTheme(icon, QIcon::fromTheme(QStringLiteral("mark-location"))));
+    const QColor dot = f.source == QLatin1String("starlink") ? QColor(0x6c, 0xff, 0x8a)
+                     : f.source == QLatin1String("wifi")     ? QColor(0x35, 0xd6, 0xff)
+                     : f.source == QLatin1String("ip")       ? QColor(0xff, 0xd1, 0x66) : QColor(0xff, 0x4f, 0x4f);
+    m_icon.setIcon(beaconIcon(dot, m_loc->busy()));
     m_icon.setToolTip(f.valid ? QStringLiteral("%1\n±%2 m · %3 · %4").arg(f.place).arg(qRound(f.accuracy)).arg(src, ageText())
                               : QStringLiteral("BeaconFix — no location"));
 }

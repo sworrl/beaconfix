@@ -3,11 +3,11 @@
         "Authors": [ { "Email": "github@falcontechnix.com", "Name": "sworrl" } ],
         "Category": "Utilities",
         "Description": "Where am I? Shows the BeaconFix position fix (Wi-Fi beacons via BeaconDB, Starlink GPS, or IP).",
-        "Icon": "mark-location",
+        "Icon": "beaconfix",
         "Id": "org.kde.plasma.beaconfix",
         "License": "GPL-2.0-or-later",
         "Name": "BeaconFix",
-        "Version": "1.0.0"
+        "Version": "1.1.0"
     },
     "KPackageStructure": "Plasma/Applet",
     "X-Plasma-API-Minimum-Version": "6.0"

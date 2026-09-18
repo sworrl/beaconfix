@@ -13,6 +13,7 @@
 #include <QTextStream>
 #include <QUrlQuery>
 #include <QtMath>
+#include <algorithm>
 
 static const char *USER_AGENT = "BeaconFix/" BEACONFIX_VERSION " (KDE desktop locator; +https://github.com/sworrl/beaconfix)";
 
@@ -46,6 +47,9 @@ Locator::Locator(bool standalone, QObject *parent) : QObject(parent), m_standalo
     m_useIp          = s.value("useIp", true).toBool();
     m_ignoreActive   = s.value("ignoreActiveAp", true).toBool();
     m_ignore         = s.value("ignorePatterns").toStringList();
+    m_wigleToken     = s.value("wigleToken").toString();
+    m_wigleTimer.setSingleShot(true);
+    connect(&m_wigleTimer, &QTimer::timeout, this, &Locator::pumpWigle);
 
     connect(&m_scanner, &WifiScanner::scanFinished, this, &Locator::onScan);
     connect(&m_scanner, &WifiScanner::scanFailed, this, [this](const QString &m) {
@@ -98,15 +102,93 @@ void Locator::setTravelling(const QString &bssid, bool travelling)
 {
     if (travelling) { m_travelling.insert(bssid); m_notTravelling.remove(bssid); }
     else            { m_travelling.remove(bssid); m_notTravelling.insert(bssid); }
-    saveApCells();
+    saveApRecords();
     emit scanUpdated();
+}
+
+void Locator::setWigleToken(const QString &t)
+{
+    m_wigleToken = t.trimmed();
+    QSettings().setValue("wigleToken", m_wigleToken);
+    if (!m_wigleToken.isEmpty()) queueWigle();
 }
 
 bool Locator::isTravelling(const QString &bssid) const
 {
     if (m_notTravelling.contains(bssid)) return false;
     if (m_travelling.contains(bssid)) return true;
-    return m_apCells.value(bssid).size() >= 2;   // seen at two stops ≥ ~5 km apart
+    const auto it = m_apRecords.constFind(bssid);
+    return it != m_apRecords.constEnd() && it->cells.size() >= 2;   // seen at two stops ≥ ~5 km apart
+}
+
+const ApRecord *Locator::record(const QString &bssid) const
+{
+    const auto it = m_apRecords.constFind(bssid);
+    return it == m_apRecords.constEnd() ? nullptr : &*it;
+}
+
+// Log-distance path loss, outdoor-ish: -25 dBm at 1 m, exponent 2.2
+// (-55 dBm ≈ 23 m, -75 dBm ≈ 190 m, -90 dBm ≈ 900 m → clamped)
+double Locator::rssiDistanceM(int dbm)
+{
+    return qBound(5.0, std::pow(10.0, (-25.0 - dbm) / 22.0), 800.0);
+}
+
+ApEstimate Locator::estimateFor(const AccessPoint &ap) const
+{
+    ApEstimate e;
+    const ApRecord *r = record(ap.bssid);
+    if (r && r->wigle) {
+        e.kind = ApEstimate::Wigle; e.lat = r->wLat; e.lon = r->wLon; e.radiusM = 25;
+        return e;
+    }
+    // Signal-weighted centroid once we've heard it from two places ≥ 25 m apart
+    if (r && r->obs.size() >= 2) {
+        double sw = 0, sl = 0, so = 0, spread = 0, worstAcc = 0;
+        for (const ApObservation &o : r->obs) {
+            const double w = std::pow(double(o.dbm + 100), 2.0);
+            sw += w; sl += w * o.lat; so += w * o.lon;
+            worstAcc = qMax(worstAcc, o.acc);
+        }
+        for (const ApObservation &o : r->obs)
+            spread = qMax(spread, distanceM(o.lat, o.lon, r->obs.first().lat, r->obs.first().lon));
+        // Real movement, not fix jitter: the spread has to beat the fixes' own uncertainty
+        if (sw > 0 && spread >= qMax(60.0, worstAcc * 1.5)) {
+            e.kind = ApEstimate::Centroid; e.lat = sl / sw; e.lon = so / sw;
+            e.radiusM = qMax(rssiDistanceM(ap.dbm) * 0.6, spread * 0.5);
+            return e;
+        }
+    }
+    if (!m_fix.valid) return e;
+    e.kind = ApEstimate::Ring; e.lat = m_fix.lat; e.lon = m_fix.lon;
+    e.radiusM = rssiDistanceM(ap.dbm);
+    e.bearingDeg = double(qHash(ap.bssid) % 3600) / 10.0;   // stable, but NOT a real bearing
+    return e;
+}
+
+Stats Locator::stats() const
+{
+    Stats st;
+    st.stops = m_history.size();
+    for (int i = 1; i < m_history.size(); ++i)
+        st.distanceKm += distanceM(m_history[i-1].lat, m_history[i-1].lon, m_history[i].lat, m_history[i].lon) / 1000.0;
+    st.beaconsTotal = m_apRecords.size();
+    st.beaconsNow = m_aps.size();
+    for (const AccessPoint &ap : m_aps) {
+        const QString s = apStatus(ap);
+        if (s == QLatin1String("used")) ++st.usedNow;
+        if (s == QLatin1String("travelling") || s == QLatin1String("active")) ++st.travellingNow;
+        const ApEstimate::Kind k = estimateFor(ap).kind;
+        if (k == ApEstimate::Centroid || k == ApEstimate::Wigle) ++st.locatedNow;
+    }
+    for (const Fix &f : m_history)
+        if (f.accuracy >= 0 && (st.bestAccuracy < 0 || f.accuracy < st.bestAccuracy)) st.bestAccuracy = f.accuracy;
+    struct R { int at; const char *name; };
+    static const R ranks[] = {{0,"Newcomer"},{10,"Wanderer"},{50,"Scout"},{150,"Pathfinder"},{400,"Navigator"},{1000,"Cartographer"},{2500,"Beaconmaster"}};
+    for (int i = 0; i < 7; ++i) {
+        if (st.beaconsTotal >= ranks[i].at) { st.rank = QString::fromLatin1(ranks[i].name); st.rankLevel = i + 1; st.nextRankAt = i < 6 ? ranks[i+1].at : 0; }
+    }
+    return st;
 }
 
 bool Locator::matchesIgnore(const AccessPoint &ap) const
@@ -150,6 +232,24 @@ QString Locator::StateJson() const
     o["busy"] = m_busy;
     o["intervalMinutes"] = m_intervalMin;
     o["wifiInterface"] = m_scanner.interfaceName();
+    QJsonArray aps;
+    for (const AccessPoint &ap : m_aps) {
+        const ApEstimate e = estimateFor(ap);
+        QJsonObject a;
+        a["bssid"] = ap.bssid; a["ssid"] = ap.ssid; a["dbm"] = ap.dbm; a["freq"] = ap.frequency;
+        a["status"] = apStatus(ap);
+        a["kind"] = e.kind == ApEstimate::Wigle ? "wigle" : e.kind == ApEstimate::Centroid ? "centroid" : e.kind == ApEstimate::Ring ? "ring" : "none";
+        a["lat"] = e.lat; a["lon"] = e.lon; a["r"] = e.radiusM; a["bearing"] = e.bearingDeg;
+        aps.append(a);
+    }
+    o["aps"] = aps;
+    const Stats st = stats();
+    QJsonObject sj;
+    sj["stops"] = st.stops; sj["distanceKm"] = st.distanceKm; sj["beaconsTotal"] = st.beaconsTotal;
+    sj["beaconsNow"] = st.beaconsNow; sj["usedNow"] = st.usedNow; sj["travellingNow"] = st.travellingNow;
+    sj["locatedNow"] = st.locatedNow; sj["bestAccuracy"] = st.bestAccuracy;
+    sj["rank"] = st.rank; sj["rankLevel"] = st.rankLevel; sj["nextRankAt"] = st.nextRankAt;
+    o["stats"] = sj;
     return QString::fromUtf8(QJsonDocument(o).toJson(QJsonDocument::Compact));
 }
 
@@ -267,8 +367,8 @@ void Locator::tryIp(const QString &why)
 void Locator::accept(Fix cand, const QString &ipCity)
 {
     m_last = cand;
-    if (cand.source == QLatin1String("wifi") && cand.accuracy >= 0 && cand.accuracy < 2000)
-        noteApCells(m_aps, cand.lat, cand.lon);
+    if (cand.source != QLatin1String("ip") && cand.accuracy >= 0 && cand.accuracy < 2000)
+        noteObservations(m_aps, cand);
 
     const bool moved = !m_fix.valid || m_fix.source != cand.source
                        || distanceM(m_fix.lat, m_fix.lon, cand.lat, cand.lon) > m_moveThresholdM;
@@ -288,6 +388,60 @@ void Locator::accept(Fix cand, const QString &ipCity)
     emit FixChanged();
     if (ipCity.isEmpty())
         reverseGeocode(cand.lat, cand.lon);
+}
+
+// ── WiGLE (optional): real AP positions, one lookup per 1.5 s, cached per BSSID ──
+void Locator::queueWigle()
+{
+    if (m_wigleToken.isEmpty()) return;
+    const QDateTime stale = QDateTime::currentDateTime().addDays(-30);
+    QList<AccessPoint> cand;
+    for (const AccessPoint &ap : m_aps) {
+        if (apStatus(ap) != QLatin1String("used")) continue;
+        const ApRecord *r = record(ap.bssid);
+        if (r && (r->wigle || (r->wigleChecked.isValid() && r->wigleChecked > stale))) continue;
+        cand << ap;
+    }
+    std::sort(cand.begin(), cand.end(), [](const AccessPoint &a, const AccessPoint &b) { return a.dbm > b.dbm; });
+    m_wigleQueue.clear();
+    for (int i = 0; i < qMin(25, cand.size()); ++i) m_wigleQueue << cand[i].bssid;
+    if (!m_wigleBusy && !m_wigleQueue.isEmpty()) m_wigleTimer.start(500);
+}
+
+void Locator::pumpWigle()
+{
+    if (m_wigleQueue.isEmpty() || m_wigleToken.isEmpty()) { m_wigleBusy = false; return; }
+    m_wigleBusy = true;
+    const QString bssid = m_wigleQueue.takeFirst();
+    QUrl url(QStringLiteral("https://api.wigle.net/api/v2/network/search"));
+    QUrlQuery q; q.addQueryItem("netid", bssid); url.setQuery(q);
+    QNetworkRequest req(url);
+    req.setRawHeader("Authorization", "Basic " + m_wigleToken.toLatin1());
+    req.setRawHeader("Accept", "application/json");
+    req.setHeader(QNetworkRequest::UserAgentHeader, QString::fromLatin1(USER_AGENT));
+    req.setTransferTimeout(15000);
+    QNetworkReply *rep = m_nam.get(req);
+    connect(rep, &QNetworkReply::finished, this, [this, rep, bssid] {
+        rep->deleteLater();
+        const int http = rep->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        if (http == 401 || http == 429) {
+            m_wigleQueue.clear(); m_wigleBusy = false;
+            emit statusMessage(http == 401 ? QStringLiteral("WiGLE rejected the API token") : QStringLiteral("WiGLE daily query limit reached"));
+            return;
+        }
+        const QJsonObject o = QJsonDocument::fromJson(rep->readAll()).object();
+        ApRecord &r = m_apRecords[bssid];
+        r.wigleChecked = QDateTime::currentDateTime();
+        const QJsonArray res = o["results"].toArray();
+        if (o["success"].toBool() && !res.isEmpty()) {
+            const QJsonObject n = res.first().toObject();
+            r.wigle = true; r.wLat = n["trilat"].toDouble(); r.wLon = n["trilong"].toDouble();
+            if (r.ssid.isEmpty()) r.ssid = n["ssid"].toString();
+        }
+        saveApRecords();
+        emit scanUpdated();
+        m_wigleTimer.start(1500);
+    });
 }
 
 void Locator::finish(bool ok, const QString &message)
@@ -359,11 +513,25 @@ void Locator::loadState()
     QFile c(stateDir() + "/aps.json");
     if (c.open(QIODevice::ReadOnly)) {
         const QJsonObject o = QJsonDocument::fromJson(c.readAll()).object();
-        const QJsonObject cells = o["cells"].toObject();
-        for (auto it = cells.begin(); it != cells.end(); ++it) {
-            QSet<QString> s;
-            for (const QJsonValue &v : it.value().toArray()) s.insert(v.toString());
-            m_apCells.insert(it.key(), s);
+        const QJsonObject cells = o["cells"].toObject();          // v1 format
+        for (auto it = cells.begin(); it != cells.end(); ++it)
+            for (const QJsonValue &v : it.value().toArray()) m_apRecords[it.key()].cells.insert(v.toString());
+        const QJsonObject recs = o["records"].toObject();         // v2+ format
+        const bool keepObs = o["version"].toInt() >= 3;           // v2 observations lacked accuracy → jitter-polluted
+        for (auto it = recs.begin(); it != recs.end(); ++it) {
+            const QJsonObject ro = it.value().toObject();
+            ApRecord &r = m_apRecords[it.key()];
+            r.ssid = ro["ssid"].toString();
+            for (const QJsonValue &v : ro["cells"].toArray()) r.cells.insert(v.toString());
+            for (const QJsonValue &v : ro["obs"].toArray()) {
+                if (!keepObs) break;
+                const QJsonObject oo = v.toObject();
+                ApObservation ob; ob.lat = oo["lat"].toDouble(); ob.lon = oo["lon"].toDouble(); ob.acc = oo["acc"].toDouble();
+                ob.dbm = oo["dbm"].toInt(); ob.time = QDateTime::fromString(oo["t"].toString(), Qt::ISODate);
+                r.obs.append(ob);
+            }
+            r.wigle = ro["wigle"].toBool(); r.wLat = ro["wLat"].toDouble(); r.wLon = ro["wLon"].toDouble();
+            r.wigleChecked = QDateTime::fromString(ro["wigleChecked"].toString(), Qt::ISODate);
         }
         for (const QJsonValue &v : o["travelling"].toArray()) m_travelling.insert(v.toString());
         for (const QJsonValue &v : o["notTravelling"].toArray()) m_notTravelling.insert(v.toString());
@@ -388,31 +556,60 @@ void Locator::appendHistory(const Fix &fx)
         h.write(QJsonDocument(fx.toJson()).toJson(QJsonDocument::Compact) + "\n");
 }
 
-void Locator::noteApCells(const QList<AccessPoint> &aps, double lat, double lon)
+void Locator::noteObservations(const QList<AccessPoint> &aps, const Fix &at)
 {
-    const QString cell = QStringLiteral("%1,%2").arg(qRound(lat * 20)).arg(qRound(lon * 20));
-    bool changed = false;
+    const QString cell = QStringLiteral("%1,%2").arg(qRound(at.lat * 20)).arg(qRound(at.lon * 20));
     for (const AccessPoint &ap : aps) {
-        QSet<QString> &s = m_apCells[ap.bssid];
-        if (!s.contains(cell)) { s.insert(cell); changed = true; }
+        ApRecord &r = m_apRecords[ap.bssid];
+        if (!ap.ssid.isEmpty()) r.ssid = ap.ssid;
+        r.cells.insert(cell);
+        // New observation if we've moved ≥ 25 m since the last one for this AP, or it's the first
+        bool add = r.obs.isEmpty();
+        if (!add) {
+            const ApObservation &last = r.obs.last();
+            const double moved = distanceM(last.lat, last.lon, at.lat, at.lon);
+            // Only count it as a new vantage point if we've clearly moved beyond both fixes' error
+            add = moved >= qMax(40.0, qMax(last.acc, at.accuracy) * 1.2);
+            if (!add && qAbs(last.dbm - ap.dbm) >= 6 && at.accuracy < last.acc) {
+                // same spot, better fix: replace the last observation
+                r.obs.last().lat = at.lat; r.obs.last().lon = at.lon; r.obs.last().acc = at.accuracy;
+                r.obs.last().dbm = ap.dbm; r.obs.last().time = at.time;
+            }
+        }
+        if (add) {
+            ApObservation ob; ob.lat = at.lat; ob.lon = at.lon; ob.acc = at.accuracy; ob.dbm = ap.dbm; ob.time = at.time;
+            r.obs.append(ob);
+            while (r.obs.size() > 60) r.obs.removeFirst();
+        }
     }
-    if (changed) saveApCells();
+    saveApRecords();
+    queueWigle();
 }
 
-void Locator::saveApCells() const
+void Locator::saveApRecords() const
 {
-    QJsonObject cells;
-    for (auto it = m_apCells.begin(); it != m_apCells.end(); ++it) {
-        QJsonArray a; for (const QString &c : it.value()) a.append(c);
-        cells[it.key()] = a;
+    QJsonObject recs;
+    for (auto it = m_apRecords.begin(); it != m_apRecords.end(); ++it) {
+        const ApRecord &r = it.value();
+        QJsonObject ro; ro["ssid"] = r.ssid;
+        QJsonArray cells; for (const QString &c : r.cells) cells.append(c); ro["cells"] = cells;
+        QJsonArray obs;
+        for (const ApObservation &o : r.obs) {
+            QJsonObject oo; oo["lat"] = o.lat; oo["lon"] = o.lon; oo["acc"] = o.acc; oo["dbm"] = o.dbm; oo["t"] = o.time.toString(Qt::ISODate);
+            obs.append(oo);
+        }
+        ro["obs"] = obs;
+        if (r.wigle) { ro["wigle"] = true; ro["wLat"] = r.wLat; ro["wLon"] = r.wLon; }
+        if (r.wigleChecked.isValid()) ro["wigleChecked"] = r.wigleChecked.toString(Qt::ISODate);
+        recs[it.key()] = ro;
     }
     QJsonArray t, nt;
     for (const QString &b : m_travelling) t.append(b);
     for (const QString &b : m_notTravelling) nt.append(b);
-    QJsonObject o; o["cells"] = cells; o["travelling"] = t; o["notTravelling"] = nt;
+    QJsonObject o; o["version"] = 3; o["records"] = recs; o["travelling"] = t; o["notTravelling"] = nt;
     QFile f(stateDir() + "/aps.json");
     if (f.open(QIODevice::WriteOnly | QIODevice::Truncate))
-        f.write(QJsonDocument(o).toJson(QJsonDocument::Indented));
+        f.write(QJsonDocument(o).toJson(QJsonDocument::Compact));
 }
 
 bool Locator::exportGpx(const QString &path, QString *error) const

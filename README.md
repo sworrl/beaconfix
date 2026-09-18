@@ -18,17 +18,36 @@ Access points that travel with you (your own router, hotspots) are excluded: the
 connected network by default, anything seen at two stops more than ~5 km apart
 automatically, plus a glob ignore list. `_nomap` SSIDs are honoured.
 
+## Where the beacons are drawn
+
+The **Beacons** view is a night-mode OpenStreetMap (tiles darkened in-app, no
+WebEngine, no GL) with you at the centre — pulsing halo, accuracy ring, radar
+sweep — and every access point you can hear placed by the best estimate available:
+
+| marker | meaning |
+|---|---|
+| gold diamond | real position from **WiGLE** (optional API token in Settings; looked up 1.5 s apart, cached per BSSID) |
+| gold dot + dashed ring | **estimated** from a signal-weighted centroid, once heard from two vantage points further apart than the fixes' own error |
+| cyan dot on a dotted orbit | heard, **distance only** from RSSI (log-distance model) at a stable pseudo-bearing — the direction is *not* known |
+| green / magenta / grey | connected · travels with you · ignored |
+
+Hover a beacon for its details. A HUD shows your rank (Newcomer → Wanderer → Scout →
+Pathfinder → Navigator → Cartographer → Beaconmaster, by beacons logged), counters
+and an XP bar. It's a display, not a game: nothing to click, nothing to win.
+
 ## Pieces
 
-- `beaconfix` — Qt Widgets app: fix card, OpenStreetMap tile map (no WebEngine),
-  access-point table, trip log with GPX export, settings.
+- `beaconfix` — Qt Widgets app: fix card, the Beacons view above, access-point table
+  (with "where" column), trip log with GPX export, settings.
 - **Tray icon** (`beaconfix --tray`, autostarted): place, accuracy, age, re-check, copy, open in OSM.
-- **Plasma widget** `org.kde.plasma.beaconfix` — panel/desktop applet reading the same fix.
+- **Plasma widget** `org.kde.plasma.beaconfix` — panel/desktop applet: place + source chip,
+  a live radar canvas of the beacons by distance, and the HUD line. Reads the same fix.
 - **D-Bus** `org.sworrl.BeaconFix` at `/org/sworrl/BeaconFix`: properties `valid latitude
   longitude accuracy source place timestamp apCount intervalMinutes`, methods `Refresh()`
   `ShowWindow()` `StateJson()`, signal `FixChanged()`. D-Bus activated.
-- **CLI**: `beaconfix --once` (standalone probe → JSON), `--json` (current fix),
-  `--refresh` (poke the running instance).
+- **CLI**: `beaconfix --once` (standalone probe → JSON), `--json` (current fix, incl.
+  `aps[]` with estimates and `stats{}`), `--refresh` (poke the running instance),
+  `--snapshot file.png` (render the window to a file — used for the screenshots).
 
 State: `~/.local/state/beaconfix/` (`state.json`, `history.jsonl`, `aps.json`).
 Settings: `~/.config/sworrl/beaconfix.conf`.

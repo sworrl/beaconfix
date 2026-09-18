@@ -31,7 +31,8 @@ int main(int argc, char **argv)
     QCommandLineOption once(QStringLiteral("once"), QStringLiteral("Run one probe standalone, print the result as JSON, exit."));
     QCommandLineOption json(QStringLiteral("json"), QStringLiteral("Print the current fix (from the running instance or the state file) as JSON, exit."));
     QCommandLineOption refresh(QStringLiteral("refresh"), QStringLiteral("Ask the running instance to re-check now (starts it if needed), exit."));
-    p.addOptions({tray, once, json, refresh});
+    QCommandLineOption snapshot(QStringLiteral("snapshot"), QStringLiteral("Render the window to <file> after one probe and exit (for docs/tests)."), QStringLiteral("file"));
+    p.addOptions({tray, once, json, refresh, snapshot});
     p.process(app);
 
     QTextStream out(stdout);
@@ -61,6 +62,22 @@ int main(int argc, char **argv)
                 QCoreApplication::quit();
             });
             poll->start(200);
+        });
+        loc.Refresh();
+        return app.exec();
+    }
+
+    if (p.isSet(snapshot)) {
+        Locator loc(true);
+        MainWindow win(&loc);
+        win.resize(1100, 720);
+        win.show();
+        const QString file = p.value(snapshot);
+        QObject::connect(&loc, &Locator::probeFinished, &app, [&, file](bool, const QString &) {
+            QTimer::singleShot(7000, &app, [&, file] {     // let tiles + geocode arrive
+                win.grab().save(file);
+                QCoreApplication::quit();
+            });
         });
         loc.Refresh();
         return app.exec();

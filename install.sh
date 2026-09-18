@@ -38,12 +38,29 @@ else
     echo "   Add 'BeaconFix' via right-click panel/desktop → Add Widgets."
 fi
 
-echo "==> Starting tray"
-if ! pgrep -x beaconfix >/dev/null 2>&1; then
-    nohup "$PREFIX/bin/beaconfix" --tray >/dev/null 2>&1 &
-    disown
-else
-    echo "   already running — quit it from the tray and re-run, or: kill \$(pgrep -x beaconfix) && beaconfix --tray &"
+echo "==> (Re)starting tray"
+if pgrep -x beaconfix >/dev/null 2>&1; then
+    pkill -x beaconfix || true
+    for _ in 1 2 3 4 5 6 7 8 9 10; do pgrep -x beaconfix >/dev/null 2>&1 || break; sleep 0.5; done
+    pkill -9 -x beaconfix 2>/dev/null || true
+fi
+nohup "$PREFIX/bin/beaconfix" --tray >/dev/null 2>&1 &
+disown
+
+# Make sure the tray icon lands in the visible row, not the overflow.
+# The system tray's item lists live in the group that holds "extraItems=".
+TRAYRC="$HOME/.config/plasma-org.kde.plasma.desktop-appletsrc"
+if [ -f "$TRAYRC" ]; then
+    grp="$(awk '/^\[/{g=$0} /^extraItems=/{print g; exit}' "$TRAYRC")"
+    if [ -n "$grp" ]; then
+        # "[Containments][409][Applets][414][General]" -> --group Containments --group 409 ...
+        args=(); for part in $(printf '%s' "$grp" | sed -E 's/\]\[/ /g; s/^\[//; s/\]$//'); do args+=(--group "$part"); done
+        shown="$(kreadconfig6 --file "$TRAYRC" "${args[@]}" --key shownItems 2>/dev/null || true)"
+        case ",$shown," in *,beaconfix,*) ;; *)
+            kwriteconfig6 --file "$TRAYRC" "${args[@]}" --key shownItems "${shown:+$shown,}beaconfix"
+            RESTART_PLASMA=1 ;;
+        esac
+    fi
 fi
 
 if [ "${RESTART_PLASMA:-0}" = 1 ] && [ "${NO_PLASMA_RESTART:-0}" != 1 ]; then

@@ -22,6 +22,35 @@ struct Fix {
     static Fix fromJson(const QJsonObject &o);
 };
 
+struct ApObservation { double lat = 0, lon = 0; double acc = 0; int dbm = -100; QDateTime time; };
+
+// Everything we've learned about one BSSID across stops
+struct ApRecord {
+    QString ssid;
+    QSet<QString> cells;              // ~5 km cells it was seen in (travelling detection)
+    QList<ApObservation> obs;         // where we were + how loud it was
+    bool wigle = false;               // WiGLE knows where it is
+    double wLat = 0, wLon = 0;
+    QDateTime wigleChecked;
+};
+
+// Where we think an AP is, for the map
+struct ApEstimate {
+    enum Kind { None, Ring, Centroid, Wigle } kind = None;
+    double lat = 0, lon = 0;          // Centroid / Wigle: the estimate. Ring: our own position.
+    double radiusM = 0;               // Ring: RSSI distance. Others: uncertainty.
+    double bearingDeg = 0;            // Ring only: stable pseudo-bearing (bearing is unknown)
+};
+
+struct Stats {
+    int stops = 0;
+    double distanceKm = 0;
+    int beaconsTotal = 0;             // distinct BSSIDs ever seen
+    int beaconsNow = 0, usedNow = 0, travellingNow = 0, locatedNow = 0;
+    double bestAccuracy = -1;
+    QString rank; int rankLevel = 0; int nextRankAt = 0;
+};
+
 // Runs the probe chain (Starlink dish GPS → BeaconDB Wi-Fi → IP) on a timer,
 // keeps state + history on disk, and is exported on the session bus as
 // org.sworrl.BeaconFix so the tray, the plasmoid and other apps share one fix.
@@ -40,7 +69,6 @@ class Locator : public QObject {
 public:
     explicit Locator(bool standalone, QObject *parent = nullptr);
 
-    // D-Bus property readers
     bool    valid()     const { return m_fix.valid; }
     double  latitude()  const { return m_fix.lat; }
     double  longitude() const { return m_fix.lon; }
@@ -61,9 +89,13 @@ public:
     const QList<Fix> &history() const { return m_history; }
     QString wifiInterface() const { return m_scanner.interfaceName(); }
 
-    // Per-AP classification for the UI: used | active | ignored | travelling | nomap
-    QString apStatus(const AccessPoint &ap) const;
-    bool    isTravelling(const QString &bssid) const;
+    QString    apStatus(const AccessPoint &ap) const;   // used | active | ignored | travelling | nomap
+    bool       isTravelling(const QString &bssid) const;
+    ApEstimate estimateFor(const AccessPoint &ap) const;
+    const ApRecord *record(const QString &bssid) const;
+    Stats      stats() const;
+    static double rssiDistanceM(int dbm);
+    static double distanceM(double lat1, double lon1, double lat2, double lon2);
 
     // Settings
     int         moveThresholdM() const { return m_moveThresholdM; }
@@ -72,6 +104,7 @@ public:
     bool        useIp()          const { return m_useIp; }
     bool        ignoreActiveAp() const { return m_ignoreActive; }
     QStringList ignorePatterns() const { return m_ignore; }
+    QString     wigleToken()     const { return m_wigleToken; }
     void setMoveThresholdM(int m);
     void setUseStarlink(bool b);
     void setStarlinkHost(const QString &h);
@@ -80,13 +113,13 @@ public:
     void setIgnorePatterns(const QStringList &l);
     void addIgnorePattern(const QString &p);
     void setTravelling(const QString &bssid, bool travelling);
+    void setWigleToken(const QString &t);
 
     void    start();
     bool    exportGpx(const QString &path, QString *error) const;
     static QString stateDir();
 
 public slots:
-    // Exported on D-Bus
     void    Refresh();
     void    ShowWindow();
     QString StateJson() const;
@@ -110,26 +143,27 @@ private:
     void loadState();
     void saveState() const;
     void appendHistory(const Fix &f);
-    void noteApCells(const QList<AccessPoint> &aps, double lat, double lon);
-    void saveApCells() const;
+    void noteObservations(const QList<AccessPoint> &aps, const Fix &at);
+    void saveApRecords() const;
     bool matchesIgnore(const AccessPoint &ap) const;
-    static double distanceM(double lat1, double lon1, double lat2, double lon2);
+    void queueWigle();
+    void pumpWigle();
 
     bool m_standalone;
     WifiScanner m_scanner;
     QNetworkAccessManager m_nam;
     QTimer m_timer;
+    QTimer m_wigleTimer;
     bool   m_busy = false;
     bool   m_geocodePending = false;
-    Fix    m_fix;          // accepted fix (what everyone reads)
-    Fix    m_last;         // result of the most recent successful probe, movement or not
-    QString m_lastError;
-    QString m_starlinkError;
+    Fix    m_fix, m_last;
+    QString m_lastError, m_starlinkError;
     QList<AccessPoint> m_aps;
     QList<Fix> m_history;
-    QHash<QString, QSet<QString>> m_apCells;   // bssid → ~5 km cells it was seen in
-    QSet<QString> m_travelling;                // manually flagged
-    QSet<QString> m_notTravelling;             // manually cleared
+    QHash<QString, ApRecord> m_apRecords;
+    QSet<QString> m_travelling, m_notTravelling;
+    QStringList m_wigleQueue;
+    bool m_wigleBusy = false;
 
     int m_intervalMin = 15;
     int m_moveThresholdM = 250;
@@ -138,4 +172,5 @@ private:
     bool m_useIp = true;
     bool m_ignoreActive = true;
     QStringList m_ignore;
+    QString m_wigleToken;
 };

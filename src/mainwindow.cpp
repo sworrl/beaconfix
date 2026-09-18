@@ -1,6 +1,6 @@
 #include "mainwindow.h"
 #include "locator.h"
-#include "tilemap.h"
+#include "beaconview.h"
 #include <QApplication>
 #include <QCheckBox>
 #include <QClipboard>
@@ -35,8 +35,8 @@ static QString sourceName(const QString &s)
 MainWindow::MainWindow(Locator *loc, QWidget *parent) : QMainWindow(parent), m_loc(loc)
 {
     setWindowTitle(QStringLiteral("BeaconFix"));
-    setWindowIcon(QIcon::fromTheme(QStringLiteral("mark-location")));
-    resize(960, 640);
+    setWindowIcon(QIcon::fromTheme(QStringLiteral("beaconfix"), QIcon::fromTheme(QStringLiteral("mark-location"))));
+    resize(1100, 720);
 
     auto *central = new QWidget(this);
     auto *outer = new QVBoxLayout(central);
@@ -47,8 +47,11 @@ MainWindow::MainWindow(Locator *loc, QWidget *parent) : QMainWindow(parent), m_l
     m_place = new QLabel; QFont big = m_place->font(); big.setPointSizeF(big.pointSizeF() * 1.8); big.setBold(true); m_place->setFont(big);
     m_place->setTextInteractionFlags(Qt::TextSelectableByMouse);
     m_coords = new QLabel; m_coords->setTextInteractionFlags(Qt::TextSelectableByMouse);
-    m_meta = new QLabel; m_meta->setStyleSheet(QStringLiteral("opacity: 0.7"));
-    texts->addWidget(m_place); texts->addWidget(m_coords); texts->addWidget(m_meta);
+    m_meta = new QLabel; { QFont mf = m_meta->font(); mf.setPointSizeF(mf.pointSizeF() * 0.95); m_meta->setFont(mf); }
+    m_chip = new QLabel; m_chip->setAlignment(Qt::AlignCenter);
+    m_chip->setStyleSheet(QStringLiteral("QLabel { color: #0b101a; background: #35d6ff; border-radius: 9px; padding: 2px 10px; font-weight: 600; }"));
+    auto *placeRow = new QHBoxLayout; placeRow->addWidget(m_place); placeRow->addWidget(m_chip); placeRow->addStretch();
+    texts->addLayout(placeRow); texts->addWidget(m_coords); texts->addWidget(m_meta);
     card->addLayout(texts, 1);
 
     auto *buttons = new QVBoxLayout;
@@ -80,11 +83,11 @@ MainWindow::MainWindow(Locator *loc, QWidget *parent) : QMainWindow(parent), m_l
 
     // ── Tabs ──────────────────────────────────────────────────────────────────
     auto *tabs = new QTabWidget;
-    m_map = new TileMap;
-    tabs->addTab(m_map, QIcon::fromTheme(QStringLiteral("map-globe")), QStringLiteral("Map"));
+    m_map = new BeaconView(m_loc);
+    tabs->addTab(m_map, QIcon::fromTheme(QStringLiteral("map-globe")), QStringLiteral("Beacons"));
 
-    m_aps = new QTableWidget(0, 5);
-    m_aps->setHorizontalHeaderLabels({QStringLiteral("SSID"), QStringLiteral("BSSID"), QStringLiteral("dBm"), QStringLiteral("MHz"), QStringLiteral("Status")});
+    m_aps = new QTableWidget(0, 6);
+    m_aps->setHorizontalHeaderLabels({QStringLiteral("SSID"), QStringLiteral("BSSID"), QStringLiteral("dBm"), QStringLiteral("MHz"), QStringLiteral("Status"), QStringLiteral("Where")});
     m_aps->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
     m_aps->setEditTriggers(QAbstractItemView::NoEditTriggers);
     m_aps->setSelectionBehavior(QAbstractItemView::SelectRows);
@@ -148,6 +151,13 @@ QWidget *MainWindow::buildSettings()
     connect(m_ignoreActive, &QCheckBox::toggled, m_loc, &Locator::setIgnoreActiveAp);
     form->addRow(QString(), m_ignoreActive);
 
+    m_wigle = new QLineEdit(m_loc->wigleToken());
+    m_wigle->setEchoMode(QLineEdit::Password);
+    m_wigle->setPlaceholderText(QStringLiteral("optional — the 'Encoded for use' token from wigle.net/account"));
+    m_wigle->setToolTip(QStringLiteral("With a WiGLE API token, beacons you hear are looked up one by one (1.5 s apart, cached) and drawn at their real mapped position as gold diamonds."));
+    connect(m_wigle, &QLineEdit::editingFinished, this, [this] { m_loc->setWigleToken(m_wigle->text()); });
+    form->addRow(QStringLiteral("WiGLE API token:"), m_wigle);
+
     m_ignore = new QPlainTextEdit(m_loc->ignorePatterns().join('\n'));
     m_ignore->setPlaceholderText(QStringLiteral("One glob per line, matched against BSSID and SSID, e.g.\nAA:BB:CC:??:EE:FF\nMyHotspot*"));
     m_ignore->setMaximumHeight(120);
@@ -157,7 +167,9 @@ QWidget *MainWindow::buildSettings()
     auto *note = new QLabel(QStringLiteral(
         "Access points seen at two stops more than ~5 km apart are flagged as travelling with you automatically. "
         "Right-click a row in the Access points tab to flag or clear one by hand.\n"
-        "Data: BeaconDB (api.beacondb.net) for Wi-Fi, Nominatim for place names, OpenStreetMap tiles for the map. "
+        "Beacon positions: WiGLE (if a token is set) → signal-weighted centroid once a beacon has been heard from two spots ≥ 25 m apart → "
+        "otherwise a ring at the RSSI-estimated distance with a stable pseudo-bearing (the direction is NOT known).\n"
+        "Data: BeaconDB (api.beacondb.net) for the fix, Nominatim for place names, CARTO dark tiles on OpenStreetMap data for the map. "
         "State lives in ") + Locator::stateDir());
     note->setWordWrap(true); note->setStyleSheet(QStringLiteral("color: palette(mid)"));
     form->addRow(note);
@@ -171,17 +183,22 @@ void MainWindow::refreshFix()
         m_place->setText(QStringLiteral("No location yet"));
         m_coords->setText(m_loc->lastError());
         m_meta->clear();
-        m_map->setFix(0, 0, -1, false);
+        m_chip->setText(QStringLiteral("NO FIX")); m_chip->setStyleSheet(QStringLiteral("QLabel { color: white; background: #ff4f4f; border-radius: 9px; padding: 2px 10px; font-weight: 600; }"));
         return;
     }
+    const QString chipBg = f.source == QLatin1String("starlink") ? QStringLiteral("#6cff8a") : f.source == QLatin1String("wifi") ? QStringLiteral("#35d6ff") : QStringLiteral("#ffd166");
+    m_chip->setText(f.source == QLatin1String("starlink") ? QStringLiteral("GPS") : f.source == QLatin1String("wifi") ? QStringLiteral("WI-FI") : QStringLiteral("IP"));
+    m_chip->setStyleSheet(QStringLiteral("QLabel { color: #0b101a; background: %1; border-radius: 9px; padding: 2px 10px; font-weight: 600; }").arg(chipBg));
     m_place->setText(f.place);
     m_coords->setText(QStringLiteral("%1, %2").arg(f.lat, 0, 'f', 6).arg(f.lon, 0, 'f', 6));
     QString meta = QStringLiteral("%1 · ±%2 m · %3").arg(sourceName(f.source)).arg(qRound(f.accuracy)).arg(f.time.toString(QStringLiteral("ddd d MMM HH:mm")));
     if (f.source == QLatin1String("wifi")) meta += QStringLiteral(" · %1 of %2 APs used").arg(f.apUsed).arg(f.apCount);
     if (!m_loc->lastError().isEmpty()) meta += QStringLiteral("\nLast attempt failed: ") + m_loc->lastError();
+    const Stats st = m_loc->stats();
+    meta += QStringLiteral("\n%1 · Lv %2 · %3 beacons logged · %4 stops · %5 km").arg(st.rank).arg(st.rankLevel).arg(st.beaconsTotal).arg(st.stops).arg(st.distanceKm, 0, 'f', 1);
     m_meta->setText(meta);
-    m_map->setFix(f.lat, f.lon, f.accuracy, true);
     if (f.source == QLatin1String("ip") && m_map->zoom() > 11) m_map->setZoom(10);
+    else if (f.source != QLatin1String("ip") && m_map->zoom() < 14) m_map->setZoom(15);
 }
 
 void MainWindow::refreshAps()
@@ -206,6 +223,12 @@ void MainWindow::refreshAps()
         auto *c4 = new QTableWidgetItem(label);
         if (st != QLatin1String("used")) c4->setForeground(palette().color(QPalette::Disabled, QPalette::Text));
         m_aps->setItem(i, 4, c4);
+        const ApEstimate e = m_loc->estimateFor(ap);
+        const ApRecord *r = m_loc->record(ap.bssid);
+        const QString where = e.kind == ApEstimate::Wigle ? QStringLiteral("WiGLE %1, %2").arg(e.lat, 0, 'f', 5).arg(e.lon, 0, 'f', 5)
+                            : e.kind == ApEstimate::Centroid ? QStringLiteral("est. %1, %2 ±%3 m (%4 obs)").arg(e.lat, 0, 'f', 5).arg(e.lon, 0, 'f', 5).arg(qRound(e.radiusM)).arg(r ? r->obs.size() : 0)
+                            : e.kind == ApEstimate::Ring ? QStringLiteral("~%1 m away, bearing unknown").arg(qRound(e.radiusM)) : QString();
+        m_aps->setItem(i, 5, new QTableWidgetItem(where));
     }
 }
 
