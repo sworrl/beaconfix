@@ -83,6 +83,7 @@ public:
     const Fix &fix() const { return m_fix; }
     const Fix &lastProbe() const { return m_last; }
     QString lastError() const { return m_lastError; }
+    QString coarseNote() const { return m_coarseNote; }
     bool    busy() const { return m_busy; }
     bool    geocodePending() const { return m_geocodePending; }
     const QList<AccessPoint> &accessPoints() const { return m_aps; }
@@ -157,7 +158,7 @@ private:
     bool   m_busy = false;
     bool   m_geocodePending = false;
     Fix    m_fix, m_last;
-    QString m_lastError, m_starlinkError;
+    QString m_lastError, m_starlinkError, m_coarseNote;
     QList<AccessPoint> m_aps;
     QList<Fix> m_history;
     QHash<QString, ApRecord> m_apRecords;

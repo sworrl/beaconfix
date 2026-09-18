@@ -194,6 +194,7 @@ void MainWindow::refreshFix()
     QString meta = QStringLiteral("%1 · ±%2 m · %3").arg(sourceName(f.source)).arg(qRound(f.accuracy)).arg(f.time.toString(QStringLiteral("ddd d MMM HH:mm")));
     if (f.source == QLatin1String("wifi")) meta += QStringLiteral(" · %1 of %2 APs used").arg(f.apUsed).arg(f.apCount);
     if (!m_loc->lastError().isEmpty()) meta += QStringLiteral("\nLast attempt failed: ") + m_loc->lastError();
+    if (!m_loc->coarseNote().isEmpty()) meta += QStringLiteral("\n") + m_loc->coarseNote();
     const Stats st = m_loc->stats();
     meta += QStringLiteral("\n%1 · Lv %2 · %3 beacons logged · %4 stops · %5 km").arg(st.rank).arg(st.rankLevel).arg(st.beaconsTotal).arg(st.stops).arg(st.distanceKm, 0, 'f', 1);
     m_meta->setText(meta);

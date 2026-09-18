@@ -229,6 +229,7 @@ QString Locator::StateJson() const
 {
     QJsonObject o = m_fix.toJson();
     o["error"] = m_lastError;
+    o["note"] = m_coarseNote;
     o["busy"] = m_busy;
     o["intervalMinutes"] = m_intervalMin;
     o["wifiInterface"] = m_scanner.interfaceName();
@@ -316,6 +317,8 @@ void Locator::queryBeaconDb(const QList<AccessPoint> &usable)
         arr.append(o);
     }
     QJsonObject body; body["wifiAccessPoints"] = arr;
+    QJsonObject fb; fb["ipf"] = false; fb["lacf"] = false;   // no GeoIP / cell fallback — we do that ourselves, honestly labelled
+    body["fallbacks"] = fb;
     QNetworkRequest req(QUrl(QStringLiteral("https://api.beacondb.net/v1/geolocate")));
     req.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json"));
     req.setHeader(QNetworkRequest::UserAgentHeader, QString::fromLatin1(USER_AGENT));
@@ -326,9 +329,15 @@ void Locator::queryBeaconDb(const QList<AccessPoint> &usable)
         rep->deleteLater();
         const QJsonObject o = QJsonDocument::fromJson(rep->readAll()).object();
         const QJsonObject loc = o["location"].toObject();
+        const double acc = o["accuracy"].toDouble(-1);
+        if (rep->error() == QNetworkReply::NoError && loc.contains("lat") && acc > 5000) {
+            // That's BeaconDB's GeoIP fallback (city-sized radius), not a Wi-Fi match
+            tryIp(QStringLiteral("BeaconDB had no match for these access points (it offered a %1 km GeoIP guess)").arg(qRound(acc / 1000)));
+            return;
+        }
         if (rep->error() == QNetworkReply::NoError && loc.contains("lat")) {
             Fix f; f.valid = true; f.lat = loc["lat"].toDouble(); f.lon = loc["lng"].toDouble();
-            f.accuracy = o["accuracy"].toDouble(-1); f.source = QStringLiteral("wifi");
+            f.accuracy = acc; f.source = QStringLiteral("wifi");
             f.time = QDateTime::currentDateTime(); f.apCount = seen; f.apUsed = used;
             accept(f);
             finish(true, QStringLiteral("BeaconDB fix from %1 access points (±%2 m)").arg(used).arg(qRound(f.accuracy)));
@@ -367,6 +376,19 @@ void Locator::tryIp(const QString &why)
 void Locator::accept(Fix cand, const QString &ipCity)
 {
     m_last = cand;
+    // A coarse (IP) answer must not overwrite a precise fix we got recently: on
+    // Starlink the IP answer is the ground station, hundreds of km off.
+    if (cand.source == QLatin1String("ip") && m_fix.valid && m_fix.source != QLatin1String("ip")
+        && m_fix.time.isValid() && m_fix.time.secsTo(cand.time) < 12 * 3600) {
+        m_lastError.clear();
+        m_coarseNote = QStringLiteral("IP says %1 — keeping the %2 fix from %3")
+                           .arg(ipCity, m_fix.source == QLatin1String("wifi") ? QStringLiteral("Wi-Fi") : QStringLiteral("GPS"),
+                                m_fix.time.toString(QStringLiteral("HH:mm")));
+        saveState();
+        emit FixChanged();
+        return;
+    }
+    m_coarseNote.clear();
     if (cand.source != QLatin1String("ip") && cand.accuracy >= 0 && cand.accuracy < 2000)
         noteObservations(m_aps, cand);
 
@@ -542,6 +564,7 @@ void Locator::saveState() const
 {
     QJsonObject o = m_fix.toJson();
     o["error"] = m_lastError;
+    o["note"] = m_coarseNote;
     o["checked"] = QDateTime::currentDateTime().toString(Qt::ISODate);
     QFile f(stateDir() + "/state.json");
     if (f.open(QIODevice::WriteOnly | QIODevice::Truncate))

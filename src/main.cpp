@@ -42,7 +42,9 @@ int main(int argc, char **argv)
         Locator loc(true);
         QObject::connect(&loc, &Locator::probeFinished, &app, [&](bool ok, const QString &msg) {
             if (!ok) {
-                QJsonObject o; o["valid"] = false; o["source"] = QStringLiteral("none"); o["error"] = msg;
+                // Probe failed: hand back the last good fix (if any) rather than nothing
+                QJsonObject o = loc.fix().valid ? loc.fix().toJson() : QJsonObject{{"valid", false}, {"source", "none"}};
+                o["probeError"] = msg;
                 out << QJsonDocument(o).toJson(QJsonDocument::Compact) << "\n";
                 out.flush();
                 QCoreApplication::quit();
@@ -55,8 +57,10 @@ int main(int argc, char **argv)
                 *waited += 200;
                 if (loc.geocodePending() && *waited < 6000) return;
                 poll->stop();
-                QJsonObject o = loc.lastProbe().toJson();
-                o["place"] = loc.fix().place;
+                QJsonObject o = loc.fix().toJson();          // the accepted fix, not a coarse candidate
+                o["probeSource"] = loc.lastProbe().source;
+                o["probeAccuracy"] = loc.lastProbe().accuracy;
+                if (!loc.coarseNote().isEmpty()) o["note"] = loc.coarseNote();
                 out << QJsonDocument(o).toJson(QJsonDocument::Compact) << "\n";
                 out.flush();
                 QCoreApplication::quit();
