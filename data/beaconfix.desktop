@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=BeaconFix
+GenericName=Wi-Fi Locator
+Comment=Where am I? Position fix from Wi-Fi beacons via BeaconDB, Starlink GPS, or IP
+Exec=beaconfix
+Icon=mark-location
+Terminal=false
+Categories=Utility;Network;Geography;
+Keywords=location;gps;wifi;beacondb;where;
+StartupNotify=false
+X-DBUS-ServiceName=org.sworrl.BeaconFix

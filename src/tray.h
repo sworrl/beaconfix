@@ -1,0 +1,28 @@
+#pragma once
+#include <QMenu>
+#include <QObject>
+#include <QSystemTrayIcon>
+#include <QTimer>
+
+class Locator;
+
+class Tray : public QObject {
+    Q_OBJECT
+public:
+    explicit Tray(Locator *loc, QObject *parent = nullptr);
+
+signals:
+    void openWindowRequested();
+    void quitRequested();
+
+private:
+    void rebuild();
+    QString ageText() const;
+
+    Locator *m_loc;
+    QSystemTrayIcon m_icon;
+    QMenu m_menu;
+    QAction *m_placeAct = nullptr, *m_coordAct = nullptr, *m_ageAct = nullptr, *m_refreshAct = nullptr;
+    QMenu *m_intervalMenu = nullptr;
+    QTimer m_ageTimer;
+};
