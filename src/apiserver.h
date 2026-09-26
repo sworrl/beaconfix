@@ -1,0 +1,166 @@
+#pragma once
+#include <QDateTime>
+#include <QHash>
+#include <QHostAddress>
+#include <QJsonObject>
+#include <QList>
+#include <QObject>
+#include <QPointer>
+#include <QProcess>
+#include <QStringList>
+#include <QTimer>
+
+class Locator;
+class QTcpServer;
+class QTcpSocket;
+
+// LAN API: a small HTTP/1.1 + JSON server on every interface so other devices
+// on the local network (a photo frame, a phone, a script) can ask "where are we?".
+//
+//   GET  /api/v1/hello                 no auth · name, version, hostname, pairing open?
+//   POST /api/v1/pair                  no auth · {"name","scopes"} → 202 {id, code, expires}  (only while pairing is open)
+//   GET  /api/v1/pair/<id>             no auth · {status: pending|denied|approved[, token — once]}
+//   GET  /api/v1/location              read    · the fix, place, elevation, sun, geo: URI, map links
+//   GET  /api/v1/state                 read    · everything (Locator::StateJson)
+//   GET  /api/v1/events?since=<id>     read    · beacon/fix/stop events newer than <id>
+//   GET  /api/v1/aps | pois | track | trip     read
+//   GET  /api/v1/stream                read    · Server-Sent Events: fix, beacon, ping (30 s)
+//   POST /api/v1/refresh | prefetch    control
+//
+// Security: only private / link-local peers are answered at all; everything
+// but hello and pairing needs "Authorization: Bearer <token>". Tokens are
+// 256-bit random, shown once, and only their SHA-256 is stored
+// (~/.config/sworrl/beaconfix-devices.json). Pairing is closed unless the user
+// opens it for a few minutes, and every request is shown with a 4-digit code
+// so the right device gets approved. Per-IP rate limit, connection cap, and an
+// access log for the Devices tab. If ~/.config/sworrl/beaconfix.crt + .key
+// exist the server speaks TLS instead of plain HTTP.
+class ApiServer : public QObject {
+    Q_OBJECT
+public:
+    struct Device {
+        QString id, name;
+        QDateTime created, lastSeen;
+        QString lastIp;
+        QStringList scopes;               // "read" [, "control"]
+        QByteArray hash;                  // SHA-256 of the token, hex
+        bool revoked = false;
+        QJsonObject toJson(bool full = true) const;
+    };
+    struct Pending {
+        enum State { Waiting, Approved, Denied };
+        QString id, name, code, ip;
+        QStringList scopes;
+        QDateTime created, expires;
+        State state = Waiting;
+        QString token;                    // approved: handed out once, then cleared
+        QJsonObject toJson() const;
+    };
+    struct AccessEntry { QDateTime time; QString ip, method, path; int status = 0; };
+    // One of OUR client devices (from the UniFi export, or added by hand). A peer is "known" when its
+    // MAC (via the neighbour table) matches, its address matches ip / fixed_ip, or mac is a glob that matches.
+    struct Known {
+        QString mac, name, hostname, fixedIp, ip, network;
+        bool online = false, wired = false, ours = true;
+        QDateTime lastSeen;
+        QStringList scopes;               // optional: what a pairing from it is auto-approved with
+        QJsonObject toJson() const;
+    };
+
+    explicit ApiServer(Locator *loc, QObject *parent = nullptr);
+    ~ApiServer() override;
+
+    bool      enabled() const { return m_enabled; }
+    void      setEnabled(bool on);
+    int       port() const { return m_port; }              // configured
+    int       boundPort() const;                            // actual (0 when not listening)
+    void      setPort(int p);
+    bool      listening() const;
+    bool      tls() const { return m_tls; }
+    QString   error() const { return m_error; }
+
+    bool      pairingOpen() const;
+    QDateTime pairingUntil() const { return m_pairingUntil; }
+    void      openPairing(int minutes);
+    void      closePairing();
+
+    QList<Device>      devices() const { return m_devices; }
+    QList<Pending>     pending() const;                     // unexpired
+    QList<AccessEntry> accessLog() const { return m_log; }
+    bool      approve(const QString &id);
+    bool      deny(const QString &id);
+    bool      revoke(const QString &nameOrId);
+    bool      remove(const QString &id);
+    QString   createToken(const QString &name, const QStringList &scopes);   // returns the token (shown once)
+    QJsonObject statusJson() const;
+
+    // Known devices (allowlist)
+    bool      knownOnly() const { return m_knownOnly; }
+    void      setKnownOnly(bool on);
+    QList<Known> known() const { return m_known; }
+    QJsonObject knownJson() const;
+    bool      knownAdd(const QString &mac, const QString &name);
+    bool      knownRemove(const QString &mac);
+    int       knownImport(const QString &path, QString *error = nullptr);   // merge by MAC; returns how many were new
+    const Known *knownFor(const QString &ip);                              // nullptr when the peer is not ours
+    static QString macForIp(const QString &ip);                            // from the kernel neighbour table ("" if unknown)
+
+    static bool       isLanAddress(const QHostAddress &a);
+    static QByteArray tokenHash(const QString &token);
+    static bool       constantTimeEqual(const QByteArray &a, const QByteArray &b);
+
+signals:
+    void changed();                                          // devices / pending / listening state
+    void accessLogged();
+    void pairingRequested(const QString &json);
+    void deviceApproved(const QString &name);
+
+private:
+    struct Request {
+        QString method, path, query;
+        QHash<QByteArray, QByteArray> headers;               // lower-case names
+        QByteArray body;
+    };
+    struct Stream { QPointer<QTcpSocket> sock; QString device; };
+
+    void restart();
+    void onConnection();
+    void onReadyRead(QTcpSocket *s);
+    void handle(QTcpSocket *s, const Request &r);
+    void reply(QTcpSocket *s, int code, const QJsonObject &body, const QList<QByteArray> &extra = {});
+    void replyRaw(QTcpSocket *s, int code, const QByteArray &type, const QByteArray &body, const QList<QByteArray> &extra = {});
+    void logAccess(QTcpSocket *s, const QString &method, const QString &path, int status);
+    bool rateLimited(const QString &ip, bool authFailure);
+    Device *authenticate(const Request &r, const QString &ip);
+    QJsonObject locationJson() const;
+    QJsonObject homeJson() const;
+    QJsonObject stateObject() const;
+    void broadcast(const QByteArray &event, const QJsonObject &data);
+    void load();
+    void save();
+    void loadKnown();
+    void saveKnown();
+    void updateDiscovery();
+    static QString randomId(int bytes);
+    static QString newToken();
+    static QString clientIp(QTcpSocket *s);
+
+    Locator *m_loc;
+    QTcpServer *m_server = nullptr;
+    bool m_enabled = true, m_tls = false;
+    int m_port = 47822;
+    QString m_error;
+    QDateTime m_pairingUntil;
+    QList<Device> m_devices;
+    QList<Pending> m_pending;
+    QList<AccessEntry> m_log;
+    QList<Known> m_known;
+    bool m_knownOnly = true;
+    QHash<QString, QPair<QString, qint64>> m_neigh;            // ip → (mac, ms looked up)
+    QHash<QString, QList<qint64>> m_hits;                     // ip → request timestamps (ms) in the last minute
+    QList<Stream> m_streams;
+    QTimer m_pingTimer, m_saveTimer, m_sweepTimer;
+    bool m_dirty = false;
+    QProcess *m_avahi = nullptr;
+    int m_open = 0;
+};

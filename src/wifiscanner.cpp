@@ -68,6 +68,29 @@ void WifiScanner::onPropertiesChanged(const QString &iface, const QVariantMap &c
     }
 }
 
+// NM80211ApSecurityFlags
+static const int SEC_PAIR_WEP40 = 0x1, SEC_PAIR_WEP104 = 0x2, SEC_PAIR_TKIP = 0x4, /*SEC_PAIR_CCMP = 0x8,*/
+                 SEC_GROUP_WEP40 = 0x10, SEC_GROUP_WEP104 = 0x20, SEC_GROUP_TKIP = 0x40, /*SEC_GROUP_CCMP = 0x80,*/
+                 SEC_KEY_MGMT_PSK = 0x100, SEC_KEY_MGMT_8021X = 0x200, SEC_KEY_MGMT_SAE = 0x400, SEC_KEY_MGMT_OWE = 0x800,
+                 SEC_KEY_MGMT_OWE_TM = 0x1000, SEC_KEY_MGMT_EAP_SUITE_B_192 = 0x2000;
+static const int AP_FLAG_PRIVACY = 0x1;
+
+QString AccessPoint::classify(int secFlags, int wpaFlags, int rsnFlags)
+{
+    const bool privacy = secFlags & AP_FLAG_PRIVACY;
+    if (rsnFlags & (SEC_KEY_MGMT_OWE | SEC_KEY_MGMT_OWE_TM)) return QStringLiteral("owe");
+    if (!privacy && !wpaFlags && !rsnFlags) return QStringLiteral("open");
+    if (privacy && !wpaFlags && !rsnFlags) return QStringLiteral("wep");
+    if (wpaFlags && !rsnFlags) return QStringLiteral("wpa1");
+    if (rsnFlags & SEC_KEY_MGMT_EAP_SUITE_B_192) return QStringLiteral("wpa3-eap192");
+    const bool sae = rsnFlags & SEC_KEY_MGMT_SAE, psk = rsnFlags & SEC_KEY_MGMT_PSK, eap = rsnFlags & SEC_KEY_MGMT_8021X;
+    if (sae && psk) return QStringLiteral("wpa2/3");
+    if (sae) return QStringLiteral("wpa3");
+    if (rsnFlags & (SEC_PAIR_TKIP | SEC_GROUP_TKIP | SEC_PAIR_WEP40 | SEC_PAIR_WEP104 | SEC_GROUP_WEP40 | SEC_GROUP_WEP104)) return QStringLiteral("wpa2-tkip");
+    if (eap && !psk) return QStringLiteral("wpa2-eap");
+    return QStringLiteral("wpa2");
+}
+
 void WifiScanner::collect()
 {
     m_timeout.stop();
@@ -96,6 +119,12 @@ void WifiScanner::collect()
         // Inverse of NetworkManager's dBm→percent mapping (-100 dBm = 0 %, -40 dBm = 100 %)
         a.dbm       = -40 - (100 - qBound(0, a.strength, 100)) * 60 / 100;
         a.active    = (p.path() == activePath);
+        a.secFlags  = int(ap.property("Flags").toUInt());
+        a.wpaFlags  = int(ap.property("WpaFlags").toUInt());
+        a.rsnFlags  = int(ap.property("RsnFlags").toUInt());
+        a.maxKbps   = int(ap.property("MaxBitrate").toUInt());
+        a.adhoc     = ap.property("Mode").toUInt() == 1;      // NM_802_11_MODE_ADHOC
+        a.security  = AccessPoint::classify(a.secFlags, a.wpaFlags, a.rsnFlags);
         if (!a.bssid.isEmpty())
             aps.append(a);
     }

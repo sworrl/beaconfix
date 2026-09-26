@@ -1,6 +1,12 @@
 #include "locator.h"
+#include "apiserver.h"
+#include "mapdb.h"
+#include <QClipboard>
 #include <QCoreApplication>
+#include <QDBusConnection>
+#include <QDBusInterface>
 #include <QDir>
+#include <QGuiApplication>
 #include <QFile>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -9,11 +15,15 @@
 #include <QProcess>
 #include <QRegularExpression>
 #include <QSettings>
+#include <QSharedPointer>
+#include <QPointF>
+#include <QHash>
 #include <QStandardPaths>
 #include <QTextStream>
 #include <QUrlQuery>
 #include <QtMath>
 #include <algorithm>
+#include <cmath>
 
 static const char *USER_AGENT = "BeaconFix/" BEACONFIX_VERSION " (KDE desktop locator; +https://github.com/sworrl/beaconfix)";
 
@@ -24,6 +34,12 @@ QJsonObject Fix::toJson() const
     o["valid"] = valid; o["lat"] = lat; o["lon"] = lon; o["accuracy"] = accuracy;
     o["source"] = source; o["place"] = place; o["time"] = time.toString(Qt::ISODate);
     o["apCount"] = apCount; o["apUsed"] = apUsed;
+    if (departed.isValid()) o["departed"] = departed.toString(Qt::ISODate);
+    if (hasElevation()) o["elev"] = elevation;
+    if (!city.isEmpty()) o["city"] = city;
+    if (!region.isEmpty()) o["region"] = region;
+    if (!country.isEmpty()) o["country"] = country;
+    if (!provider.isEmpty()) o["provider"] = provider;
     return o;
 }
 Fix Fix::fromJson(const QJsonObject &o)
@@ -33,7 +49,23 @@ Fix Fix::fromJson(const QJsonObject &o)
     f.accuracy = o["accuracy"].toDouble(-1); f.source = o["source"].toString();
     f.place = o["place"].toString(); f.time = QDateTime::fromString(o["time"].toString(), Qt::ISODate);
     f.apCount = o["apCount"].toInt(); f.apUsed = o["apUsed"].toInt();
+    f.departed = QDateTime::fromString(o["departed"].toString(), Qt::ISODate);
+    f.elevation = o["elev"].toDouble(-9999);
+    f.city = o["city"].toString(); f.region = o["region"].toString(); f.country = o["country"].toString();
+    f.provider = o["provider"].toString();
     return f;
+}
+
+QJsonObject BeaconEvent::toJson() const
+{
+    QJsonObject o;
+    o["id"] = id; o["type"] = type; o["time"] = time.toString(Qt::ISODate); o["text"] = text;
+    if (!bssid.isEmpty()) { o["bssid"] = bssid; o["ssid"] = ssid; o["dbm"] = dbm; o["kind"] = kind; o["status"] = status; if (!security.isEmpty()) o["security"] = security; }
+    if (delta) o["delta"] = delta;
+    if (hasPos) { o["lat"] = lat; o["lon"] = lon; }
+    if (hasFrom) { o["fromLat"] = fromLat; o["fromLon"] = fromLon; }
+    if (r > 0) { o["r"] = r; o["bearing"] = bearing; }
+    return o;
 }
 
 // ── Locator ───────────────────────────────────────────────────────────────────
@@ -45,20 +77,471 @@ Locator::Locator(bool standalone, QObject *parent) : QObject(parent), m_standalo
     m_useStarlink    = s.value("useStarlink", true).toBool();
     m_starlinkHost   = s.value("starlinkHost", "192.168.100.1").toString();
     m_useIp          = s.value("useIp", true).toBool();
+    m_useApple       = s.value("useApple", true).toBool();
     m_ignoreActive   = s.value("ignoreActiveAp", true).toBool();
     m_ignore         = s.value("ignorePatterns").toStringList();
+    m_home           = s.value("homeNetworks").toStringList();
+    {                                                          // our UniFi radios: BSSID → SSID, for home:true / homeSsid in the AP JSON
+        QFile hf(QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation) + QStringLiteral("/sworrl/home-networks.json"));
+        if (hf.open(QIODevice::ReadOnly))
+            for (const QJsonValue &v : QJsonDocument::fromJson(hf.readAll()).object()["bssids"].toArray())
+                if (v.isObject()) m_homeSsids.insert(v.toObject()["bssid"].toString().toUpper(), v.toObject()["ssid"].toString());
+    }
+    if (m_home.isEmpty()) {                                    // first run: seed from the UniFi export if it is there
+        const QString seed = QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation) + QStringLiteral("/sworrl/home-networks.json");
+        if (QFile::exists(seed)) {
+            QString err;
+            const QStringList l = parseHomeNetworksFile(seed, &err);
+            if (!l.isEmpty()) { m_home = l; s.setValue("homeNetworks", m_home); qInfo("beaconfix: home networks seeded from %s (%d patterns)", qPrintable(seed), int(l.size())); }
+        }
+    }
+    m_homeFix        = Fix::fromJson(QJsonDocument::fromJson(s.value("homeFix").toByteArray()).object());
+    rebuildPatternCaches();
     m_wigleToken     = s.value("wigleToken").toString();
+    m_poiRadiusKm    = qBound(1, s.value("poiRadiusKm", 6).toInt(), 30);
+    m_notifyStops    = s.value("notifyStops", true).toBool();
+    m_notifyRegions  = s.value("notifyRegions", true).toBool();
+    m_notifyAchievements = s.value("notifyAchievements", true).toBool();
+    m_prefetch       = s.value("prefetchTiles", true).toBool();
+    m_useElevation   = s.value("useElevation", true).toBool();
+    m_tripStart      = s.value("tripStart").toDateTime();
+    m_prefetchedTiles = s.value("prefetchedTiles", 0).toInt();
+    m_liveScanSecs   = qBound(0, s.value("liveScanSeconds", 45).toInt(), 3600);
+    m_liveTimer.setInterval(qMax(15, m_liveScanSecs) * 1000);
+    connect(&m_liveTimer, &QTimer::timeout, this, &Locator::liveScan);
     m_wigleTimer.setSingleShot(true);
     connect(&m_wigleTimer, &QTimer::timeout, this, &Locator::pumpWigle);
 
-    connect(&m_scanner, &WifiScanner::scanFinished, this, &Locator::onScan);
+    connect(&m_scanner, &WifiScanner::scanFinished, this, &Locator::onScanFinished);
     connect(&m_scanner, &WifiScanner::scanFailed, this, [this](const QString &m) {
+        if (m_liveScan && !m_probeWantsScan) { m_liveScan = false; return; }   // quiet: the next live scan retries
+        m_liveScan = false; m_probeWantsScan = false;
         m_aps.clear(); emit scanUpdated();
         tryIp(QStringLiteral("Wi-Fi scan failed: ") + m);
     });
     m_timer.setInterval(m_intervalMin * 60 * 1000);
     connect(&m_timer, &QTimer::timeout, this, &Locator::Refresh);
+    // The internal mapping database (encrypted SQLite). A standalone process only reads it.
+    m_db = new MapDb(stateDir(), this);
+    if (!m_db->open(standalone)) {
+        if (!standalone || m_db->error() != QLatin1String("no database yet")) qWarning("beaconfix: map database unavailable: %s", qPrintable(m_db->error()));
+    }
+    m_dbUsable = m_db->isOpen() && !m_db->readOnly();
+    const bool anyJson = QFile::exists(stateDir() + "/aps.json") || QFile::exists(stateDir() + "/history.jsonl") || QFile::exists(stateDir() + "/pois.json")
+                      || QFile::exists(stateDir() + "/elev.json") || QFile::exists(stateDir() + "/achievements.json");
     loadState();
+    loadPois();
+    loadElevationCache();
+    loadAchievements();
+    if (m_dbUsable && m_db->isEmpty() && anyJson) migrateJsonToDb();
+    else if (m_db->isOpen()) loadFromDb();
+    for (const Fix &f : m_history) noteVisited(f, false);
+    connect(this, &Locator::FixChanged, this, [this] { refreshPois(); fetchElevation(); checkAchievements(); });
+    connect(this, &Locator::scanUpdated, this, [this] { checkAchievements(); });
+}
+
+void Locator::setNotifyStops(bool b)        { m_notifyStops = b; QSettings().setValue("notifyStops", b); }
+void Locator::setNotifyRegions(bool b)      { m_notifyRegions = b; QSettings().setValue("notifyRegions", b); }
+void Locator::setNotifyAchievements(bool b) { m_notifyAchievements = b; QSettings().setValue("notifyAchievements", b); }
+void Locator::setPrefetchTiles(bool b)      { m_prefetch = b; QSettings().setValue("prefetchTiles", b); }
+void Locator::setUseElevation(bool b)       { m_useElevation = b; QSettings().setValue("useElevation", b); if (b) fetchElevation(); }
+
+void Locator::notePrefetchDone(int tiles)
+{
+    m_prefetchedTiles += tiles;
+    QSettings().setValue("prefetchedTiles", m_prefetchedTiles);
+    if (tiles > 0) emit statusMessage(QStringLiteral("Map around here saved for offline use (%1 tiles)").arg(tiles));
+    if (tiles > 0) { BeaconEvent ev; ev.type = QStringLiteral("prefetch"); ev.text = QStringLiteral("Saved %1 map tiles around here for offline use").arg(tiles); logEvent(ev); }
+    checkAchievements();
+}
+
+// Desktop notification through the freedesktop daemon (Plasma's), else the tray balloon
+void Locator::notify(const QString &summary, const QString &body, const QString &icon)
+{
+    if (m_standalone) return;
+    QDBusInterface n(QStringLiteral("org.freedesktop.Notifications"), QStringLiteral("/org/freedesktop/Notifications"),
+                     QStringLiteral("org.freedesktop.Notifications"), QDBusConnection::sessionBus());
+    if (n.isValid()) {
+        QVariantMap hints; hints[QStringLiteral("desktop-entry")] = QStringLiteral("beaconfix");
+        n.asyncCall(QStringLiteral("Notify"), QStringLiteral("BeaconFix"), uint(0), icon.isEmpty() ? QStringLiteral("beaconfix") : icon,
+                    summary, body, QStringList(), hints, int(8000));
+        return;
+    }
+    emit notificationFallback(summary, body);
+}
+
+void Locator::startTrip(const QDateTime &at)
+{
+    m_tripStart = at;
+    QSettings().setValue("tripStart", m_tripStart);
+    emit statusMessage(QStringLiteral("New trip started %1").arg(at.toString(QStringLiteral("ddd d MMM HH:mm"))));
+    emit FixChanged();
+}
+void Locator::StartTrip() { startTrip(); }
+
+// ── LAN API forwarding (D-Bus / CLI) ─────────────────────────────────────────
+void Locator::setApiServer(ApiServer *api)
+{
+    m_api = api;
+    if (!api) return;
+    connect(api, &ApiServer::pairingRequested, this, &Locator::pairingRequested);
+    connect(api, &ApiServer::deviceApproved, this, &Locator::deviceApproved);
+}
+bool    Locator::apiListening() const { return m_api && m_api->listening(); }
+QString Locator::ApiStatus() const { return m_api ? QString::fromUtf8(QJsonDocument(m_api->statusJson()).toJson(QJsonDocument::Compact)) : QStringLiteral("{\"enabled\":false,\"listening\":false}"); }
+bool    Locator::ApproveDevice(const QString &id) { return m_api && m_api->approve(id); }
+bool    Locator::DenyDevice(const QString &id) { return m_api && m_api->deny(id); }
+bool    Locator::RevokeDevice(const QString &nameOrId) { return m_api && m_api->revoke(nameOrId); }
+QString Locator::CreateToken(const QString &name, const QString &scopes) { return m_api ? m_api->createToken(name, scopes.split(QLatin1Char(','), Qt::SkipEmptyParts)) : QString(); }
+bool    Locator::OpenPairing(int minutes) { if (!m_api) return false; if (minutes <= 0) m_api->closePairing(); else m_api->openPairing(minutes); return true; }
+QString Locator::KnownDevices() const { return m_api ? QString::fromUtf8(QJsonDocument(m_api->knownJson()).toJson(QJsonDocument::Compact)) : QStringLiteral("{}"); }
+bool    Locator::KnownAdd(const QString &mac, const QString &name) { return m_api && m_api->knownAdd(mac, name); }
+bool    Locator::KnownRemove(const QString &mac) { return m_api && m_api->knownRemove(mac); }
+int     Locator::KnownImport(const QString &path) { return m_api ? m_api->knownImport(path) : -1; }
+void Locator::PrefetchTiles() { emit prefetchRequested(); }
+
+bool Locator::ExportGpx(const QString &path)
+{
+    QString err;
+    const bool ok = exportGpx(path, &err);
+    emit statusMessage(ok ? QStringLiteral("Exported %1 fixes to %2").arg(m_history.size()).arg(path) : QStringLiteral("GPX export failed: ") + err);
+    return ok;
+}
+
+bool Locator::CopyToClipboard(const QString &what)
+{
+    if (!m_fix.valid) return false;
+    const QString w = what.toLower();
+    const QString text = w == QLatin1String("geo") ? geoUri() : w == QLatin1String("osm") ? osmUrl()
+                       : w == QLatin1String("google") ? googleMapsUrl() : w == QLatin1String("apple") ? appleMapsUrl()
+                       : w == QLatin1String("text") ? shareText() : coordsText();
+    if (QClipboard *cb = QGuiApplication::clipboard()) { cb->setText(text); emit statusMessage(QStringLiteral("Copied: ") + text.section('\n', 0, 0)); return true; }
+    return false;
+}
+
+// ── Sharing ───────────────────────────────────────────────────────────────────
+QString Locator::coordsText() const { return QStringLiteral("%1, %2").arg(m_fix.lat, 0, 'f', 6).arg(m_fix.lon, 0, 'f', 6); }
+QString Locator::geoUri() const
+{
+    if (!m_fix.valid) return {};
+    QString u = QStringLiteral("geo:%1,%2").arg(m_fix.lat, 0, 'f', 6).arg(m_fix.lon, 0, 'f', 6);
+    if (m_fix.accuracy > 0) u += QStringLiteral(";u=%1").arg(qRound(m_fix.accuracy));
+    return u;
+}
+QString Locator::osmUrl() const { return QStringLiteral("https://www.openstreetmap.org/?mlat=%1&mlon=%2#map=15/%1/%2").arg(m_fix.lat, 0, 'f', 6).arg(m_fix.lon, 0, 'f', 6); }
+QString Locator::googleMapsUrl() const { return QStringLiteral("https://www.google.com/maps/search/?api=1&query=%1,%2").arg(m_fix.lat, 0, 'f', 6).arg(m_fix.lon, 0, 'f', 6); }
+QString Locator::appleMapsUrl() const { return QStringLiteral("https://maps.apple.com/?ll=%1,%2&q=%3").arg(m_fix.lat, 0, 'f', 6).arg(m_fix.lon, 0, 'f', 6).arg(QString::fromLatin1(QUrl::toPercentEncoding(m_fix.place.isEmpty() ? QStringLiteral("BeaconFix") : m_fix.place))); }
+QString Locator::shareText() const
+{
+    if (!m_fix.valid) return {};
+    QString t = m_fix.place + QStringLiteral("\n") + coordsText();
+    if (m_fix.accuracy > 0) t += QStringLiteral(" (±%1 m, %2)").arg(qRound(m_fix.accuracy)).arg(m_fix.source == QLatin1String("wifi") ? QStringLiteral("Wi-Fi") : m_fix.source == QLatin1String("starlink") ? QStringLiteral("GPS") : QStringLiteral("IP, approximate"));
+    if (m_fix.hasElevation()) t += QStringLiteral("\n") + elevationText();
+    t += QStringLiteral("\n") + osmUrl();
+    return t;
+}
+
+QString Locator::compass(double deg)
+{
+    static const char *pts[] = {"N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"};
+    if (deg < 0) return QStringLiteral("—");
+    return QString::fromLatin1(pts[int(std::fmod(deg + 11.25 + 360.0, 360.0) / 22.5) % 16]);
+}
+
+QString Locator::durationText(qint64 secs)
+{
+    if (secs < 0) return QStringLiteral("—");
+    if (secs < 60) return QStringLiteral("%1 s").arg(secs);
+    if (secs < 3600) return QStringLiteral("%1 min").arg(secs / 60);
+    if (secs < 86400) return QStringLiteral("%1 h %2 min").arg(secs / 3600).arg((secs % 3600) / 60);
+    return QStringLiteral("%1 d %2 h").arg(secs / 86400).arg((secs % 86400) / 3600);
+}
+
+QString Locator::elevationText() const
+{
+    if (!m_fix.hasElevation()) return QStringLiteral("elevation unknown");
+    return QStringLiteral("%1 m (%2 ft) above sea level").arg(qRound(m_fix.elevation)).arg(qRound(m_fix.elevation * 3.28084));
+}
+
+// ── Sun: NOAA / Wikipedia sunrise equation, good to a minute or two ─────────────
+static QDateTime jdToDateTime(double jd) { return QDateTime::fromSecsSinceEpoch(qint64((jd - 2440587.5) * 86400.0), QTimeZone::utc()).toLocalTime(); }
+
+SunTimes Locator::sunTimes(double lat, double lon, const QDateTime &when)
+{
+    SunTimes st;
+    if (!when.isValid()) return st;
+    const double d2r = M_PI / 180.0;
+    // Julian day of local noon so "today" is the observer's calendar day
+    const QDateTime noonLocal(when.toLocalTime().date(), QTime(12, 0), when.toLocalTime().timeZone());
+    const double jd = noonLocal.toSecsSinceEpoch() / 86400.0 + 2440587.5;
+    const double n = std::round(jd - 2451545.0 + 0.0008 + lon / 360.0);
+    const double js = n - lon / 360.0;
+    const double M = std::fmod(357.5291 + 0.98560028 * js, 360.0);
+    const double C = 1.9148 * std::sin(M * d2r) + 0.02 * std::sin(2 * M * d2r) + 0.0003 * std::sin(3 * M * d2r);
+    const double L = std::fmod(M + C + 180.0 + 102.9372, 360.0);
+    const double jt = 2451545.0 + js + 0.0053 * std::sin(M * d2r) - 0.0069 * std::sin(2 * L * d2r);
+    const double sinDec = std::sin(L * d2r) * std::sin(23.4397 * d2r), dec = std::asin(sinDec);
+    auto hourAngle = [&](double altDeg, bool *ok) {
+        const double c = (std::sin(altDeg * d2r) - std::sin(lat * d2r) * sinDec) / (std::cos(lat * d2r) * std::cos(dec));
+        *ok = c >= -1.0 && c <= 1.0;
+        return *ok ? std::acos(c) / d2r : (c < -1.0 ? 180.0 : 0.0);
+    };
+    bool ok = false;
+    const double w0 = hourAngle(-0.833, &ok);
+    st.valid = true;
+    st.solarNoon = jdToDateTime(jt);
+    if (!ok) { st.polarDay = w0 >= 180.0; st.polarNight = !st.polarDay; st.dayLengthSecs = st.polarDay ? 86400 : 0; return st; }
+    st.sunrise = jdToDateTime(jt - w0 / 360.0); st.sunset = jdToDateTime(jt + w0 / 360.0);
+    st.dayLengthSecs = int(st.sunrise.secsTo(st.sunset));
+    bool okG = false, okC = false;
+    const double wg = hourAngle(6.0, &okG), wc = hourAngle(-6.0, &okC);
+    if (okG) { st.goldenMorningEnd = jdToDateTime(jt - wg / 360.0); st.goldenEveningStart = jdToDateTime(jt + wg / 360.0); }
+    if (okC) { st.civilDawn = jdToDateTime(jt - wc / 360.0); st.civilDusk = jdToDateTime(jt + wc / 360.0); }
+    return st;
+}
+
+SunTimes Locator::sun() const
+{
+    if (!m_fix.valid) return {};
+    return sunTimes(m_fix.lat, m_fix.lon, QDateTime::currentDateTime());
+}
+
+// ── Elevation (Open Topo Data SRTM 30 m), cached per ~100 m cell ────────────────
+static QString elevKey(double lat, double lon) { return QStringLiteral("%1,%2").arg(lat, 0, 'f', 3).arg(lon, 0, 'f', 3); }
+
+void Locator::fetchElevation()
+{
+    if (!m_useElevation || !m_fix.precise() || m_elevBusy) return;
+    const QString k = elevKey(m_fix.lat, m_fix.lon);
+    const auto it = m_elevCache.constFind(k);
+    if (it != m_elevCache.constEnd()) {
+        if (!m_fix.hasElevation() || std::abs(m_fix.elevation - *it) > 0.5) {
+            m_fix.elevation = *it;
+            if (!m_history.isEmpty() && distanceM(m_history.last().lat, m_history.last().lon, m_fix.lat, m_fix.lon) < 200) { m_history.last().elevation = *it; rewriteHistory(); }
+            saveState(); emit elevationUpdated();
+        }
+        return;
+    }
+    if (m_elevTried.isValid() && m_elevTried.secsTo(QDateTime::currentDateTime()) < 60) return;
+    m_elevTried = QDateTime::currentDateTime();
+    m_elevBusy = true;
+    QNetworkRequest req(QUrl(QStringLiteral("https://api.opentopodata.org/v1/srtm30m?locations=%1,%2").arg(m_fix.lat, 0, 'f', 5).arg(m_fix.lon, 0, 'f', 5)));
+    req.setHeader(QNetworkRequest::UserAgentHeader, QString::fromLatin1(USER_AGENT));
+    req.setTransferTimeout(12000);
+    QNetworkReply *rep = m_nam.get(req);
+    const double lat = m_fix.lat, lon = m_fix.lon;
+    connect(rep, &QNetworkReply::finished, this, [this, rep, k, lat, lon] {
+        rep->deleteLater();
+        m_elevBusy = false;
+        const QJsonObject o = QJsonDocument::fromJson(rep->readAll()).object();
+        const QJsonArray res = o["results"].toArray();
+        if (rep->error() != QNetworkReply::NoError || res.isEmpty() || res.first().toObject()["elevation"].isNull()) {
+            m_elevNote = QStringLiteral("elevation lookup failed (%1)").arg(rep->error() == QNetworkReply::NoError ? o["error"].toString().left(60) : rep->errorString());
+            return;
+        }
+        const double e = res.first().toObject()["elevation"].toDouble();
+        m_elevNote.clear();
+        m_elevCache.insert(k, e);
+        while (m_elevCache.size() > 600) m_elevCache.erase(m_elevCache.begin());
+        saveElevationCache();
+        if (m_fix.valid && distanceM(m_fix.lat, m_fix.lon, lat, lon) < 150) {
+            m_fix.elevation = e;
+            if (!m_history.isEmpty() && distanceM(m_history.last().lat, m_history.last().lon, lat, lon) < 200) { m_history.last().elevation = e; rewriteHistory(); }
+            saveState();
+            emit elevationUpdated();
+            checkAchievements();
+        }
+    });
+}
+
+void Locator::loadElevationCache()
+{
+    QFile f(stateDir() + "/elev.json");
+    if (!f.open(QIODevice::ReadOnly)) return;
+    const QJsonObject o = QJsonDocument::fromJson(f.readAll()).object();
+    for (auto it = o.begin(); it != o.end(); ++it) m_elevCache.insert(it.key(), it.value().toDouble());
+}
+void Locator::saveElevationCache() const
+{
+    if (m_dbUsable) { m_db->saveElevation(m_elevCache); return; }
+    QJsonObject o;
+    for (auto it = m_elevCache.begin(); it != m_elevCache.end(); ++it) o[it.key()] = it.value();
+    QFile f(stateDir() + "/elev.json");
+    if (f.open(QIODevice::WriteOnly | QIODevice::Truncate)) f.write(QJsonDocument(o).toJson(QJsonDocument::Compact));
+}
+
+// ── Places visited ────────────────────────────────────────────────────────────
+void Locator::parsePlace(const Fix &f, QString *city, QString *region, QString *country)
+{
+    *city = f.city; *region = f.region; *country = f.country;
+    if (!city->isEmpty() || !region->isEmpty()) return;
+    // Old entries only carry "Neighbourhood, City, State"; a bare "lat, lon" placeholder
+    // (geocode never arrived) is not a place at all
+    static const QRegularExpression numeric(QStringLiteral("^\\s*-?\\d+(\\.\\d+)?\\s*$"));
+    const QStringList parts = f.place.split(QStringLiteral(", "), Qt::SkipEmptyParts);
+    for (const QString &p : parts) if (numeric.match(p).hasMatch()) return;
+    if (parts.size() >= 2) { *region = parts.last(); *city = parts[parts.size() - 2]; }
+    else if (parts.size() == 1) *city = parts[0];
+}
+
+void Locator::noteVisited(const Fix &f, bool announce)
+{
+    if (!f.precise()) return;
+    QString city, region, country;
+    parsePlace(f, &city, &region, &country);
+    const bool newRegion = !region.isEmpty() && !m_seenRegions.contains(region);
+    const bool newCountry = !country.isEmpty() && !m_seenCountries.contains(country);
+    if (!region.isEmpty()) m_seenRegions.insert(region);
+    if (!country.isEmpty()) m_seenCountries.insert(country);
+    if (announce && (newRegion || newCountry)) {
+        BeaconEvent ev; ev.type = QStringLiteral("region"); ev.hasPos = true; ev.lat = f.lat; ev.lon = f.lon;
+        ev.text = QStringLiteral("Welcome to %1 · first time here").arg(newCountry ? country : region);
+        logEvent(ev);
+    }
+    if (announce && m_notifyRegions && (newRegion || newCountry))
+        notify(newCountry ? QStringLiteral("Welcome to %1").arg(country) : QStringLiteral("Welcome to %1").arg(region),
+               QStringLiteral("%1 · first time here").arg(f.place), QStringLiteral("flag"));
+}
+
+// ── Trip log with dwell and legs ───────────────────────────────────────────────
+QList<Stop> Locator::stops() const
+{
+    QList<Stop> out;
+    int lastPrecise = -1;
+    for (int i = 0; i < m_history.size(); ++i) {
+        Stop s; s.fix = m_history[i];
+        const QDateTime left = s.fix.departed.isValid() ? s.fix.departed
+                             : i + 1 < m_history.size() ? QDateTime() : (m_fix.valid && m_fix.time.isValid() && m_fix.time >= s.fix.time ? m_fix.time : QDateTime());
+        if (left.isValid()) s.dwellSecs = int(s.fix.time.secsTo(left));
+        if (s.fix.precise() && lastPrecise >= 0) {
+            const Fix &p = m_history[lastPrecise];
+            s.legKm = distanceM(p.lat, p.lon, s.fix.lat, s.fix.lon) / 1000.0;
+            if (p.departed.isValid() && p.departed < s.fix.time) s.legSecs = int(p.departed.secsTo(s.fix.time));
+        }
+        if (s.fix.precise()) lastPrecise = i;
+        out << s;
+    }
+    return out;
+}
+
+// ── Ranks & achievements ──────────────────────────────────────────────────────
+const QList<RankTier> &Locator::rankLadder()
+{
+    static const QList<RankTier> ladder = {{0, "Newcomer"}, {10, "Wanderer"}, {50, "Scout"}, {150, "Pathfinder"}, {400, "Navigator"},
+                                           {1000, "Cartographer"}, {2500, "Beaconmaster"}, {5000, "Surveyor"}, {10000, "Wayfinder"}, {25000, "Lighthouse"}};
+    return ladder;
+}
+
+static const QList<Achievement> &achievementDefs()
+{
+    static const QList<Achievement> defs = {
+        {QStringLiteral("first_fix"),     QStringLiteral("On the map"),        QStringLiteral("First precise fix (Wi-Fi or GPS)"),            QStringLiteral("📍"), {}},
+        {QStringLiteral("first_wifi"),    QStringLiteral("Heard the beacons"), QStringLiteral("First BeaconDB Wi-Fi fix"),                    QStringLiteral("📶"), {}},
+        {QStringLiteral("first_gps"),     QStringLiteral("Dish talks"),        QStringLiteral("First Starlink dish GPS fix"),                 QStringLiteral("🛰️"), {}},
+        {QStringLiteral("sharp_fix"),     QStringLiteral("Pin-sharp"),         QStringLiteral("A fix better than ±30 m"),                     QStringLiteral("🎯"), {}},
+        {QStringLiteral("first_wigle"),   QStringLiteral("Ground truth"),      QStringLiteral("First beacon placed by WiGLE"),                QStringLiteral("💎"), {}},
+        {QStringLiteral("first_located"), QStringLiteral("Triangulated"),      QStringLiteral("First beacon multilaterated from your own stops"), QStringLiteral("📐"), {}},
+        {QStringLiteral("beacons_100"),   QStringLiteral("Century"),           QStringLiteral("100 beacons logged"),                          QStringLiteral("💯"), {}},
+        {QStringLiteral("beacons_1000"),  QStringLiteral("Grand"),             QStringLiteral("1,000 beacons logged"),                        QStringLiteral("🏆"), {}},
+        {QStringLiteral("beacons_5000"),  QStringLiteral("Beacon hoard"),      QStringLiteral("5,000 beacons logged"),                        QStringLiteral("👑"), {}},
+        {QStringLiteral("stops_10"),      QStringLiteral("Ten stops"),         QStringLiteral("10 entries in the trip log"),                  QStringLiteral("🛑"), {}},
+        {QStringLiteral("stops_50"),      QStringLiteral("Fifty stops"),       QStringLiteral("50 entries in the trip log"),                  QStringLiteral("🗺️"), {}},
+        {QStringLiteral("regions_5"),     QStringLiteral("Five states"),       QStringLiteral("Precise fixes in 5 states or provinces"),       QStringLiteral("🧭"), {}},
+        {QStringLiteral("regions_10"),    QStringLiteral("Ten states"),        QStringLiteral("Precise fixes in 10 states or provinces"),      QStringLiteral("🌎"), {}},
+        {QStringLiteral("countries_2"),   QStringLiteral("Border crossing"),   QStringLiteral("Precise fixes in 2 countries"),                QStringLiteral("🛂"), {}},
+        {QStringLiteral("km_1000"),       QStringLiteral("Thousand-kilometre club"), QStringLiteral("1,000 km between precise stops"),         QStringLiteral("🛣️"), {}},
+        {QStringLiteral("km_10000"),      QStringLiteral("Ten thousand"),      QStringLiteral("10,000 km between precise stops"),             QStringLiteral("🌐"), {}},
+        {QStringLiteral("long_haul"),     QStringLiteral("Long haul"),         QStringLiteral("A single leg over 500 km inside a day"),       QStringLiteral("🚛"), {}},
+        {QStringLiteral("homebody"),      QStringLiteral("Settled in"),        QStringLiteral("A week at one stop"),                          QStringLiteral("🏕️"), {}},
+        {QStringLiteral("night_owl"),     QStringLiteral("Night owl"),         QStringLiteral("A precise fix between midnight and 4 am"),     QStringLiteral("🦉"), {}},
+        {QStringLiteral("early_bird"),    QStringLiteral("Early bird"),        QStringLiteral("A precise fix before sunrise"),                QStringLiteral("🐦"), {}},
+        {QStringLiteral("high_ground"),   QStringLiteral("High ground"),       QStringLiteral("A stop above 2,000 m"),                        QStringLiteral("⛰️"), {}},
+        {QStringLiteral("sea_level"),     QStringLiteral("Sea level"),         QStringLiteral("A stop within 5 m of sea level"),              QStringLiteral("🌊"), {}},
+        {QStringLiteral("offline_ready"), QStringLiteral("Off-grid ready"),    QStringLiteral("Map tiles saved for offline use"),             QStringLiteral("💾"), {}},
+        {QStringLiteral("lighthouse"),    QStringLiteral("Lighthouse"),        QStringLiteral("Reached the top of the rank ladder"),          QStringLiteral("🗼"), {}},
+    };
+    return defs;
+}
+
+void Locator::loadAchievements()
+{
+    m_achievements = achievementDefs();
+    QFile f(stateDir() + "/achievements.json");
+    if (!f.open(QIODevice::ReadOnly)) return;
+    const QJsonObject o = QJsonDocument::fromJson(f.readAll()).object();
+    for (Achievement &a : m_achievements) a.unlocked = QDateTime::fromString(o[a.key].toString(), Qt::ISODate);
+}
+void Locator::saveAchievements() const
+{
+    if (m_dbUsable) { m_db->saveAchievements(m_achievements); return; }
+    QJsonObject o;
+    for (const Achievement &a : m_achievements) if (a.unlocked.isValid()) o[a.key] = a.unlocked.toString(Qt::ISODate);
+    QFile f(stateDir() + "/achievements.json");
+    if (f.open(QIODevice::WriteOnly | QIODevice::Truncate)) f.write(QJsonDocument(o).toJson(QJsonDocument::Compact));
+}
+void Locator::unlock(const QString &key)
+{
+    for (Achievement &a : m_achievements) {
+        if (a.key != key || a.unlocked.isValid()) continue;
+        a.unlocked = QDateTime::currentDateTime();
+        saveAchievements();
+        emit achievementUnlocked(a.key, a.title);
+        { BeaconEvent ev; ev.type = QStringLiteral("achievement"); ev.text = QStringLiteral("%1 %2 — %3").arg(a.icon, a.title, a.desc); logEvent(ev); }
+        if (m_notifyAchievements) notify(QStringLiteral("%1 %2").arg(a.icon, a.title), a.desc, QStringLiteral("games-highscores"));
+        emit statusMessage(QStringLiteral("Milestone: %1 — %2").arg(a.title, a.desc));
+    }
+}
+
+void Locator::checkAchievements()
+{
+    if (m_standalone) return;
+    const Stats st = stats();
+    const QDateTime now = QDateTime::currentDateTime();
+    bool anyPrecise = false, anyWifi = false, anyGps = false, sharp = false, nightOwl = false, earlyBird = false, high = false, sea = false, longHaul = false, homebody = false;
+    for (const Stop &s : stops()) {
+        const Fix &f = s.fix;
+        if (!f.precise()) continue;
+        anyPrecise = true;
+        if (f.source == QLatin1String("wifi")) anyWifi = true;
+        if (f.source == QLatin1String("starlink")) anyGps = true;
+        if (f.accuracy >= 0 && f.accuracy <= 30) sharp = true;
+        const int h = f.time.toLocalTime().time().hour();
+        if (h < 4) nightOwl = true;
+        const SunTimes sun = sunTimes(f.lat, f.lon, f.time);
+        if (sun.sunrise.isValid() && f.time < sun.sunrise && f.time > sun.sunrise.addSecs(-2 * 3600)) earlyBird = true;
+        if (f.hasElevation() && f.elevation >= 2000) high = true;
+        if (f.hasElevation() && std::abs(f.elevation) <= 5) sea = true;
+        if (s.legKm >= 500 && s.legSecs > 0 && s.legSecs <= 86400) longHaul = true;
+        if (s.dwellSecs >= 7 * 86400) homebody = true;
+    }
+    if (anyPrecise) unlock(QStringLiteral("first_fix"));
+    if (anyWifi) unlock(QStringLiteral("first_wifi"));
+    if (anyGps) unlock(QStringLiteral("first_gps"));
+    if (sharp) unlock(QStringLiteral("sharp_fix"));
+    if (nightOwl) unlock(QStringLiteral("night_owl"));
+    if (earlyBird) unlock(QStringLiteral("early_bird"));
+    if (high) unlock(QStringLiteral("high_ground"));
+    if (sea) unlock(QStringLiteral("sea_level"));
+    if (longHaul) unlock(QStringLiteral("long_haul"));
+    if (homebody) unlock(QStringLiteral("homebody"));
+    bool wigle = false, located = false;
+    for (const ApRecord &r : m_apRecords) if (r.wigle) { wigle = true; break; }
+    for (const AccessPoint &ap : m_aps) if (estimateFor(ap).kind == ApEstimate::Centroid) { located = true; break; }
+    if (wigle) unlock(QStringLiteral("first_wigle"));
+    if (located) unlock(QStringLiteral("first_located"));
+    if (st.beaconsTotal >= 100) unlock(QStringLiteral("beacons_100"));
+    if (st.beaconsTotal >= 1000) unlock(QStringLiteral("beacons_1000"));
+    if (st.beaconsTotal >= 5000) unlock(QStringLiteral("beacons_5000"));
+    if (st.stops >= 10) unlock(QStringLiteral("stops_10"));
+    if (st.stops >= 50) unlock(QStringLiteral("stops_50"));
+    if (st.regions.size() >= 5) unlock(QStringLiteral("regions_5"));
+    if (st.regions.size() >= 10) unlock(QStringLiteral("regions_10"));
+    if (st.countries.size() >= 2) unlock(QStringLiteral("countries_2"));
+    if (st.distanceAllKm >= 1000) unlock(QStringLiteral("km_1000"));
+    if (st.distanceAllKm >= 10000) unlock(QStringLiteral("km_10000"));
+    if (m_prefetchedTiles > 0) unlock(QStringLiteral("offline_ready"));
+    if (st.rankLevel >= rankLadder().size()) unlock(QStringLiteral("lighthouse"));
+    Q_UNUSED(now);
 }
 
 QString Locator::stateDir()
@@ -74,7 +557,17 @@ QString Locator::stateDir()
 void Locator::start()
 {
     m_timer.start();
+    if (m_liveScanSecs > 0 && !m_standalone) m_liveTimer.start();
     Refresh();
+    refreshPois();
+}
+
+void Locator::setLiveScanSeconds(int s)
+{
+    m_liveScanSecs = qBound(0, s, 3600);
+    QSettings().setValue("liveScanSeconds", m_liveScanSecs);
+    m_liveTimer.setInterval(qMax(15, m_liveScanSecs) * 1000);
+    if (m_liveScanSecs > 0 && !m_standalone && m_timer.isActive()) m_liveTimer.start(); else m_liveTimer.stop();
 }
 
 void Locator::setIntervalMinutes(int m)
@@ -88,15 +581,96 @@ void Locator::setMoveThresholdM(int m)      { m_moveThresholdM = qMax(0, m); QSe
 void Locator::setUseStarlink(bool b)        { m_useStarlink = b; QSettings().setValue("useStarlink", b); }
 void Locator::setStarlinkHost(const QString &h) { m_starlinkHost = h.trimmed().isEmpty() ? QStringLiteral("192.168.100.1") : h.trimmed(); QSettings().setValue("starlinkHost", m_starlinkHost); }
 void Locator::setUseIp(bool b)              { m_useIp = b; QSettings().setValue("useIp", b); }
+void Locator::setUseApple(bool b)           { m_useApple = b; QSettings().setValue("useApple", b); }
 void Locator::setIgnoreActiveAp(bool b)     { m_ignoreActive = b; QSettings().setValue("ignoreActiveAp", b); }
 void Locator::setIgnorePatterns(const QStringList &l)
 {
     m_ignore.clear();
     for (const QString &p : l) { const QString t = p.trimmed(); if (!t.isEmpty()) m_ignore << t; }
+    rebuildPatternCaches();
     QSettings().setValue("ignorePatterns", m_ignore);
     emit scanUpdated();
 }
 void Locator::addIgnorePattern(const QString &p) { QStringList l = m_ignore; l << p; setIgnorePatterns(l); }
+
+// ── Home networks ─────────────────────────────────────────────────────────────
+void Locator::setHomeNetworks(const QStringList &l)
+{
+    QStringList clean;
+    for (const QString &p : l) { const QString t = p.trimmed(); if (!t.isEmpty() && !clean.contains(t, Qt::CaseInsensitive)) clean << t; }
+    if (clean == m_home) return;
+    m_home = clean;
+    rebuildPatternCaches();
+    QSettings().setValue("homeNetworks", m_home);
+    emit scanUpdated();
+    emit FixChanged();
+}
+void Locator::addHomeNetwork(const QString &p) { QStringList l = m_home; l << p; setHomeNetworks(l); }
+void Locator::removeHomeNetwork(const QString &p)
+{
+    QStringList l;
+    for (const QString &x : m_home) if (x.compare(p.trimmed(), Qt::CaseInsensitive) != 0) l << x;
+    setHomeNetworks(l);
+}
+// The UniFi export: {"ssids":[…], "bssids":[{"bssid","ssid",…}], "patterns":[…]}. Patterns are
+// merged as-is; every listed BSSID becomes an exact home BSSID too.
+QStringList Locator::parseHomeNetworksFile(const QString &path, QString *error)
+{
+    QFile f(path);
+    if (!f.open(QIODevice::ReadOnly)) { if (error) *error = f.errorString(); return {}; }
+    QJsonParseError pe;
+    const QJsonObject o = QJsonDocument::fromJson(f.readAll(), &pe).object();
+    if (pe.error != QJsonParseError::NoError) { if (error) *error = pe.errorString(); return {}; }
+    QStringList out;
+    auto add = [&out](const QString &v) { const QString t = v.trimmed(); if (!t.isEmpty() && !out.contains(t, Qt::CaseInsensitive)) out << t; };
+    for (const QJsonValue &v : o["patterns"].toArray()) add(v.toString());
+    for (const QJsonValue &v : o["ssids"].toArray()) add(v.toString());
+    for (const QJsonValue &v : o["bssids"].toArray()) add(v.isObject() ? v.toObject()["bssid"].toString().toUpper() : v.toString().toUpper());
+    if (out.isEmpty() && error) *error = QStringLiteral("no patterns, ssids or bssids in the file");
+    return out;
+}
+int Locator::importHomeNetworks(const QString &path, QString *error)
+{
+    const QStringList l = parseHomeNetworksFile(path, error);
+    if (l.isEmpty()) return 0;
+    QStringList merged = m_home; int added = 0;
+    for (const QString &p : l) if (!merged.contains(p, Qt::CaseInsensitive)) { merged << p; ++added; }
+    setHomeNetworks(merged);
+    return added;
+}
+bool Locator::isHome(const AccessPoint &ap) const
+{
+    for (const QRegularExpression &re : m_homeRe)
+        if (re.match(ap.bssid).hasMatch() || (!ap.ssid.isEmpty() && re.match(ap.ssid).hasMatch())) return true;
+    return false;
+}
+bool Locator::atHome() const
+{
+    for (const AccessPoint &ap : m_aps) if (isHome(ap)) return true;
+    return false;
+}
+// Candidates for "this is my own network": the connected AP's SSID, plus the loudest APs
+// whose BSSID shares the first five octets with it (one router, several radios/SSIDs).
+QStringList Locator::suggestHomeNetworks() const
+{
+    QStringList out;
+    QString family;
+    for (const AccessPoint &ap : m_aps) if (ap.active) { family = ap.bssid.left(14); break; }
+    if (family.isEmpty()) {                       // not connected: take the loudest AP as the anchor
+        int best = -200;
+        for (const AccessPoint &ap : m_aps) if (ap.dbm > best) { best = ap.dbm; family = ap.bssid.left(14); }
+    }
+    if (family.isEmpty()) return out;
+    for (const AccessPoint &ap : m_aps) {
+        if (ap.bssid.left(14).compare(family, Qt::CaseInsensitive) != 0 || ap.dbm < -75) continue;
+        if (!ap.ssid.isEmpty() && !out.contains(ap.ssid)) out << ap.ssid;
+    }
+    // Same router family, any last octet / any locally-administered variant of the second octet
+    QString pat = family + QStringLiteral(":??");
+    pat[1] = QLatin1Char('?'); pat[10] = QLatin1Char('?');
+    out << pat;
+    return out;
+}
 
 void Locator::setTravelling(const QString &bssid, bool travelling)
 {
@@ -104,6 +678,13 @@ void Locator::setTravelling(const QString &bssid, bool travelling)
     else            { m_travelling.remove(bssid); m_notTravelling.insert(bssid); }
     saveApRecords();
     emit scanUpdated();
+}
+
+void Locator::setPoiRadiusKm(int km)
+{
+    m_poiRadiusKm = qBound(1, km, 30);
+    QSettings().setValue("poiRadiusKm", m_poiRadiusKm);
+    refreshPois(true);
 }
 
 void Locator::setWigleToken(const QString &t)
@@ -118,7 +699,28 @@ bool Locator::isTravelling(const QString &bssid) const
     if (m_notTravelling.contains(bssid)) return false;
     if (m_travelling.contains(bssid)) return true;
     const auto it = m_apRecords.constFind(bssid);
-    return it != m_apRecords.constEnd() && it->cells.size() >= 2;   // seen at two stops ≥ ~5 km apart
+    if (it == m_apRecords.constEnd()) return false;
+    if (it->cells.size() >= 2) return true;                          // seen at two precise stops ≥ ~5 km apart
+    // Heard at two places further apart than both fixes' error allows (works with IP fixes too)
+    QList<ApSighting> places = it->seen;
+    if (!it->obs.isEmpty()) places.append({it->obs.last().lat, it->obs.last().lon, it->obs.last().acc, it->obs.last().time});
+    for (int i = 0; i < places.size(); ++i)
+        for (int j = i + 1; j < places.size(); ++j) {
+            const ApSighting &a = places[i], &b = places[j];
+            if (distanceM(a.lat, a.lon, b.lat, b.lon) > a.acc + b.acc + 3000) return true;
+        }
+    return false;
+}
+
+// Phone hotspots, car Wi-Fi, dashcams… by name: these follow someone around
+bool Locator::looksMobile(const QString &ssid)
+{
+    static const QRegularExpression re(QStringLiteral(
+        "iphone|ipad|galaxy|pixel|android|hotspot|mifi|jetpack|oneplus|redmi|xiaomi|huawei|motorola|moto ?[egz]|"
+        "tesla|uconnect|onstar|fordpass|sync ?\\d|\\bmy ?car\\b|gopro|dashcam|viofo|nextbase|\\bcar ?wifi\\b|"
+        "starlink ?mini|\\bmobile ?wifi\\b|verizon_mifi|coolpad|franklin|inseego|netgear ?nighthawk ?m"),
+        QRegularExpression::CaseInsensitiveOption);
+    return !ssid.isEmpty() && re.match(ssid).hasMatch();
 }
 
 const ApRecord *Locator::record(const QString &bssid) const
@@ -127,41 +729,97 @@ const ApRecord *Locator::record(const QString &bssid) const
     return it == m_apRecords.constEnd() ? nullptr : &*it;
 }
 
-// Log-distance path loss, outdoor-ish: -25 dBm at 1 m, exponent 2.2
-// (-55 dBm ≈ 23 m, -75 dBm ≈ 190 m, -90 dBm ≈ 900 m → clamped)
-double Locator::rssiDistanceM(int dbm)
+// Log-distance path loss, band-aware. Reference RSSI at 1 m ≈ 20 dBm EIRP minus
+// free-space loss at the band (2.4 GHz ≈ 40 dB, 5 GHz ≈ 46, 6 GHz ≈ 48) and a
+// few dB for walls/vehicles; exponent 2.4 for campground / suburban clutter.
+// (2.4 GHz: -55 dBm ≈ 18 m, -70 ≈ 75 m, -85 ≈ 320 m. 5 GHz: ~0.55× that.)
+double Locator::rssiDistanceM(int dbm, int freqMHz)
 {
-    return qBound(5.0, std::pow(10.0, (-25.0 - dbm) / 22.0), 800.0);
+    const double p1m = freqMHz >= 5925 ? -32.0 : freqMHz >= 4900 ? -30.0 : -24.0;
+    return qBound(3.0, std::pow(10.0, (p1m - dbm) / 24.0), 800.0);
+}
+
+double Locator::bearingDeg(double lat1, double lon1, double lat2, double lon2)
+{
+    const double d2r = M_PI / 180.0;
+    const double y = std::sin((lon2 - lon1) * d2r) * std::cos(lat2 * d2r);
+    const double x = std::cos(lat1 * d2r) * std::sin(lat2 * d2r) - std::sin(lat1 * d2r) * std::cos(lat2 * d2r) * std::cos((lon2 - lon1) * d2r);
+    return std::fmod(qRadiansToDegrees(std::atan2(y, x)) + 360.0, 360.0);
 }
 
 ApEstimate Locator::estimateFor(const AccessPoint &ap) const
 {
     ApEstimate e;
-    const ApRecord *r = record(ap.bssid);
+    const QString st = apStatus(ap);
+    // Our own gear rides along: wherever it was "located" before is meaningless now
+    const ApRecord *r = st == QLatin1String("travelling") || st == QLatin1String("active") ? nullptr : record(ap.bssid);
     if (r && r->wigle) {
         e.kind = ApEstimate::Wigle; e.lat = r->wLat; e.lon = r->wLon; e.radiusM = 25;
         return e;
     }
-    // Signal-weighted centroid once we've heard it from two places ≥ 25 m apart
+    // Multilateration from distinct vantage points. Observations whose fixes overlap
+    // (a parked rig, BeaconDB jitter) are merged into one vantage point: the fix was
+    // computed from these very APs, so jitter alone says nothing about where they are.
     if (r && r->obs.size() >= 2) {
-        double sw = 0, sl = 0, so = 0, spread = 0, worstAcc = 0;
+        struct V { double lat, lon, acc, dbmSum; int n; };
+        QList<V> vs;
         for (const ApObservation &o : r->obs) {
-            const double w = std::pow(double(o.dbm + 100), 2.0);
-            sw += w; sl += w * o.lat; so += w * o.lon;
-            worstAcc = qMax(worstAcc, o.acc);
+            bool merged = false;
+            for (V &v : vs) {
+                if (distanceM(v.lat, v.lon, o.lat, o.lon) < qMax(80.0, v.acc + o.acc)) {
+                    v.lat = (v.lat * v.n + o.lat) / (v.n + 1); v.lon = (v.lon * v.n + o.lon) / (v.n + 1);
+                    v.acc = qMin(v.acc, o.acc); v.dbmSum += o.dbm; ++v.n; merged = true; break;
+                }
+            }
+            if (!merged) vs.append({o.lat, o.lon, o.acc, double(o.dbm), 1});
         }
-        for (const ApObservation &o : r->obs)
-            spread = qMax(spread, distanceM(o.lat, o.lon, r->obs.first().lat, r->obs.first().lon));
-        // Real movement, not fix jitter: the spread has to beat the fixes' own uncertainty
-        if (sw > 0 && spread >= qMax(60.0, worstAcc * 1.5)) {
-            e.kind = ApEstimate::Centroid; e.lat = sl / sw; e.lon = so / sw;
-            e.radiusM = qMax(rssiDistanceM(ap.dbm) * 0.6, spread * 0.5);
+        if (vs.size() >= 2) {
+            // Local metric frame around the first vantage point
+            const double lat0 = vs[0].lat, lon0 = vs[0].lon;
+            const double my = 111320.0, mx = 111320.0 * std::cos(qDegreesToRadians(lat0));
+            const int freq = ap.frequency ? ap.frequency : r->freq;
+            struct P { double x, y, d, w, acc; };
+            QList<P> ps; double sw = 0, sx = 0, sy = 0, meanAcc = 0;
+            for (const V &v : vs) {
+                const double dbm = v.dbmSum / v.n;
+                const double w = std::pow(qMax(1.0, dbm + 100.0), 2.0) / qMax(10.0, v.acc);
+                P p{(v.lon - lon0) * mx, (v.lat - lat0) * my, rssiDistanceM(qRound(dbm), freq), w, v.acc};
+                ps << p; sw += w; sx += w * p.x; sy += w * p.y; meanAcc += v.acc / vs.size();
+            }
+            double x = sx / sw, y = sy / sw;                 // weighted centroid as the seed
+            if (vs.size() >= 3) {                            // Gauss–Newton on range residuals
+                for (int it = 0; it < 25; ++it) {
+                    double a11 = 0, a12 = 0, a22 = 0, b1 = 0, b2 = 0;
+                    for (const P &p : ps) {
+                        const double dx = x - p.x, dy = y - p.y, rr = qMax(1.0, std::hypot(dx, dy));
+                        const double res = rr - p.d, jx = dx / rr, jy = dy / rr;
+                        a11 += p.w * jx * jx; a12 += p.w * jx * jy; a22 += p.w * jy * jy;
+                        b1 -= p.w * jx * res; b2 -= p.w * jy * res;
+                    }
+                    const double det = a11 * a22 - a12 * a12;
+                    if (std::abs(det) < 1e-9) break;
+                    const double ux = (a22 * b1 - a12 * b2) / det, uy = (a11 * b2 - a12 * b1) / det;
+                    x += ux; y += uy;
+                    if (std::hypot(ux, uy) < 0.5) break;
+                }
+            }
+            double rms = 0;
+            for (const P &p : ps) { const double res = std::hypot(x - p.x, y - p.y) - p.d; rms += res * res / ps.size(); }
+            e.kind = ApEstimate::Centroid; e.vantage = vs.size();
+            e.lat = lat0 + y / my; e.lon = lon0 + x / mx;
+            e.radiusM = qBound(15.0, std::sqrt(rms) + meanAcc * (vs.size() >= 3 ? 0.7 : 1.2), 600.0);
             return e;
         }
     }
+    if (r && !r->obs.isEmpty()) {                       // one place we heard it: the internal map's "observed" position
+        const ApObservation &o = r->obs.last();
+        e.kind = ApEstimate::Observed; e.lat = o.lat; e.lon = o.lon; e.vantage = 1;
+        e.radiusM = qBound(20.0, o.acc + rssiDistanceM(o.dbm, ap.frequency ? ap.frequency : r->freq), 900.0);
+        return e;
+    }
     if (!m_fix.valid) return e;
     e.kind = ApEstimate::Ring; e.lat = m_fix.lat; e.lon = m_fix.lon;
-    e.radiusM = rssiDistanceM(ap.dbm);
+    e.radiusM = rssiDistanceM(ap.dbm, ap.frequency);
     e.bearingDeg = double(qHash(ap.bssid) % 3600) / 10.0;   // stable, but NOT a real bearing
     return e;
 }
@@ -179,25 +837,102 @@ Stats Locator::stats() const
         if (s == QLatin1String("used")) ++st.usedNow;
         if (s == QLatin1String("travelling") || s == QLatin1String("active")) ++st.travellingNow;
         const ApEstimate::Kind k = estimateFor(ap).kind;
-        if (k == ApEstimate::Centroid || k == ApEstimate::Wigle) ++st.locatedNow;
+        if (k == ApEstimate::Centroid || k == ApEstimate::Wigle || k == ApEstimate::Observed) ++st.locatedNow;
     }
     for (const Fix &f : m_history)
         if (f.accuracy >= 0 && (st.bestAccuracy < 0 || f.accuracy < st.bestAccuracy)) st.bestAccuracy = f.accuracy;
-    struct R { int at; const char *name; };
-    static const R ranks[] = {{0,"Newcomer"},{10,"Wanderer"},{50,"Scout"},{150,"Pathfinder"},{400,"Navigator"},{1000,"Cartographer"},{2500,"Beaconmaster"}};
-    for (int i = 0; i < 7; ++i) {
-        if (st.beaconsTotal >= ranks[i].at) { st.rank = QString::fromLatin1(ranks[i].name); st.rankLevel = i + 1; st.nextRankAt = i < 6 ? ranks[i+1].at : 0; }
+    const QList<RankTier> &ranks = rankLadder();
+    st.rankCount = ranks.size();
+    for (int i = 0; i < ranks.size(); ++i) {
+        if (st.beaconsTotal >= ranks[i].at) { st.rank = QString::fromLatin1(ranks[i].name); st.rankLevel = i + 1; st.rankAt = ranks[i].at; st.nextRankAt = i + 1 < ranks.size() ? ranks[i+1].at : 0; }
     }
+
+    // ── Trip intelligence ──
+    const QDateTime now = QDateTime::currentDateTime();
+    const QDate today = now.toLocalTime().date();
+    // Trip start: explicit, else the last gap of a week or more between stops, else the first stop
+    QDateTime tripStart = m_tripStart;
+    if (!tripStart.isValid() && !m_history.isEmpty()) {
+        tripStart = m_history.first().time;
+        for (int i = 1; i < m_history.size(); ++i)
+            if (m_history[i-1].time.daysTo(m_history[i].time) >= 7) tripStart = m_history[i].time;
+    }
+    st.tripStart = tripStart;
+    if (tripStart.isValid()) st.tripDays = int(tripStart.daysTo(now)) + 1;
+    const QList<Stop> sl = stops();
+    int lastPrecise = -1;
+    for (int i = 0; i < sl.size(); ++i) {
+        const Stop &s = sl[i];
+        const bool inTrip = tripStart.isValid() && s.fix.time >= tripStart;
+        if (inTrip) ++st.stopsTrip;
+        if (s.fix.time.toLocalTime().date() == today) ++st.stopsToday;
+        if (s.dwellSecs > 0) { st.stoppedSecs += s.dwellSecs; if (inTrip) st.stoppedTripSecs += s.dwellSecs; }
+        if (s.legSecs > 0) { st.movingSecs += s.legSecs; if (inTrip) st.movingTripSecs += s.legSecs; }
+        if (s.legKm > 0) {
+            st.distanceAllKm += s.legKm;
+            if (inTrip) st.distanceTripKm += s.legKm;
+            // A leg counts for "today" only if we also left the previous stop today —
+            // a nine-day drive that ends this afternoon is trip distance, not today's.
+            if (s.fix.time.toLocalTime().date() == today && lastPrecise >= 0) {
+                const Fix &p = sl[lastPrecise].fix;
+                const QDateTime dep = p.departed.isValid() ? p.departed : p.time;
+                if (dep.toLocalTime().date() == today) st.distanceTodayKm += s.legKm;
+            }
+            st.longestLegKm = qMax(st.longestLegKm, s.legKm);
+        }
+        if (s.dwellSecs > st.longestStaySecs && s.fix.precise()) { st.longestStaySecs = s.dwellSecs; st.longestStayPlace = s.fix.place; }
+        if (s.fix.precise()) {
+            QString city, region, country;
+            parsePlace(s.fix, &city, &region, &country);
+            if (!city.isEmpty() && !st.cities.contains(city)) st.cities << city;
+            if (!region.isEmpty() && !st.regions.contains(region)) st.regions << region;
+            if (!country.isEmpty() && !st.countries.contains(country)) st.countries << country;
+            if (lastPrecise >= 0) {
+                const Fix &p = sl[lastPrecise].fix;
+                st.headingDeg = bearingDeg(p.lat, p.lon, s.fix.lat, s.fix.lon);
+                const qint64 secs = s.legSecs > 0 ? s.legSecs : p.time.secsTo(s.fix.time);
+                // Average speed over a leg only means something for a leg of a few hours;
+                // a multi-day gap between confirmations is not "10 km/h".
+                st.speedKmh = (secs > 0 && secs <= 6 * 3600) ? s.legKm / (secs / 3600.0) : -1;
+            }
+            lastPrecise = i;
+        }
+    }
+    if (!sl.isEmpty()) {
+        st.dwellSecs = sl.last().dwellSecs;
+        // "Moving" = the latest stop is precise, was reached within the last 15 min, and the
+        // leg into it was short enough that the speed is real (not fix jitter, not a 9-day gap).
+        st.moving = lastPrecise == sl.size() - 1 && st.speedKmh >= 0 && sl.last().legSecs > 0
+                    && sl.last().legSecs <= 6 * 3600 && sl.last().fix.time.secsTo(now) < 900;
+    }
+    if (!st.moving) st.speedKmh = st.speedKmh >= 0 ? st.speedKmh : -1;
+    st.achievementsTotal = m_achievements.size();
+    for (const Achievement &a : m_achievements) if (a.unlocked.isValid()) ++st.achievementsUnlocked;
+    // Home
+    st.atHome = atHome();
+    st.homeKnown = m_homeFix.valid;
+    if (m_homeFix.valid) { st.homeLat = m_homeFix.lat; st.homeLon = m_homeFix.lon; st.homeTime = m_homeFix.time; }
+    if (m_home.isEmpty()) st.awayText.clear();
+    else if (st.atHome) { st.awayKm = 0; st.awayText = QStringLiteral("at the RV"); }
+    else if (m_homeFix.valid && m_fix.valid) {
+        st.awayKm = distanceM(m_homeFix.lat, m_homeFix.lon, m_fix.lat, m_fix.lon) / 1000.0;
+        st.awayText = st.awayKm < 0.3 ? QStringLiteral("next to the RV")
+                    : QStringLiteral("%1 km %2 of the RV").arg(st.awayKm, 0, 'f', st.awayKm < 10 ? 1 : 0).arg(compass(bearingDeg(m_homeFix.lat, m_homeFix.lon, m_fix.lat, m_fix.lon)));
+    } else st.awayText = QStringLiteral("away from the RV (its position is not known yet)");
     return st;
 }
 
+void Locator::rebuildPatternCaches()
+{
+    m_homeRe.clear(); m_ignoreRe.clear();
+    for (const QString &pat : m_home) m_homeRe << QRegularExpression(QRegularExpression::wildcardToRegularExpression(pat), QRegularExpression::CaseInsensitiveOption);
+    for (const QString &pat : m_ignore) m_ignoreRe << QRegularExpression(QRegularExpression::wildcardToRegularExpression(pat), QRegularExpression::CaseInsensitiveOption);
+}
 bool Locator::matchesIgnore(const AccessPoint &ap) const
 {
-    for (const QString &pat : m_ignore) {
-        const QRegularExpression re(QRegularExpression::wildcardToRegularExpression(pat), QRegularExpression::CaseInsensitiveOption);
+    for (const QRegularExpression &re : m_ignoreRe)
         if (re.match(ap.bssid).hasMatch() || re.match(ap.ssid).hasMatch())
             return true;
-    }
     return false;
 }
 
@@ -205,8 +940,10 @@ QString Locator::apStatus(const AccessPoint &ap) const
 {
     if (ap.ssid.endsWith(QLatin1String("_nomap")) || ap.ssid.contains(QLatin1String("_optout")))
         return QStringLiteral("nomap");
+    if (isHome(ap))                      return QStringLiteral("home");
     if (matchesIgnore(ap))               return QStringLiteral("ignored");
     if (isTravelling(ap.bssid))          return QStringLiteral("travelling");
+    if (!m_notTravelling.contains(ap.bssid) && looksMobile(ap.ssid)) return QStringLiteral("travelling");
     if (ap.active && m_ignoreActive)     return QStringLiteral("active");
     return QStringLiteral("used");
 }
@@ -220,7 +957,7 @@ void Locator::Refresh()
     m_starlinkError.clear();
     emit probeStarted();
     if (m_useStarlink) tryStarlink();
-    else { emit statusMessage(QStringLiteral("Scanning Wi-Fi…")); m_scanner.scan(); }
+    else { emit statusMessage(QStringLiteral("Scanning Wi-Fi…")); startProbeScan(); }
 }
 
 void Locator::ShowWindow() { emit showWindowRequested(); }
@@ -239,17 +976,119 @@ QString Locator::StateJson() const
         QJsonObject a;
         a["bssid"] = ap.bssid; a["ssid"] = ap.ssid; a["dbm"] = ap.dbm; a["freq"] = ap.frequency;
         a["status"] = apStatus(ap);
-        a["kind"] = e.kind == ApEstimate::Wigle ? "wigle" : e.kind == ApEstimate::Centroid ? "centroid" : e.kind == ApEstimate::Ring ? "ring" : "none";
+        a["kind"] = e.kind == ApEstimate::Wigle ? "wigle" : e.kind == ApEstimate::Centroid ? "centroid" : e.kind == ApEstimate::Observed ? "observed" : e.kind == ApEstimate::Ring ? "ring" : "none";
         a["lat"] = e.lat; a["lon"] = e.lon; a["r"] = e.radiusM; a["bearing"] = e.bearingDeg;
+        if (e.vantage) a["vantage"] = e.vantage;
+        const int f = ap.frequency;
+        a["band"] = f >= 5925 ? QStringLiteral("6") : f >= 4900 ? QStringLiteral("5") : QStringLiteral("2.4");
+        a["ch"] = f >= 5925 ? (f - 5950) / 5 : f >= 4900 ? (f - 5000) / 5 : f == 2484 ? 14 : f > 2400 ? (f - 2407) / 5 : 0;
+        a["security"] = ap.security; a["secFlags"] = ap.secFlags; a["wpaFlags"] = ap.wpaFlags; a["rsnFlags"] = ap.rsnFlags; a["maxKbps"] = ap.maxKbps; a["adhoc"] = ap.adhoc;
+        a["insecure"] = AccessPoint::insecure(ap.security);
+        if (isHome(ap)) { a["home"] = true; const QString hs = m_homeSsids.value(ap.bssid.toUpper()); if (!hs.isEmpty()) a["homeSsid"] = hs; }
         aps.append(a);
     }
     o["aps"] = aps;
+    {
+        int open = 0, wep = 0, wpa1 = 0, tkip = 0, wpa3 = 0;
+        for (const AccessPoint &ap : m_aps) {
+            if (ap.security == QLatin1String("open")) ++open; else if (ap.security == QLatin1String("wep")) ++wep; else if (ap.security == QLatin1String("wpa1")) ++wpa1;
+            else if (ap.security == QLatin1String("wpa2-tkip")) ++tkip; else if (ap.security.startsWith(QLatin1String("wpa3")) || ap.security == QLatin1String("wpa2/3")) ++wpa3;
+        }
+        o["securitySummary"] = QJsonObject{{"open", open}, {"wep", wep}, {"wpa1", wpa1}, {"tkip", tkip}, {"wpa3", wpa3}, {"total", m_aps.size()}};
+    }
+    if (m_api) {
+        QJsonArray kd;
+        for (const QJsonValue &v : m_api->knownJson()["devices"].toArray()) {
+            const QJsonObject d = v.toObject();
+            kd.append(QJsonObject{{"mac", d["mac"]}, {"name", d["name"]}, {"ip", d["fixed_ip"].isString() ? d["fixed_ip"] : d["ip"]}, {"network", d["network"]},
+                                  {"online", d["online"]}, {"wired", d["wired"]}, {"ours", d["ours"]}, {"last_seen", d["last_seen"]}});
+        }
+        o["knownDevices"] = kd;
+    }
+    QJsonArray events;
+    for (const BeaconEvent &e : m_events) events.append(e.toJson());
+    o["events"] = events;
+    o["lastEventId"] = m_eventId;
+    o["liveScanSeconds"] = m_liveScanSecs;
+    QJsonArray pois;
+    for (const Poi &pt : m_pois) {
+        const PoiCategory *c = poiCategory(pt.cat);
+        QJsonObject a;
+        a["cat"] = pt.cat; a["name"] = pt.name; a["lat"] = pt.lat; a["lon"] = pt.lon;
+        a["icon"] = c ? c->icon : QString(); a["color"] = c ? c->color.name() : QStringLiteral("#9fb0c8");
+        a["label"] = c ? c->label : pt.cat; a["detail"] = pt.detail;
+        if (pt.wifi) a["wifi"] = true;
+        if (!pt.hours.isEmpty()) a["hours"] = pt.hours;
+        if (!pt.phone.isEmpty()) a["phone"] = pt.phone;
+        if (!pt.website.isEmpty()) a["website"] = pt.website;
+        a["osm"] = QStringLiteral("https://www.openstreetmap.org/%1/%2").arg(pt.osmType).arg(pt.osmId);
+        if (m_fix.valid) {
+            a["d"] = qRound(distanceM(m_fix.lat, m_fix.lon, pt.lat, pt.lon));
+            a["brg"] = qRound(bearingDeg(m_fix.lat, m_fix.lon, pt.lat, pt.lon));
+        }
+        pois.append(a);
+    }
+    o["pois"] = pois;
+    o["poiNote"] = m_poiNote;
+    o["tileBase"] = m_tileBase;
+    QJsonArray cats;
+    for (const PoiCategory &c : poiCategories())
+        cats.append(QJsonObject{{"key", c.key}, {"label", c.label}, {"icon", c.icon}, {"color", c.color.name()}});
+    o["poiCategories"] = cats;
+    QJsonArray track;
+    for (const Stop &s : stops()) {
+        const Fix &f = s.fix;
+        QJsonObject t{{"lat", f.lat}, {"lon", f.lon}, {"acc", f.accuracy}, {"source", f.source},
+                      {"place", f.place}, {"time", f.time.toString(Qt::ISODate)}};
+        if (f.departed.isValid()) t["departed"] = f.departed.toString(Qt::ISODate);
+        if (s.dwellSecs >= 0) t["dwellSecs"] = s.dwellSecs;
+        if (s.legKm >= 0) t["legKm"] = s.legKm;
+        if (s.legSecs >= 0) t["legSecs"] = s.legSecs;
+        if (f.hasElevation()) t["elev"] = f.elevation;
+        if (!f.city.isEmpty()) t["city"] = f.city;
+        if (!f.region.isEmpty()) t["region"] = f.region;
+        if (!f.country.isEmpty()) t["country"] = f.country;
+        track.append(t);
+    }
+    o["track"] = track;
+    if (m_fix.hasElevation()) o["elevation"] = m_fix.elevation; else o["elevation"] = QJsonValue();
+    o["elevationNote"] = m_elevNote;
+    const SunTimes su = sun();
+    if (su.valid) {
+        auto iso = [](const QDateTime &d) { return d.isValid() ? QJsonValue(d.toString(Qt::ISODate)) : QJsonValue(); };
+        o["sun"] = QJsonObject{{"sunrise", iso(su.sunrise)}, {"sunset", iso(su.sunset)}, {"solarNoon", iso(su.solarNoon)},
+                               {"goldenMorningEnd", iso(su.goldenMorningEnd)}, {"goldenEveningStart", iso(su.goldenEveningStart)},
+                               {"civilDawn", iso(su.civilDawn)}, {"civilDusk", iso(su.civilDusk)}, {"dayLengthSecs", su.dayLengthSecs},
+                               {"isDay", su.isDay(QDateTime::currentDateTime())}, {"polarDay", su.polarDay}, {"polarNight", su.polarNight}};
+    }
+    if (m_fix.valid)
+        o["share"] = QJsonObject{{"coords", coordsText()}, {"geo", geoUri()}, {"osm", osmUrl()}, {"google", googleMapsUrl()}, {"apple", appleMapsUrl()}, {"text", shareText()}};
     const Stats st = stats();
     QJsonObject sj;
     sj["stops"] = st.stops; sj["distanceKm"] = st.distanceKm; sj["beaconsTotal"] = st.beaconsTotal;
     sj["beaconsNow"] = st.beaconsNow; sj["usedNow"] = st.usedNow; sj["travellingNow"] = st.travellingNow;
     sj["locatedNow"] = st.locatedNow; sj["bestAccuracy"] = st.bestAccuracy;
-    sj["rank"] = st.rank; sj["rankLevel"] = st.rankLevel; sj["nextRankAt"] = st.nextRankAt;
+    sj["rank"] = st.rank; sj["rankLevel"] = st.rankLevel; sj["nextRankAt"] = st.nextRankAt; sj["rankAt"] = st.rankAt; sj["rankCount"] = st.rankCount;
+    QJsonArray ladder;
+    for (const RankTier &r : rankLadder()) ladder.append(QJsonObject{{"at", r.at}, {"name", QString::fromLatin1(r.name)}});
+    sj["rankLadder"] = ladder;
+    sj["distanceTodayKm"] = st.distanceTodayKm; sj["distanceTripKm"] = st.distanceTripKm; sj["distanceAllKm"] = st.distanceAllKm;
+    sj["movingSecs"] = double(st.movingSecs); sj["stoppedSecs"] = double(st.stoppedSecs);
+    sj["movingTripSecs"] = double(st.movingTripSecs); sj["stoppedTripSecs"] = double(st.stoppedTripSecs);
+    sj["speedKmh"] = st.speedKmh; sj["headingDeg"] = st.headingDeg; sj["heading"] = compass(st.headingDeg); sj["moving"] = st.moving;
+    sj["atHome"] = st.atHome; sj["awayKm"] = st.awayKm; sj["awayText"] = st.awayText; sj["homeNetworks"] = QJsonArray::fromStringList(m_home);
+    sj["homeFix"] = st.homeKnown ? QJsonValue(QJsonObject{{"lat", st.homeLat}, {"lon", st.homeLon}, {"time", st.homeTime.toString(Qt::ISODate)}}) : QJsonValue();
+    sj["dwellSecs"] = double(st.dwellSecs);
+    sj["tripStart"] = st.tripStart.isValid() ? QJsonValue(st.tripStart.toString(Qt::ISODate)) : QJsonValue();
+    sj["tripDays"] = st.tripDays; sj["stopsTrip"] = st.stopsTrip; sj["stopsToday"] = st.stopsToday;
+    sj["cities"] = QJsonArray::fromStringList(st.cities); sj["regions"] = QJsonArray::fromStringList(st.regions); sj["countries"] = QJsonArray::fromStringList(st.countries);
+    sj["longestLegKm"] = st.longestLegKm; sj["longestStaySecs"] = double(st.longestStaySecs); sj["longestStayPlace"] = st.longestStayPlace;
+    sj["achievementsUnlocked"] = st.achievementsUnlocked; sj["achievementsTotal"] = st.achievementsTotal;
+    QJsonArray ach;
+    for (const Achievement &a : m_achievements)
+        ach.append(QJsonObject{{"key", a.key}, {"title", a.title}, {"desc", a.desc}, {"icon", a.icon},
+                               {"unlocked", a.unlocked.isValid()}, {"at", a.unlocked.isValid() ? QJsonValue(a.unlocked.toString(Qt::ISODate)) : QJsonValue()}});
+    sj["achievements"] = ach;
     o["stats"] = sj;
     return QString::fromUtf8(QJsonDocument(o).toJson(QJsonDocument::Compact));
 }
@@ -264,7 +1103,7 @@ void Locator::tryStarlink()
     if (grpcurl.isEmpty()) {
         m_starlinkError = QStringLiteral("grpcurl not installed");
         emit statusMessage(QStringLiteral("Scanning Wi-Fi…"));
-        m_scanner.scan();
+        startProbeScan();
         return;
     }
     emit statusMessage(QStringLiteral("Asking Starlink dish for GPS…"));
@@ -286,11 +1125,149 @@ void Locator::tryStarlink()
         const auto m = re.match(QString::fromUtf8(out));
         m_starlinkError = m.hasMatch() ? m.captured(0).left(160).trimmed() : QString::fromUtf8(out.left(160)).simplified();
         emit statusMessage(QStringLiteral("Scanning Wi-Fi…"));
-        m_scanner.scan();
+        startProbeScan();
     });
     proc->start(grpcurl, {QStringLiteral("-plaintext"), QStringLiteral("-max-time"), QStringLiteral("5"),
                           QStringLiteral("-d"), QStringLiteral("{\"get_location\":{}}"),
                           m_starlinkHost + ":9200", QStringLiteral("SpaceX.API.Device.Device/Handle")});
+}
+
+// ── Scans: one scanner, two callers ───────────────────────────────────────────
+// The probe chain asks for a scan to geolocate; the live timer asks for one just
+// to keep the beacons fresh. NetworkManager only runs one at a time, so a probe
+// that arrives while a live scan is in flight simply takes that scan's result.
+void Locator::startProbeScan()
+{
+    if (m_liveScan) { m_probeWantsScan = true; return; }
+    m_scanner.scan();
+}
+
+void Locator::liveScan()
+{
+    if (m_busy || m_liveScan || m_standalone || m_scanner.busy()) return;
+    m_liveScan = true;
+    m_scanner.scan();
+}
+
+void Locator::onScanFinished(const QList<AccessPoint> &aps)
+{
+    diffScan(aps);
+    if (m_liveScan) {
+        m_liveScan = false;
+        if (m_probeWantsScan) { m_probeWantsScan = false; onScan(aps); return; }
+        // Live path: refresh the beacons without re-geolocating…
+        QSet<QString> before, after;
+        for (const AccessPoint &ap : m_aps) if (apStatus(ap) == QLatin1String("used")) before.insert(ap.bssid);
+        for (const AccessPoint &ap : aps)   if (apStatus(ap) == QLatin1String("used")) after.insert(ap.bssid);
+        m_aps = aps;
+        if (m_fix.valid) noteSightings(m_aps, m_fix);
+        emit scanUpdated();
+        queueWigle();
+        // …unless the neighbourhood changed by more than half: then we've arrived somewhere
+        const int common = (before & after).size(), all = (before | after).size();
+        const bool changed = all >= 2 && common * 2 < all;
+        const QDateTime now = QDateTime::currentDateTime();
+        if (changed && !before.isEmpty() && (!m_lastLiveProbe.isValid() || m_lastLiveProbe.secsTo(now) > 120)) {
+            m_lastLiveProbe = now;
+            emit statusMessage(QStringLiteral("The beacons around you changed — re-checking the position"));
+            Refresh();
+        }
+        return;
+    }
+    onScan(aps);
+}
+
+// Turn two consecutive scans into events: new beacons, ones that faded (after two
+// misses, so a single dropped frame doesn't flap), and level changes of ≥ 8 dB.
+void Locator::diffScan(const QList<AccessPoint> &aps)
+{
+    QSet<QString> seen;
+    bool homeHeard = false; QString homeName;
+    for (const AccessPoint &ap : aps) {
+        if (isHome(ap)) {                          // our own networks never "appear" or "fade"
+            homeHeard = true; if (homeName.isEmpty() && !ap.ssid.isEmpty()) homeName = ap.ssid;
+            continue;
+        }
+        seen.insert(ap.bssid);
+        const auto last = m_lastDbm.constFind(ap.bssid);
+        if (last == m_lastDbm.constEnd()) {
+            // "Appeared" only if it is genuinely new here: not heard in the last 10 minutes
+            // (weak beacons drop in and out of scans; that is noise, not an event).
+            const QDateTime lastSeen = m_lastSeenAt.value(ap.bssid);
+            if (m_firstScanDone && (!lastSeen.isValid() || lastSeen.secsTo(QDateTime::currentDateTime()) > 600)) {
+                BeaconEvent e = apEvent(QStringLiteral("ap_new"), ap);
+                e.text = QStringLiteral("%1 appeared · %2 dBm").arg(ap.ssid.isEmpty() ? QStringLiteral("(hidden)") : ap.ssid).arg(ap.dbm);
+                logEvent(e);
+            }
+        } else if (std::abs(ap.dbm - last.value()) >= 8) {
+            const int d = ap.dbm - last.value();
+            BeaconEvent e = apEvent(d > 0 ? QStringLiteral("ap_up") : QStringLiteral("ap_down"), ap);
+            e.delta = d;
+            e.text = QStringLiteral("%1 %2%3 dB → %4 dBm").arg(ap.ssid.isEmpty() ? QStringLiteral("(hidden)") : ap.ssid, d > 0 ? QStringLiteral("+") : QString()).arg(d).arg(ap.dbm);
+            logEvent(e);
+        }
+        m_lastDbm.insert(ap.bssid, ap.dbm);
+        m_lastSeenAt.insert(ap.bssid, QDateTime::currentDateTime());
+        m_missing.remove(ap.bssid);
+        if (AccessPoint::insecure(ap.security)) {             // once per BSSID per day: "X is open / WEP / WPA1"
+            const QDateTime noted = m_insecureNoted.value(ap.bssid);
+            if (!noted.isValid() || noted.secsTo(QDateTime::currentDateTime()) > 86400) {
+                m_insecureNoted.insert(ap.bssid, QDateTime::currentDateTime());
+                BeaconEvent e = apEvent(QStringLiteral("ap_insecure"), ap);
+                const QString how = ap.security == QLatin1String("open") ? QStringLiteral("open (no encryption)") : ap.security == QLatin1String("wep") ? QStringLiteral("WEP (broken since 2001)")
+                                  : ap.security == QLatin1String("wpa1") ? QStringLiteral("WPA1 (TKIP, deprecated)") : QStringLiteral("WPA2 with TKIP (weak cipher)");
+                e.text = QStringLiteral("%1 is %2").arg(ap.ssid.isEmpty() ? QStringLiteral("(hidden)") : ap.ssid, how);
+                logEvent(e);
+            }
+        }
+    }
+    for (auto it = m_lastDbm.begin(); it != m_lastDbm.end();) {
+        if (seen.contains(it.key())) { ++it; continue; }
+        const int misses = ++m_missing[it.key()];
+        if (misses < 2) { ++it; continue; }
+        AccessPoint ap; ap.bssid = it.key(); ap.dbm = it.value();
+        if (ap.dbm < -85) {                       // a beacon at the edge of hearing: drop it quietly
+            m_missing.remove(it.key()); it = m_lastDbm.erase(it); continue;
+        }
+        if (const ApRecord *r = record(ap.bssid)) { ap.ssid = r->ssid; ap.frequency = r->freq; }
+        BeaconEvent e = apEvent(QStringLiteral("ap_lost"), ap);
+        e.text = QStringLiteral("%1 faded out").arg(ap.ssid.isEmpty() ? QStringLiteral("(hidden)") : ap.ssid);
+        logEvent(e);
+        m_missing.remove(it.key());
+        it = m_lastDbm.erase(it);
+    }
+    if (m_firstScanDone && homeHeard != m_homeInRange) {
+        BeaconEvent e; e.type = QStringLiteral("home");
+        e.text = homeHeard ? QStringLiteral("Home network in range%1").arg(homeName.isEmpty() ? QString() : QStringLiteral(": ") + homeName)
+                           : QStringLiteral("Home network out of range");
+        e.ssid = homeName;
+        logEvent(e);
+    }
+    m_homeInRange = homeHeard;
+    m_firstScanDone = true;
+}
+
+BeaconEvent Locator::apEvent(const QString &type, const AccessPoint &ap) const
+{
+    BeaconEvent e;
+    e.type = type; e.bssid = ap.bssid; e.ssid = ap.ssid; e.dbm = ap.dbm;
+    e.status = apStatus(ap);
+    const ApEstimate est = estimateFor(ap);
+    e.kind = est.kind == ApEstimate::Wigle ? QStringLiteral("wigle") : est.kind == ApEstimate::Centroid ? QStringLiteral("centroid")
+           : est.kind == ApEstimate::Observed ? QStringLiteral("observed") : est.kind == ApEstimate::Ring ? QStringLiteral("ring") : QStringLiteral("none");
+    if (est.kind != ApEstimate::None) { e.hasPos = true; e.lat = est.lat; e.lon = est.lon; }
+    e.security = ap.security;
+    if (est.kind == ApEstimate::Ring) { e.r = est.radiusM; e.bearing = est.bearingDeg; }
+    return e;
+}
+
+void Locator::logEvent(BeaconEvent e)
+{
+    e.id = ++m_eventId;
+    if (!e.time.isValid()) e.time = QDateTime::currentDateTime();
+    m_events.append(e);
+    while (m_events.size() > 60) m_events.removeFirst();
+    emit eventLogged(QString::fromUtf8(QJsonDocument(e.toJson()).toJson(QJsonDocument::Compact)));
 }
 
 void Locator::onScan(const QList<AccessPoint> &aps)
@@ -301,9 +1278,11 @@ void Locator::onScan(const QList<AccessPoint> &aps)
     for (const AccessPoint &ap : aps)
         if (apStatus(ap) == QLatin1String("used")) usable << ap;
     if (usable.size() < 2) {
-        tryIp(QStringLiteral("Only %1 usable access point(s); BeaconDB needs 2").arg(usable.size()));
+        // BeaconDB wants two; Apple answers per BSSID, so one is enough to try
+        tryApple(usable, QStringLiteral("Only %1 usable access point(s); BeaconDB needs 2").arg(usable.size()));
         return;
     }
+    if (tryInternal(usable)) return;                    // somewhere we have been: no network needed
     queryBeaconDb(usable);
 }
 
@@ -325,19 +1304,19 @@ void Locator::queryBeaconDb(const QList<AccessPoint> &usable)
     req.setTransferTimeout(15000);
     QNetworkReply *rep = m_nam.post(req, QJsonDocument(body).toJson(QJsonDocument::Compact));
     const int used = usable.size(), seen = m_aps.size();
-    connect(rep, &QNetworkReply::finished, this, [this, rep, used, seen] {
+    connect(rep, &QNetworkReply::finished, this, [this, rep, used, seen, usable] {
         rep->deleteLater();
         const QJsonObject o = QJsonDocument::fromJson(rep->readAll()).object();
         const QJsonObject loc = o["location"].toObject();
         const double acc = o["accuracy"].toDouble(-1);
         if (rep->error() == QNetworkReply::NoError && loc.contains("lat") && acc > 5000) {
             // That's BeaconDB's GeoIP fallback (city-sized radius), not a Wi-Fi match
-            tryIp(QStringLiteral("BeaconDB had no match for these access points (it offered a %1 km GeoIP guess)").arg(qRound(acc / 1000)));
+            tryApple(usable, QStringLiteral("BeaconDB had no match for these access points (it offered a %1 km GeoIP guess)").arg(qRound(acc / 1000)));
             return;
         }
         if (rep->error() == QNetworkReply::NoError && loc.contains("lat")) {
             Fix f; f.valid = true; f.lat = loc["lat"].toDouble(); f.lon = loc["lng"].toDouble();
-            f.accuracy = acc; f.source = QStringLiteral("wifi");
+            f.accuracy = acc; f.source = QStringLiteral("wifi"); f.provider = QStringLiteral("beacondb");
             f.time = QDateTime::currentDateTime(); f.apCount = seen; f.apUsed = used;
             accept(f);
             finish(true, QStringLiteral("BeaconDB fix from %1 access points (±%2 m)").arg(used).arg(qRound(f.accuracy)));
@@ -345,8 +1324,167 @@ void Locator::queryBeaconDb(const QList<AccessPoint> &usable)
         }
         QString why = o["error"].toObject()["message"].toString();
         if (why.isEmpty()) why = rep->error() == QNetworkReply::NoError ? QStringLiteral("no location in reply") : rep->errorString();
-        tryIp(QStringLiteral("BeaconDB: ") + why);
+        tryApple(usable, QStringLiteral("BeaconDB: ") + why);
     });
+}
+
+// ── Apple Wi-Fi positioning (keyless; used when BeaconDB has no match) ─────────
+// gs-loc.apple.com returns the mapped position of every BSSID it knows (plus
+// ~100 neighbours it volunteers). No account, no token. Request and reply are
+// two tiny protobuf messages, hand-encoded here rather than pulling in a library.
+static QByteArray pbVarint(quint64 v)
+{
+    QByteArray b;
+    do { quint8 c = v & 0x7f; v >>= 7; if (v) c |= 0x80; b.append(char(c)); } while (v);
+    return b;
+}
+static QByteArray pbBytes(int tag, const QByteArray &d) { return pbVarint(quint64(tag << 3) | 2) + pbVarint(quint64(d.size())) + d; }
+static bool pbReadVarint(const QByteArray &b, int &i, quint64 &v)
+{
+    v = 0; int s = 0;
+    while (i < b.size() && s < 64) {
+        const quint8 c = quint8(b[i++]);
+        v |= quint64(c & 0x7f) << s; s += 7;
+        if (!(c & 0x80)) return true;
+    }
+    return false;
+}
+struct PbField { int tag = 0; int wt = 0; quint64 v = 0; QByteArray d; };
+static QList<PbField> pbParse(const QByteArray &b)
+{
+    QList<PbField> out; int i = 0;
+    while (i < b.size()) {
+        quint64 k; if (!pbReadVarint(b, i, k)) break;
+        PbField f; f.tag = int(k >> 3); f.wt = int(k & 7);
+        if (f.wt == 0)      { if (!pbReadVarint(b, i, f.v)) break; }
+        else if (f.wt == 2) { quint64 l; if (!pbReadVarint(b, i, l) || i + int(l) > b.size()) break; f.d = b.mid(i, int(l)); i += int(l); }
+        else if (f.wt == 1) { if (i + 8 > b.size()) break; i += 8; }
+        else if (f.wt == 5) { if (i + 4 > b.size()) break; i += 4; }
+        else break;
+        out << f;
+    }
+    return out;
+}
+// Apple writes octets without leading zeros ("f8:3e:b0:9:42:ec"); we keep "f8:3e:b0:09:42:ec"
+static QString appleBssid(const QString &mac)
+{
+    QStringList parts;
+    for (const QString &o : mac.split(QLatin1Char(':'))) { bool ok; parts << QString::number(o.toInt(&ok, 16), 16); }
+    return parts.join(QLatin1Char(':'));
+}
+static QString canonMac(const QString &mac)
+{
+    QStringList parts;
+    for (const QString &o : mac.split(QLatin1Char(':'))) { bool ok; parts << QStringLiteral("%1").arg(o.toInt(&ok, 16), 2, 16, QLatin1Char('0')); }
+    return parts.join(QLatin1Char(':')).toLower();
+}
+
+void Locator::tryApple(const QList<AccessPoint> &usable, const QString &why)
+{
+    if (!m_useApple || usable.isEmpty()) { tryIp(why); return; }
+    QList<AccessPoint> aps = usable;                                   // strongest first, at most 30
+    std::sort(aps.begin(), aps.end(), [](const AccessPoint &a, const AccessPoint &b) { return a.dbm > b.dbm; });
+    if (aps.size() > 30) aps = aps.mid(0, 30);
+    emit statusMessage(QStringLiteral("BeaconDB had nothing — asking Apple about %1 access points…").arg(aps.size()));
+
+    struct Shared { int pending = 0; QHash<QString, QPointF> pos; QHash<QString, double> acc; QString err; };
+    auto sh = QSharedPointer<Shared>::create();
+    const int seen = m_aps.size();
+    for (int start = 0; start < aps.size(); start += 10) {              // the framing length is one byte → batches of 10
+        QByteArray body;
+        for (int i = start; i < qMin(start + 10, aps.size()); ++i)
+            body += pbBytes(2, pbBytes(1, appleBssid(aps[i].bssid).toLatin1()));
+        body += pbVarint(3 << 3) + pbVarint(0) + pbVarint(4 << 3) + pbVarint(100);   // noise 0, signal 100
+        QByteArray req = QByteArray("\x00\x01\x00\x05", 4) + "en_US" + QByteArray("\x00\x13", 2) + "com.apple.locationd"
+                       + QByteArray("\x00\x0a", 2) + "8.1.12B411" + QByteArray("\x00\x00\x00\x01\x00\x00\x00", 7);
+        req.append(char(body.size())); req += body;
+        QNetworkRequest nr(QUrl(QStringLiteral("https://gs-loc.apple.com/clls/wloc")));
+        nr.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/x-www-form-urlencoded"));
+        nr.setHeader(QNetworkRequest::UserAgentHeader, QStringLiteral("locationd/1753.17 CFNetwork/711.1.12 Darwin/14.0.0"));
+        nr.setTransferTimeout(15000);
+        ++sh->pending;
+        QNetworkReply *rep = m_nam.post(nr, req);
+        connect(rep, &QNetworkReply::finished, this, [this, rep, sh, aps, seen, why] {
+            rep->deleteLater();
+            if (rep->error() != QNetworkReply::NoError) sh->err = rep->errorString();
+            else {
+                const QByteArray all = rep->readAll();
+                for (const PbField &dev : pbParse(all.mid(10))) {
+                    if (dev.tag != 2 || dev.wt != 2) continue;
+                    QString mac; double lat = -180, lon = -180, hacc = -1;
+                    for (const PbField &f : pbParse(dev.d)) {
+                        if (f.tag == 1 && f.wt == 2) mac = QString::fromLatin1(f.d);
+                        else if (f.tag == 2 && f.wt == 2)
+                            for (const PbField &l : pbParse(f.d)) {
+                                if (l.tag == 1)      lat = double(qint64(l.v)) / 1e8;
+                                else if (l.tag == 2) lon = double(qint64(l.v)) / 1e8;
+                                else if (l.tag == 3) hacc = double(qint64(l.v));
+                            }
+                    }
+                    if (mac.isEmpty() || lat < -90 || lat > 90 || lon < -180 || lon > 180 || (lat == 0 && lon == 0)) continue;   // -180,-180 = unknown
+                    sh->pos.insert(canonMac(mac), QPointF(lat, lon));
+                    sh->acc.insert(canonMac(mac), hacc);
+                }
+            }
+            if (--sh->pending > 0) return;
+
+            // Every heard AP Apple placed goes on the map (same slot the WiGLE lookup fills).
+            // Runs after accept(): that is what creates the records for newly heard APs.
+            auto place = [this, sh] {
+                int placed = 0;
+                for (auto it = sh->pos.constBegin(); it != sh->pos.constEnd(); ++it) {
+                    auto r = m_apRecords.find(it.key());
+                    if (r == m_apRecords.end()) r = m_apRecords.find(it.key().toUpper());
+                    if (r == m_apRecords.end()) continue;
+                    if (!r->wigle) {
+                        ++placed;
+                        for (const AccessPoint &ap : m_aps) {
+                            if (ap.bssid != r.key()) continue;
+                            BeaconEvent ev = apEvent(QStringLiteral("ap_placed"), ap);      // before: the ring guess
+                            if (ev.kind == QLatin1String("ring")) { ev.hasFrom = true; ev.fromLat = ev.lat; ev.fromLon = ev.lon; }
+                            ev.kind = QStringLiteral("wigle"); ev.hasPos = true; ev.lat = it->x(); ev.lon = it->y();   // r/bearing kept: the orbit point it animates from
+                            ev.text = QStringLiteral("%1 placed on the map by Apple").arg(ap.ssid.isEmpty() ? QStringLiteral("(hidden)") : ap.ssid);
+                            logEvent(ev);
+                            break;
+                        }
+                    }
+                    r->wigle = true; r->wLat = it->x(); r->wLon = it->y(); r->wigleChecked = QDateTime::currentDateTime();
+                }
+                if (placed) { saveApRecords(); emit scanUpdated(); }
+            };
+
+            // Our position: signal-weighted centroid of the APs we asked about and Apple knew
+            double sw = 0, slat = 0, slon = 0; int matched = 0; QList<double> accs;
+            for (const AccessPoint &ap : aps) {
+                const auto it = sh->pos.constFind(canonMac(ap.bssid));
+                if (it == sh->pos.constEnd()) continue;
+                const double w = std::pow(10.0, ap.dbm / 20.0);
+                sw += w; slat += w * it->x(); slon += w * it->y(); ++matched;
+                const double a = sh->acc.value(canonMac(ap.bssid), -1); if (a > 0) accs << a;
+            }
+            if (matched == 0 || sw <= 0) {
+                place();
+                tryIp(why + (sh->err.isEmpty() ? QStringLiteral("; Apple knows none of them either") : QStringLiteral("; Apple: ") + sh->err));
+                return;
+            }
+            Fix f; f.valid = true; f.lat = slat / sw; f.lon = slon / sw;
+            double spread = 0;
+            for (const AccessPoint &ap : aps) {
+                const auto it = sh->pos.constFind(canonMac(ap.bssid)); if (it == sh->pos.constEnd()) continue;
+                const double w = std::pow(10.0, ap.dbm / 20.0), d = distanceM(f.lat, f.lon, it->x(), it->y());
+                spread += w * d * d;
+            }
+            spread = std::sqrt(spread / sw);
+            std::sort(accs.begin(), accs.end());
+            const double medAcc = accs.isEmpty() ? 100.0 : accs[accs.size() / 2];
+            f.accuracy = qBound(30.0, qMax(spread, medAcc) + (matched < 3 ? 50.0 : 0.0), 1500.0);
+            f.source = QStringLiteral("wifi"); f.provider = QStringLiteral("apple");
+            f.time = QDateTime::currentDateTime(); f.apCount = seen; f.apUsed = matched;
+            accept(f);
+            place();
+            finish(true, QStringLiteral("Apple Wi-Fi fix from %1 of %2 access points (±%3 m)").arg(matched).arg(aps.size()).arg(qRound(f.accuracy)));
+        });
+    }
 }
 
 void Locator::tryIp(const QString &why)
@@ -389,8 +1527,16 @@ void Locator::accept(Fix cand, const QString &ipCity)
         return;
     }
     m_coarseNote.clear();
-    if (cand.source != QLatin1String("ip") && cand.accuracy >= 0 && cand.accuracy < 2000)
-        noteObservations(m_aps, cand);
+    noteSightings(m_aps, cand);
+    if (cand.source != QLatin1String("ip") && cand.accuracy >= 0 && cand.accuracy < 2000) {
+        QList<AccessPoint> fixed;                       // home networks move with the RV: no vantage points from them
+        for (const AccessPoint &ap : m_aps) if (!isHome(ap)) fixed << ap;
+        noteObservations(fixed, cand);
+    }
+    if (cand.precise() && atHome()) {                   // a precise fix while a home AP is heard = where the RV is
+        m_homeFix = cand;
+        QSettings().setValue("homeFix", QJsonDocument(cand.toJson()).toJson(QJsonDocument::Compact));
+    }
 
     const bool moved = !m_fix.valid || m_fix.source != cand.source
                        || distanceM(m_fix.lat, m_fix.lon, cand.lat, cand.lon) > m_moveThresholdM;
@@ -399,15 +1545,46 @@ void Locator::accept(Fix cand, const QString &ipCity)
         m_fix.apCount = cand.apCount; m_fix.apUsed = cand.apUsed;
         saveState();
         emit FixChanged();
+        BeaconEvent ev; ev.type = QStringLiteral("fix"); ev.hasPos = true; ev.lat = m_fix.lat; ev.lon = m_fix.lon;
+        ev.text = QStringLiteral("Fix confirmed · ±%1 m via %2").arg(qRound(cand.accuracy)).arg(cand.source == QLatin1String("wifi") ? (cand.provider == QLatin1String("apple") ? QStringLiteral("Apple Wi-Fi") : QStringLiteral("BeaconDB")) : cand.source == QLatin1String("starlink") ? QStringLiteral("Starlink GPS") : QStringLiteral("IP"));
+        logEvent(ev);
         return;
     }
-    cand.place = !ipCity.isEmpty() ? ipCity : (m_fix.valid && distanceM(m_fix.lat, m_fix.lon, cand.lat, cand.lon) < 500 ? m_fix.place : QString());
+    const bool nearby = m_fix.valid && distanceM(m_fix.lat, m_fix.lon, cand.lat, cand.lon) < 500;
+    cand.place = !ipCity.isEmpty() ? ipCity : (nearby ? m_fix.place : QString());
+    if (nearby) { cand.city = m_fix.city; cand.region = m_fix.region; cand.country = m_fix.country; if (m_fix.hasElevation()) cand.elevation = m_fix.elevation; }
     if (cand.place.isEmpty())
         cand.place = QStringLiteral("%1, %2").arg(cand.lat, 0, 'f', 4).arg(cand.lon, 0, 'f', 4);
+    // We're leaving the previous stop: its last confirmation is when we were last seen there
+    if (!m_history.isEmpty() && m_fix.valid && m_fix.time.isValid() && !m_history.last().departed.isValid()
+        && distanceM(m_history.last().lat, m_history.last().lon, m_fix.lat, m_fix.lon) < 1) {
+        m_history.last().departed = m_fix.time >= m_history.last().time ? m_fix.time : m_history.last().time;
+        rewriteHistory();
+    }
+    const Fix prev = m_fix;
     m_fix = cand;
     appendHistory(m_fix);
     saveState();
     emit FixChanged();
+    {
+        const double movedM = prev.valid ? distanceM(prev.lat, prev.lon, cand.lat, cand.lon) : 0;
+        BeaconEvent ev; ev.type = QStringLiteral("fix"); ev.hasPos = true; ev.lat = cand.lat; ev.lon = cand.lon;
+        if (prev.valid && movedM > qMax(0.0, cand.accuracy)) { ev.hasFrom = true; ev.fromLat = prev.lat; ev.fromLon = prev.lon; }
+        ev.text = QStringLiteral("New fix: %1 · ±%2 m").arg(cand.place).arg(qRound(cand.accuracy));
+        logEvent(ev);
+        BeaconEvent st; st.type = QStringLiteral("stop"); st.hasPos = true; st.lat = cand.lat; st.lon = cand.lon; st.hasFrom = ev.hasFrom; st.fromLat = ev.fromLat; st.fromLon = ev.fromLon;
+        st.text = movedM > 1000 && prev.valid ? QStringLiteral("Stop logged: %1 · %2 km from %3").arg(cand.place).arg(movedM / 1000.0, 0, 'f', 1).arg(prev.place)
+                                              : QStringLiteral("Stop logged: %1").arg(cand.place);
+        logEvent(st);
+    }
+    emit stopAdded(cand.lat, cand.lon);
+    if (m_notifyStops && cand.precise() && !nearby) {
+        const double km = prev.precise() ? distanceM(prev.lat, prev.lon, cand.lat, cand.lon) / 1000.0 : -1;
+        notify(QStringLiteral("New stop: %1").arg(cand.place),
+               km >= 0 ? QStringLiteral("%1 km %2 of %3 · ±%4 m").arg(km, 0, 'f', km < 10 ? 1 : 0).arg(compass(bearingDeg(prev.lat, prev.lon, cand.lat, cand.lon)), prev.place).arg(qRound(cand.accuracy))
+                       : QStringLiteral("±%1 m via %2").arg(qRound(cand.accuracy)).arg(cand.source == QLatin1String("wifi") ? (cand.provider == QLatin1String("apple") ? QStringLiteral("Apple Wi-Fi") : QStringLiteral("BeaconDB Wi-Fi")) : QStringLiteral("Starlink GPS")),
+               QStringLiteral("mark-location"));
+    }
     if (ipCity.isEmpty())
         reverseGeocode(cand.lat, cand.lon);
 }
@@ -457,8 +1634,19 @@ void Locator::pumpWigle()
         const QJsonArray res = o["results"].toArray();
         if (o["success"].toBool() && !res.isEmpty()) {
             const QJsonObject n = res.first().toObject();
+            const bool first = !r.wigle;
             r.wigle = true; r.wLat = n["trilat"].toDouble(); r.wLon = n["trilong"].toDouble();
             if (r.ssid.isEmpty()) r.ssid = n["ssid"].toString();
+            if (first)
+                for (const AccessPoint &ap : m_aps) {
+                    if (ap.bssid != bssid) continue;
+                    BeaconEvent ev; ev.type = QStringLiteral("ap_placed"); ev.bssid = bssid; ev.ssid = ap.ssid; ev.dbm = ap.dbm; ev.status = apStatus(ap);
+                    ev.kind = QStringLiteral("wigle"); ev.hasPos = true; ev.lat = r.wLat; ev.lon = r.wLon;
+                    if (m_fix.valid) { ev.hasFrom = true; ev.fromLat = m_fix.lat; ev.fromLon = m_fix.lon; }
+                    ev.text = QStringLiteral("%1 placed on the map by WiGLE").arg(ap.ssid.isEmpty() ? QStringLiteral("(hidden)") : ap.ssid);
+                    logEvent(ev);
+                    break;
+                }
         }
         saveApRecords();
         emit scanUpdated();
@@ -469,7 +1657,7 @@ void Locator::pumpWigle()
 void Locator::finish(bool ok, const QString &message)
 {
     m_busy = false;
-    if (!ok) { m_lastError = message; saveState(); }
+    if (!ok) { m_lastError = message; saveState(); BeaconEvent ev; ev.type = QStringLiteral("error"); ev.text = message.section(QLatin1Char('\n'), 0, 0); logEvent(ev); }
     QString msg = message;
     if (!m_starlinkError.isEmpty() && m_fix.source != QLatin1String("starlink"))
         msg += QStringLiteral("\nStarlink: ") + m_starlinkError;
@@ -505,14 +1693,247 @@ void Locator::reverseGeocode(double lat, double lon)
         const QString state = a["state"].toString();
         if (!state.isEmpty()) place += (place.isEmpty() ? "" : ", ") + state;
         if (place.isEmpty()) return;
+        QString city;
+        for (const char *k : {"city", "town", "village", "hamlet", "municipality", "county"}) { city = a[k].toString(); if (!city.isEmpty()) break; }
+        const QString region = !state.isEmpty() ? state : a["province"].toString();
+        const QString country = a["country"].toString();
         // Only apply if we're still at that spot
         if (m_fix.valid && distanceM(m_fix.lat, m_fix.lon, lat, lon) < 50) {
-            m_fix.place = place;
-            if (!m_history.isEmpty()) m_history.last().place = place;
+            m_fix.place = place; m_fix.city = city; m_fix.region = region; m_fix.country = country;
+            if (!m_history.isEmpty() && distanceM(m_history.last().lat, m_history.last().lon, lat, lon) < 50) {
+                m_history.last().place = place; m_history.last().city = city; m_history.last().region = region; m_history.last().country = country;
+                rewriteHistory();
+            }
             saveState();
+            noteVisited(m_fix, true);
             emit FixChanged();
         }
     });
+}
+
+// ── Points of interest (OpenStreetMap via Overpass) ──────────────────────────
+// Picked for life on the road: fuel, food, water, dump stations, camping, laundry…
+const QList<PoiCategory> &Locator::poiCategories()
+{
+    static const QList<PoiCategory> cats = {
+        {QStringLiteral("fuel"),     QStringLiteral("Fuel"),           QStringLiteral("⛽"), QColor(0xff, 0x9f, 0x43)},
+        {QStringLiteral("propane"),  QStringLiteral("Propane"),        QStringLiteral("🔥"), QColor(0xff, 0x6b, 0x3d)},
+        {QStringLiteral("charging"), QStringLiteral("EV charging"),    QStringLiteral("🔌"), QColor(0x2e, 0xd5, 0x73)},
+        {QStringLiteral("grocery"),  QStringLiteral("Groceries"),      QStringLiteral("🛒"), QColor(0x6c, 0xff, 0x8a)},
+        {QStringLiteral("food"),     QStringLiteral("Food"),           QStringLiteral("🍴"), QColor(0xff, 0x6b, 0x81)},
+        {QStringLiteral("cafe"),     QStringLiteral("Café"),           QStringLiteral("☕"), QColor(0xd9, 0xa4, 0x7a)},
+        {QStringLiteral("camp"),     QStringLiteral("Camping / RV"),   QStringLiteral("⛺"), QColor(0x7b, 0xed, 0x9f)},
+        {QStringLiteral("water"),    QStringLiteral("Drinking water"), QStringLiteral("🚰"), QColor(0x4f, 0xc3, 0xf7)},
+        {QStringLiteral("dump"),     QStringLiteral("Dump station"),   QStringLiteral("🚐"), QColor(0xa2, 0x9b, 0xfe)},
+        {QStringLiteral("shower"),   QStringLiteral("Showers"),        QStringLiteral("🚿"), QColor(0x74, 0xb9, 0xff)},
+        {QStringLiteral("toilets"),  QStringLiteral("Toilets"),        QStringLiteral("🚻"), QColor(0x8a, 0x93, 0xa6)},
+        {QStringLiteral("laundry"),  QStringLiteral("Laundry"),        QStringLiteral("🧺"), QColor(0x81, 0xec, 0xec)},
+        {QStringLiteral("health"),   QStringLiteral("Hospital / clinic"), QStringLiteral("🏥"), QColor(0xff, 0x4f, 0x4f)},
+        {QStringLiteral("pharmacy"), QStringLiteral("Pharmacy"),       QStringLiteral("💊"), QColor(0xff, 0x7a, 0xa8)},
+        {QStringLiteral("repair"),   QStringLiteral("Auto / tyres"),   QStringLiteral("🔧"), QColor(0xb2, 0xbe, 0xc3)},
+        {QStringLiteral("hardware"), QStringLiteral("Hardware / outdoor"), QStringLiteral("🧰"), QColor(0xc8, 0xa0, 0x6a)},
+        {QStringLiteral("wifi"),     QStringLiteral("Public Wi-Fi"),   QStringLiteral("📶"), QColor(0x35, 0xd6, 0xff)},
+        {QStringLiteral("library"),  QStringLiteral("Library"),        QStringLiteral("📚"), QColor(0xfd, 0xcb, 0x6e)},
+        {QStringLiteral("post"),     QStringLiteral("Post / parcels"), QStringLiteral("📮"), QColor(0xe1, 0x70, 0x55)},
+        {QStringLiteral("rest"),     QStringLiteral("Rest area"),      QStringLiteral("🅿️"), QColor(0x60, 0xa3, 0xff)},
+    };
+    return cats;
+}
+
+const PoiCategory *Locator::poiCategory(const QString &key)
+{
+    for (const PoiCategory &c : poiCategories()) if (c.key == key) return &c;
+    return nullptr;
+}
+
+static QString poiCategoryFor(const QJsonObject &t)
+{
+    const QString am = t["amenity"].toString(), shop = t["shop"].toString(), tour = t["tourism"].toString(), hw = t["highway"].toString();
+    if (am == "fuel") return t["fuel:lpg"].toString() == "yes" && t["fuel:diesel"].toString() != "yes" && t["fuel:octane_87"].toString() != "yes" ? "propane" : "fuel";
+    if (shop == "gas" || (shop == "bottled_gas")) return "propane";
+    if (am == "charging_station") return "charging";
+    if (shop == "supermarket" || shop == "convenience" || shop == "greengrocer" || shop == "wholesale") return "grocery";
+    if (am == "restaurant" || am == "fast_food" || am == "food_court" || am == "pub") return "food";
+    if (am == "cafe") return "cafe";
+    if (tour == "camp_site" || tour == "caravan_site") return "camp";
+    if (am == "sanitary_dump_station") return "dump";
+    if (am == "drinking_water" || am == "water_point") return "water";
+    if (am == "shower") return "shower";
+    if (am == "toilets") return t["shower"].toString() == "yes" ? "shower" : "toilets";
+    if (shop == "laundry" || am == "laundry") return "laundry";
+    if (am == "hospital" || am == "clinic" || am == "doctors" || am == "urgent_care") return "health";
+    if (am == "pharmacy" || shop == "chemist") return "pharmacy";
+    if (shop == "car_repair" || shop == "tyres" || shop == "car_parts" || am == "vehicle_inspection") return "repair";
+    if (shop == "hardware" || shop == "doityourself" || shop == "outdoor" || shop == "trade") return "hardware";
+    if (am == "library") return "library";
+    if (am == "post_office" || am == "parcel_locker") return "post";
+    if (hw == "rest_area" || hw == "services") return "rest";
+    const QString ia = t["internet_access"].toString();
+    if (ia == "wlan" || ia == "yes") return "wifi";
+    return {};
+}
+
+void Locator::refreshPois(bool force)
+{
+    if (!m_fix.valid || m_poiBusy) return;
+    const int radius = m_poiRadiusKm * 1000;
+    const bool coarse = m_fix.source == QLatin1String("ip");
+    const double moved = m_poiTime.isValid() ? distanceM(m_poiLat, m_poiLon, m_fix.lat, m_fix.lon) : 1e9;
+    const bool stale = !m_poiTime.isValid() || m_poiTime.daysTo(QDateTime::currentDateTime()) >= 7;
+    if (!force && !stale && moved < qMax(500.0, radius / 3.0) && m_poiRadiusM == radius) {
+        m_poiNote = coarse ? QStringLiteral("around the approximate (IP) position — may be far off") : QString();
+        return;
+    }
+    // Don't hammer Overpass after a failure
+    if (!force && m_poiTried.isValid() && m_poiTried.secsTo(QDateTime::currentDateTime()) < 120) return;
+    m_poiTried = QDateTime::currentDateTime();
+    queryOverpass(m_fix.lat, m_fix.lon, radius, 0);
+}
+
+void Locator::queryOverpass(double lat, double lon, int radiusM, int mirror)
+{
+    static const char *mirrors[] = {"https://overpass-api.de/api/interpreter",
+                                    "https://overpass.kumi.systems/api/interpreter"};
+    const int lastMirror = int(sizeof(mirrors) / sizeof(*mirrors)) - 1;
+    m_poiBusy = true;
+    m_poiNote = QStringLiteral("Loading places within %1 km…").arg(radiusM / 1000);
+    emit poisUpdated();
+    // A bbox query is ~20× faster than around: on ways; the radius is applied below
+    const double dLat = radiusM / 111320.0, dLon = radiusM / (111320.0 * std::cos(qDegreesToRadians(lat)));
+    const QString bbox = QStringLiteral("%1,%2,%3,%4").arg(lat - dLat, 0, 'f', 5).arg(lon - dLon, 0, 'f', 5).arg(lat + dLat, 0, 'f', 5).arg(lon + dLon, 0, 'f', 5);
+    const QString q = QStringLiteral(
+        "[out:json][timeout:25][bbox:%1];("
+        "nwr[amenity~\"^(fuel|charging_station|restaurant|fast_food|food_court|cafe|sanitary_dump_station|drinking_water|water_point|"
+        "shower|toilets|laundry|hospital|clinic|doctors|urgent_care|pharmacy|library|post_office|vehicle_inspection)$\"];"
+        "nwr[shop~\"^(supermarket|convenience|greengrocer|wholesale|gas|bottled_gas|laundry|chemist|car_repair|tyres|car_parts|hardware|doityourself|outdoor|trade)$\"];"
+        "nwr[tourism~\"^(camp_site|caravan_site)$\"];"
+        "nwr[highway~\"^(rest_area|services)$\"];"
+        "nwr[internet_access~\"^(wlan|yes)$\"][name];"
+        ");out center tags qt 1500;").arg(bbox);
+    QNetworkRequest req{QUrl(QString::fromLatin1(mirrors[mirror]))};
+    req.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/x-www-form-urlencoded"));
+    req.setHeader(QNetworkRequest::UserAgentHeader, QString::fromLatin1(USER_AGENT));
+    req.setTransferTimeout(30000);
+    QUrlQuery body; body.addQueryItem(QStringLiteral("data"), q);
+    QNetworkReply *rep = m_nam.post(req, body.toString(QUrl::FullyEncoded).toUtf8());
+    connect(rep, &QNetworkReply::finished, this, [this, rep, lat, lon, radiusM, mirror, lastMirror] {
+        rep->deleteLater();
+        const int http = rep->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        const QJsonDocument doc = QJsonDocument::fromJson(rep->readAll());
+        // Overpass reports timeouts / overload as HTTP 200 with a "remark" and no elements
+        const QString remark = doc.object()["remark"].toString();
+        if (rep->error() != QNetworkReply::NoError || !doc.isObject() || remark.contains(QLatin1String("error"), Qt::CaseInsensitive)) {
+            if (mirror < lastMirror) { queryOverpass(lat, lon, radiusM, mirror + 1); return; }
+            m_poiBusy = false;
+            m_poiNote = QStringLiteral("Couldn't load places (%1)").arg(!remark.isEmpty() ? remark.left(80) : http ? QStringLiteral("HTTP %1").arg(http) : rep->errorString());
+            emit poisUpdated();
+            return;
+        }
+        QHash<QString, QList<Poi>> byCat;
+        for (const QJsonValue &v : doc.object()["elements"].toArray()) {
+            const QJsonObject el = v.toObject(), t = el["tags"].toObject();
+            const QString cat = poiCategoryFor(t);
+            if (cat.isEmpty()) continue;
+            Poi pt;
+            pt.cat = cat;
+            pt.lat = el.contains("lat") ? el["lat"].toDouble() : el["center"].toObject()["lat"].toDouble();
+            pt.lon = el.contains("lon") ? el["lon"].toDouble() : el["center"].toObject()["lon"].toDouble();
+            if ((pt.lat == 0 && pt.lon == 0) || distanceM(lat, lon, pt.lat, pt.lon) > radiusM) continue;
+            pt.osmType = el["type"].toString(); pt.osmId = qint64(el["id"].toDouble());
+            pt.name = t["name"].toString();
+            if (pt.name.isEmpty()) pt.name = t["brand"].toString();
+            if (pt.name.isEmpty()) pt.name = t["operator"].toString();
+            const QString ia = t["internet_access"].toString();
+            pt.wifi = ia == "wlan" || ia == "yes";
+            pt.hours = t["opening_hours"].toString();
+            pt.phone = t["phone"].toString(); if (pt.phone.isEmpty()) pt.phone = t["contact:phone"].toString();
+            pt.website = t["website"].toString(); if (pt.website.isEmpty()) pt.website = t["contact:website"].toString();
+            QStringList d;
+            if (!t["brand"].toString().isEmpty() && t["brand"].toString() != pt.name) d << t["brand"].toString();
+            if (cat == "fuel") {
+                QStringList f;
+                if (t["fuel:diesel"].toString() == "yes") f << "diesel";
+                if (t["fuel:lpg"].toString() == "yes") f << "propane";
+                if (t["fuel:HGV_diesel"].toString() == "yes" || t["hgv"].toString() == "yes") f << "truck lanes";
+                if (!f.isEmpty()) d << f.join(" · ");
+            }
+            if (cat == "camp") {
+                if (t["fee"].toString() == "no") d << "free";
+                if (t["power_supply"].toString() == "yes") d << "hookups";
+                if (t["sanitary_dump_station"].toString() == "yes") d << "dump station";
+                if (t["shower"].toString() == "yes" || t["showers"].toString() == "yes") d << "showers";
+                if (!t["capacity"].toString().isEmpty()) d << t["capacity"].toString() + " sites";
+            }
+            if (cat == "dump" || cat == "water" || cat == "toilets" || cat == "shower") {
+                if (t["fee"].toString() == "no") d << "free";
+                else if (t["fee"].toString() == "yes") d << "fee";
+                if (t["access"].toString() == "customers") d << "customers only";
+            }
+            if (cat == "food" || cat == "cafe") {
+                const QString c = t["cuisine"].toString();
+                if (!c.isEmpty()) d << QString(c).replace('_', ' ').replace(';', ", ");
+            }
+            if (cat == "charging") {
+                QStringList s;
+                for (const char *k : {"socket:tesla_supercharger", "socket:type2_combo", "socket:chademo", "socket:nacs"})
+                    if (!t[k].toString().isEmpty() && t[k].toString() != "no") s << QString::fromLatin1(k).section(':', 1);
+                if (!s.isEmpty()) d << s.join(", ");
+            }
+            if (pt.wifi && cat != "wifi") d << "Wi-Fi";
+            pt.detail = d.join(" · ");
+            if (pt.name.isEmpty() && (cat == "food" || cat == "cafe" || cat == "grocery" || cat == "wifi" || cat == "hardware")) continue;
+            byCat[cat] << pt;
+        }
+        // Keep the nearest few dozen per category so a city doesn't bury the map
+        QList<Poi> out;
+        for (auto it = byCat.begin(); it != byCat.end(); ++it) {
+            QList<Poi> &l = it.value();
+            std::sort(l.begin(), l.end(), [lat, lon](const Poi &a, const Poi &b) {
+                return distanceM(lat, lon, a.lat, a.lon) < distanceM(lat, lon, b.lat, b.lon); });
+            out += l.mid(0, it.key() == QLatin1String("toilets") || it.key() == QLatin1String("water") ? 15 : 30);
+        }
+        m_pois = out;
+        m_poiLat = lat; m_poiLon = lon; m_poiRadiusM = radiusM;
+        m_poiTime = QDateTime::currentDateTime();
+        m_poiBusy = false;
+        m_poiNote = m_fix.source == QLatin1String("ip") ? QStringLiteral("around the approximate (IP) position — may be far off") : QString();
+        if (m_pois.isEmpty()) m_poiNote = QStringLiteral("No mapped places within %1 km").arg(radiusM / 1000);
+        savePois();
+        emit poisUpdated();
+    });
+}
+
+void Locator::loadPois()
+{
+    QFile f(stateDir() + "/pois.json");
+    if (!f.open(QIODevice::ReadOnly)) return;
+    const QJsonObject o = QJsonDocument::fromJson(f.readAll()).object();
+    m_poiLat = o["lat"].toDouble(); m_poiLon = o["lon"].toDouble(); m_poiRadiusM = o["radius"].toInt();
+    m_poiTime = QDateTime::fromString(o["time"].toString(), Qt::ISODate);
+    for (const QJsonValue &v : o["pois"].toArray()) {
+        const QJsonObject a = v.toObject();
+        Poi pt;
+        pt.cat = a["cat"].toString(); pt.name = a["name"].toString(); pt.detail = a["detail"].toString();
+        pt.lat = a["lat"].toDouble(); pt.lon = a["lon"].toDouble();
+        pt.osmType = a["type"].toString(); pt.osmId = qint64(a["id"].toDouble());
+        pt.wifi = a["wifi"].toBool(); pt.hours = a["hours"].toString(); pt.phone = a["phone"].toString(); pt.website = a["website"].toString();
+        if (poiCategory(pt.cat)) m_pois << pt;
+    }
+    if (m_fix.valid && m_fix.source == QLatin1String("ip")) m_poiNote = QStringLiteral("around the approximate (IP) position — may be far off");
+}
+
+void Locator::savePois() const
+{
+    if (m_dbUsable) { m_db->savePois(m_pois, m_poiLat, m_poiLon, m_poiRadiusM, m_poiTime); return; }
+    QJsonArray arr;
+    for (const Poi &pt : m_pois)
+        arr.append(QJsonObject{{"cat", pt.cat}, {"name", pt.name}, {"detail", pt.detail}, {"lat", pt.lat}, {"lon", pt.lon},
+                               {"type", pt.osmType}, {"id", double(pt.osmId)}, {"wifi", pt.wifi}, {"hours", pt.hours},
+                               {"phone", pt.phone}, {"website", pt.website}});
+    QJsonObject o{{"lat", m_poiLat}, {"lon", m_poiLon}, {"radius", m_poiRadiusM}, {"time", m_poiTime.toString(Qt::ISODate)}, {"pois", arr}};
+    QFile f(stateDir() + "/pois.json");
+    if (f.open(QIODevice::WriteOnly | QIODevice::Truncate))
+        f.write(QJsonDocument(o).toJson(QJsonDocument::Compact));
 }
 
 // ── Persistence ───────────────────────────────────────────────────────────────
@@ -552,6 +1973,13 @@ void Locator::loadState()
                 ob.dbm = oo["dbm"].toInt(); ob.time = QDateTime::fromString(oo["t"].toString(), Qt::ISODate);
                 r.obs.append(ob);
             }
+            for (const QJsonValue &v : ro["seen"].toArray()) {
+                const QJsonObject so = v.toObject();
+                r.seen.append({so["lat"].toDouble(), so["lon"].toDouble(), so["acc"].toDouble(50000),
+                               QDateTime::fromString(so["t"].toString(), Qt::ISODate)});
+            }
+            r.freq = ro["freq"].toInt();
+            r.security = ro["security"].toString(); r.secFlags = ro["secFlags"].toInt(); r.wpaFlags = ro["wpaFlags"].toInt(); r.rsnFlags = ro["rsnFlags"].toInt(); r.maxKbps = ro["maxKbps"].toInt(); r.adhoc = ro["adhoc"].toBool();
             r.wigle = ro["wigle"].toBool(); r.wLat = ro["wLat"].toDouble(); r.wLon = ro["wLon"].toDouble();
             r.wigleChecked = QDateTime::fromString(ro["wigleChecked"].toString(), Qt::ISODate);
         }
@@ -571,9 +1999,18 @@ void Locator::saveState() const
         f.write(QJsonDocument(o).toJson(QJsonDocument::Compact) + "\n");
 }
 
+void Locator::rewriteHistory() const
+{
+    if (m_dbUsable) { m_db->saveFixes(m_history); return; }
+    QFile h(stateDir() + "/history.jsonl");
+    if (!h.open(QIODevice::WriteOnly | QIODevice::Truncate)) return;
+    for (const Fix &fx : m_history) h.write(QJsonDocument(fx.toJson()).toJson(QJsonDocument::Compact) + "\n");
+}
+
 void Locator::appendHistory(const Fix &fx)
 {
     m_history.append(fx);
+    if (m_dbUsable) { m_db->appendFix(fx); return; }
     QFile h(stateDir() + "/history.jsonl");
     if (h.open(QIODevice::WriteOnly | QIODevice::Append))
         h.write(QJsonDocument(fx.toJson()).toJson(QJsonDocument::Compact) + "\n");
@@ -585,6 +2022,7 @@ void Locator::noteObservations(const QList<AccessPoint> &aps, const Fix &at)
     for (const AccessPoint &ap : aps) {
         ApRecord &r = m_apRecords[ap.bssid];
         if (!ap.ssid.isEmpty()) r.ssid = ap.ssid;
+        if (ap.frequency) r.freq = ap.frequency;
         r.cells.insert(cell);
         // New observation if we've moved ≥ 25 m since the last one for this AP, or it's the first
         bool add = r.obs.isEmpty();
@@ -592,7 +2030,7 @@ void Locator::noteObservations(const QList<AccessPoint> &aps, const Fix &at)
             const ApObservation &last = r.obs.last();
             const double moved = distanceM(last.lat, last.lon, at.lat, at.lon);
             // Only count it as a new vantage point if we've clearly moved beyond both fixes' error
-            add = moved >= qMax(40.0, qMax(last.acc, at.accuracy) * 1.2);
+            add = moved >= qMax(60.0, last.acc + at.accuracy);
             if (!add && qAbs(last.dbm - ap.dbm) >= 6 && at.accuracy < last.acc) {
                 // same spot, better fix: replace the last observation
                 r.obs.last().lat = at.lat; r.obs.last().lon = at.lon; r.obs.last().acc = at.accuracy;
@@ -609,8 +2047,148 @@ void Locator::noteObservations(const QList<AccessPoint> &aps, const Fix &at)
     queueWigle();
 }
 
+void Locator::noteSightings(const QList<AccessPoint> &aps, const Fix &at)
+{
+    if (!at.valid || aps.isEmpty()) return;
+    const double acc = at.accuracy > 0 ? at.accuracy : 50000;
+    bool changed = false;
+    for (const AccessPoint &ap : aps) {
+        ApRecord &r = m_apRecords[ap.bssid];
+        if (!ap.ssid.isEmpty()) r.ssid = ap.ssid;
+        if (ap.frequency) r.freq = ap.frequency;
+        if (!ap.security.isEmpty()) { r.security = ap.security; r.secFlags = ap.secFlags; r.wpaFlags = ap.wpaFlags; r.rsnFlags = ap.rsnFlags; r.maxKbps = ap.maxKbps; r.adhoc = ap.adhoc; }
+        bool found = false;
+        for (ApSighting &s : r.seen) {
+            if (distanceM(s.lat, s.lon, at.lat, at.lon) <= qMax(s.acc, acc)) {
+                if (acc < s.acc) { s.lat = at.lat; s.lon = at.lon; s.acc = acc; }
+                s.time = at.time; found = true; break;
+            }
+        }
+        if (!found) {
+            r.seen.append({at.lat, at.lon, acc, at.time});
+            while (r.seen.size() > 24) r.seen.removeFirst();
+            changed = true;
+        }
+    }
+    if (changed) { saveApRecords(); emit scanUpdated(); }
+}
+
+QHash<QString, int> Locator::apFlags() const
+{
+    QHash<QString, int> flags;
+    for (auto it = m_apRecords.constBegin(); it != m_apRecords.constEnd(); ++it) {
+        AccessPoint ap; ap.bssid = it.key(); ap.ssid = it->ssid;
+        int f = 0;
+        if (isHome(ap)) f |= 1;
+        if (isTravelling(it.key()) || (!m_notTravelling.contains(it.key()) && looksMobile(it->ssid))) f |= 2;
+        if (matchesIgnore(ap) || it->ssid.endsWith(QLatin1String("_nomap")) || it->ssid.contains(QLatin1String("_optout"))) f |= 4;
+        flags.insert(it.key(), f);
+    }
+    return flags;
+}
+
+// ── Internal mapping database ────────────────────────────────────────────────
+void Locator::loadFromDb()
+{
+    QSet<QString> trav, notTrav;
+    const QHash<QString, ApRecord> recs = m_db->loadApRecords(&trav, &notTrav);
+    if (!recs.isEmpty()) { m_apRecords = recs; m_travelling = trav; m_notTravelling = notTrav; }
+    const QList<Fix> fixes = m_db->loadFixes();
+    if (!fixes.isEmpty()) m_history = fixes;
+    QList<Poi> pois; double plat = 0, plon = 0; int prad = 0; QDateTime ptime;
+    if (m_db->loadPois(&pois, &plat, &plon, &prad, &ptime)) {
+        m_pois.clear(); for (const Poi &p : pois) if (poiCategory(p.cat)) m_pois << p;
+        m_poiLat = plat; m_poiLon = plon; m_poiRadiusM = prad; m_poiTime = ptime;
+    }
+    const QHash<QString, double> elev = m_db->loadElevation();
+    for (auto it = elev.constBegin(); it != elev.constEnd(); ++it) m_elevCache.insert(it.key(), it.value());
+    const QHash<QString, QDateTime> ach = m_db->loadAchievements();
+    for (Achievement &a : m_achievements) if (ach.contains(a.key) && ach.value(a.key).isValid()) a.unlocked = ach.value(a.key);
+}
+
+// First run with the database: everything the JSON files held goes in, and the files are kept as *.migrated
+void Locator::migrateJsonToDb()
+{
+    m_db->saveApRecords(m_apRecords, m_travelling, m_notTravelling, apFlags());
+    m_db->saveFixes(m_history);
+    if (!m_pois.isEmpty() || m_poiTime.isValid()) m_db->savePois(m_pois, m_poiLat, m_poiLon, m_poiRadiusM, m_poiTime);
+    if (!m_elevCache.isEmpty()) m_db->saveElevation(m_elevCache);
+    m_db->saveAchievements(m_achievements);
+    int moved = 0;
+    for (const char *f : {"aps.json", "history.jsonl", "pois.json", "elev.json", "achievements.json"}) {
+        const QString p = stateDir() + QLatin1Char('/') + QLatin1String(f);
+        if (!QFile::exists(p)) continue;
+        QFile::remove(p + QStringLiteral(".migrated"));
+        if (QFile::rename(p, p + QStringLiteral(".migrated"))) ++moved;
+    }
+    m_db->flush();
+    qInfo("beaconfix: migrated %d JSON state file(s) into the map database (%d APs, %d fixes)", moved, int(m_apRecords.size()), int(m_history.size()));
+    emit statusMessage(QStringLiteral("Map database created from %1 APs and %2 stops").arg(m_apRecords.size()).arg(m_history.size()));
+}
+
+int Locator::rebuildDbFromJson()
+{
+    if (!m_dbUsable) return -1;
+    int n = 0;
+    for (const char *f : {"aps.json", "history.jsonl", "pois.json", "elev.json", "achievements.json"}) {
+        const QString p = stateDir() + QLatin1Char('/') + QLatin1String(f), m = p + QStringLiteral(".migrated");
+        if (QFile::exists(m) && !QFile::exists(p) && QFile::copy(m, p)) ++n;
+    }
+    if (!n) return 0;
+    loadState(); loadPois(); loadElevationCache(); loadAchievements();     // merges the files over what we have
+    m_db->saveApRecords(m_apRecords, m_travelling, m_notTravelling, apFlags());
+    m_db->saveFixes(m_history);
+    m_db->savePois(m_pois, m_poiLat, m_poiLon, m_poiRadiusM, m_poiTime);
+    m_db->saveElevation(m_elevCache);
+    m_db->saveAchievements(m_achievements);
+    for (const char *f : {"aps.json", "history.jsonl", "pois.json", "elev.json", "achievements.json"}) QFile::remove(stateDir() + QLatin1Char('/') + QLatin1String(f));
+    m_db->flush();
+    emit FixChanged(); emit scanUpdated();
+    return n;
+}
+
+QString Locator::DbStats() const { return m_db ? QString::fromUtf8(QJsonDocument(m_db->stats()).toJson(QJsonDocument::Compact)) : QStringLiteral("{\"open\":false}"); }
+bool Locator::DbExport(const QString &path)
+{
+    if (!m_db || !m_db->isOpen()) return false;
+    QFile f(path);
+    if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate)) return false;
+    f.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner);
+    f.write(QJsonDocument(m_db->exportJson()).toJson(QJsonDocument::Compact));
+    emit statusMessage(QStringLiteral("Database exported to %1").arg(path));
+    return true;
+}
+int Locator::DbImport(const QString &path)
+{
+    if (!m_dbUsable) return -1;
+    QFile f(path);
+    if (!f.open(QIODevice::ReadOnly)) return -1;
+    QString err;
+    const int n = m_db->importJson(QJsonDocument::fromJson(f.readAll()).object(), &err);
+    if (n >= 0) { loadFromDb(); emit FixChanged(); emit scanUpdated(); emit statusMessage(QStringLiteral("Imported %1 rows from %2").arg(n).arg(path)); }
+    return n;
+}
+
+// Offline self-location: places we have been before. Two or more heard beacons with a
+// position of their own in the database put us at their signal-weighted centroid.
+bool Locator::tryInternal(const QList<AccessPoint> &usable)
+{
+    if (!m_db || !m_db->isOpen() || usable.size() < 2) return false;
+    QList<QPair<QString, int>> heard;
+    for (const AccessPoint &ap : usable) heard << qMakePair(ap.bssid, ap.dbm);
+    double lat = 0, lon = 0, acc = 0; int used = 0;
+    if (!m_db->estimate(heard, &lat, &lon, &acc, &used, nullptr, 2, 150) || acc > 150) return false;
+    Fix f; f.valid = true; f.lat = lat; f.lon = lon; f.accuracy = acc;
+    f.source = QStringLiteral("wifi"); f.provider = QStringLiteral("internal");
+    f.time = QDateTime::currentDateTime(); f.apCount = m_aps.size(); f.apUsed = used;
+    accept(f);
+    finish(true, QStringLiteral("Internal map fix from %1 access points (±%2 m) — a place we have been before").arg(used).arg(qRound(acc)));
+    return true;
+}
+
 void Locator::saveApRecords() const
 {
+    if (m_dbUsable) { m_db->saveApRecords(m_apRecords, m_travelling, m_notTravelling, apFlags()); return; }
     QJsonObject recs;
     for (auto it = m_apRecords.begin(); it != m_apRecords.end(); ++it) {
         const ApRecord &r = it.value();
@@ -622,6 +2200,14 @@ void Locator::saveApRecords() const
             obs.append(oo);
         }
         ro["obs"] = obs;
+        if (!r.seen.isEmpty()) {
+            QJsonArray seen;
+            for (const ApSighting &sg : r.seen)
+                seen.append(QJsonObject{{"lat", sg.lat}, {"lon", sg.lon}, {"acc", sg.acc}, {"t", sg.time.toString(Qt::ISODate)}});
+            ro["seen"] = seen;
+        }
+        if (r.freq) ro["freq"] = r.freq;
+        if (!r.security.isEmpty()) { ro["security"] = r.security; ro["secFlags"] = r.secFlags; ro["wpaFlags"] = r.wpaFlags; ro["rsnFlags"] = r.rsnFlags; ro["maxKbps"] = r.maxKbps; if (r.adhoc) ro["adhoc"] = true; }
         if (r.wigle) { ro["wigle"] = true; ro["wLat"] = r.wLat; ro["wLon"] = r.wLon; }
         if (r.wigleChecked.isValid()) ro["wigleChecked"] = r.wigleChecked.toString(Qt::ISODate);
         recs[it.key()] = ro;
@@ -645,17 +2231,25 @@ bool Locator::exportGpx(const QString &path, QString *error) const
     QTextStream ts(&f);
     ts << "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
        << "<gpx version=\"1.1\" creator=\"BeaconFix\" xmlns=\"http://www.topografix.com/GPX/1/1\">\n";
-    for (const Fix &fx : m_history) {
-        ts << "  <wpt lat=\"" << QString::number(fx.lat, 'f', 6) << "\" lon=\"" << QString::number(fx.lon, 'f', 6) << "\">\n"
-           << "    <time>" << fx.time.toUTC().toString(Qt::ISODate) << "</time>\n"
+    const Stats st = stats();
+    ts << "  <metadata><name>BeaconFix trip</name><desc>" << QStringLiteral("%1 stops · %2 km between precise stops · %3").arg(st.stops).arg(st.distanceAllKm, 0, 'f', 1).arg(st.rank).toHtmlEscaped()
+       << "</desc><time>" << QDateTime::currentDateTimeUtc().toString(Qt::ISODate) << "</time></metadata>\n";
+    for (const Stop &s : stops()) {
+        const Fix &fx = s.fix;
+        ts << "  <wpt lat=\"" << QString::number(fx.lat, 'f', 6) << "\" lon=\"" << QString::number(fx.lon, 'f', 6) << "\">\n";
+        if (fx.hasElevation()) ts << "    <ele>" << QString::number(fx.elevation, 'f', 1) << "</ele>\n";
+        ts << "    <time>" << fx.time.toUTC().toString(Qt::ISODate) << "</time>\n"
            << "    <name>" << fx.place.toHtmlEscaped() << "</name>\n"
-           << "    <desc>" << fx.source << (fx.accuracy >= 0 ? QStringLiteral(" ±%1 m").arg(qRound(fx.accuracy)) : QString()) << "</desc>\n"
+           << "    <desc>" << fx.source << (fx.accuracy >= 0 ? QStringLiteral(" ±%1 m").arg(qRound(fx.accuracy)) : QString())
+           << (s.dwellSecs >= 0 ? QStringLiteral(" · stayed %1").arg(durationText(s.dwellSecs)) : QString()) << "</desc>\n"
            << "  </wpt>\n";
     }
     ts << "  <trk><name>BeaconFix track</name><trkseg>\n";
-    for (const Fix &fx : m_history)
-        ts << "    <trkpt lat=\"" << QString::number(fx.lat, 'f', 6) << "\" lon=\"" << QString::number(fx.lon, 'f', 6)
-           << "\"><time>" << fx.time.toUTC().toString(Qt::ISODate) << "</time></trkpt>\n";
+    for (const Fix &fx : m_history) {
+        ts << "    <trkpt lat=\"" << QString::number(fx.lat, 'f', 6) << "\" lon=\"" << QString::number(fx.lon, 'f', 6) << "\">";
+        if (fx.hasElevation()) ts << "<ele>" << QString::number(fx.elevation, 'f', 1) << "</ele>";
+        ts << "<time>" << fx.time.toUTC().toString(Qt::ISODate) << "</time></trkpt>\n";
+    }
     ts << "  </trkseg></trk>\n</gpx>\n";
     return true;
 }

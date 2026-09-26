@@ -6,14 +6,58 @@
     <group name="General">
         <entry name="pollSeconds" type="Int">
             <label>Seconds between reads of the BeaconFix state</label>
-            <default>60</default>
-            <min>10</min>
+            <default>20</default>
+            <min>5</min>
             <max>3600</max>
         </entry>
         <entry name="showPlaceInPanel" type="Bool">
             <label>Show the place name next to the icon in the panel</label>
             <default>true</default>
         </entry>
+        <entry name="mapLayer" type="Int">
+            <label>Map style: 0 dark, 1 streets, 2 satellite, 3 topographic</label>
+            <default>0</default>
+            <min>0</min>
+            <max>3</max>
+        </entry>
+        <entry name="hiddenCategories" type="StringList">
+            <label>Place categories hidden on the map</label>
+            <default>toilets</default>
+        </entry>
+        <entry name="startTab" type="Int">
+            <label>Last tab shown (index into the enabled tabs)</label>
+            <default>0</default>
+        </entry>
+        <entry name="showAccuracyInPanel" type="Bool">
+            <label>Show a source + accuracy chip next to the icon in the panel</label>
+            <default>false</default>
+        </entry>
+        <entry name="showMotionInPanel" type="Bool">
+            <label>Show speed and heading (or elevation) next to the icon in the panel</label>
+            <default>false</default>
+        </entry>
+        <entry name="showSsids" type="Bool">
+            <label>Draw Wi-Fi network names beside the beacons on the map and radar</label>
+            <default>true</default>
+        </entry>
+        <entry name="animatedMap" type="Bool">
+            <label>Cinematic map: glide to events and periodically zoom out to the city / state</label>
+            <default>true</default>
+        </entry>
+        <entry name="tourMinutes" type="Int">
+            <label>Minutes between overview zoom-outs</label>
+            <default>2</default>
+            <min>1</min>
+            <max>60</max>
+        </entry>
+        <entry name="showEvents" type="Bool">
+            <label>Animate events on the map (new / lost / louder beacons, fixes, stops) and show the ticker</label>
+            <default>true</default>
+        </entry>
+        <entry name="showMapTab" type="Bool"><label>Show the Map tab</label><default>true</default></entry>
+        <entry name="showNearbyTab" type="Bool"><label>Show the Nearby tab</label><default>true</default></entry>
+        <entry name="showRadarTab" type="Bool"><label>Show the Radar tab</label><default>true</default></entry>
+        <entry name="showTripTab" type="Bool"><label>Show the Trip tab</label><default>true</default></entry>
         <entry name="binary" type="String">
             <label>beaconfix executable</label>
             <default>beaconfix</default>

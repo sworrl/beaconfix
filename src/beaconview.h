@@ -1,6 +1,7 @@
 #pragma once
+#include <QCache>
+#include <QDateTime>
 #include <QHash>
-#include <QNetworkAccessManager>
 #include <QImage>
 #include <QPixmap>
 #include <QPointF>
@@ -9,20 +10,31 @@
 #include <QWidget>
 
 class Locator;
+class TileSource;
 struct AccessPoint;
 
-// The beacon view: dark basemap, our position with a pulsing halo and radar
-// sweep, every access point placed by its estimate (WiGLE / centroid / RSSI
-// ring), and a HUD with rank + counters. Painted with QPainter — no WebEngine,
-// no GL — so it's safe on the i915 vGPU.
+// The map: slippy basemap (dark / streets / satellite / topo), our position with
+// accuracy ring, pulse and radar sweep, the trip track, points of interest from
+// OpenStreetMap, and every access point placed by its best estimate. Painted with
+// QPainter — no WebEngine, no GL — so it's safe on the i915 vGPU.
 class BeaconView : public QWidget {
     Q_OBJECT
 public:
-    explicit BeaconView(Locator *loc, QWidget *parent = nullptr);
+    enum Layer { Dark, Streets, Satellite, Topo };
+
+    explicit BeaconView(Locator *loc, TileSource *tiles, QWidget *parent = nullptr);
     void setZoom(int z);
-    int  zoom() const { return m_zoom; }
+    int  zoom() const { return qRound(m_zoom); }
     void recenter();
     void fitBeacons();
+    void focusOn(double lat, double lon, double zoom = 17);
+    void selectPoi(int index);
+    void setLayer(Layer l);
+    Layer layer() const { return m_layer; }
+    QSet<QString> hiddenCategories() const { return m_hiddenCats; }
+    void setCategoryVisible(const QString &key, bool visible);
+    bool showNames() const { return m_showNames; }
+    void setShowNames(bool on);
 
 protected:
     void paintEvent(QPaintEvent *) override;
@@ -31,32 +43,93 @@ protected:
     void mouseMoveEvent(QMouseEvent *) override;
     void mouseReleaseEvent(QMouseEvent *) override;
     void mouseDoubleClickEvent(QMouseEvent *) override;
+    void keyPressEvent(QKeyEvent *) override;
+    void contextMenuEvent(QContextMenuEvent *) override;
     void showEvent(QShowEvent *) override;
     void hideEvent(QHideEvent *) override;
     void leaveEvent(QEvent *) override;
+    void resizeEvent(QResizeEvent *) override;
 
 private:
-    struct Placed { QPointF pos; double radiusPx; int index; };
-    QString key(int z, int x, int y) const;
-    void ensureTile(int z, int x, int y);
-    QPointF project(double lat, double lon) const;     // to widget coords
-    double metersPerPixel(double lat) const;
-    static double metersPerPixelAt(double lat, int zoom);
-    static QImage darken(const QImage &src);
-    void drawHud(QPainter &p);
-    void drawLegend(QPainter &p);
+    enum HitKind { HitNone, HitBeacon, HitPoi, HitCluster, HitButton };
+    struct Hit { HitKind kind; QPointF pos; double radius; QList<int> items; int button = -1; };
+
+    // Web-Mercator, normalised to [0,1]²
+    static QPointF merc(double lat, double lon);
+    static void    unmerc(const QPointF &m, double *lat, double *lon);
+    double  worldPx() const;                                   // world size in logical px at m_zoom
+    QPointF toScreen(const QPointF &m) const;
+    QPointF toScreen(double lat, double lon) const { return toScreen(merc(lat, lon)); }
+    QPointF toMerc(const QPointF &screen) const;
+    double  metersPerPixel(double lat) const;
+    static double metersPerPixelAt(double lat, double zoom);
+
+    int     maxZoom() const;
+    QString tileKey(Layer l, int z, int x, int y, bool labels) const;
+    void    ensureTile(Layer l, int z, int x, int y, bool labels);
+    void    drawTiles(QPainter &p, bool labels);
+    void    drawTrack(QPainter &p);
+    void    drawPois(QPainter &p);
+    void    drawBeacons(QPainter &p);
+    void    drawMe(QPainter &p);
+    void    drawLabels(QPainter &p);
+    void    drawEvents(QPainter &p);
+    void    drawTicker(QPainter &p);
+    void    rebuildLabelCache();
+    void    onEvent(const QString &json);
+    bool    beaconScreenPos(const QString &bssid, QPointF *out) const;
+    void    drawHud(QPainter &p);
+    void    drawControls(QPainter &p);
+    void    drawCard(QPainter &p);
+    void    drawScale(QPainter &p);
+    void    drawAttribution(QPainter &p);
+
+    void    zoomAt(double delta, const QPointF &anchor, bool animate = true);
+    void    applyZoom(double z, const QPointF &anchor);
+    void    buttonClicked(int b, const QPoint &globalPos);
+    void    showItemMenu(const Hit &h, const QPoint &globalPos);
+    int     hitAt(const QPointF &pos) const;
+    QString beaconCard(int apIndex) const;
+    QString poiCard(int poiIndex) const;
+    static QString compass(double deg);
+    static QString distText(double m);
 
     Locator *m_loc;
-    QNetworkAccessManager m_nam;
-    QHash<QString, QPixmap> m_tiles;
+    TileSource *m_src;
+    QCache<QString, QPixmap> m_tiles;
     QSet<QString> m_pending;
-    QTimer m_anim;
-    int    m_zoom = 15;
-    double m_centerLat = 39, m_centerLon = -105;      // view centre (pan)
-    bool   m_followFix = true;
-    QPointF m_dragStart; double m_dragLat = 0, m_dragLon = 0; bool m_dragging = false;
-    QList<Placed> m_placed;
-    int    m_hover = -1;
-    double m_phase = 0;                                 // animation phase 0..1
-    double m_sweep = 0;                                 // radar sweep angle
+    QHash<QString, QDateTime> m_failed;
+    QTimer  m_anim;
+    Layer   m_layer = Dark;
+    QSet<QString> m_hiddenCats;
+
+    double  m_zoom = 15, m_zoomTarget = 15;
+    QPointF m_zoomAnchor;
+    QPointF m_center{0.5, 0.5};                                 // view centre, mercator
+    bool    m_follow = true, m_autoZoom = true;
+    QPointF m_dragStart, m_dragCenter; bool m_dragging = false, m_dragMoved = false;
+
+    QList<Hit> m_hits;
+    int     m_hover = -1;                                       // index into m_hits
+    HitKind m_selKind = HitNone; int m_selItem = -1;            // pinned card
+    QList<QPointF> m_beaconPos;                                 // per AP index, this frame
+    QHash<QString, int> m_apIndex;                              // bssid → AP index (rebuilt on scan)
+    struct LabelInfo { QString text; double width = 0; QString band; QColor col; bool hidden = false; };
+    QList<LabelInfo> m_labels;                                  // per AP index, rebuilt on scan (not per frame)
+    bool    m_showNames = true;
+    // Live events, animated on the map and listed in the ticker
+    struct Anim {
+        QString type, bssid, ssid, text, glyph;
+        qint64  start = 0; int durationMs = 2000;
+        bool    hasPos = false, hasFrom = false;
+        double  lat = 0, lon = 0, fromLat = 0, fromLon = 0, r = 0, bearing = 0;
+        int     delta = 0; QColor col;
+    };
+    QList<Anim> m_anims;                                        // in flight (≤ 24)
+    QList<Anim> m_ticker;                                       // last 5 events, newest first
+    QHash<QString, qint64> m_labelBorn;                         // bssid → when its label should slide in
+    QRectF  m_tickerRect; bool m_tickerHover = false; qint64 m_tickerPausedAt = 0;
+    double  m_hudBottom = 0;
+    QList<QPointF> m_poiPos;                                    // per POI index, this frame (null = hidden)
+    double  m_phase = 0, m_sweep = 0;
 };

@@ -1,13 +1,18 @@
 {
     "KPlugin": {
-        "Authors": [ { "Email": "github@falcontechnix.com", "Name": "sworrl" } ],
+        "Authors": [
+            {
+                "Email": "github@falcontechnix.com",
+                "Name": "sworrl"
+            }
+        ],
         "Category": "Utilities",
-        "Description": "Where am I? Shows the BeaconFix position fix (Wi-Fi beacons via BeaconDB, Starlink GPS, or IP).",
+        "Description": "Where am I? Live map of the BeaconFix position fix (Wi-Fi beacons via BeaconDB, Starlink GPS, or IP), nearby places from OpenStreetMap, the beacons around you with their Wi-Fi names and live events (new, lost, louder, placed) animated on the map, and your trip: distances, time moving, speed, elevation, sun, places visited and milestones.",
         "Icon": "beaconfix",
         "Id": "org.kde.plasma.beaconfix",
         "License": "GPL-2.0-or-later",
         "Name": "BeaconFix",
-        "Version": "1.1.0"
+        "Version": "3.3.0"
     },
     "KPackageStructure": "Plasma/Applet",
     "X-Plasma-API-Minimum-Version": "6.0"

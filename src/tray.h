@@ -23,6 +23,7 @@ private:
     QSystemTrayIcon m_icon;
     QMenu m_menu;
     QAction *m_placeAct = nullptr, *m_coordAct = nullptr, *m_ageAct = nullptr, *m_refreshAct = nullptr;
-    QMenu *m_intervalMenu = nullptr;
+    QMenu *m_intervalMenu = nullptr, *m_shareMenu = nullptr;
+    QAction *m_tripAct = nullptr, *m_sunAct = nullptr;
     QTimer m_ageTimer;
 };

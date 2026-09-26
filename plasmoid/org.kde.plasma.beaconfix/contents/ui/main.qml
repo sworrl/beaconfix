@@ -11,6 +11,18 @@ PlasmoidItem {
 
     readonly property int    pollSecs:  Plasmoid.configuration.pollSeconds
     readonly property bool   showPlace: Plasmoid.configuration.showPlaceInPanel
+    readonly property bool   showAccuracy: Plasmoid.configuration.showAccuracyInPanel
+    readonly property bool   showMotion:   Plasmoid.configuration.showMotionInPanel
+    readonly property bool   showSsids:    Plasmoid.configuration.showSsids
+    readonly property bool   showEvents:   Plasmoid.configuration.showEvents
+    readonly property var    tabKeys: {
+        var k = []
+        if (Plasmoid.configuration.showMapTab) k.push("map")
+        if (Plasmoid.configuration.showNearbyTab) k.push("nearby")
+        if (Plasmoid.configuration.showRadarTab) k.push("radar")
+        if (Plasmoid.configuration.showTripTab) k.push("trip")
+        return k.length ? k : ["map"]
+    }
     readonly property string bin:
         'PATH="$HOME/.local/bin:/usr/local/bin:$PATH" ' + (Plasmoid.configuration.binary || "beaconfix")
 
@@ -19,6 +31,7 @@ PlasmoidItem {
     property double lon:      0
     property double accuracy: -1
     property string source:   ""
+    property string provider: ""
     property string place:    ""
     property string time:     ""
     property int    apCount:  0
@@ -26,10 +39,42 @@ PlasmoidItem {
     property bool   busy:     false
     property var    aps:      []
     property var    stats:    ({})
+    property var    pois:     []
+    property var    track:    []
+    property var    knownDevices: []
+    property var    securitySummary: null
+    property var    poiCategories: []
+    property string poiNote:  ""
+    property string tileBase: ""
+    property string _poisJson: ""
+    property string _trackJson: ""
+    property var    elevation: null
+    property string elevationNote: ""
+    property var    sun: null
+    property var    share: null
+    property var    events:   []                // recent things that happened (newest last)
+    property int    lastEventId: 0
+    property int    liveScanSeconds: 0
+    property int    _seenEventId: -1            // -1 until the first read: never animate history
+    property string _eventsJson: ""
+    signal newEvents(var list, bool animate)    // events not seen before; animate=false on the first read
+    readonly property var hiddenCats: Plasmoid.configuration.hiddenCategories || []
+
+    function setCategory(key, visible) {
+        var l = []
+        for (var i = 0; i < hiddenCats.length; i++) if (hiddenCats[i] !== key) l.push(hiddenCats[i])
+        if (!visible) l.push(key)
+        Plasmoid.configuration.hiddenCategories = l
+    }
+    function setAllCategories(visible) {
+        var l = []
+        if (!visible) for (var i = 0; i < poiCategories.length; i++) l.push(poiCategories[i].key)
+        Plasmoid.configuration.hiddenCategories = l
+    }
 
     readonly property string sourceName:
         source === "starlink" ? "Starlink dish GPS" :
-        source === "wifi"     ? "BeaconDB Wi-Fi" :
+        source === "wifi" ? (provider === "apple" ? "Apple Wi-Fi" : "BeaconDB Wi-Fi") :
         source === "ip"       ? "IP geolocation (approximate)" : "no fix"
     readonly property string sourceIcon: "beaconfix"
     readonly property color  sourceColor:
@@ -37,7 +82,10 @@ PlasmoidItem {
 
     Plasmoid.icon: sourceIcon
     toolTipMainText: valid ? place : "BeaconFix"
-    toolTipSubText:  valid ? `±${Math.round(accuracy)} m · ${sourceName} · ${ageText()}` : (error || "No location yet")
+    toolTipSubText:  valid ? `±${Math.round(accuracy)} m · ${sourceName} · ${ageText()}`
+                               + (stats && stats.rank ? `\n${stats.rank} · Lv ${stats.rankLevel} · today ${(stats.distanceTodayKm || 0).toFixed(1)} km · trip ${(stats.distanceTripKm || 0).toFixed(0)} km` : "")
+                               + (elevation !== null ? `\n⛰ ${elevText()}` : "") + (sun && sun.sunrise ? ` · ☀ ${hm(sun.sunrise)} – ${hm(sun.sunset)}` : "")
+                           : (error || "No location yet")
 
     function ageText() {
         if (!time) return "never"
@@ -47,6 +95,15 @@ PlasmoidItem {
         if (s < 86400) return `${Math.floor(s / 3600)} h ago`
         return new Date(time).toLocaleString(Qt.locale(), "ddd d MMM HH:mm")
     }
+
+    // Header click → KWin "Show Desktop" (windows step aside, the widget stays; click again to restore).
+    Plasma5Support.DataSource {
+        id: shellRunner
+        engine: "executable"
+        connectedSources: []
+        onNewData: function(sourceName) { disconnectSource(sourceName) }
+    }
+    function showDesktop() { shellRunner.connectSource('qdbus6 org.kde.kglobalaccel /component/kwin org.kde.kglobalaccel.Component.invokeShortcut "Show Desktop"') }
 
     Plasma5Support.DataSource {
         id: exec
@@ -59,16 +116,51 @@ PlasmoidItem {
                 var d = JSON.parse((data["stdout"] || "").trim())
                 root.valid = !!d.valid; root.lat = d.lat || 0; root.lon = d.lon || 0
                 root.accuracy = d.accuracy !== undefined ? d.accuracy : -1
-                root.source = d.source || ""; root.place = d.place || ""; root.time = d.time || ""
+                root.source = d.source || ""; root.provider = d.provider || ""; root.place = d.place || ""; root.time = d.time || ""
                 root.apCount = d.apCount || 0; root.error = d.error || ""; root.busy = !!d.busy
                 root.aps = d.aps || []; root.stats = d.stats || {}
-                radar.requestPaint()
+                // Only reassign the big arrays when they changed: that re-clusters and repaints the map
+                var pj = JSON.stringify(d.pois || [])
+                if (pj !== root._poisJson) { root._poisJson = pj; root.pois = d.pois || [] }
+                var tj = JSON.stringify(d.track || [])
+                if (tj !== root._trackJson) { root._trackJson = tj; root.track = d.track || [] }
+                if (!root.poiCategories.length) root.poiCategories = d.poiCategories || []
+                root.poiNote = d.poiNote || ""
+                root.tileBase = d.tileBase || ""
+                root.knownDevices = d.knownDevices || []
+                root.securitySummary = d.securitySummary || null
+                root.elevation = (d.elevation === undefined) ? null : d.elevation
+                root.elevationNote = d.elevationNote || ""
+                root.sun = d.sun || null
+                root.share = d.share || null
+                root.liveScanSeconds = d.liveScanSeconds || 0
+                var ev = d.events || []
+                var ej = JSON.stringify(ev)
+                if (ej !== root._eventsJson) {
+                    root._eventsJson = ej; root.events = ev
+                    var fresh = [], maxId = root._seenEventId, first = root._seenEventId < 0
+                    for (var i = 0; i < ev.length; i++) {
+                        var id = (ev[i] && ev[i].id !== undefined) ? ev[i].id : i
+                        if (id > maxId) maxId = id
+                        if (!first && id > root._seenEventId) fresh.push(ev[i])
+                    }
+                    root._seenEventId = maxId
+                    root.lastEventId = d.lastEventId !== undefined ? d.lastEventId : maxId
+                    var out = first ? ev.slice(-5) : fresh
+                    if (out.length) root.newEvents(out, !first)
+                }
             } catch(e) { root.error = "beaconfix --json failed" }
         }
     }
     function poll()    { exec.connectSource(`${root.bin} --json`) }
     function refresh() { exec.connectSource(`${root.bin} --refresh`); refreshFollow.restart() }
     function openApp() { exec.connectSource(`${root.bin}`) }
+    function copy(what) { exec.connectSource(`${root.bin} --copy ${what}`) }
+    function saveGpx() { exec.connectSource(`${root.bin} --gpx "$HOME/Documents/beaconfix-trip.gpx"`) }
+    function newTrip() { exec.connectSource(`${root.bin} --new-trip`); refreshFollow.restart() }
+    function prefetch() { exec.connectSource(`${root.bin} --prefetch`) }
+    function elevText() { return elevation === null ? "" : `${Math.round(elevation)} m` }
+    function hm(iso) { return iso ? new Date(iso).toLocaleTimeString(Qt.locale(), "HH:mm") : "—" }
 
     Timer { interval: root.pollSecs * 1000; running: true; repeat: true; triggeredOnStart: true; onTriggered: root.poll() }
     // After a manual refresh, poll a few times quickly so the new fix shows up promptly
@@ -100,20 +192,48 @@ PlasmoidItem {
                 elide: Text.ElideRight
                 Layout.maximumWidth: Kirigami.Units.gridUnit * 12
             }
+            Rectangle {
+                visible: root.showAccuracy && !compact.vertical && root.valid
+                radius: 7; height: 14; width: accChip.implicitWidth + 10; color: root.sourceColor
+                PC3.Label { id: accChip; anchors.centerIn: parent; color: "#0b101a"; font.bold: true; font.pixelSize: Kirigami.Theme.smallFont.pixelSize - 1
+                            text: (root.source === "starlink" ? "GPS " : root.source === "wifi" ? "WI-FI " : root.source === "ip" ? "IP " : "")
+                                  + (root.accuracy >= 1000 ? Math.round(root.accuracy / 1000) + " km" : Math.round(root.accuracy) + " m") }
+            }
+            PC3.Label {
+                visible: root.showMotion && !compact.vertical && root.valid && root.stats && root.stats.rank !== undefined
+                text: root.stats.moving && root.stats.speedKmh >= 0 ? `→ ${Math.round(root.stats.speedKmh)} km/h ${root.stats.heading || ""}`
+                      : root.elevation !== null ? `⛰ ${root.elevText()}` : ""
+                color: root.stats.moving ? "#ff9f43" : Kirigami.Theme.textColor
+                font.pixelSize: Kirigami.Theme.smallFont.pixelSize
+            }
         }
     }
 
     fullRepresentation: Item {
         id: fullRep
-        Layout.preferredWidth:  Kirigami.Units.gridUnit * 24
-        Layout.preferredHeight: Kirigami.Units.gridUnit * 26
-        Layout.minimumWidth:    Kirigami.Units.gridUnit * 18
-        Layout.minimumHeight:   Kirigami.Units.gridUnit * 20
+        Layout.preferredWidth:  Kirigami.Units.gridUnit * 30
+        Layout.preferredHeight: Kirigami.Units.gridUnit * 32
+        Layout.minimumWidth:    Kirigami.Units.gridUnit * 20
+        Layout.minimumHeight:   Kirigami.Units.gridUnit * 22
 
-        // Pulse + sweep animation while the popup is open
+        // Pulse + sweep: a 2.4 s cycle stepped at 12 fps by a timer, not a NumberAnimation.
+        // An infinite NumberAnimation makes Qt Quick re-render the whole desktop at 60 fps for
+        // as long as the widget is on it, which on this VM's GL path costs most of a core.
+        // …and on the desktop it only runs while the pointer is over the widget or for two
+        // minutes after the last interaction or event, so an idle desktop stays idle.
         property real phase: 0
-        NumberAnimation on phase { from: 0; to: 1; duration: 2400; loops: Animation.Infinite; running: root.expanded }
-        onPhaseChanged: radar.requestPaint()
+        property bool  awake: true
+        readonly property bool onDesktop: Plasmoid.location === PlasmaCore.Types.Floating || Plasmoid.formFactor === PlasmaCore.Types.Planar
+        HoverHandler { id: repHover; onHoveredChanged: if (hovered) fullRep.wake() }
+        function wake() { awake = true; idleTimer.restart() }
+        Timer { id: idleTimer; interval: 120000; onTriggered: if (!repHover.hovered) { fullRep.awake = false; fullRep.phase = 0 } }
+        Connections { target: root; function onNewEvents(list, animate) { if (animate && list.length) fullRep.wake() } }
+        Component.onCompleted: wake()
+        Timer {
+            interval: 83; repeat: true
+            running: fullRep.visible && (root.expanded || (fullRep.onDesktop && fullRep.awake))
+            onTriggered: fullRep.phase = (Date.now() % 2400) / 2400
+        }
 
         Rectangle {
             anchors.fill: parent
@@ -130,6 +250,9 @@ PlasmoidItem {
             RowLayout {
                 Layout.fillWidth: true
                 spacing: Kirigami.Units.smallSpacing
+                TapHandler { acceptedButtons: Qt.LeftButton; onTapped: root.showDesktop() }
+                HoverHandler { id: headerHover; cursorShape: Qt.PointingHandCursor }
+                PC3.ToolTip { visible: headerHover.hovered; delay: 900; text: "Click: show the desktop (windows step aside). Click again to bring them back." }
                 Rectangle {
                     width: 10; height: 10; radius: 5; color: root.sourceColor
                     Rectangle { anchors.centerIn: parent; width: 10 + 16 * fullRep.phase; height: width; radius: width / 2
@@ -150,70 +273,74 @@ PlasmoidItem {
             }
             PC3.Label {
                 text: root.valid
-                      ? `${root.lat.toFixed(5)}, ${root.lon.toFixed(5)}  ·  ±${Math.round(root.accuracy)} m  ·  ${root.ageText()}`
+                      ? `${root.lat.toFixed(5)}, ${root.lon.toFixed(5)}  ·  ±${root.accuracy >= 1000 ? (root.accuracy / 1000).toFixed(0) + " km" : Math.round(root.accuracy) + " m"}  ·  ${root.ageText()}`
                       : (root.error || "Waiting for BeaconFix…")
                 color: "#9fb0c8"; font.pixelSize: Kirigami.Theme.smallFont.pixelSize
                 elide: Text.ElideRight; Layout.fillWidth: true
             }
+            PC3.Label {
+                visible: !!(root.valid && (root.elevation !== null || !!root.sun || (root.stats && root.stats.moving)))
+                text: [root.elevation !== null ? `⛰ ${root.elevText()} · ${Math.round(root.elevation * 3.28084)} ft` : "",
+                       root.sun && root.sun.sunrise ? `☀ ${root.hm(root.sun.sunrise)} – ${root.hm(root.sun.sunset)}` + (root.sun.goldenEveningStart ? ` · golden ${root.hm(root.sun.goldenEveningStart)}` : "") : (root.sun && root.sun.polarDay ? "☀ up all day" : root.sun && root.sun.polarNight ? "☀ down all day" : ""),
+                       root.stats && root.stats.moving && root.stats.speedKmh >= 0 ? `→ ${Math.round(root.stats.speedKmh)} km/h ${root.stats.heading || ""}` : (root.stats && root.stats.dwellSecs > 0 ? `here ${Math.floor(root.stats.dwellSecs / 3600)} h ${Math.floor((root.stats.dwellSecs % 3600) / 60)} min` : "")
+                      ].filter(function(s) { return !!s }).join("  ·  ")
+                color: "#ffd166"; font.pixelSize: Kirigami.Theme.smallFont.pixelSize
+                elide: Text.ElideRight; Layout.fillWidth: true
+            }
 
-            // ── Radar: beacons by distance, ring = RSSI distance, gold = located ──
-            Canvas {
-                id: radar
-                Layout.fillWidth: true; Layout.fillHeight: true
-                onPaint: {
-                    var ctx = getContext("2d")
-                    ctx.reset()
-                    var w = width, h = height, cx = w / 2, cy = h / 2
-                    var R = Math.min(w, h) / 2 - 8
-                    var aps = root.aps || []
-                    var maxR = 40
-                    for (var i = 0; i < aps.length; i++) maxR = Math.max(maxR, aps[i].r || 0)
-                    maxR = Math.min(maxR, 600) * 1.08
-                    var scale = R / maxR
-                    // rings with distance labels
-                    ctx.strokeStyle = "rgba(53,214,255,0.18)"; ctx.lineWidth = 1
-                    ctx.fillStyle = "rgba(159,176,200,0.6)"; ctx.font = (Kirigami.Theme.smallFont.pixelSize - 1) + "px sans-serif"
-                    var steps = [0.25, 0.5, 0.75, 1.0]
-                    for (var s = 0; s < steps.length; s++) {
-                        var rr = R * steps[s]
-                        ctx.beginPath(); ctx.arc(cx, cy, rr, 0, Math.PI * 2); ctx.stroke()
-                        ctx.fillText(Math.round(maxR * steps[s] / 1.08) + " m", cx + 4, cy - rr + 11)
+            PC3.TabBar {
+                id: tabs
+                Layout.fillWidth: true
+                currentIndex: Math.min(Plasmoid.configuration.startTab, root.tabKeys.length - 1)
+                onCurrentIndexChanged: Plasmoid.configuration.startTab = currentIndex
+                Repeater {
+                    model: root.tabKeys
+                    delegate: PC3.TabButton {
+                        required property string modelData
+                        text: modelData === "map" ? "Map" : modelData === "nearby" ? `Nearby (${root.pois.length})` : modelData === "radar" ? "Radar" : "Trip"
+                        icon.name: modelData === "map" ? "map-flat" : modelData === "nearby" ? "find-location" : modelData === "radar" ? "network-wireless" : "flag"
                     }
-                    // sweep
-                    var a = fullRep.phase * Math.PI * 2
-                    var g = ctx.createConicalGradient ? null : null
-                    ctx.save(); ctx.beginPath(); ctx.moveTo(cx, cy); ctx.arc(cx, cy, R, a - 0.9, a); ctx.closePath()
-                    ctx.fillStyle = "rgba(53,214,255,0.10)"; ctx.fill(); ctx.restore()
-                    ctx.strokeStyle = "rgba(53,214,255,0.5)"; ctx.beginPath(); ctx.moveTo(cx, cy)
-                    ctx.lineTo(cx + Math.cos(a) * R, cy + Math.sin(a) * R); ctx.stroke()
-                    // beacons
-                    for (var k = 0; k < aps.length; k++) {
-                        var ap = aps[k]
-                        var col = ap.status === "used" ? (ap.kind === "ring" ? "#35d6ff" : "#ffd166")
-                                : ap.status === "active" ? "#6cff8a"
-                                : ap.status === "travelling" ? "#ff4fd8" : "#8a93a6"
-                        var dist, ang
-                        if (ap.kind === "ring") { dist = ap.r; ang = (ap.bearing - 90) * Math.PI / 180 }
-                        else {
-                            // real/estimated position: true bearing + distance from us
-                            var dLat = (ap.lat - root.lat) * 111320
-                            var dLon = (ap.lon - root.lon) * 111320 * Math.cos(root.lat * Math.PI / 180)
-                            dist = Math.sqrt(dLat * dLat + dLon * dLon); ang = Math.atan2(-dLat, dLon)
-                        }
-                        var px = cx + Math.cos(ang) * Math.min(dist, maxR) * scale
-                        var py = cy + Math.sin(ang) * Math.min(dist, maxR) * scale
-                        var rad = ap.status === "used" || ap.status === "active" ? 4 : 2.5
-                        ctx.beginPath(); ctx.fillStyle = col.replace(")", "") ; ctx.globalAlpha = 0.25
-                        ctx.fillStyle = col; ctx.arc(px, py, rad * 2.6, 0, Math.PI * 2); ctx.fill()
-                        ctx.globalAlpha = 1
-                        ctx.beginPath(); ctx.arc(px, py, rad, 0, Math.PI * 2); ctx.fill()
-                        if (ap.kind !== "ring") { ctx.strokeStyle = "#ffffff"; ctx.lineWidth = 1; ctx.stroke() }
-                    }
-                    // us
-                    ctx.beginPath(); ctx.fillStyle = "rgba(53,214,255,0.25)"; ctx.arc(cx, cy, 10 + 14 * fullRep.phase, 0, Math.PI * 2); ctx.fill()
-                    ctx.beginPath(); ctx.fillStyle = "#35d6ff"; ctx.arc(cx, cy, 5, 0, Math.PI * 2); ctx.fill()
-                    ctx.beginPath(); ctx.fillStyle = "#ffffff"; ctx.arc(cx, cy, 2, 0, Math.PI * 2); ctx.fill()
                 }
+            }
+
+            StackLayout {
+                Layout.fillWidth: true; Layout.fillHeight: true
+                currentIndex: Math.max(0, ["map", "nearby", "radar", "trip"].indexOf(root.tabKeys[tabs.currentIndex] || "map"))
+                Item {
+                    Rectangle { anchors.fill: parent; radius: 6; color: "#0b101a" }
+                    BeaconMap {
+                        id: beaconMap
+                        anchors.fill: parent
+                        src: root
+                        phase: fullRep.phase
+                        layerIndex: Plasmoid.configuration.mapLayer
+                        hiddenCats: root.hiddenCats
+                        showSsids: root.showSsids
+                        showEvents: root.showEvents
+                        cinematic: Plasmoid.configuration.animatedMap
+                        tourMinutes: Plasmoid.configuration.tourMinutes
+                        onCinematicToggled: on => Plasmoid.configuration.animatedMap = on
+                        onSsidsToggled: on => Plasmoid.configuration.showSsids = on
+                        onEventsToggled: on => Plasmoid.configuration.showEvents = on
+                        onLayerPicked: index => Plasmoid.configuration.mapLayer = index
+                        onCategoryToggled: (key, visible) => root.setCategory(key, visible)
+                        onAllCategories: visible => root.setAllCategories(visible)
+                    }
+                }
+                NearbyList {
+                    src: root
+                    hiddenCats: root.hiddenCats
+                    onShowOnMap: index => {
+                        var p = root.pois[index]
+                        if (root.hiddenCats.indexOf(p.cat) >= 0) root.setCategory(p.cat, true)
+                        var mi = root.tabKeys.indexOf("map")
+                        if (mi >= 0) tabs.currentIndex = mi
+                        beaconMap.focusOn(p.lat, p.lon, Math.max(beaconMap.zoom, 16.5))
+                        beaconMap.selected = index
+                    }
+                }
+                Radar { src: root; phase: fullRep.phase; showSsids: root.showSsids }
+                TripView { src: root }
             }
 
             // ── HUD line ───────────────────────────────────────────────────
@@ -221,14 +348,15 @@ PlasmoidItem {
                 Layout.fillWidth: true
                 color: "#ffd166"; font.bold: true; font.pixelSize: Kirigami.Theme.smallFont.pixelSize
                 text: root.stats && root.stats.rank
-                      ? `${root.stats.rank.toUpperCase()} · Lv ${root.stats.rankLevel} · ${root.stats.beaconsTotal} beacons logged`
+                      ? `${root.stats.rank.toUpperCase()} · Lv ${root.stats.rankLevel}${root.stats.rankCount ? "/" + root.stats.rankCount : ""} · ${root.stats.beaconsTotal} beacons logged${root.stats.nextRankAt ? " · next at " + root.stats.nextRankAt : ""} · ${root.stats.achievementsUnlocked || 0}/${root.stats.achievementsTotal || 0} milestones`
                       : ""
+                elide: Text.ElideRight
             }
             PC3.Label {
                 Layout.fillWidth: true
                 color: "#9fb0c8"; font.pixelSize: Kirigami.Theme.smallFont.pixelSize
                 text: root.stats && root.stats.rank
-                      ? `In range ${root.stats.beaconsNow} · used ${root.stats.usedNow} · located ${root.stats.locatedNow} · travelling ${root.stats.travellingNow} · stops ${root.stats.stops} · ${(root.stats.distanceKm || 0).toFixed(1)} km`
+                      ? `In range ${root.stats.beaconsNow} · used ${root.stats.usedNow} · located ${root.stats.locatedNow} · with you ${root.stats.travellingNow} · ${root.stats.stops} stops · ${(root.stats.distanceKm || 0).toFixed(0)} km` + (root.liveScanSeconds > 0 ? ` · live scan ${root.liveScanSeconds} s` : "")
                       : ""
                 elide: Text.ElideRight
             }
@@ -236,8 +364,28 @@ PlasmoidItem {
             RowLayout {
                 Layout.fillWidth: true
                 PC3.Button { icon.name: "view-refresh"; text: "Re-check"; enabled: !root.busy; onClicked: root.refresh() }
-                PC3.Button { icon.name: "internet-web-browser"; text: "Map"; enabled: root.valid
+                PC3.Button { icon.name: "internet-web-browser"; text: "OSM"; enabled: root.valid
                     onClicked: Qt.openUrlExternally(`https://www.openstreetmap.org/?mlat=${root.lat}&mlon=${root.lon}#map=15/${root.lat}/${root.lon}`) }
+                PC3.Button {
+                    id: shareBtn
+                    icon.name: "document-share"; text: "Share"; enabled: root.valid
+                    onClicked: shareMenu.visible ? shareMenu.close() : shareMenu.popup(shareBtn, 0, -shareMenu.height)
+                    PC3.Menu {
+                        id: shareMenu
+                        PC3.MenuItem { text: "Copy coordinates"; icon.name: "edit-copy"; onTriggered: root.copy("coords") }
+                        PC3.MenuItem { text: "Copy geo: URI"; icon.name: "edit-copy"; onTriggered: root.copy("geo") }
+                        PC3.MenuItem { text: "Copy place + link"; icon.name: "edit-copy"; onTriggered: root.copy("text") }
+                        PC3.MenuItem { text: "Copy Google Maps link"; icon.name: "edit-copy"; onTriggered: root.copy("google") }
+                        PC3.MenuItem { text: "Copy Apple Maps link"; icon.name: "edit-copy"; onTriggered: root.copy("apple") }
+                        PC3.MenuSeparator {}
+                        PC3.MenuItem { text: "Open in Google Maps"; icon.name: "internet-web-browser"; onTriggered: if (root.share) Qt.openUrlExternally(root.share.google) }
+                        PC3.MenuItem { text: "Open in Apple Maps"; icon.name: "internet-web-browser"; onTriggered: if (root.share) Qt.openUrlExternally(root.share.apple) }
+                        PC3.MenuSeparator {}
+                        PC3.MenuItem { text: "Save trip as GPX (~/Documents/beaconfix-trip.gpx)"; icon.name: "document-export"; onTriggered: root.saveGpx() }
+                        PC3.MenuItem { text: "Save map around here for offline"; icon.name: "document-save"; onTriggered: root.prefetch() }
+                        PC3.MenuItem { text: "Start a new trip here"; icon.name: "flag"; onTriggered: root.newTrip() }
+                    }
+                }
                 Item { Layout.fillWidth: true }
                 PC3.Button { icon.name: "window"; text: "Open app"; onClicked: root.openApp() }
             }
