@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=BeaconFix Tray
+Comment=Background location fix in the system tray
+Exec=@CMAKE_INSTALL_FULL_BINDIR@/beaconfix --tray
+Icon=beaconfix
+Terminal=false
+NoDisplay=true
+X-KDE-autostart-after=panel
+X-KDE-StartupNotify=false

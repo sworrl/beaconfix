@@ -1,0 +1,3 @@
+[D-BUS Service]
+Name=org.sworrl.BeaconFix
+Exec=@CMAKE_INSTALL_FULL_BINDIR@/beaconfix --tray
