@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Launcher shortcut: Find the RV (van). -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="48dp" android:height="48dp" android:viewportWidth="48" android:viewportHeight="48">
+    <path android:fillColor="#0B101A" android:pathData="M24,24m-24,0a24,24 0,1 1,48 0a24,24 0,1 1,-48 0" />
+    <group android:translateX="12" android:translateY="12">
+        <path android:fillColor="#FFD166" android:pathData="M17,5H3C1.9,5 1,5.89 1,7v9h2c0,1.65 1.34,3 3,3s3,-1.35 3,-3h5.5c0,1.65 1.34,3 3,3s3,-1.35 3,-3H23v-5l-6,-6zM3,11V7h4v4H3zM6,17.5c-0.83,0 -1.5,-0.67 -1.5,-1.5s0.67,-1.5 1.5,-1.5 1.5,0.67 1.5,1.5 -0.67,1.5 -1.5,1.5zM13,11H9V7h4v4zM17.5,17.5c-0.83,0 -1.5,-0.67 -1.5,-1.5s0.67,-1.5 1.5,-1.5 1.5,0.67 1.5,1.5 -0.67,1.5 -1.5,1.5zM15,11V7h1l4,4h-5z" />
+    </group>
+</vector>
