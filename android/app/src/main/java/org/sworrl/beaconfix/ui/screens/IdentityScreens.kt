@@ -6,6 +6,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -102,9 +103,18 @@ fun IdentityScreen(onBack: () -> Unit, vm: IdentityViewModel = hiltViewModel()) 
     val saveFile = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("text/plain")) { uri -> uri?.let { vm.writeExport(it) } }
     if (mode == "scan") { QrScanner("Scan a link QR from another BeaconFix, or an identity QR", onResult = { vm.handleScanned(it); mode = "view" }); return }
     val r = rec
+    if (r == null) {
+        // The record flow's first frame is always null (stateIn's initial value) — that is "still loading", not "no
+        // identity" (the root shows onboarding for that). Never nest the full-screen, scrolling OnboardingScreen in
+        // this screen's own verticalScroll: Compose throws on the infinite height.
+        Column(Modifier.fillMaxSize().padding(vertical = 8.dp)) {
+            Row(Modifier.padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) { TextButton(onClick = onBack) { Text("‹ Back") }; Text("Identity", style = MaterialTheme.typography.titleLarge) }
+            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
+        }
+        return
+    }
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(vertical = 8.dp)) {
         Row(Modifier.padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) { TextButton(onClick = onBack) { Text("‹ Back") }; Text("Identity", style = MaterialTheme.typography.titleLarge) }
-        if (r == null) { OnboardingScreen(vm = vm); return }
         InfoCard(r.name) {
             Text(Crypto.grouped(r.id), fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodyLarge)
             KeyValue("Created", r.created.take(10)); KeyValue("Public key", r.pub.take(16) + "…")
