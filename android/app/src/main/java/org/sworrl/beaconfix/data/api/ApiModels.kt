@@ -91,10 +91,32 @@ data class ObservationDto(val bssid: String, val ssid: String = "", val dbm: Int
 @Serializable data class EventDto(val id: Long = 0, val type: String = "", val time: String = "", val text: String = "", val bssid: String = "", val ssid: String = "", val dbm: Int = 0, val lat: Double? = null, val lon: Double? = null, val kind: String = "", val status: String = "",
                                   val fromLat: Double? = null, val fromLon: Double? = null, val acc: Double? = null, val prevAcc: Double? = null, val n: Int = 0, val vantage: Int = 0, val rms: Double = 0.0, val vantagePoints: List<VantageDto> = emptyList())
 @Serializable data class EventsDto(val events: List<EventDto> = emptyList(), val lastEventId: Long = 0, val since: Long = 0)
+/** One place from `/api/v1/pois` (and state `pois[]`). The fields after [osm] arrived with desktop 3.8 (pediatric); older desktops leave them out. */
 @Serializable data class PoiDto(val name: String = "", val label: String = "", val cat: String = "", val group: String = "", val icon: String = "", val color: String = "",
                                 val lat: Double = 0.0, val lon: Double = 0.0, val d: Double = 0.0, val brg: Double = 0.0, val address: String = "", val detail: String = "",
-                                val phone: String = "", val hours: String = "", val website: String = "", val osm: String = "")
-@Serializable data class PoisTyped(val pois: List<PoiDto> = emptyList(), val count: Int = 0, val ts: String = "")
+                                val phone: String = "", val hours: String = "", val website: String = "", val osm: String = "",
+                                val osmType: String = "", val osmId: Long = 0L, val wheelchair: String = "", val emergency: Boolean = false, val wifi: Boolean = false,
+                                /** 0 none, 1 pediatric ER, 2 children's hospital (ER not confirmed), 3 ER with pediatrics, 4 pediatric urgent care */
+                                val peds: Int = 0, val er: String = "", val campusEr: String = "", val scope: String = "near",
+                                val driveS: Int = 0, val driveM: Int = 0, val driveEst: Boolean = true)
+@Serializable data class PoisTyped(val pois: List<PoiDto> = emptyList(), val count: Int = 0, val ts: String = "",
+                                   val categories: List<PoiCategoryDto> = emptyList(), val note: String = "", val origin: OriginDto? = null, val pedsOrigin: OriginDto? = null)
+/** An entry of `poiCategories` / `/pois` `categories`. [reachKm] 0 = the desktop's usual wide rule. */
+@Serializable data class PoiCategoryDto(val key: String = "", val label: String = "", val icon: String = "", val color: String = "", val group: String = "", val groupLabel: String = "",
+                                        val wide: Boolean = false, val reachKm: Int = 0)
+/** Where a desktop answer was computed from. */
+@Serializable data class OriginDto(val lat: Double = 0.0, val lon: Double = 0.0, val acc: Double? = null, val source: String = "", val time: String = "", val radiusKm: Double = 0.0)
+/** One place in `/api/v1/emergency`: [d] metres and [brg] degrees from the desktop's fix (absent without a fix). */
+@Serializable data class HelpPlaceDto(val name: String = "", val lat: Double = 0.0, val lon: Double = 0.0, val d: Double? = null, val brg: Double? = null,
+                                      val phone: String = "", val address: String = "", val hours: String = "", val website: String = "", val osm: String = "",
+                                      val tier: Int = 0, val er: String = "", val campusEr: String = "", val driveS: Int = 0, val driveM: Int = 0, val driveEst: Boolean = true,
+                                      val notEr: Boolean = false)
+/** `/api/v1/emergency`. The `pediatric*` keys and [origin] exist on desktops with the "pediatric" feature (3.8+); a 3.7 desktop leaves them out. */
+@Serializable data class EmergencyDto(val number: String = "", val countryCode: String = "",
+                                      val police: HelpPlaceDto? = null, val fire: HelpPlaceDto? = null, val hospital: HelpPlaceDto? = null, val urgent: HelpPlaceDto? = null,
+                                      val pharmacy: HelpPlaceDto? = null, val vet: HelpPlaceDto? = null,
+                                      val pediatric: HelpPlaceDto? = null, val pediatricCloser: HelpPlaceDto? = null, val pediatricUrgent: HelpPlaceDto? = null,
+                                      val pediatricNote: String = "", val pediatricSearchKm: Int = 0, val pediatricTime: String = "", val origin: OriginDto? = null, val ts: String = "")
 @Serializable data class PeerDto(val host: String = "", val port: Int = 47822, val name: String = "", val hostname: String = "", val kind: String = "", val id: String = "", val version: String = "", val pairing: Boolean = false, val features: List<String> = emptyList())
 @Serializable data class PeersDto(val peers: List<PeerDto> = emptyList())
 @Serializable data class HelloIdentity(val id: String = "", val name: String = "")
