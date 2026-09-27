@@ -125,6 +125,15 @@ QString baseCategory(const QJsonObject &t)
     return {};
 }
 
+bool isUrgentCare(const QString &name, const QString &detail)
+{
+    static const QRegularExpression re(QStringLiteral("\\burgent\\b|express ?care|after.?hours|walk.?in|immediate ?care|convenient ?care|med ?express"),
+                                       QRegularExpression::CaseInsensitiveOption);
+    if (detail.contains(QLatin1String("urgent care"), Qt::CaseInsensitive)) return true;
+    QString n = name; n.replace(QChar(0x2019), QLatin1Char('\''));
+    return re.match(n).hasMatch();
+}
+
 static const QString kNotConfirmed = QStringLiteral("ER not confirmed — call ahead");
 static const QString kLikely24 = QStringLiteral("likely ER (24/7) — call ahead");
 

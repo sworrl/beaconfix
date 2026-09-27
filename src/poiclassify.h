@@ -47,6 +47,10 @@ QList<Result> classifyAll(const QList<Element> &elements);
 QString address(const QJsonObject &tags);
 // "pediatric ER", "children's hospital — ER not confirmed", … (empty for 0)
 QString tierLabel(int peds);
+// An actual urgent care, not just any clinic or doctor's office (the "urgent" category holds all of them, a
+// chiropractor too): tagged urgent_care (the place detail then says "urgent care"), or named like one (C6's urgent
+// name rule, plus "convenient care" / "MedExpress"). Same rule as the phone's NearestHelp.isUrgentCare.
+bool isUrgentCare(const QString &name, const QString &detail);
 
 double distanceM(double lat1, double lon1, double lat2, double lon2);
 // Straight-line distance × 1.4 at 70 km/h, rounded to 5 minutes (at least 5 minutes)

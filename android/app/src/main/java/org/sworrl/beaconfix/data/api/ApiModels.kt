@@ -110,7 +110,9 @@ data class ObservationDto(val bssid: String, val ssid: String = "", val dbm: Int
 @Serializable data class HelpPlaceDto(val name: String = "", val lat: Double = 0.0, val lon: Double = 0.0, val d: Double? = null, val brg: Double? = null,
                                       val phone: String = "", val address: String = "", val hours: String = "", val website: String = "", val osm: String = "",
                                       val tier: Int = 0, val er: String = "", val campusEr: String = "", val driveS: Int = 0, val driveM: Int = 0, val driveEst: Boolean = true,
-                                      val notEr: Boolean = false)
+                                      val notEr: Boolean = false,
+                                      /** `urgent` only: an actual urgent care (desktop 3.8+ never puts a plain clinic there). */
+                                      val urgentCare: Boolean = false)
 /** `/api/v1/emergency`. The `pediatric*` keys and [origin] exist on desktops with the "pediatric" feature (3.8+); a 3.7 desktop leaves them out. */
 @Serializable data class EmergencyDto(val number: String = "", val countryCode: String = "",
                                       val police: HelpPlaceDto? = null, val fire: HelpPlaceDto? = null, val hospital: HelpPlaceDto? = null, val urgent: HelpPlaceDto? = null,

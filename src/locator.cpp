@@ -3380,7 +3380,17 @@ QJsonObject Locator::emergencyJson() const
     o["police"] = nearest(QStringLiteral("police"));
     o["fire"] = nearest(QStringLiteral("fire"));
     o["hospital"] = hp.hospital ? QJsonValue(helpPlaceJson(*hp.hospital)) : QJsonValue();   // the nearest general ER (children's hospitals are "pediatric")
-    o["urgent"] = nearest(QStringLiteral("urgent"));
+    {   // "urgent" is every clinic and doctor's office: under "Urgent care" only an actual urgent care
+        const Poi *best = nullptr; double bd = 1e18;
+        for (const Poi &p : m_allPois) {
+            if (p.cat != QLatin1String("urgent") || !PoiClassify::isUrgentCare(p.name, p.detail)) continue;
+            const double d = have ? distanceM(lat, lon, p.lat, p.lon) : 0;
+            if (!best || d < bd) { bd = d; best = &p; }
+        }
+        QJsonValue u;
+        if (best) { QJsonObject a = helpPlaceJson(*best); a["urgentCare"] = true; u = a; }
+        o["urgent"] = u;
+    }
     o["pharmacy"] = nearest(QStringLiteral("pharmacy"));
     o["vet"] = nearest(QStringLiteral("vet"));
     o["pediatric"] = pedsPlace(hp.pediatric, false);

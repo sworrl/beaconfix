@@ -33,11 +33,11 @@ object NearestHelp {
         val peds: Int = 0, val er: String = "", val campus: String = "", val emergency: Boolean = false,
         val driveS: Int = 0, val driveEst: Boolean = true, val fromLat: Double = 0.0, val fromLon: Double = 0.0,
         val source: String = "", val fetchedAt: Long = 0, val originLat: Double = 0.0, val originLon: Double = 0.0,
-        val guessed: Boolean = false,
+        val guessed: Boolean = false, val detail: String = "",
     )
 
     fun fromPoi(p: PoiEntity) = Candidate(
-        key = p.key, cat = p.cat, name = p.name.ifBlank { p.label }, lat = p.lat, lon = p.lon, phone = p.phone, address = p.address,
+        key = p.key, cat = p.cat, name = p.name.ifBlank { p.label }, detail = p.detail, lat = p.lat, lon = p.lon, phone = p.phone, address = p.address,
         hours = p.hours, website = p.website, peds = p.peds, er = p.er, campus = p.campus, emergency = p.emergency,
         driveS = p.driveS, driveEst = p.driveEst, fromLat = p.originLat, fromLon = p.originLon,
         source = p.source, fetchedAt = p.fetchedAt, originLat = p.originLat, originLon = p.originLon,
@@ -94,13 +94,24 @@ object NearestHelp {
             place(HelpKind.PEDS_CLOSER, closer),
             place(HelpKind.PEDS_URGENT, nearest("peds_urgent"), notEr = true),
             place(HelpKind.ER, er),
-            place(HelpKind.URGENT, nearest("urgent"), notEr = true),
+            // the desktop's "urgent" category is every clinic and doctor's office (a chiropractor too): only an actual
+            // urgent care may sit under that heading on an emergency screen
+            place(HelpKind.URGENT, ms.filter { it.c.cat == "urgent" && isUrgentCare(it.c.name, it.c.detail) }.minWithOrNull(byDist), notEr = true),
             place(HelpKind.POLICE, nearest("police")),
             place(HelpKind.FIRE, nearest("fire")),
             place(HelpKind.PHARMACY, nearest("pharmacy")),
             place(HelpKind.VET, nearest("vet")),
         )
     }
+
+    private val URGENT_NAME = Regex("""\burgent\b|express ?care|after.?hours|walk.?in|immediate ?care|convenient ?care|med ?express""", RegexOption.IGNORE_CASE)
+
+    /**
+     * An urgent care, not just any clinic (same rule as the desktop's `PoiClassify::isUrgentCare`): tagged
+     * `urgent_care` (the place detail then says "urgent care"), or named like one (C6's `urgent` name rule).
+     */
+    fun isUrgentCare(name: String, detail: String): Boolean =
+        detail.contains("urgent care", ignoreCase = true) || URGENT_NAME.containsMatchIn(name.replace('\u2019', '\''))
 
     /** Poison Control for the country ([cc] ISO 3166 alpha-2), or null where we do not know one. */
     fun poisonControl(cc: String?): String? = if (cc?.uppercase(Locale.ROOT) == "US") POISON_CONTROL_US else null

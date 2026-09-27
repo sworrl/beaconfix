@@ -129,6 +129,15 @@ int main(int argc, char **argv)
     CHECK(classify(QJsonObject{{"amenity", "hospital"}, {"name", "Anytown General"}, {"opening_hours", "24/7"}}).emergency, "a general hospital open 24/7 counts as an ER");
     CHECK(!classify(QJsonObject{{"amenity", "hospital"}, {"name", "Anytown General"}, {"opening_hours", "24/7"}, {"emergency", "no"}}).emergency, "emergency=no beats 24/7");
 
+    // The Urgent care help pick: an actual urgent care, not the nearest clinic (a chiropractor was shown under it)
+    CHECK(isUrgentCare(QStringLiteral("Test Health Center"), QStringLiteral("urgent care")), "tagged urgent_care (detail \"urgent care\")");
+    CHECK(isUrgentCare(QStringLiteral("Test MedExpress"), QStringLiteral("clinic")), "a MedExpress by name");
+    CHECK(isUrgentCare(QStringLiteral("Test Walk-In Clinic"), QString()) && isUrgentCare(QStringLiteral("Test After Hours Care"), QString())
+          && isUrgentCare(QStringLiteral("Test Immediate Care"), QString()), "walk-in, after hours, immediate care");
+    CHECK(!isUrgentCare(QStringLiteral("Test Chiropractic"), QStringLiteral("chiropractic")), "a chiropractor is not urgent care");
+    CHECK(!isUrgentCare(QStringLiteral("Test Family Practice"), QStringLiteral("doctor's office")), "a doctor's office is not urgent care");
+    CHECK(!isUrgentCare(QStringLiteral("Test Urgently Needed Supplies"), QStringLiteral("clinic")), "a word containing 'urgent' is not enough");
+
     std::printf("%s: %d checks, %d failed\n", fails ? "FAILED" : "PASSED", checks, fails);
     return fails ? 1 : 0;
 }

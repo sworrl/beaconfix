@@ -86,6 +86,22 @@ class NearestHelpTest {
         assertNull(k.openNow)
     }
 
+    @Test fun theUrgentCareRowIsAnUrgentCareNotTheNearestClinic() {
+        // the desktop's "urgent" category holds every clinic and doctor's office
+        val chiro = NearestHelp.Candidate(key = "n/5", cat = "urgent", name = "Test Chiropractic", detail = "chiropractic", lat = oLat, lon = oLon + 0.001)
+        val office = NearestHelp.Candidate(key = "n/6", cat = "urgent", name = "Test Family Practice", detail = "doctor's office", lat = oLat, lon = oLon + 0.002)
+        val tagged = NearestHelp.Candidate(key = "n/7", cat = "urgent", name = "Test Health Center", detail = "urgent care", lat = oLat, lon = oLon + 0.05)
+        val named = NearestHelp.Candidate(key = "n/8", cat = "urgent", name = "Test MedExpress", detail = "clinic", lat = oLat, lon = oLon + 0.03)
+        assertEquals("Test MedExpress", NearestHelp.pick(listOf(chiro, office, tagged, named), oLat, oLon).of(HelpKind.URGENT)!!.name)
+        assertEquals("Test Health Center", NearestHelp.pick(listOf(chiro, office, tagged), oLat, oLon).of(HelpKind.URGENT)!!.name)
+        assertNull(NearestHelp.pick(listOf(chiro, office), oLat, oLon).of(HelpKind.URGENT))
+        assertTrue(NearestHelp.isUrgentCare("Test After Hours Care", ""))
+        assertTrue(NearestHelp.isUrgentCare("Test Immediate Care", "clinic"))
+        assertTrue(NearestHelp.isUrgentCare("Test Walk-In Clinic", ""))
+        assertFalse(NearestHelp.isUrgentCare("Test Urgently Needed Supplies", "clinic"))
+        assertFalse(NearestHelp.isUrgentCare("Test Dental", "dentist"))
+    }
+
     @Test fun routedDriveTimesAreKeptOnlyNearTheirOrigin() {
         val routed = upmc.copy(driveS = 5000, driveEst = false, fromLat = oLat + 0.005, fromLon = oLon)
         assertEquals(5000, NearestHelp.pick(listOf(routed), oLat, oLon).of(HelpKind.PEDS_ER)!!.driveS)

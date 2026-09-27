@@ -208,6 +208,10 @@ The classifier rules are in `src/poiclassify.cpp`, with the shared test fixture
   without one, or tier 3. The pick is the lowest `driveS` among rank 0, else among rank 1.
 - **`pediatricCloser`**: a rank-1 site with a lower `driveS` than a rank-0 `pediatric`.
 - **`pediatricUrgent`**: the nearest pediatric urgent care; never an ER.
+- **`urgent`** (3.8): the nearest actual urgent care — tagged `urgent_care`, or named like one
+  (urgent, express care, after hours, walk-in, immediate care, convenient care, MedExpress) —
+  with `"urgentCare": true`; `null` when there is none. The `urgent` category itself still holds
+  every clinic and doctor's office.
 - **`pediatricNote`** (first match): no search yet and the last one failed → "Overpass busy — will
   retry"; searched and nothing found → "No pediatric ER mapped within N km — go to the nearest
   ER"; the saved answer is older than 30 days, more than half the radius from here, or the last

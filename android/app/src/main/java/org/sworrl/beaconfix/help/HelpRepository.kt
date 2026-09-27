@@ -155,6 +155,7 @@ class HelpRepository(private val io: HelpInputs) {
             val realCat = if (cat == "peds_er" && peds == 3) "health" else cat
             return NearestHelp.Candidate(
                 key = DesktopCache.osmKey(p.osm) ?: DesktopCache.llKey(p.lat, p.lon, realCat), cat = realCat, name = p.name, lat = p.lat, lon = p.lon,
+                detail = if (p.urgentCare) "urgent care" else "",
                 phone = p.phone, address = p.address, hours = p.hours, website = p.website, peds = peds, er = p.er, campus = p.campusEr,
                 emergency = p.er == "yes", driveS = p.driveS, driveEst = p.driveEst, fromLat = e.oLat, fromLon = e.oLon,
                 source = e.snap.source, fetchedAt = e.snap.fetchedAt, originLat = e.oLat, originLon = e.oLon,
