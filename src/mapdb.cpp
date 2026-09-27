@@ -280,6 +280,11 @@ bool MapDb::schema()
         " elev REAL, ap_count INTEGER, ap_used INTEGER, departed TEXT)",
         "CREATE TABLE IF NOT EXISTS pois (osm_type TEXT NOT NULL, osm_id INTEGER NOT NULL, cat TEXT, name TEXT, detail TEXT, lat REAL, lon REAL, wifi INTEGER, hours TEXT, phone TEXT, website TEXT,"
         " PRIMARY KEY (osm_type, osm_id))",
+        // The pediatric ER search's answer (scope far), kept apart from the near list: sharing pois' (osm_type, osm_id) key,
+        // a near save replaced every far row inside the near radius, so a restart lost the ERs closest to us.
+        "CREATE TABLE IF NOT EXISTS pois_far (osm_type TEXT NOT NULL, osm_id INTEGER NOT NULL, cat TEXT, name TEXT, detail TEXT, lat REAL, lon REAL, wifi INTEGER,"
+        " hours TEXT, phone TEXT, website TEXT, address TEXT DEFAULT '', wheelchair TEXT DEFAULT '', emergency INTEGER DEFAULT 0, scope TEXT DEFAULT 'far',"
+        " peds INTEGER DEFAULT 0, er TEXT DEFAULT '', campus TEXT DEFAULT '', drive_s INTEGER DEFAULT 0, drive_m INTEGER DEFAULT 0, PRIMARY KEY (osm_type, osm_id))",
         "CREATE TABLE IF NOT EXISTS elevation (cell TEXT PRIMARY KEY, elev REAL, time TEXT)",
         "CREATE TABLE IF NOT EXISTS achievements (key TEXT PRIMARY KEY, unlocked TEXT)",
         "CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT)",
@@ -313,6 +318,11 @@ bool MapDb::schema()
     // Pediatric ERs (3.8): which search a place came from, its tier / ER status / campus ER, a stored drive time (0 = estimate)
     addCol("pois", "scope", "TEXT DEFAULT 'near'"); addCol("pois", "peds", "INTEGER DEFAULT 0"); addCol("pois", "er", "TEXT DEFAULT ''");
     addCol("pois", "campus", "TEXT DEFAULT ''"); addCol("pois", "drive_s", "INTEGER DEFAULT 0"); addCol("pois", "drive_m", "INTEGER DEFAULT 0");
+    // far rows written by an earlier 3.8 build move from pois to pois_far (the ones a near save had not yet replaced)
+    q.exec(QStringLiteral("INSERT OR IGNORE INTO pois_far(osm_type, osm_id, cat, name, detail, lat, lon, wifi, hours, phone, website, address, wheelchair, emergency, scope, peds, er,"
+                          " campus, drive_s, drive_m) SELECT osm_type, osm_id, cat, name, detail, lat, lon, wifi, hours, phone, website, address, wheelchair, emergency, 'far', peds,"
+                          " er, campus, drive_s, drive_m FROM pois WHERE scope='far'"));
+    q.exec(QStringLiteral("DELETE FROM pois WHERE scope='far'"));
     q.exec(QStringLiteral("CREATE INDEX IF NOT EXISTS obs_seq ON observations(seq)"));
     q.exec(QStringLiteral("CREATE INDEX IF NOT EXISTS aps_seq ON aps(seq)"));
     q.exec(QStringLiteral("CREATE INDEX IF NOT EXISTS fix_seq ON fixes(seq)"));
@@ -758,7 +768,7 @@ bool MapDb::loadPois(QList<Poi> *pois, double *lat, double *lon, int *radiusM, Q
     }
     if (!any) return false;
     q.prepare(QStringLiteral("SELECT osm_type, osm_id, cat, name, detail, lat, lon, wifi, hours, phone, website, address, wheelchair, emergency, peds, er, campus, drive_s, drive_m"
-                             " FROM pois WHERE scope=?"));
+                             " FROM %1 WHERE scope=?").arg(far ? QStringLiteral("pois_far") : QStringLiteral("pois")));
     q.addBindValue(far ? QStringLiteral("far") : QStringLiteral("near"));
     q.exec();
     while (q.next()) {
@@ -780,10 +790,12 @@ void MapDb::savePois(const QList<Poi> &pois, double lat, double lon, int radiusM
     const QString sc = far ? QStringLiteral("far") : QStringLiteral("near"), pre = far ? QStringLiteral("peds_") : QStringLiteral("poi_");
     m_db.transaction();
     QSqlQuery q(m_db);
-    q.prepare(QStringLiteral("DELETE FROM pois WHERE scope=?")); q.addBindValue(sc); q.exec();
-    // A place both searches found is stored once: near replaces a far row, far never replaces a near one
-    q.prepare(QStringLiteral("INSERT OR %1 INTO pois(osm_type, osm_id, cat, name, detail, lat, lon, wifi, hours, phone, website, address, wheelchair, emergency,"
-                             " scope, peds, er, campus, drive_s, drive_m) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").arg(far ? QStringLiteral("IGNORE") : QStringLiteral("REPLACE")));
+    // Each search has its own table (pois = near, pois_far = the pediatric search), so saving one never touches the
+    // other: a place both found is stored twice and merged in memory (Locator::rebuildMergedPois, near wins)
+    const QString table = far ? QStringLiteral("pois_far") : QStringLiteral("pois");
+    q.prepare(QStringLiteral("DELETE FROM %1 WHERE scope=?").arg(table)); q.addBindValue(sc); q.exec();
+    q.prepare(QStringLiteral("INSERT OR REPLACE INTO %1(osm_type, osm_id, cat, name, detail, lat, lon, wifi, hours, phone, website, address, wheelchair, emergency,"
+                             " scope, peds, er, campus, drive_s, drive_m) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").arg(table));
     for (const Poi &p : pois) {
         q.addBindValue(p.osmType); q.addBindValue(p.osmId); q.addBindValue(p.cat); q.addBindValue(p.name); q.addBindValue(p.detail); q.addBindValue(p.lat); q.addBindValue(p.lon);
         q.addBindValue(p.wifi ? 1 : 0); q.addBindValue(p.hours); q.addBindValue(p.phone); q.addBindValue(p.website); q.addBindValue(p.address); q.addBindValue(p.wheelchair); q.addBindValue(p.emergency ? 1 : 0);
@@ -1118,6 +1130,7 @@ QJsonObject MapDb::exportJson() const
     o["flags"] = dumpTable(m_db, QStringLiteral("SELECT kind, bssid FROM flags"));
     o["fixes"] = dumpTable(m_db, QStringLiteral("SELECT time, lat, lon, acc, source, provider, place, city, region, country, elev, ap_count, ap_used, departed, device FROM fixes ORDER BY id"));
     o["pois"] = dumpTable(m_db, QStringLiteral("SELECT * FROM pois"));
+    o["poisFar"] = dumpTable(m_db, QStringLiteral("SELECT * FROM pois_far"));
     o["elevation"] = dumpTable(m_db, QStringLiteral("SELECT * FROM elevation"));
     o["achievements"] = dumpTable(m_db, QStringLiteral("SELECT * FROM achievements"));
     o["kv"] = dumpTable(m_db, QStringLiteral("SELECT * FROM kv"));
@@ -1151,6 +1164,7 @@ int MapDb::importJson(const QJsonObject &dump, QString *error)
     insertRows(QStringLiteral("flags"), dump["flags"].toArray(), true);
     insertRows(QStringLiteral("fixes"), dump["fixes"].toArray(), true);
     insertRows(QStringLiteral("pois"), dump["pois"].toArray(), true);
+    insertRows(QStringLiteral("pois_far"), dump["poisFar"].toArray(), true);
     insertRows(QStringLiteral("elevation"), dump["elevation"].toArray(), true);
     insertRows(QStringLiteral("achievements"), dump["achievements"].toArray(), true);
     insertRows(QStringLiteral("estimates"), dump["estimates"].toArray(), true);
