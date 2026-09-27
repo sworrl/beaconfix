@@ -1,0 +1,10 @@
+{
+  "number": "911",
+  "countryCode": "US",
+  "police": {"name": "Test Township Police", "lat": 40.010, "lon": -75.000, "d": 1112, "brg": 0, "phone": "+1 555 0101"},
+  "fire": {"name": "Test Volunteer Fire Company", "lat": 40.000, "lon": -75.012, "d": 1022, "brg": 270},
+  "hospital": {"name": "Test General Hospital", "lat": 40.020, "lon": -75.010, "d": 2375, "brg": 339, "phone": "+1 555 0102", "hours": "24/7"},
+  "urgent": {"name": "Test Walk-In Clinic", "lat": 39.990, "lon": -75.000, "d": 1112, "brg": 180, "hours": "Mo-Fr 08:00-20:00; Sa-Su 09:00-17:00"},
+  "pharmacy": {"name": "Test Pharmacy", "lat": 40.002, "lon": -75.003, "d": 330, "brg": 315},
+  "vet": null
+}

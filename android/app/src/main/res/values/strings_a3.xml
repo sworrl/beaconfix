@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- A3: the Places screen. -->
+<resources>
+    <string name="places_title">Places</string>
+    <plurals name="places_count">
+        <item quantity="one">%1$d place</item>
+        <item quantity="other">%1$d places</item>
+    </plurals>
+    <string name="places_search">Search name, address or kind</string>
+
+    <string name="places_chip_all">All</string>
+    <string name="places_chip_help">Help &amp; medical</string>
+    <string name="places_chip_kids_er">Kids ER</string>
+    <string name="places_chip_civic">Civic</string>
+    <string name="places_chip_kids">Kids &amp; fun</string>
+    <string name="places_chip_services">Services</string>
+    <string name="places_chip_open">Open now</string>
+
+    <string name="places_updated_now">Updated just now</string>
+    <string name="places_saved">Saved %1$s</string>
+    <string name="places_saved_near">Saved %1$s near %2$s</string>
+    <string name="places_from_here">%1$s from here</string>
+    <string name="places_from_phone">Found by this phone %1$s</string>
+    <string name="places_search_phone">Search from this phone</string>
+    <string name="places_searching">Searching…</string>
+    <string name="places_refresh">Refresh</string>
+
+    <string name="places_empty_unpaired_title">No desktop paired</string>
+    <string name="places_empty_unpaired_body">Places come from the BeaconFix desktop in the RV (OpenStreetMap). Pair one, or let this phone look for help places itself.</string>
+    <string name="places_empty_unreachable_title">Desktop unreachable, nothing saved yet</string>
+    <string name="places_empty_unreachable_body">Once the desktop has answered, its places are kept on this phone for when it is out of reach. This phone can look for help places itself meanwhile.</string>
+    <string name="places_empty_fetching_title">No places yet</string>
+    <string name="places_empty_fetching_body">The desktop is still fetching its surroundings, or it has no precise fix. Pull to refresh in a minute.</string>
+    <string name="places_empty_filter_title">No places in this filter</string>
+    <string name="places_empty_filter_body">Try another filter, or clear the search.</string>
+
+    <string name="places_badge_er">ER</string>
+    <string name="places_badge_no_er">No ER</string>
+    <string name="places_badge_kids_er">Kids ER</string>
+    <string name="places_badge_kids_campus">Kids ER · ER on campus — call ahead</string>
+    <string name="places_badge_kids_unconfirmed">Kids hospital · ER not confirmed</string>
+    <string name="places_badge_peds_dept">Pediatrics dept.</string>
+    <string name="places_badge_kids_urgent">Kids urgent care · not an ER</string>
+    <string name="places_badge_wheelchair">♿ Wheelchair</string>
+    <string name="places_badge_wheelchair_limited">♿ Limited</string>
+    <string name="places_badge_wifi">Wi-Fi</string>
+    <string name="places_open">Open</string>
+    <string name="places_closed">Closed</string>
+    <string name="places_closes">closes %1$s</string>
+
+    <string name="places_call">Call</string>
+    <string name="places_directions">Directions</string>
+    <string name="places_share">Share</string>
+    <string name="places_website">Website</string>
+    <string name="places_map">Map</string>
+    <string name="places_cd_call">Call %1$s</string>
+    <string name="places_cd_directions">Directions to %1$s</string>
+    <string name="places_cd_share">Share %1$s</string>
+    <string name="places_cd_website">Website of %1$s</string>
+    <string name="places_cd_map">Show %1$s on the map</string>
+</resources>
