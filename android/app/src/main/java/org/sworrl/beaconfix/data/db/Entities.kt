@@ -65,18 +65,61 @@ data class FixEntity(
     val place: String = "",
 )
 
-@Entity(tableName = "pois", primaryKeys = ["osmType", "osmId"])
+/**
+ * A cached place (schema v4). One row per ([source], [key]): every paired desktop keeps its own copy
+ * (`desktop:<DesktopEntity.id>`) next to what this phone found itself (`phone`), so places survive being offline.
+ * [key] is the OSM object (`way/329264979`) or, without one, `ll:<lat5>,<lon5>:<cat>`. [scope] is `near` (the
+ * everyday search) or `far` (the wide children's ER search). Read it through `data.DesktopCache`, which dedupes by key.
+ */
+@Entity(tableName = "pois", primaryKeys = ["source", "key"], indices = [Index("cat"), Index(value = ["source", "scope"])])
 data class PoiEntity(
-    val osmType: String,
-    val osmId: Long,
+    val source: String,
+    val key: String,
+    val scope: String = "near",
     val cat: String,
-    val name: String,
+    val label: String = "",
+    val grp: String = "",
+    val icon: String = "",
+    val color: String = "",
+    val name: String = "",
     val detail: String = "",
+    val address: String = "",
     val lat: Double,
     val lon: Double,
     val phone: String = "",
     val hours: String = "",
     val website: String = "",
+    val wheelchair: String = "",
+    val emergency: Boolean = false,
+    val wifi: Boolean = false,
+    /** pediatric tier: 0 none, 1 pediatric ER, 2 children's hospital (ER not confirmed), 3 ER with pediatrics, 4 pediatric urgent care */
+    val peds: Int = 0,
+    /** "yes" | "no" | "" (unknown) */
+    val er: String = "",
+    /** the ER on the same campus, for a tier-2 children's hospital */
+    val campus: String = "",
+    val driveS: Int = 0,
+    val driveM: Int = 0,
+    val driveEst: Boolean = true,
+    val fetchedAt: Long,
+    /** where the search that found this row was made from */
+    val originLat: Double = 0.0,
+    val originLon: Double = 0.0,
+)
+
+/**
+ * The last answer of one kind from one source, kept so every screen works offline (schema v4). [kind] is one of
+ * emergency | track | trip | devices | location | hello | home | address | phoneplaces; [json] is the body as received
+ * (or as the phone built it); [lat]/[lon] is where it applies, when that matters.
+ */
+@Entity(tableName = "snapshots", primaryKeys = ["source", "kind"])
+data class SnapshotEntity(
+    val source: String,
+    val kind: String,
+    val json: String,
+    val lat: Double = 0.0,
+    val lon: Double = 0.0,
+    val fetchedAt: Long,
 )
 
 /** A paired desktop. The token itself lives in EncryptedSharedPreferences keyed by [id]. */

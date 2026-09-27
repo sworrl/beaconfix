@@ -1,8 +1,10 @@
 package org.sworrl.beaconfix.data.api
 
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
+import okhttp3.RequestBody
 import okhttp3.ResponseBody
 import retrofit2.Response
 import retrofit2.Retrofit
@@ -55,6 +57,11 @@ interface BeaconFixApi {
     @GET("api/v1/ranging/info") suspend fun rangingInfo(@Header("Authorization") auth: String): Response<RangingInfo>
     @POST("api/v1/ranging") suspend fun postRanging(@Header("Authorization") auth: String, @Body body: RangingPost): Response<DeviceRange>
     @GET("api/v1/ranging") suspend fun ranging(@Header("Authorization") auth: String): Response<RangingList>
+    // help + places (desktop 3.8 adds the "pediatric" keys; treat a 404 from /emergency as an older desktop)
+    @GET("api/v1/emergency") suspend fun emergency(@Header("Authorization") auth: String): Response<EmergencyDto>
+    @GET("api/v1/pois") suspend fun poisFiltered(@Header("Authorization") auth: String, @Query("cat") cat: String?, @Query("group") group: String?, @Query("radius") radius: Int?): Response<PoisTyped>
+    @POST("api/v1/prefetch") suspend fun prefetch(@Header("Authorization") auth: String): Response<JsonObject>
+    @POST("api/v1/db/import") suspend fun dbImport(@Header("Authorization") auth: String, @Query("name") name: String, @Body body: RequestBody): Response<JsonObject>
 }
 
 object ApiFactory {
