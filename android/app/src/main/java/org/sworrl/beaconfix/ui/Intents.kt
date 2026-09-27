@@ -28,11 +28,13 @@ object Intents {
     fun navigate(ctx: Context, lat: Double, lon: Double, label: String = ""): Boolean =
         start(ctx, Intent(Intent.ACTION_VIEW, Uri.parse(geoUri(lat, lon, label))))
 
-    /** Open [url] in the browser (https:// is assumed when there is no scheme). */
+    /**
+     * Open [url] in the browser (https:// is assumed when there is no scheme). Only http(s): a place's `website` tag is
+     * third-party data, and anything else (a `beaconfix://link/…`, `intent:`, `file:`) must not be launched from it.
+     */
     fun web(ctx: Context, url: String): Boolean {
-        val u = url.trim()
-        if (u.isEmpty()) return false
-        return start(ctx, Intent(Intent.ACTION_VIEW, Uri.parse(if (u.contains("://")) u else "https://$u")))
+        val u = webUrl(url) ?: run { if (url.isNotBlank()) toast(ctx, "Not a web address"); return false }
+        return start(ctx, Intent(Intent.ACTION_VIEW, Uri.parse(u)))
     }
 
     /** The system share sheet with plain [text] (and an optional [subject]). */
@@ -50,6 +52,20 @@ object Intents {
     }
 
     // ── pure helpers (unit-tested) ────────────────────────────────────────────
+    /** [url] as an http(s) address ("example.org" → "https://example.org"); null when empty or another scheme. */
+    fun webUrl(url: String): String? {
+        val u = url.trim()
+        if (u.isEmpty() || u.any { it.isWhitespace() }) return null
+        val scheme = Regex("""^([A-Za-z][A-Za-z0-9+.-]*):""").find(u)?.groupValues?.get(1)?.lowercase(Locale.ROOT)
+        return when {
+            scheme == "http" || scheme == "https" -> if (u.substringAfter(':').startsWith("//")) u else null
+            scheme == null -> "https://$u"
+            // "example.org:8080/x" has a "scheme" that is really a host; a dot says so (no URI scheme has one we launch)
+            u.substringBefore(':').contains('.') && !u.contains("://") -> "https://$u"
+            else -> null
+        }
+    }
+
     /** "112 / 911" → "112"; "+1 (304) 598-1111" → "+13045981111"; "tel:911" → "911"; "" when there is no digit. */
     fun dialable(number: String): String {
         val first = number.trim().removePrefix("tel:")

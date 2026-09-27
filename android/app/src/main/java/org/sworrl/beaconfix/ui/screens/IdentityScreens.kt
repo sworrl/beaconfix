@@ -97,6 +97,7 @@ fun IdentityScreen(onBack: () -> Unit, vm: IdentityViewModel = hiltViewModel()) 
     val busy by vm.busy.collectAsState(); val msg by vm.message.collectAsState()
     val exportText by vm.exportText.collectAsState(); val exportCode by vm.exportCode.collectAsState()
     val offer by vm.offerText.collectAsState(); val statement by vm.statementText.collectAsState(); val staged by vm.importBundle.collectAsState()
+    val incoming by vm.incomingLink.collectAsState()
     val ctx = LocalContext.current; val clip = LocalClipboardManager.current
     var mode by remember { mutableStateOf("view") }   // view | scan
     var pass by remember { mutableStateOf("") }; var newName by remember(rec?.name) { mutableStateOf(rec?.name ?: "") }
@@ -115,6 +116,14 @@ fun IdentityScreen(onBack: () -> Unit, vm: IdentityViewModel = hiltViewModel()) 
     }
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(vertical = 8.dp)) {
         Row(Modifier.padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) { TextButton(onClick = onBack) { Text("‹ Back") }; Text("Identity", style = MaterialTheme.typography.titleLarge) }
+        if (incoming.isNotEmpty()) InfoCard("A link was opened") {
+            Text(vm.describeIncoming(incoming), style = MaterialTheme.typography.bodyMedium)
+            Text("Only say yes if you started this yourself, from your own other device.", color = Slate, style = MaterialTheme.typography.bodySmall)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(onClick = { vm.confirmIncoming() }, enabled = !busy) { Text("Link") }
+                OutlinedButton(onClick = { vm.dismissIncoming() }) { Text("Cancel") }
+            }
+        }
         InfoCard(r.name) {
             Text(Crypto.grouped(r.id), fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodyLarge)
             KeyValue("Created", r.created.take(10)); KeyValue("Public key", r.pub.take(16) + "…")

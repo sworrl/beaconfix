@@ -56,6 +56,17 @@ class IdentityViewModel @Inject constructor(
     val statementText = MutableStateFlow("")    // a completed statement to show back as QR (BFLINKS1:…)
     /** pending import: bundle text waiting for its passphrase */
     val importBundle = MutableStateFlow("")
+    /**
+     * A link offer / statement that came from outside the app (a tapped beaconfix://link… link, another app's
+     * `link_payload` extra). Linking lets that BeaconFix sign in as us and receive our history, so it waits here for
+     * the user's yes on the Identity screen; only the in-app QR scanner hands payloads to [handleScanned] directly.
+     */
+    val incomingLink = MutableStateFlow("")
+    fun offerIncoming(payload: String) { incomingLink.value = payload.trim() }
+    fun confirmIncoming() { val t = incomingLink.value; incomingLink.value = ""; if (t.isNotEmpty()) handleScanned(t) }
+    fun dismissIncoming() { incomingLink.value = "" }
+    /** What [incomingLink] would do, in words, for the confirmation card. */
+    fun describeIncoming(t: String): String = describeLinkPayload(t)
 
     private fun run(block: suspend () -> Unit) = viewModelScope.launch { busy.value = true; message.value = ""; try { block() } catch (e: Exception) { message.value = e.message ?: e.toString() } finally { busy.value = false } }
 
@@ -148,4 +159,17 @@ class IdentityViewModel @Inject constructor(
     fun dismissPending(id: String) = run { store.removePending(id) }
     fun clearLinkUi() { offerText.value = ""; statementText.value = "" }
     fun statementFor(p: PendingLinkEntity): String = p.statementJson.takeIf { it.isNotEmpty() }?.let { IdentityOps.encodeStatement(identityJson.decodeFromString(LinkStatement.serializer(), it)) } ?: ""
+}
+
+/** A link payload in words (pure): who it would link this identity with. */
+fun describeLinkPayload(t: String): String {
+    val p = t.trim()
+    IdentityOps.decodeOffer(p)?.let { o ->
+        return "Link with ${o.name.ifEmpty { "another BeaconFix" }} (id ${Crypto.grouped(o.id)})? That device will be able to sign in as you and receive your history."
+    }
+    if (p.startsWith(IdentityOps.STMT_PREFIX)) {
+        val st = IdentityOps.decodeStatement(p) ?: return "This link statement cannot be read."
+        return "Accept a link statement between ${Crypto.grouped(st.a)} and ${Crypto.grouped(st.b)}? The other identity's devices will be able to sign in as you and receive your history."
+    }
+    return "This link is not one BeaconFix understands."
 }

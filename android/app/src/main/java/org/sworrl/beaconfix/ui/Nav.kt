@@ -93,7 +93,9 @@ fun BeaconFixRoot(launch: LaunchArgs = LaunchArgs()) {
     val shareVm: ShareViewModel = hiltViewModel()
     LaunchedEffect(launch.seq) {
         if (!launch.pairHost.isNullOrBlank()) nav.navigate("pair?host=${launch.pairHost}&port=${launch.pairPort}")
-        if (!launch.linkPayload.isNullOrBlank()) { if (!launch.linkPayload.startsWith(org.sworrl.beaconfix.identity.IdentityOps.PREFIX)) idVm.handleScanned(launch.linkPayload); nav.navigate("identity") }
+        // A link offer / statement from outside (a tapped link, another app) is never acted on unasked: it waits on the
+        // Identity screen for the user's yes (linking lets that device sign in as us and receive our history).
+        if (!launch.linkPayload.isNullOrBlank()) { if (!launch.linkPayload.startsWith(org.sworrl.beaconfix.identity.IdentityOps.PREFIX)) idVm.offerIncoming(launch.linkPayload); nav.navigate("identity") }
         if (launch.file != null) nav.navigate("import")
         if (launch.importDryRun) nav.navigate("identity")
         when (launch.action) {
