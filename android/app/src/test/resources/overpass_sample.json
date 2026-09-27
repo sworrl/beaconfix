@@ -1,0 +1,27 @@
+{
+  "version": 0.6,
+  "generator": "Overpass API (hand-trimmed test sample)",
+  "osm3s": {"timestamp_osm_base": "2026-09-27T00:00:00Z", "copyright": "The data included in this document is from www.openstreetmap.org. The data is made available under ODbL."},
+  "elements": [
+    {"type": "way", "id": 1135527599, "center": {"lat": 39.654058, "lon": -79.955153},
+     "tags": {"building": "hospital", "name": "WVU Medicine Children's", "operator": "WVU Medicine", "contact:phone": "+13045981111", "website": "https://childrens.wvumedicine.org/"}},
+    {"type": "way", "id": 463483594, "center": {"lat": 39.654462, "lon": -79.959066},
+     "tags": {"amenity": "hospital", "healthcare": "hospital", "name": "Ruby Memorial Hospital", "emergency": "yes", "opening_hours": "24/7", "phone": "+1 855 988 2273", "operator": "WVU Medicine"}},
+    {"type": "way", "id": 329264979, "center": {"lat": 40.467202, "lon": -79.953245},
+     "tags": {"amenity": "hospital", "healthcare": "hospital", "name": "UPMC Children's Hospital of Pittsburgh", "healthcare:speciality": "paediatrics", "emergency": "yes", "opening_hours": "24/7", "phone": "+1 412 692 5325", "wheelchair": "yes"}},
+    {"type": "way", "id": 473666430, "center": {"lat": 40.466810, "lon": -79.953126},
+     "tags": {"building": "hospital", "name": "UPMC Children's Hospital of Pittsburgh", "building:levels": "9"}},
+    {"type": "node", "id": 9000000005, "lat": 39.5, "lon": -80.0,
+     "tags": {"amenity": "hospital", "name": "Test General Hospital", "healthcare:speciality": "general;paediatrics", "emergency": "yes"}},
+    {"type": "node", "id": 9000000006, "lat": 39.6, "lon": -80.0,
+     "tags": {"amenity": "clinic", "name": "Test Kids Express Care"}},
+    {"type": "node", "id": 9000000009, "lat": 39.9, "lon": -80.0,
+     "tags": {"healthcare": "hospital", "name": "Test City Hospital"}},
+    {"type": "node", "id": 9000000010, "lat": 40.0, "lon": -80.0,
+     "tags": {"amenity": "hospital", "healthcare": "hospital", "name": "Test Children’s Hospital", "emergency": "yes"}},
+    {"type": "node", "id": 9000000101, "lat": 39.7, "lon": -80.0,
+     "tags": {"amenity": "police", "name": "Test Police Department", "phone": "+1 555 0100", "addr:housenumber": "1", "addr:street": "Test Street", "addr:city": "Testville", "addr:state": "WV"}},
+    {"type": "node", "id": 9000000102, "lat": 39.8, "lon": -80.0,
+     "tags": {"amenity": "pharmacy", "name": "Test Pharmacy", "brand": "Test Drug", "wheelchair": "limited"}}
+  ]
+}
