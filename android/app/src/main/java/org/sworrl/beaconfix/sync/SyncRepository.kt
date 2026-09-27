@@ -7,6 +7,7 @@ import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.doubleOrNull
 import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonPrimitive
+import org.sworrl.beaconfix.data.DesktopCache
 import org.sworrl.beaconfix.data.DesktopStore
 import org.sworrl.beaconfix.data.Prefs
 import org.sworrl.beaconfix.data.api.ApiFactory
@@ -18,7 +19,6 @@ import org.sworrl.beaconfix.data.api.outcome
 import org.sworrl.beaconfix.data.db.ApEntity
 import org.sworrl.beaconfix.data.db.AppDatabase
 import org.sworrl.beaconfix.data.db.DesktopEntity
-import org.sworrl.beaconfix.data.db.FixEntity
 import org.sworrl.beaconfix.data.db.ObservationEntity
 import org.sworrl.beaconfix.estimate.EstimateRepository
 import java.time.Instant
@@ -35,7 +35,9 @@ data class SyncReport(val desktop: String, val ok: Boolean, val pushed: Int = 0,
  * Push: our unsynced observations, in body-size-limited batches (the desktop caps request bodies at 4 KB).
  * Pull: the desktop's beacons (positions, security, home flags), its location/track, its places, and — with the
  * control scope — the full database export (or, when the desktop advertises the "sync" feature, incremental changes).
- * Merge rules: newest observation wins (dedupe by bssid+time+position); AP positions merge by better accuracy.
+ * Mirror: places, nearest help, trip, track, devices and home go to the offline cache (`DesktopCache`) as they arrive.
+ * Merge rules: newest observation wins (dedupe by bssid+time+position); AP positions merge by better accuracy;
+ * desktop fixes are stored once per timestamp; home networks follow [Mirror.homeStep].
  */
 @Singleton
 class SyncRepository @Inject constructor(
@@ -46,18 +48,27 @@ class SyncRepository @Inject constructor(
     private val identity: org.sworrl.beaconfix.identity.IdentityStore,
     private val widgets: org.sworrl.beaconfix.widget.WidgetUpdater,
     private val anchors: org.sworrl.beaconfix.anchors.AnchorRepository,
-    private val cache: org.sworrl.beaconfix.data.DesktopCache,
+    private val cache: DesktopCache,
 ) {
     suspend fun syncAll(): List<SyncReport> {
+        val paired = desktops.paired()
+        if (org.sworrl.beaconfix.data.DevFlags.desktopBlocked()) return paired.map { SyncReport(it.name, false, message = "offline (simulated)") }
         val out = ArrayList<SyncReport>()
-        for (d in desktops.paired()) out += sync(d)
+        // the home list as it stands now: pushed where we may, never overwritten by a pull before that (Mirror.homeStep)
+        val home = HomeRun(prefs.homeDirty.first(), prefs.homePatterns.first())
+        for (d in paired) out += sync(d, home)
+        if (home.pushed && Mirror.mayClearDirty(home.local, prefs.homePatterns.first())) prefs.setHomeDirty(false)
+        runCatching { db.fixes().dedupeDesktop() }     // older builds stored the same desktop fix on every sync
         prefs.setLastSync(out.joinToString("\n") { "${it.desktop}: " + (if (it.ok) "pushed ${it.pushed}, pulled ${it.pulledAps} beacons / ${it.pulledObs} observations, refit ${it.refit}" else "failed — ${it.message}") })
         out.forEach { widgets.note(if (it.ok) "sync ${it.desktop}: pushed ${it.pushed}, pulled ${it.pulledAps}" else "sync ${it.desktop} failed: ${it.message.take(60)}") }
         widgets.touch("sync")
         return out
     }
 
-    suspend fun sync(d: DesktopEntity): SyncReport {
+    /** One sync run's view of the home-network list: [dirty] = edited on this phone since the last push. */
+    class HomeRun(val dirty: Boolean, val local: Set<String>) { var pushed = false }
+
+    suspend fun sync(d: DesktopEntity, home: HomeRun? = null): SyncReport {
         val api = desktops.api(d)
         val auth = desktops.auth(d) ?: return fail(d, "not paired")
         var pushed = 0; var pulledAps = 0; var pulledObs = 0; var pulledFixes = 0
@@ -118,21 +129,47 @@ class SyncRepository @Inject constructor(
                 runCatching { api.anchors(auth) }.getOrNull()?.takeIf { it.isSuccessful }?.body()?.let { anchors.mergeDtos(it) }
             }
 
-            // ── pull: home patterns (so the phone excludes the same networks) ──
-            api.home(auth).body()?.let { h -> if (h.patterns.isNotEmpty()) prefs.setHomePatterns(h.patterns.toSet()) }
+            // ── home patterns: push the phone's edit (control scope), else pull (so the phone excludes the same networks) ──
+            val src = DesktopCache.desktopSource(d.id)
+            val run = home ?: HomeRun(prefs.homeDirty.first(), prefs.homePatterns.first())
+            when (Mirror.homeStep(run.dirty, canControl)) {
+                Mirror.HomeStep.PUSH -> {
+                    val r = Mirror.rawPut(d, auth, "api/v1/home", Mirror.homeBody(run.local))
+                    if (r.ok) { run.pushed = true; runCatching { cache.putSnapshot(src, Mirror.HOME, r.body) } }
+                    if (home == null && r.ok && Mirror.mayClearDirty(run.local, prefs.homePatterns.first())) prefs.setHomeDirty(false)
+                }
+                Mirror.HomeStep.KEEP -> {}      // edited here, and this desktop may not take it: leave both lists alone
+                Mirror.HomeStep.PULL -> Mirror.bodyOf { api.home(auth) }?.let { h ->
+                    val mine = prefs.homePatterns.first()
+                    val next = Mirror.pulled(mine, h.patterns)
+                    if (next != mine) prefs.setHomePatterns(next)
+                    runCatching { cache.putSnapshot(src, Mirror.HOME, cache.encode(h)) }
+                }
+            }
 
-            // ── pull: the desktop's fix + track ──────────────────────────────
-            val loc = api.location(auth).body()
-            loc?.let { l -> if (l.valid) db.fixes().insert(FixEntity(time = parseIso(l.time), lat = l.lat, lon = l.lon, acc = l.accuracy, source = "desktop", provider = l.provider, place = l.place)) }
-            api.track(auth).body()?.track?.let { t ->
-                val have = HashSet<Long>()
-                for (p in t) { val ts = parseIso(p.time); if (have.add(ts)) db.fixes().insert(FixEntity(time = ts, lat = p.lat, lon = p.lon, acc = p.acc, source = "desktop", provider = p.source, place = p.place)); pulledFixes++ }
+            // ── pull: the desktop's fix + track (stops) — each stored once (Mirror.newDesktopFixes) ──
+            val loc = Mirror.bodyOf { api.location(auth) }
+            val at = loc?.takeIf { it.valid }?.let { it.lat to it.lon } ?: (0.0 to 0.0)
+            loc?.let { l ->
+                Mirror.newLocationFix(l, { db.fixes().existsDesktopAt(it) })?.let { db.fixes().insert(it) }
+                runCatching { cache.putSnapshot(src, Mirror.LOCATION, cache.encode(l), at.first, at.second) }
+            }
+            Mirror.rawGet(d, auth, "api/v1/track").takeIf { it.ok }?.let { r ->
+                for (f in Mirror.newDesktopFixes(Mirror.trackPoints(r.body), { db.fixes().existsDesktopAt(it) })) { db.fixes().insert(f); pulledFixes++ }
+                runCatching { cache.putSnapshot(src, Mirror.TRACK, r.body, at.first, at.second) }
             }
             // places → the offline cache (per desktop; an empty or failed answer keeps what is cached)
             runCatching { api.poisTyped(auth) }.getOrNull()?.body()?.let { p ->
-                val origin = p.origin ?: loc?.takeIf { it.valid }?.let { org.sworrl.beaconfix.data.api.OriginDto(lat = it.lat, lon = it.lon) }
+                val origin = p.origin?.takeIf { it.lat != 0.0 || it.lon != 0.0 } ?: loc?.takeIf { it.valid }?.let { org.sworrl.beaconfix.data.api.OriginDto(lat = it.lat, lon = it.lon) }
                 cache.saveDesktopPois(d.id, p.pois, origin?.lat ?: 0.0, origin?.lon ?: 0.0)
             }
+            // nearest help, the trip and our other devices → snapshots, so Help, Trip and "where's the RV" work offline
+            Mirror.bodyOf { api.emergency(auth) }?.let { e ->       // a 404 = a desktop older than /emergency: skipped
+                val (la, lo) = Mirror.emergencyAt(e, loc)
+                runCatching { cache.putSnapshot(src, Mirror.EMERGENCY, cache.encode(e), la, lo) }
+            }
+            Mirror.bodyOf { api.trip(auth) }?.let { t -> runCatching { cache.putSnapshot(src, Mirror.TRIP, cache.encode(t), at.first, at.second) } }
+            Mirror.bodyOf { api.devicesPositions(auth) }?.let { dv -> runCatching { cache.putSnapshot(src, Mirror.DEVICES, cache.encode(dv), at.first, at.second) } }
 
             // ── pull: the observations behind those positions (control scope) ──
             if (canControl) {

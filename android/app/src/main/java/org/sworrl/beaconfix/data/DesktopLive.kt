@@ -2,10 +2,12 @@ package org.sworrl.beaconfix.data
 
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.Request
@@ -13,21 +15,36 @@ import okhttp3.sse.EventSource
 import okhttp3.sse.EventSourceListener
 import okhttp3.sse.EventSources
 import org.sworrl.beaconfix.data.api.ApiFactory
+import org.sworrl.beaconfix.data.api.DevicesPositions
+import org.sworrl.beaconfix.data.api.EmergencyDto
 import org.sworrl.beaconfix.data.api.EventDto
+import org.sworrl.beaconfix.data.api.Hello
 import org.sworrl.beaconfix.data.api.LocationDto
 import org.sworrl.beaconfix.data.api.LinkedDevice
 import org.sworrl.beaconfix.data.api.PoiDto
 import org.sworrl.beaconfix.data.api.Trip
+import org.sworrl.beaconfix.data.api.TripDto
+import org.sworrl.beaconfix.data.db.AppDatabase
 import org.sworrl.beaconfix.data.db.DesktopEntity
+import org.sworrl.beaconfix.sync.Mirror
 import javax.inject.Inject
 import javax.inject.Singleton
 
-/** One paired desktop's live picture: fix, trip, places, events — polled on demand and streamed over SSE while a screen listens. */
+/**
+ * One paired desktop's live picture: fix, trip, places, events — polled on demand and streamed over SSE while a screen listens.
+ * Until the desktop answers (or while it cannot), the parts it answered before come from the offline cache:
+ * [cached] names them (location, trip, pois, emergency, devices), [cachedAt] is when they were saved, and [stale] is
+ * true while anything shown is not from this run's latest answer. [emergency] is `/emergency` (null on desktops without it).
+ */
 data class DesktopView(val desktop: DesktopEntity, val location: LocationDto? = null, val trip: Trip? = null, val pois: List<PoiDto> = emptyList(),
-                       val events: List<EventDto> = emptyList(), val error: String = "", val fetched: Long = 0, val streaming: Boolean = false, val devices: List<LinkedDevice> = emptyList())
+                       val events: List<EventDto> = emptyList(), val error: String = "", val fetched: Long = 0, val streaming: Boolean = false, val devices: List<LinkedDevice> = emptyList(),
+                       val emergency: EmergencyDto? = null, val cachedAt: Long = 0, val stale: Boolean = false, val cached: Set<String> = emptySet())
 
 @Singleton
-class DesktopLive @Inject constructor(private val store: DesktopStore, private val refits: org.sworrl.beaconfix.estimate.RefitBus) {
+class DesktopLive @Inject constructor(
+    private val store: DesktopStore, private val refits: org.sworrl.beaconfix.estimate.RefitBus,
+    private val cache: DesktopCache, private val db: AppDatabase,
+) {
     private val seenRefits = HashSet<Long>()
     private fun noteRefit(e: EventDto) { if (e.type == "ap_refit" && e.lat != null && e.lon != null && seenRefits.add(e.id)) refits.emit(org.sworrl.beaconfix.estimate.RefitEvent(e.bssid, e.ssid, e.lat, e.lon, e.fromLat, e.fromLon, e.acc ?: 50.0, e.prevAcc, e.n, e.vantage, e.rms, e.vantagePoints.map { org.sworrl.beaconfix.estimate.RefitEvent.Vantage(it.lat, it.lon, it.dbm, it.device) }, origin = "desktop")) }
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -36,37 +53,83 @@ class DesktopLive @Inject constructor(private val store: DesktopStore, private v
     private var stream: EventSource? = null
     private var streamJob: Job? = null
 
-    private fun put(id: String, f: (DesktopView) -> DesktopView) { val cur = _views.value; cur[id]?.let { _views.value = cur + (id to f(it)) } }
+    private fun put(id: String, f: (DesktopView) -> DesktopView) = _views.update { cur -> cur[id]?.let { cur + (id to f(it)) } ?: cur }
+    /** A live answer for [part]: apply it and drop [part] from what the view shows from the cache. */
+    private fun live(id: String, part: String, f: (DesktopView) -> DesktopView) = put(id) { f(it).let { v -> if (part in v.cached) v.copy(cached = v.cached - part) else v } }
 
-    /** Refresh everything for every paired desktop (cheap: four small GETs each). */
-    suspend fun refreshAll(what: Set<String> = setOf("location", "trip", "pois", "events")) {
+    /**
+     * Refresh what [what] names for every paired desktop — any of location, trip, pois, events, emergency, track,
+     * devices, hello (devices also come with location). Every answer is mirrored into the offline cache
+     * (`DesktopCache`: snapshots per kind, places per desktop), and a desktop's view starts from that cache the first
+     * time it is built, so screens show the last known picture while the desktop is out of reach. A 404 (an older
+     * desktop without that endpoint) or an unreadable answer skips that part only; `DevFlags` blocks the network.
+     */
+    suspend fun refreshAll(what: Set<String> = DEFAULT) {
         val paired = store.paired()
-        val keep = _views.value.filterKeys { k -> paired.any { it.id == k } }.toMutableMap()
-        for (d in paired) {
-            val v = keep[d.id] ?: DesktopView(d)
-            keep[d.id] = v.copy(desktop = d)
-            _views.value = keep
-            val api = store.api(d); val auth = store.auth(d) ?: continue
-            try {
-                withTimeoutOrNull(12_000) {
-                    if ("location" in what) api.location(auth).body()?.let { l -> put(d.id) { it.copy(location = l) } }
-                    if ("trip" in what) api.trip(auth).body()?.trip?.let { t -> put(d.id) { it.copy(trip = t) } }
-                    if ("pois" in what) api.poisTyped(auth).body()?.pois?.let { p -> put(d.id) { it.copy(pois = p) } }
-                    if ("events" in what) api.events(auth, 0).body()?.events?.let { e -> e.takeLast(5).forEach { ev -> noteRefit(ev) }; put(d.id) { it.copy(events = e.takeLast(60)) } }
-                    if ("location" in what) runCatching { api.devicesPositions(auth) }.getOrNull()?.takeIf { it.isSuccessful }?.body()?.devices?.let { dv -> put(d.id) { it.copy(devices = dv) } }
+        val fresh = HashMap<String, DesktopView>()
+        for (d in paired) if (_views.value[d.id] == null) fresh[d.id] = prefill(d)
+        _views.update { cur -> paired.associate { d -> d.id to ((cur[d.id] ?: fresh[d.id] ?: DesktopView(d)).copy(desktop = d)) } }
+        for (d in paired) refreshOne(d, what)
+    }
+
+    private suspend fun prefill(d: DesktopEntity): DesktopView = runCatching {
+        val src = DesktopCache.desktopSource(d.id)
+        val snaps = Mirror.PREFILLED.mapNotNull { k -> cache.snapshotFrom(src, k)?.let { k to it } }.toMap()
+        Mirror.prefill(d, snaps, db.pois().allNow())
+    }.getOrElse { DesktopView(d) }
+
+    private suspend fun refreshOne(d: DesktopEntity, what: Set<String>) {
+        if (DevFlags.desktopBlocked()) { put(d.id) { Mirror.settle(it, false, BLOCKED, System.currentTimeMillis()) }; return }
+        val api = store.api(d); val auth = store.auth(d) ?: return
+        val src = DesktopCache.desktopSource(d.id)
+        try {
+            val done = withTimeoutOrNull(timeoutFor(what)) {
+                // where the desktop is: positions its snapshots and its places' origin
+                var fix: LocationDto? = _views.value[d.id]?.location?.takeIf { it.valid }
+                suspend fun <T> snap(kind: String, body: T, s: kotlinx.serialization.KSerializer<T>, at: Pair<Double, Double>? = null) {
+                    val (la, lo) = at ?: fix?.let { it.lat to it.lon } ?: (0.0 to 0.0)
+                    runCatching { cache.putSnapshot(src, kind, ApiFactory.json.encodeToString(s, body), la, lo) }
                 }
-                put(d.id) { it.copy(error = "", fetched = System.currentTimeMillis()) }
-            } catch (e: Exception) {
-                val code = (e as? retrofit2.HttpException)?.code()
-                if (code == 401) store.forgetToken(d.id)
-                put(d.id) { it.copy(error = e.message ?: "unreachable") }
+                if ("hello" in what) Mirror.bodyOf { api.hello() }?.let { h -> snap(Mirror.HELLO, h, Hello.serializer()) }
+                if ("location" in what) Mirror.bodyOf { api.location(auth) }?.let { l ->
+                    live(d.id, Mirror.LOCATION) { it.copy(location = l) }
+                    if (l.valid) fix = l
+                    snap(Mirror.LOCATION, l, LocationDto.serializer())
+                }
+                if ("trip" in what) Mirror.bodyOf { api.trip(auth) }?.let { t -> live(d.id, Mirror.TRIP) { it.copy(trip = t.trip) }; snap(Mirror.TRIP, t, TripDto.serializer()) }
+                if ("pois" in what) Mirror.bodyOf { api.poisTyped(auth) }?.let { p ->
+                    live(d.id, "pois") { it.copy(pois = p.pois) }
+                    val o = p.origin?.takeIf { it.lat != 0.0 || it.lon != 0.0 }?.let { it.lat to it.lon } ?: fix?.let { it.lat to it.lon }
+                    runCatching { cache.saveDesktopPois(d.id, p.pois, o?.first ?: 0.0, o?.second ?: 0.0) }
+                }
+                if ("events" in what) Mirror.bodyOf { api.events(auth, 0) }?.events?.let { e -> e.takeLast(5).forEach { ev -> noteRefit(ev) }; put(d.id) { it.copy(events = e.takeLast(60)) } }
+                if ("emergency" in what) Mirror.bodyOf { api.emergency(auth) }?.let { e ->
+                    live(d.id, Mirror.EMERGENCY) { it.copy(emergency = e) }
+                    snap(Mirror.EMERGENCY, e, EmergencyDto.serializer(), Mirror.emergencyAt(e, fix))
+                }
+                if ("track" in what) Mirror.rawGet(d, auth, "api/v1/track").takeIf { it.ok }?.let { r ->
+                    val (la, lo) = fix?.let { it.lat to it.lon } ?: (0.0 to 0.0)
+                    runCatching { cache.putSnapshot(src, Mirror.TRACK, r.body, la, lo) }
+                }
+                if ("location" in what || "devices" in what) Mirror.bodyOf { api.devicesPositions(auth) }?.let { dv ->
+                    live(d.id, Mirror.DEVICES) { it.copy(devices = dv.devices) }
+                    snap(Mirror.DEVICES, dv, DevicesPositions.serializer())
+                }
+                true
             }
+            put(d.id) { Mirror.settle(it, done == true, if (done == true) "" else "timed out", System.currentTimeMillis()) }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            val code = (e as? retrofit2.HttpException)?.code()
+            if (code == 401) store.forgetToken(d.id)
+            put(d.id) { Mirror.settle(it, false, e.message ?: "unreachable", System.currentTimeMillis()) }
         }
     }
 
     /** Server-sent events from the first paired desktop while a screen is visible: `fix` and `beacon` events. */
     fun startStream() {
-        if (stream != null) return
+        if (stream != null || DevFlags.desktopBlocked()) return
         streamJob = scope.launch {
             val d = store.paired().firstOrNull() ?: return@launch
             val auth = store.auth(d) ?: return@launch
@@ -86,4 +149,12 @@ class DesktopLive @Inject constructor(private val store: DesktopStore, private v
         }
     }
     fun stopStream() { stream?.cancel(); stream = null; streamJob?.cancel(); streamJob = null; _views.value = _views.value.mapValues { it.value.copy(streaming = false) } }
+
+    companion object {
+        /** What a screen refreshes by default. */
+        val DEFAULT = setOf("location", "trip", "pois", "events", "emergency")
+        const val BLOCKED = "offline (simulated)"
+        /** 12 s for the usual handful of small GETs, a little more when more is asked for (Starlink can be slow). */
+        fun timeoutFor(what: Set<String>): Long = (12_000L + 2_000L * (what.size - 5).coerceAtLeast(0)).coerceAtMost(20_000L)
+    }
 }
