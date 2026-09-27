@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- A12: connected Wi-Fi safety (Home card, open-network alert). -->
+<resources>
+    <string name="wifi_card_title">Connected Wi-Fi</string>
+    <string name="wifi_card_not_connected">Not connected to Wi-Fi</string>
+    <string name="wifi_card_hidden_name">Network name hidden (needs location permission)</string>
+    <string name="wifi_card_ok">OK</string>
+    <string name="wifi_card_bad">Not safe</string>
+    <string name="wifi_card_unknown">Unknown</string>
+    <string name="wifi_card_home">Home network</string>
+    <string name="wifi_card_advice_open">Others nearby can see unencrypted traffic. Prefer Starlink or your hotspot for banking.</string>
+    <string name="wifi_card_advice_weak">Others nearby can break this network\'s encryption. Prefer Starlink or your hotspot for banking.</string>
+    <string name="wifi_card_band">%1$s GHz · channel %2$d</string>
+    <string name="wifi_card_band_only">%1$s GHz</string>
+    <string name="wifi_alert_title">Unsafe Wi-Fi</string>
+    <string name="wifi_alert_public">Wi-Fi safety warning</string>
+    <string name="wifi_alerts_channel_name">Alerts</string>
+    <string name="wifi_alerts_channel_desc">Heads-ups: nearest help in a new area, and Wi-Fi networks that aren\'t safe for banking</string>
+</resources>
