@@ -18,6 +18,7 @@ Kirigami.FormLayout {
     property alias cfg_showEvents:       eventsCheck.checked
     property alias cfg_animatedMap: cineCheck.checked
     property alias cfg_tourMinutes: tourSpin.value
+    property alias cfg_spotlightMinutes: spotSpin.value
 
     RowLayout {
         Kirigami.FormData.label: "Read state every:"
@@ -38,11 +39,18 @@ Kirigami.FormLayout {
     QQC2.CheckBox { id: motionCheck; text: "Show speed & heading while moving (elevation when stopped)" }
     Kirigami.Separator { Kirigami.FormData.isSection: true; Kirigami.FormData.label: "Map" }
     QQC2.CheckBox { id: ssidCheck;   Kirigami.FormData.label: "Show:"; text: "Wi-Fi names beside the beacons (all from zoom 15, the 12 strongest from 13)" }
-    QQC2.CheckBox { id: cineCheck; text: "Cinematic map — glide to events, and every few minutes zoom out to show the city and state" }
+    QQC2.CheckBox { id: cineCheck; text: "Cinematic map — glide to significant events (a real move, a beacon placed, a much better beacon fit), now and then zoom out to show the city and state, and re-fit the zoom once you have moved somewhere new (never while parked). At most one automatic zoom every 10 minutes, never while the pointer is over the widget or for 3 minutes after you use the map. Off: the map only pans to keep your position in view." }
     RowLayout {
         Kirigami.FormData.label: "Overview every:"
-        QQC2.SpinBox { id: tourSpin; from: 1; to: 60 }
-        QQC2.Label { text: "min" }
+        enabled: cineCheck.checked
+        QQC2.SpinBox { id: tourSpin; from: 0; to: 180 }
+        QQC2.Label { text: tourSpin.value === 0 ? "min (never)" : "min" }
+    }
+    RowLayout {
+        Kirigami.FormData.label: "Glide to an event at most every:"
+        enabled: cineCheck.checked
+        QQC2.SpinBox { id: spotSpin; from: 0; to: 240 }
+        QQC2.Label { text: spotSpin.value === 0 ? "min (never)" : "min" }
     }
     QQC2.CheckBox { id: eventsCheck; text: "Events as motion — ripples for new beacons, fade-outs for lost ones, signal arrows, fix arrows, stop pins — plus the ticker" }
     Kirigami.Separator { Kirigami.FormData.isSection: true; Kirigami.FormData.label: "Tabs" }

@@ -42,6 +42,14 @@ PlasmoidItem {
     property var    pois:     []
     property var    track:    []
     property var    knownDevices: []
+    property var    linkedDevices: []
+    // Surveyed antenna anchors: the desktop's list merged with ones placed in this widget that the
+    // desktop has not stored yet (kept in the widget config and pushed as soon as it supports anchors).
+    property var    antennaAnchors: []
+    property bool   anchorsSupported: false
+    property var    _deskAnchors: []
+    property string _anchorsJson: ""
+    property var    _pushedAt: ({})
     property var    emergency: null
     property var    securitySummary: null
     property var    poiCategories: []
@@ -55,6 +63,8 @@ PlasmoidItem {
     property var    share: null
     property var    events:   []                // recent things that happened (newest last)
     property int    lastEventId: 0
+    property var    _prevFit: null
+    property string _linkedJson: ""
     property int    liveScanSeconds: 0
     property int    _seenEventId: -1            // -1 until the first read: never animate history
     property string _eventsJson: ""
@@ -120,7 +130,30 @@ PlasmoidItem {
                 root.accuracy = d.accuracy !== undefined ? d.accuracy : -1
                 root.source = d.source || ""; root.provider = d.provider || ""; root.place = d.place || ""; root.time = d.time || ""
                 root.apCount = d.apCount || 0; root.error = d.error || ""; root.busy = !!d.busy
-                root.aps = d.aps || []; root.stats = d.stats || {}
+                // Synthesise ap_refit events from real changes of fitted beacons so the triangulation
+                // animation plays even on desktops that do not emit the event yet. Only for a fit that moved
+                // more than max(5 m, 25 % of its accuracy) or tightened by more than 25 % since it was last
+                // shown (the baseline only advances when it is shown, so slow drift still counts once), at
+                // most 3 per poll. They animate in place and never move the camera (marked synthetic).
+                var newAps = d.aps || [], synth = [], nowIso = new Date().toISOString()
+                var deskRefit = {}
+                for (var ri = 0; ri < (d.events || []).length; ri++) { var re = d.events[ri]; if (re && re.type === "ap_refit") deskRefit[re.bssid] = true }
+                var pf = {}, prevFit = root._prevFit
+                for (var fi = 0; fi < newAps.length; fi++) {
+                    var na = newAps[fi]; if (!na || !na.fit || na.lat === undefined) continue
+                    var cur = {lat: na.lat, lon: na.lon, acc: na.fit.acc || na.r}
+                    var prev = prevFit ? prevFit[na.bssid] : null
+                    pf[na.bssid] = cur
+                    if (!prev || deskRefit[na.bssid]) continue            // new, or the desktop reported it itself
+                    var movedM = root.distM(prev.lat, prev.lon, cur.lat, cur.lon)
+                    var worth = movedM > Math.max(5, 0.25 * (prev.acc || cur.acc)) || (prev.acc > 0 && cur.acc < prev.acc * 0.75)
+                    if (worth && synth.length < 3)
+                        synth.push({type: "ap_refit", bssid: na.bssid, ssid: na.ssid, lat: cur.lat, lon: cur.lon, fromLat: prev.lat, fromLon: prev.lon,
+                                    acc: cur.acc, prevAcc: prev.acc || cur.acc, n: na.fit.n, vantage: na.fit.vantage, movedM: movedM, time: nowIso, synthetic: true})
+                    else pf[na.bssid] = prev                             // not shown: keep comparing against what was
+                }
+                root._prevFit = pf
+                root.aps = newAps; root.stats = d.stats || {}
                 // Only reassign the big arrays when they changed: that re-clusters and repaints the map
                 var pj = JSON.stringify(d.pois || [])
                 if (pj !== root._poisJson) { root._poisJson = pj; root.pois = d.pois || [] }
@@ -130,6 +163,12 @@ PlasmoidItem {
                 root.poiNote = d.poiNote || ""
                 root.tileBase = d.tileBase || ""
                 root.knownDevices = d.knownDevices || []
+                var ldj = JSON.stringify(d.linkedDevices || [])
+                if (ldj !== root._linkedJson) { root._linkedJson = ldj; root.linkedDevices = d.linkedDevices || [] }
+                root.anchorsSupported = (d.features || []).indexOf("anchors") >= 0 || d.anchors !== undefined
+                var anj = JSON.stringify(d.anchors || [])
+                if (anj !== root._anchorsJson) { root._anchorsJson = anj; root._deskAnchors = d.anchors || [] }
+                root._mergeAnchors()
                 root.emergency = d.emergency || null
                 root.securitySummary = d.securitySummary || null
                 root.elevation = (d.elevation === undefined) ? null : d.elevation
@@ -152,6 +191,7 @@ PlasmoidItem {
                     var out = first ? ev.slice(-5) : fresh
                     if (out.length) root.newEvents(out, !first)
                 }
+                if (synth.length) root.newEvents(synth, true)
             } catch(e) { root.error = "beaconfix --json failed" }
         }
     }
@@ -162,6 +202,70 @@ PlasmoidItem {
     function saveGpx() { exec.connectSource(`${root.bin} --gpx "$HOME/Documents/beaconfix-trip.gpx"`) }
     function newTrip() { exec.connectSource(`${root.bin} --new-trip`); refreshFollow.restart() }
     function prefetch() { exec.connectSource(`${root.bin} --prefetch`) }
+
+    // ── anchors ──
+    function _localAnchors() { try { var l = JSON.parse(Plasmoid.configuration.localAnchors || "[]"); return Array.isArray(l) ? l : [] } catch (e) { return [] } }
+    function _mergeAnchors() {
+        var loc = _localAnchors(), onDesk = {}
+        for (var i = 0; i < _deskAnchors.length; i++) onDesk[_deskAnchors[i].id] = _deskAnchors[i]
+        // once the desktop holds an anchor we placed (same id, same position), forget our copy
+        var pending = loc.filter(function(a) { var d = onDesk[a.id]; return !d || Math.abs(d.lat - a.lat) > 1e-7 || Math.abs(d.lon - a.lon) > 1e-7 || d.name !== a.name || d.kind !== a.kind })
+        if (pending.length !== loc.length) Plasmoid.configuration.localAnchors = JSON.stringify(pending)
+        if (anchorsSupported) {
+            var now = Date.now()
+            for (var j = 0; j < pending.length; j++) if (!_pushedAt[pending[j].id] || now - _pushedAt[pending[j].id] > 60000) { _pushedAt[pending[j].id] = now; _pushAnchor(pending[j]) }
+        }
+        var pendIds = {}; for (var k = 0; k < pending.length; k++) pendIds[pending[k].id] = true
+        antennaAnchors = _deskAnchors.filter(function(a) { return !pendIds[a.id] }).concat(pending)
+    }
+    function _utf8(str) {
+        var out = []
+        for (var i = 0; i < str.length; i++) {
+            var c = str.charCodeAt(i)
+            if (c >= 0xD800 && c <= 0xDBFF && i + 1 < str.length) { var d2 = str.charCodeAt(i + 1); if (d2 >= 0xDC00 && d2 <= 0xDFFF) { c = 0x10000 + ((c - 0xD800) << 10) + (d2 - 0xDC00); i++ } }
+            if (c < 0x80) out.push(c)
+            else if (c < 0x800) out.push(0xC0 | (c >> 6), 0x80 | (c & 63))
+            else if (c < 0x10000) out.push(0xE0 | (c >> 12), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63))
+            else out.push(0xF0 | (c >> 18), 0x80 | ((c >> 12) & 63), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63))
+        }
+        return out
+    }
+    function _b64(str) {                       // standard base64 of the UTF-8 bytes (names may carry emoji)
+        var b = _utf8(str), A = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/", o = ""
+        for (var i = 0; i < b.length; i += 3) {
+            var n = (b[i] << 16) | ((i + 1 < b.length ? b[i + 1] : 0) << 8) | (i + 2 < b.length ? b[i + 2] : 0)
+            o += A[(n >> 18) & 63] + A[(n >> 12) & 63] + (i + 1 < b.length ? A[(n >> 6) & 63] : "=") + (i + 2 < b.length ? A[n & 63] : "=")
+        }
+        return o
+    }
+    function _pushAnchor(a) { exec.connectSource(`${root.bin} --anchor-set 'b64:${_b64(JSON.stringify(a))}'`) }
+    function saveAnchor(a) {
+        var loc = _localAnchors().filter(function(x) { return x.id !== a.id })
+        // only one "this computer" anchor: a new one replaces the old
+        if (a.kind === "this-computer") {
+            var olds = antennaAnchors.filter(function(x) { return x.kind === "this-computer" && x.id !== a.id })
+            for (var i = 0; i < olds.length; i++) removeAnchor(olds[i].id)
+            loc = loc.filter(function(x) { return x.kind !== "this-computer" })
+        }
+        loc.push(a)
+        Plasmoid.configuration.localAnchors = JSON.stringify(loc)
+        _pushedAt[a.id] = 0
+        _mergeAnchors()
+        refreshFollow.restart()
+    }
+    function removeAnchor(id) {
+        var safe = String(id).replace(/[^A-Za-z0-9-]/g, "")
+        Plasmoid.configuration.localAnchors = JSON.stringify(_localAnchors().filter(function(x) { return x.id !== id }))
+        _deskAnchors = _deskAnchors.filter(function(x) { return x.id !== id })
+        if (anchorsSupported && safe) exec.connectSource(`${root.bin} --anchor-remove '${safe}'`)
+        _mergeAnchors()
+    }
+    function distM(la1, lo1, la2, lo2) {
+        var R = 6371000, d2r = Math.PI / 180
+        var dLa = (la2 - la1) * d2r, dLo = (lo2 - lo1) * d2r
+        var a = Math.sin(dLa / 2) * Math.sin(dLa / 2) + Math.cos(la1 * d2r) * Math.cos(la2 * d2r) * Math.sin(dLo / 2) * Math.sin(dLo / 2)
+        return 2 * R * Math.asin(Math.sqrt(a))
+    }
     function elevText() { return elevation === null ? "" : `${Math.round(elevation)} m` }
     function hm(iso) { return iso ? new Date(iso).toLocaleTimeString(Qt.locale(), "HH:mm") : "—" }
 
@@ -322,6 +426,8 @@ PlasmoidItem {
                         showEvents: root.showEvents
                         cinematic: Plasmoid.configuration.animatedMap
                         tourMinutes: Plasmoid.configuration.tourMinutes
+                        spotlightMinutes: Plasmoid.configuration.spotlightMinutes
+                        hostHovered: repHover.hovered
                         onCinematicToggled: on => Plasmoid.configuration.animatedMap = on
                         onSsidsToggled: on => Plasmoid.configuration.showSsids = on
                         onEventsToggled: on => Plasmoid.configuration.showEvents = on

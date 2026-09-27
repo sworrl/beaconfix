@@ -41,14 +41,24 @@
             <default>true</default>
         </entry>
         <entry name="animatedMap" type="Bool">
-            <label>Cinematic map: glide to events and periodically zoom out to the city / state</label>
+            <label>Cinematic map: glide to significant events, occasionally zoom out to the city / state, and re-fit the zoom after moving somewhere new (at most one automatic zoom per 10 minutes)</label>
             <default>true</default>
         </entry>
         <entry name="tourMinutes" type="Int">
-            <label>Minutes between overview zoom-outs</label>
-            <default>2</default>
-            <min>1</min>
-            <max>60</max>
+            <label>Minutes between overview zoom-outs (0: never)</label>
+            <default>20</default>
+            <min>0</min>
+            <max>180</max>
+        </entry>
+        <entry name="spotlightMinutes" type="Int">
+            <label>At most one glide to an event per this many minutes (0: never)</label>
+            <default>10</default>
+            <min>0</min>
+            <max>240</max>
+        </entry>
+        <entry name="localAnchors" type="String">
+            <label>Antenna anchors placed in this widget that the desktop app has not stored yet (JSON array)</label>
+            <default></default>
         </entry>
         <entry name="showEvents" type="Bool">
             <label>Animate events on the map (new / lost / louder beacons, fixes, stops) and show the ticker</label>
