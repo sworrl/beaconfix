@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2" xmlns:gx="http://www.google.com/kml/ext/2.2"><Document>
+  <Placemark><name>Coffee</name><TimeStamp><when>2023-08-01T08:00:00Z</when></TimeStamp><Point><coordinates>-75.0680,40.0030,120</coordinates></Point></Placemark>
+  <Placemark><name>Drive</name><gx:Track>
+    <when>2023-08-01T09:00:00Z</when><when>2023-08-01T09:01:00Z</when><when>2023-08-01T09:02:00Z</when>
+    <gx:coord>-75.0680 40.0030 120</gx:coord><gx:coord>-75.0700 40.0100 125</gx:coord><gx:coord>-75.0800 40.0200 130</gx:coord>
+  </gx:Track></Placemark>
+  <Placemark><name>Untimed line</name><LineString><coordinates>-75.0,40.0,0 -75.1,40.1,0</coordinates></LineString></Placemark>
+</Document></kml>

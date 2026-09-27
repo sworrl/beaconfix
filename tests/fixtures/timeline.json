@@ -1,0 +1,22 @@
+{
+  "semanticSegments": [
+    {"startTime": "2024-03-10T08:00:00.000-04:00", "endTime": "2024-03-10T09:30:00.000-04:00",
+     "visit": {"hierarchyLevel": 0, "probability": 0.9, "topCandidate": {"placeId": "ChIJtest1", "semanticType": "HOME", "probability": 0.8, "placeLocation": {"latLng": "40.0030°, -75.0680°"}}}},
+    {"startTime": "2024-03-10T09:30:00.000-04:00", "endTime": "2024-03-10T10:00:00.000-04:00",
+     "timelinePath": [{"point": "40.0031°, -75.0681°", "durationMinutesOffsetFromStartTime": "0"}, {"point": "40.0100°, -75.0700°", "durationMinutesOffsetFromStartTime": "15"}, {"point": "40.0200°, -75.0800°", "time": "2024-03-10T10:00:00.000-04:00"}]},
+    {"startTime": "2024-03-10T10:00:00.000-04:00", "endTime": "2024-03-10T12:00:00.000-04:00",
+     "visit": {"topCandidate": {"placeId": "ChIJtest2", "semanticType": "WORK", "placeLocation": {"latLng": "40.0200°, -75.0800°"}}}}
+  ],
+  "rawSignals": [
+    {"position": {"LatLng": "40.0030°, -75.0680°", "accuracyMeters": 12, "altitudeMeters": 120.5, "source": "WIFI", "timestamp": "2024-03-10T08:00:00.000-04:00"}},
+    {"wifiScan": {"deliveryTime": "2024-03-10T08:00:20.000-04:00", "devicesRecords": [{"mac": 1234567890123, "rawRssi": -50}, {"mac": 98765432109876, "rawRssi": -72}]}},
+    {"position": {"LatLng": "40.0040°, -75.0690°", "accuracyMeters": 20, "timestamp": "2024-03-10T08:01:00.000-04:00"}},
+    {"wifiScan": {"deliveryTime": "2024-03-10T08:00:30.000-04:00", "devicesRecords": [{"mac": 1234567890123, "rawRssi": -55}]}},
+    {"position": {"LatLng": "40.0050°, -75.0700°", "accuracyMeters": 900, "timestamp": "2024-03-10T08:10:00.000-04:00"}},
+    {"wifiScan": {"deliveryTime": "2024-03-10T08:10:10.000-04:00", "devicesRecords": [{"mac": 1234567890123, "rawRssi": -60}]}},
+    {"wifiScan": {"deliveryTime": "2024-03-10T20:00:00.000-04:00", "devicesRecords": [{"mac": 1234567890123, "rawRssi": -60}]}},
+    {"activityRecord": {"probableActivities": [{"type": "STILL", "confidence": 0.9}], "timestamp": "2024-03-10T08:00:05.000-04:00"}},
+    {"position": {"LatLng": "40.0300°, -75.0900°", "accuracyMeters": 15, "timestamp": "2025-01-01T00:00:00.000Z"}}
+  ],
+  "userLocationProfile": {"frequentPlaces": [{"placeId": "ChIJtest1", "placeLocation": "40.0030°, -75.0680°", "label": "HOME"}]}
+}

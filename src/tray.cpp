@@ -1,6 +1,8 @@
 #include "tray.h"
 #include "locator.h"
 #include "identity.h"
+#include "apiserver.h"
+#include "mdns.h"
 #include "osintegration.h"
 #include <QActionGroup>
 #include <QApplication>
@@ -101,6 +103,7 @@ Tray::Tray(Locator *loc, QObject *parent) : QObject(parent), m_loc(loc)
     });
 
     connect(m_loc, &Locator::FixChanged, this, &Tray::rebuild);
+    connect(m_loc, &Locator::peersChanged, this, &Tray::rebuild);
     connect(m_loc, &Locator::elevationUpdated, this, &Tray::rebuild);
     connect(m_loc, &Locator::probeStarted, this, &Tray::rebuild);
     connect(m_loc, &Locator::notificationFallback, this, [this](const QString &s, const QString &b) { m_icon.showMessage(s, b, QSystemTrayIcon::Information, 6000); });
@@ -166,6 +169,11 @@ void Tray::rebuild()
                      : f.source == QLatin1String("wifi")     ? QColor(0x35, 0xd6, 0xff)
                      : f.source == QLatin1String("ip")       ? QColor(0xff, 0xd1, 0x66) : QColor(0xff, 0x4f, 0x4f);
     m_icon.setIcon(beaconIcon(dot, m_loc->busy()));
-    m_icon.setToolTip(f.valid ? QStringLiteral("%1\n±%2 m · %3 · %4\n%5%6").arg(f.place).arg(qRound(f.accuracy)).arg(src, ageText(), trip, sunText.isEmpty() ? QString() : QStringLiteral("\n") + sunText)
-                              : QStringLiteral("BeaconFix — no location"));
+    QString peers;
+    if (m_loc->apiServer() && m_loc->apiServer()->mdns()) {
+        const int n = m_loc->apiServer()->mdns()->peers(false).size();
+        if (n > 0) peers = QStringLiteral("\n📡 %1 other BeaconFix device%2 on this network").arg(n).arg(n == 1 ? QString() : QStringLiteral("s"));
+    }
+    m_icon.setToolTip(f.valid ? QStringLiteral("%1\n±%2 m · %3 · %4\n%5%6%7").arg(f.place).arg(qRound(f.accuracy)).arg(src, ageText(), trip, sunText.isEmpty() ? QString() : QStringLiteral("\n") + sunText, peers)
+                              : QStringLiteral("BeaconFix — no location") + peers);
 }

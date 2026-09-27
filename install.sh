@@ -132,6 +132,24 @@ if [ "$WANT_POLKIT" = 1 ]; then
     fi
 fi
 
+# ── 3c. Avahi on hosts with Docker / libvirt bridges ─────────────────────────
+# Avahi announces every interface's address; with docker0 (172.17.0.1) present, a phone resolving
+# <host>.local may get the bridge address and never reach the API. BeaconFix also lists its real
+# addresses in the mDNS TXT record, but telling Avahi to skip the bridges fixes .local for everything.
+if [ "$WANT_POLKIT" = 1 ] && [ -f /etc/avahi/avahi-daemon.conf ]; then
+    bridges=""
+    for i in docker0 virbr0 lxcbr0 lxdbr0; do ip -br link show "$i" >/dev/null 2>&1 && bridges="${bridges:+$bridges,}$i"; done
+    if [ -n "$bridges" ] && ! grep -qE '^deny-interfaces=' /etc/avahi/avahi-daemon.conf; then
+        say "Avahi: virtual bridge(s) $bridges are announced over mDNS"
+        if ask "Add deny-interfaces=$bridges to /etc/avahi/avahi-daemon.conf and restart avahi-daemon (sudo)?"; then
+            sudo sed -i "s|^#\?deny-interfaces=.*|deny-interfaces=$bridges|" /etc/avahi/avahi-daemon.conf \
+              && (grep -qE '^deny-interfaces=' /etc/avahi/avahi-daemon.conf || sudo sed -i "s|^\[server\]|[server]\ndeny-interfaces=$bridges|" /etc/avahi/avahi-daemon.conf) \
+              && sudo systemctl restart avahi-daemon && note "done — $HOSTNAME.local now resolves to a real address" \
+              || note "could not change avahi-daemon.conf; devices will still find BeaconFix through the addresses in its mDNS record"
+        fi
+    fi
+fi
+
 # ── 4. Plasma widget (per-user) ──────────────────────────────────────────────
 RESTART_PLASMA=0
 if [ "$WANT_WIDGET" = 1 ]; then

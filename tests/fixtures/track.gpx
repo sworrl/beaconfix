@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<gpx version="1.1" creator="test" xmlns="http://www.topografix.com/GPX/1/1">
+  <wpt lat="40.0030" lon="-75.0680"><ele>120</ele><time>2023-07-01T10:00:00Z</time><name>Start</name></wpt>
+  <trk><name>Walk</name><trkseg>
+    <trkpt lat="40.0030" lon="-75.0680"><ele>120</ele><time>2023-07-01T10:00:00Z</time></trkpt>
+    <trkpt lat="40.0035" lon="-75.0685"><ele>121</ele><time>2023-07-01T10:01:00Z</time><hdop>2.0</hdop></trkpt>
+    <trkpt lat="40.0040" lon="-75.0690"><ele>122</ele></trkpt>
+    <trkpt lat="40.0045" lon="-75.0695"><time>2023-07-01T10:03:00Z</time></trkpt>
+  </trkseg></trk>
+</gpx>

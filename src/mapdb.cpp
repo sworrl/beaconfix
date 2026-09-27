@@ -223,7 +223,7 @@ void MapDb::loadSeq()
     QSqlQuery q(m_db);
     q.exec(QStringLiteral("SELECT value FROM kv WHERE key='seq'"));
     m_seq = q.next() ? q.value(0).toLongLong() : 0;
-    for (const char *t : {"aps", "observations", "fixes", "estimates"}) {
+    for (const char *t : {"aps", "observations", "fixes", "estimates", "anchors"}) {
         QSqlQuery m(m_db); m.exec(QStringLiteral("SELECT COALESCE(MAX(seq),0) FROM %1").arg(QLatin1String(t)));
         if (m.next()) m_seq = qMax(m_seq, m.value(0).toLongLong());
     }
@@ -289,6 +289,8 @@ bool MapDb::schema()
     };
     QSqlQuery q(m_db);
     for (const char *s : ddl) if (!q.exec(QString::fromLatin1(s))) { m_error = q.lastError().text(); return false; }
+    for (const QString &stmt : Anchors::schemaSql().split(QLatin1Char(';'), Qt::SkipEmptyParts))   // docs/RANGING.md §4.2
+        if (!stmt.trimmed().isEmpty() && !q.exec(stmt.trimmed())) { m_error = q.lastError().text(); return false; }
     // Columns added after schema 1 (safe to run every time)
     QSqlQuery cols(m_db); cols.exec(QStringLiteral("PRAGMA table_info(aps)"));
     QSet<QString> have; while (cols.next()) have.insert(cols.value(1).toString());
@@ -312,6 +314,7 @@ bool MapDb::schema()
     q.exec(QStringLiteral("CREATE INDEX IF NOT EXISTS aps_seq ON aps(seq)"));
     q.exec(QStringLiteral("CREATE INDEX IF NOT EXISTS fix_seq ON fixes(seq)"));
     q.exec(QStringLiteral("CREATE UNIQUE INDEX IF NOT EXISTS obs_dedup ON observations(bssid, time, device)"));
+    q.exec(QStringLiteral("CREATE INDEX IF NOT EXISTS fix_device_time ON fixes(device, time)"));   // appendPeerFixes dedup + per-device history: not a table scan per row
     q.exec(QStringLiteral("INSERT OR IGNORE INTO kv(key, value) VALUES ('schema', '3')"));
     q.exec(QStringLiteral("UPDATE kv SET value='3' WHERE key='schema'"));
     q.exec(QStringLiteral("INSERT OR IGNORE INTO kv(key, value) VALUES ('created', '%1')").arg(QDateTime::currentDateTime().toString(Qt::ISODate)));
@@ -322,6 +325,7 @@ void MapDb::markDirty()
 {
     if (m_readOnly) return;
     m_dirty = true;
+    if (m_batch) return;                                   // saveApRecords: one changed() for the whole batch, not one per record
     m_flushTimer.start();
     emit changed();
 }
@@ -444,9 +448,11 @@ QHash<QString, ApRecord> MapDb::loadApRecords(QSet<QString> *travelling, QSet<QS
     QHash<QString, ApRecord> out;
     if (!m_db.isOpen()) return out;
     QSqlQuery q(m_db);
-    q.exec(QStringLiteral("SELECT bssid, ssid, freq, wigle, wlat, wlon, wigle_checked, security, sec_flags, wpa_flags, rsn_flags, max_kbps, adhoc, peer_lat, peer_lon, peer_acc, peer_from FROM aps"));
+    QHash<QString, int> storedFlags;
+    q.exec(QStringLiteral("SELECT bssid, ssid, freq, wigle, wlat, wlon, wigle_checked, security, sec_flags, wpa_flags, rsn_flags, max_kbps, adhoc, peer_lat, peer_lon, peer_acc, peer_from, home, travelling, ignored FROM aps"));
     while (q.next()) {
         ApRecord &r = out[q.value(0).toString()];
+        storedFlags.insert(q.value(0).toString(), (q.value(17).toInt() ? 1 : 0) | (q.value(18).toInt() ? 2 : 0) | (q.value(19).toInt() ? 4 : 0));
         r.ssid = q.value(1).toString(); r.freq = q.value(2).toInt();
         r.wigle = q.value(3).toInt() != 0; r.wLat = q.value(4).toDouble(); r.wLon = q.value(5).toDouble();
         r.wigleChecked = QDateTime::fromString(q.value(6).toString(), Qt::ISODate);
@@ -483,21 +489,66 @@ QHash<QString, ApRecord> MapDb::loadApRecords(QSet<QString> *travelling, QSet<QS
         if (q.value(0).toString() == QLatin1String("travelling")) { if (travelling) travelling->insert(q.value(1).toString()); }
         else if (notTravelling) notTravelling->insert(q.value(1).toString());
     }
+    // What is stored now: saveApRecords() writes a record again only when its signature changes
+    m_recSig.clear();
+    for (auto it = out.constBegin(); it != out.constEnd(); ++it) m_recSig.insert(it.key(), recordSignature(it.value(), storedFlags.value(it.key(), 0)));
     return out;
+}
+
+// FNV-1a over everything saveRecord() writes. Observations that are new (id 0) or edited (dirty) make the
+// record dirty by themselves; the rest is summarised by count and the last one.
+quint64 MapDb::recordSignature(const ApRecord &r, int flags)
+{
+    quint64 h = 1469598103934665603ULL;
+    auto mix = [&h](const void *p, size_t n) { const unsigned char *c = static_cast<const unsigned char *>(p); for (size_t i = 0; i < n; ++i) { h ^= c[i]; h *= 1099511628211ULL; } };
+    auto mixD = [&](double d) { mix(&d, sizeof d); };
+    auto mixI = [&](qint64 i) { mix(&i, sizeof i); };
+    auto mixS = [&](const QString &s) { mix(s.constData(), size_t(s.size()) * sizeof(QChar)); mixI(s.size()); };
+    for (const ApObservation &o : r.obs) if (o.id == 0 || o.dirty) return 0;          // 0 never matches a stored signature
+    mixS(r.ssid); mixI(r.freq); mixI(flags);
+    mixI(r.wigle); mixD(r.wLat); mixD(r.wLon); mixI(r.wigleChecked.isValid() ? r.wigleChecked.toSecsSinceEpoch() : 0);
+    mixS(r.security); mixI(r.secFlags); mixI(r.wpaFlags); mixI(r.rsnFlags); mixI(r.maxKbps); mixI(r.adhoc);
+    mixD(r.peerLat); mixD(r.peerLon); mixD(r.peerAcc); mixS(r.peerFrom);
+    mixI(r.obs.size()); if (!r.obs.isEmpty()) { mixI(r.obs.last().id); mixD(r.obs.last().lat); mixD(r.obs.last().lon); mixI(r.obs.last().dbm); }
+    mixI(r.fit.valid); if (r.fit.valid) { mixD(r.fit.lat); mixD(r.fit.lon); mixD(r.fit.acc); }
+    mixI(r.seen.size()); for (const ApSighting &sg : r.seen) { mixD(sg.lat); mixD(sg.lon); mixD(sg.acc); mixI(sg.time.isValid() ? sg.time.toSecsSinceEpoch() : 0); }
+    QStringList cells(r.cells.begin(), r.cells.end()); cells.sort(); for (const QString &c : cells) mixS(c);
+    return h ? h : 1;
 }
 
 void MapDb::saveApRecords(QHash<QString, ApRecord> &recs, const QSet<QString> &travelling, const QSet<QString> &notTravelling, const QHash<QString, int> &flags)
 {
     if (!m_db.isOpen() || m_readOnly) return;
+    m_batch = true;                                        // thousands of records: listeners (stats, views) hear about it once
     m_db.transaction();
-    for (auto it = recs.begin(); it != recs.end(); ++it) saveRecord(it.key(), it.value(), flags.value(it.key(), 0));
-    QSqlQuery q(m_db), ins(m_db);
-    q.exec(QStringLiteral("DELETE FROM flags"));
-    ins.prepare(QStringLiteral("INSERT OR IGNORE INTO flags(kind, bssid) VALUES(?,?)"));
-    for (const QString &b : travelling) { ins.addBindValue(QStringLiteral("travelling")); ins.addBindValue(b); ins.exec(); }
-    for (const QString &b : notTravelling) { ins.addBindValue(QStringLiteral("notTravelling")); ins.addBindValue(b); ins.exec(); }
+    int written = 0;
+    // Only records whose content changed since they were stored (per-record signature): a Wi-Fi scan touches a few
+    // dozen of them, not the ~100k a well-travelled database holds.
+    for (auto it = recs.begin(); it != recs.end(); ++it) {
+        const int f = flags.value(it.key(), 0);
+        const quint64 sig = recordSignature(it.value(), f);
+        if (sig != 0 && m_recSig.value(it.key()) == sig) continue;
+        saveRecord(it.key(), it.value(), f);
+        ++written;
+    }
+    // The travelling flags table only when the sets changed
+    quint64 fh = 1469598103934665603ULL;
+    for (const QSet<QString> *set : {&travelling, &notTravelling}) {
+        QStringList l(set->begin(), set->end()); l.sort();
+        for (const QString &b : l) { for (QChar c : b) { fh ^= c.unicode(); fh *= 1099511628211ULL; } fh ^= 0xff; fh *= 1099511628211ULL; }
+        fh ^= 0x1234; fh *= 1099511628211ULL;
+    }
+    if (fh != m_flagsSig) {
+        QSqlQuery q(m_db), ins(m_db);
+        q.exec(QStringLiteral("DELETE FROM flags"));
+        ins.prepare(QStringLiteral("INSERT OR IGNORE INTO flags(kind, bssid) VALUES(?,?)"));
+        for (const QString &b : travelling) { ins.addBindValue(QStringLiteral("travelling")); ins.addBindValue(b); ins.exec(); }
+        for (const QString &b : notTravelling) { ins.addBindValue(QStringLiteral("notTravelling")); ins.addBindValue(b); ins.exec(); }
+        m_flagsSig = fh; ++written;
+    }
     m_db.commit();
-    markDirty();
+    m_batch = false;
+    if (written) markDirty();
 }
 
 // One record. Observations are written incrementally (INSERT new ones and remember their row id,
@@ -565,6 +616,7 @@ void MapDb::saveRecord(const QString &bssid, ApRecord &r, int flags)
         sec.exec();
     }
     if (ownTx) m_db.commit();
+    m_recSig.insert(bssid, recordSignature(r, flags));
     markDirty();
 }
 
@@ -629,6 +681,19 @@ void MapDb::appendFix(const Fix &f)
     q.prepare(QString::fromLatin1(FIX_INSERT));
     bindFix(q, f); q.addBindValue(double(nextSeq())); q.addBindValue(QString()); q.exec();
     markDirty();
+}
+
+QJsonArray MapDb::latestFixesByDevice() const
+{
+    QJsonArray out;
+    if (!isOpen()) return out;
+    QSqlQuery q(m_db);
+    q.exec(QStringLiteral("SELECT f.device, f.time, f.lat, f.lon, f.acc, f.source, f.provider, f.place FROM fixes f "
+                          "JOIN (SELECT device, MAX(time) AS t FROM fixes WHERE device <> '' GROUP BY device) m ON f.device = m.device AND f.time = m.t"));
+    while (q.next())
+        out.append(QJsonObject{{"device", q.value(0).toString()}, {"time", q.value(1).toString()}, {"lat", q.value(2).toDouble()}, {"lon", q.value(3).toDouble()},
+                               {"acc", q.value(4).toDouble()}, {"source", q.value(5).toString()}, {"provider", q.value(6).toString()}, {"place", q.value(7).toString()}});
+    return out;
 }
 
 int MapDb::appendPeerFixes(const QJsonArray &fixes, const QString &device)
@@ -771,10 +836,40 @@ QList<MapDb::ApPos> MapDb::positions(const QStringList &bssids, double maxAcc) c
     }
     QSqlQuery q(m_db);
     q.exec(sql);
+    QSet<QString> pinnedSeen;
     while (q.next()) {
         ApPos p; p.bssid = q.value(0).toString(); p.ssid = q.value(1).toString(); p.lat = q.value(2).toDouble(); p.lon = q.value(3).toDouble(); p.acc = q.value(4).toDouble();
         p.source = q.value(5).toString(); p.home = q.value(6).toInt(); p.travelling = q.value(7).toInt(); p.ignored = q.value(8).toInt();
+        const auto pin = m_pins.constFind(p.bssid.toUpper());
+        if (pin != m_pins.constEnd()) { p.lat = pin->lat; p.lon = pin->lon; p.acc = pin->acc; p.source = pin->source; p.travelling = 0; pinnedSeen.insert(p.bssid.toUpper()); }
         out << p;
+    }
+    // Anchored transmitters are known even before we ever stored a position for them (docs/RANGING.md §4.3.2)
+    for (auto it = m_pins.constBegin(); it != m_pins.constEnd(); ++it) {
+        if (pinnedSeen.contains(it.key())) continue;
+        if (!bssids.isEmpty() && !bssids.contains(it.key(), Qt::CaseInsensitive)) continue;
+        out << it.value();
+    }
+    return out;
+}
+
+QJsonArray MapDb::positionsPage(const QString &after, int limit, QString *next) const
+{
+    QJsonArray out;
+    if (next) next->clear();
+    if (!m_db.isOpen()) return out;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("SELECT bssid, ssid, freq, lat, lon, acc, source, home, travelling, ignored, security, seq FROM aps WHERE bssid > ? ORDER BY bssid LIMIT ?"));
+    q.addBindValue(after.isNull() ? QStringLiteral("") : after); q.addBindValue(limit + 1);   // NULL would match nothing
+    if (!q.exec()) return out;
+    while (q.next()) {
+        if (out.size() >= limit) { if (next) *next = out.last().toObject()["bssid"].toString(); break; }
+        QJsonObject a{{"bssid", q.value(0).toString()}, {"ssid", q.value(1).toString()}, {"freq", q.value(2).toInt()}, {"source", q.value(6).toString()},
+                      {"home", q.value(7).toInt() != 0}, {"travelling", q.value(8).toInt() != 0}, {"ignored", q.value(9).toInt() != 0}, {"security", q.value(10).toString()}, {"seq", q.value(11).toDouble()}};
+        const auto pin = m_pins.constFind(q.value(0).toString().toUpper());
+        if (pin != m_pins.constEnd()) { a["lat"] = pin->lat; a["lon"] = pin->lon; a["acc"] = pin->acc; a["source"] = QStringLiteral("anchor"); }
+        else if (!q.value(3).isNull()) { a["lat"] = q.value(3).toDouble(); a["lon"] = q.value(4).toDouble(); a["acc"] = q.value(5).toDouble(); }
+        out.append(a);
     }
     return out;
 }
@@ -809,7 +904,10 @@ int MapDb::addObservations(const QJsonArray &observations, const QString &device
     if (!m_db.isOpen() || m_readOnly) { if (error) *error = QStringLiteral("database not writable"); return -1; }
     int n = 0;
     m_db.transaction();
-    QSqlQuery q(m_db);
+    QSqlQuery ap(m_db), q(m_db);                    // prepared once: an import pushes hundreds of thousands of rows through here
+    ap.prepare(QStringLiteral("INSERT INTO aps(bssid, ssid, freq, first_seen, last_seen, times_seen, seq) VALUES(?,?,?,?,?,1,?) ON CONFLICT(bssid) DO UPDATE SET last_seen=excluded.last_seen, times_seen=aps.times_seen+1,"
+                              " ssid=CASE WHEN excluded.ssid<>'' THEN excluded.ssid ELSE aps.ssid END, freq=CASE WHEN excluded.freq>0 THEN excluded.freq ELSE aps.freq END"));
+    q.prepare(QStringLiteral("INSERT OR IGNORE INTO observations(bssid, time, lat, lon, acc, dbm, fix_source, device, seq) VALUES(?,?,?,?,?,?,?,?,?)"));
     for (const QJsonValue &v : observations) {
         const QJsonObject o = v.toObject();
         const QString bssid = o["bssid"].toString().toUpper().trimmed();
@@ -818,10 +916,7 @@ int MapDb::addObservations(const QJsonArray &observations, const QString &device
         if (acc <= 0 || acc > 2000) continue;
         const QString dev = o["device"].toString().isEmpty() ? device : o["device"].toString();
         const QString t = o["time"].toString().isEmpty() ? QDateTime::currentDateTime().toString(Qt::ISODate) : o["time"].toString();
-        q.prepare(QStringLiteral("INSERT INTO aps(bssid, ssid, freq, first_seen, last_seen, times_seen, seq) VALUES(?,?,?,?,?,1,?) ON CONFLICT(bssid) DO UPDATE SET last_seen=excluded.last_seen, times_seen=aps.times_seen+1,"
-                                 " ssid=CASE WHEN excluded.ssid<>'' THEN excluded.ssid ELSE aps.ssid END, freq=CASE WHEN excluded.freq>0 THEN excluded.freq ELSE aps.freq END"));
-        q.addBindValue(bssid); q.addBindValue(o["ssid"].toString()); q.addBindValue(o["freq"].toInt(0)); q.addBindValue(t); q.addBindValue(t); q.addBindValue(double(nextSeq())); q.exec();
-        q.prepare(QStringLiteral("INSERT OR IGNORE INTO observations(bssid, time, lat, lon, acc, dbm, fix_source, device, seq) VALUES(?,?,?,?,?,?,?,?,?)"));
+        ap.addBindValue(bssid); ap.addBindValue(o["ssid"].toString()); ap.addBindValue(o["freq"].toInt(0)); ap.addBindValue(t); ap.addBindValue(t); ap.addBindValue(double(nextSeq())); ap.exec();
         q.addBindValue(bssid); q.addBindValue(t); q.addBindValue(o["lat"].toDouble()); q.addBindValue(o["lon"].toDouble()); q.addBindValue(acc);
         q.addBindValue(o["dbm"].toInt(-80)); q.addBindValue(o["source"].toString().isEmpty() ? QStringLiteral("remote") : o["source"].toString()); q.addBindValue(dev); q.addBindValue(double(nextSeq()));
         if (!q.exec() || q.numRowsAffected() <= 0) continue;   // duplicate (bssid, time, device)
@@ -905,17 +1000,75 @@ QJsonObject MapDb::changesSince(qint64 since, int limit, bool *more, qint64 *cur
         if (!q.value(10).isNull()) f["elev"] = q.value(10).toDouble();
         fixes.append(f); maxSeq = qMax(maxSeq, q.value(12).toLongLong()); ++total;
     }
+    QJsonArray anchors;
+    q.prepare(QStringLiteral("SELECT json, deleted, seq FROM anchors WHERE seq>? ORDER BY seq LIMIT ?")); q.addBindValue(double(since)); q.addBindValue(limit + 1);
+    if (q.exec()) while (q.next()) {
+        if (anchors.size() >= limit) { if (more) *more = true; break; }
+        Anchors::Anchor a = Anchors::Anchor::fromJson(QJsonDocument::fromJson(q.value(0).toString().toUtf8()).object());
+        a.deleted = a.deleted || q.value(1).toInt() != 0; a.seq = q.value(2).toLongLong();
+        anchors.append(a.toJson(true)); maxSeq = qMax(maxSeq, a.seq); ++total;
+    }
     // The cursor a client should store: when a table hit the cap, the smallest "next" seq across tables keeps ordering safe
     qint64 next = maxSeq;
     if (more && *more) {
         next = m_seq;
-        for (const QJsonArray *arr : {&aps, &obs, &fixes}) if (arr->size() >= limit) next = qMin(next, qint64(arr->last().toObject()["seq"].toDouble()));
+        for (const QJsonArray *arr : {&aps, &obs, &fixes, &anchors}) if (arr->size() >= limit) next = qMin(next, qint64(arr->last().toObject()["seq"].toDouble()));
         // every table is complete up to `next` only if the others have no rows in (since, next] beyond what we returned — they were read fully or capped at ≥ next
     }
     if (cursor) *cursor = (more && *more) ? next : m_seq;
-    out["since"] = double(since); out["aps"] = aps; out["observations"] = obs; out["fixes"] = fixes; out["count"] = total;
+    out["since"] = double(since); out["aps"] = aps; out["observations"] = obs; out["fixes"] = fixes; out["anchors"] = anchors; out["count"] = total;
     out["cursor"] = double(cursor ? *cursor : m_seq); out["more"] = more ? *more : false;
     return out;
+}
+
+// ── Anchors (docs/RANGING.md §4.2) ────────────────────────────────────────────
+QList<Anchors::Anchor> MapDb::loadAnchors(bool includeDeleted) const
+{
+    QList<Anchors::Anchor> out;
+    if (!m_db.isOpen()) return out;
+    QSqlQuery q(m_db);
+    if (!q.exec(QStringLiteral("SELECT json, deleted, seq FROM anchors ORDER BY seq"))) return out;
+    while (q.next()) {
+        if (!includeDeleted && q.value(1).toInt() != 0) continue;
+        Anchors::Anchor a = Anchors::Anchor::fromJson(QJsonDocument::fromJson(q.value(0).toString().toUtf8()).object());
+        a.seq = q.value(2).toLongLong();
+        out << a;
+    }
+    return out;
+}
+
+static QString anchorStamp(const Anchors::Anchor &a) { return a.deleted ? a.deletedAt : a.placedAt; }
+
+bool MapDb::putAnchor(Anchors::Anchor a, bool force, Anchors::Anchor *stored)
+{
+    if (!m_db.isOpen() || m_readOnly || a.id.isEmpty()) return false;
+    QSqlQuery cur(m_db); cur.prepare(QStringLiteral("SELECT json, deleted FROM anchors WHERE id=?")); cur.addBindValue(a.id); cur.exec();
+    if (cur.next()) {
+        Anchors::Anchor old = Anchors::Anchor::fromJson(QJsonDocument::fromJson(cur.value(0).toString().toUtf8()).object());
+        old.deleted = cur.value(1).toInt() != 0;
+        if (!force) {
+            // Sync: newest placedAt / deletedAt wins; equal stamps keep ours (idempotent re-delivery)
+            const QDateTime tNew = QDateTime::fromString(anchorStamp(a), Qt::ISODateWithMs), tOld = QDateTime::fromString(anchorStamp(old), Qt::ISODateWithMs);
+            if (tOld.isValid() && (!tNew.isValid() || tNew <= tOld)) { if (stored) *stored = old; return false; }
+        }
+        if (!a.deleted && old.toJson(false) == a.toJson(false) && !old.deleted) { if (stored) *stored = old; return false; }
+    } else if (a.deleted && !force) {
+        // a tombstone for something we never had: keep it so it propagates, but only once
+    }
+    if (a.deleted && a.deletedAt.isEmpty()) a.deletedAt = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
+    a.seq = nextSeq();
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("INSERT OR REPLACE INTO anchors(id, json, kind, lat, lon, rv, ref, deleted, updated, seq) VALUES(?,?,?,?,?,?,?,?,?,?)"));
+    q.addBindValue(a.id);
+    q.addBindValue(QString::fromUtf8(QJsonDocument(a.toJson(false)).toJson(QJsonDocument::Compact)));
+    q.addBindValue(a.deleted ? QVariant() : QVariant(a.kind));
+    q.addBindValue(a.deleted ? QVariant() : QVariant(a.lat)); q.addBindValue(a.deleted ? QVariant() : QVariant(a.lon));
+    q.addBindValue(a.rv ? 1 : 0); q.addBindValue(a.ref ? 1 : 0); q.addBindValue(a.deleted ? 1 : 0);
+    q.addBindValue(QDateTime::currentDateTimeUtc().toString(Qt::ISODate)); q.addBindValue(double(a.seq));
+    if (!q.exec()) { m_error = q.lastError().text(); return false; }
+    markDirty();
+    if (stored) *stored = a;
+    return true;
 }
 
 // ── Export / import ───────────────────────────────────────────────────────────
@@ -950,6 +1103,8 @@ QJsonObject MapDb::exportJson() const
     o["elevation"] = dumpTable(m_db, QStringLiteral("SELECT * FROM elevation"));
     o["achievements"] = dumpTable(m_db, QStringLiteral("SELECT * FROM achievements"));
     o["kv"] = dumpTable(m_db, QStringLiteral("SELECT * FROM kv"));
+    QJsonArray an; for (const Anchors::Anchor &a : loadAnchors(true)) an.append(a.toJson(false));
+    o["anchors"] = an;
     return o;
 }
 
@@ -982,6 +1137,7 @@ int MapDb::importJson(const QJsonObject &dump, QString *error)
     insertRows(QStringLiteral("achievements"), dump["achievements"].toArray(), true);
     insertRows(QStringLiteral("estimates"), dump["estimates"].toArray(), true);
     m_db.commit();
+    for (const QJsonValue &v : dump["anchors"].toArray()) if (putAnchor(Anchors::Anchor::fromJson(v.toObject()), false)) ++n;
     if (n) markDirty();
     return n;
 }

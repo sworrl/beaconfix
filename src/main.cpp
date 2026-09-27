@@ -4,15 +4,18 @@
 #include <QStandardPaths>
 #include <QProcess>
 #include "identity.h"
+#include "mdns.h"
 #include "mainwindow.h"
 #include "beaconview.h"
 #include "tilesource.h"
 #include "tray.h"
 #include "apiserver.h"
 #include "mapdb.h"
+#include "ranging/rangingservice.h"
 #include <QApplication>
 #include <QCommandLineParser>
 #include <QDBusConnection>
+#include <QDBusConnectionInterface>
 #include <QDBusInterface>
 #include <QDBusReply>
 #include <QJsonArray>
@@ -22,15 +25,41 @@
 #include <QTextStream>
 #include <QEventLoop>
 #include <QFileInfo>
+#include <QDir>
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QNetworkRequest>
 #include <QUrl>
 #include <QTimer>
 #include <cstdio>
+#include <unistd.h>
+#include <QDate>
+#include <QLocale>
+#include <QDBusPendingCall>
+#include <QDBusPendingCallWatcher>
+#include <QDBusPendingReply>
 
 static const char *SVC  = "org.sworrl.BeaconFix";
 static const char *PATH = "/org/sworrl/BeaconFix";
+
+// --import: prints the tray's importProgress signals while the D-Bus call is in flight
+class ImportProgressPrinter : public QObject {
+    Q_OBJECT
+public:
+    ImportProgressPrinter(bool tty, const QString &file) : m_tty(tty), m_file(file) {}
+public slots:
+    void onProgress(const QString &json)
+    {
+        const QJsonObject o = QJsonDocument::fromJson(json.toUtf8()).object();
+        if (o["file"].toString() != m_file || o["done"].toBool()) return;
+        if (m_tty) fprintf(stderr, "\r\033[K  %3d%%  %s", o["percent"].toInt(), qPrintable(o["stage"].toString()));
+        else if (o["percent"].toInt() / 10 != m_lastTen) fprintf(stderr, "  %3d%%  %s\n", o["percent"].toInt(), qPrintable(o["stage"].toString()));
+        m_lastTen = o["percent"].toInt() / 10;
+        fflush(stderr);
+    }
+private:
+    bool m_tty; QString m_file; int m_lastTen = -1;
+};
 
 int main(int argc, char **argv)
 {
@@ -75,8 +104,16 @@ int main(int argc, char **argv)
     QCommandLineOption dbStats(QStringLiteral("db-stats"), QStringLiteral("Print the internal map database's statistics as JSON, exit."));
     QCommandLineOption dbExport(QStringLiteral("db-export"), QStringLiteral("Export the internal map database (JSON dump) to <file>, exit."), QStringLiteral("file"));
     QCommandLineOption dbImport(QStringLiteral("db-import"), QStringLiteral("Merge a JSON dump (from --db-export) into the internal map database, exit."), QStringLiteral("file"));
+    QCommandLineOption importOpt(QStringLiteral("import"), QStringLiteral("Import your location history into the map database: Google Timeline.json / Records.json / Semantic Location History, WiGLE CSV, GPX, KML or a BeaconFix export (docs/DATABASE.md), exit."), QStringLiteral("file"));
+    QCommandLineOption importFrom(QStringLiteral("from"), QStringLiteral("With --import: only entries at or after <date> (ISO 8601, e.g. 2024-01-01)."), QStringLiteral("date"));
+    QCommandLineOption importTo(QStringLiteral("to"), QStringLiteral("With --import: only entries at or before <date>."), QStringLiteral("date"));
+    QCommandLineOption importWhat(QStringLiteral("what"), QStringLiteral("With --import: what to take, comma-separated from positions,wifi,places (default all)."), QStringLiteral("list"));
     QCommandLineOption refit(QStringLiteral("refit"), QStringLiteral("Re-estimate every beacon's position from all its samples (least squares), print the count, exit."));
-    QCommandLineOption sync(QStringLiteral("sync"), QStringLiteral("Sync samples, positions and stops with another BeaconFix: --sync <http://host:47822> --sync-token <token>; exit."), QStringLiteral("url"));
+    QCommandLineOption sync(QStringLiteral("sync"), QStringLiteral("Sync samples, positions and stops with another BeaconFix: --sync <peer name | host | http://host:47822> [--sync-token <token>]; without a token our identity signs in when the peer shares or links it; exit."), QStringLiteral("peer"));
+    QCommandLineOption noMdns(QStringLiteral("no-mdns"), QStringLiteral("With --tray: do not advertise this BeaconFix on the network (mDNS); browsing for others still works. Test instances with a non-default XDG_CONFIG_HOME never advertise."));
+    QCommandLineOption peers(QStringLiteral("peers"), QStringLiteral("List the BeaconFix devices on this network (mDNS), exit."));
+    QCommandLineOption scan(QStringLiteral("scan"), QStringLiteral("With --peers: also probe every host of the local /24 networks for the API (for networks that block multicast)."));
+    QCommandLineOption allPeers(QStringLiteral("all"), QStringLiteral("With --peers: include this computer's own records (debugging several instances on one host)."));
     QCommandLineOption identity(QStringLiteral("identity"), QStringLiteral("Show this BeaconFix's identity (id, name, devices, links, pending link requests), exit."));
     QCommandLineOption identityNew(QStringLiteral("identity-new"), QStringLiteral("Create a new identity called <name> (Ed25519 key pair sealed with the map-database key), exit."), QStringLiteral("name"));
     QCommandLineOption identityExport(QStringLiteral("identity-export"), QStringLiteral("Export the identity as an encrypted BFID1 bundle (text + QR if qrencode is installed); asks for a passphrase or use --words, exit."));
@@ -84,7 +121,7 @@ int main(int argc, char **argv)
     QCommandLineOption identityWords(QStringLiteral("words"), QStringLiteral("With --identity-export: protect the bundle with a generated 6-word code (shown once) instead of asking for a passphrase."));
     QCommandLineOption identityPass(QStringLiteral("passphrase"), QStringLiteral("Passphrase for --identity-export / --identity-import (otherwise asked on the terminal)."), QStringLiteral("text"));
     QCommandLineOption identityImport(QStringLiteral("identity-import"), QStringLiteral("Import an identity from <file> or a BFID1: text (asks for the passphrase / word code), exit."), QStringLiteral("file-or-text"));
-    QCommandLineOption identityLinkQr(QStringLiteral("identity-link-qr"), QStringLiteral("Print our link payload (BFLNK1: text + QR) for another identity to scan and co-sign, exit."));
+    QCommandLineOption identityLinkQr(QStringLiteral("identity-link-qr"), QStringLiteral("Print our link payload (beaconfix://link/… text + QR, from the running tray) for another identity to scan and co-sign, exit."));
     QCommandLineOption identitySelftest(QStringLiteral("identity-selftest"), QStringLiteral("Print the fixed-seed test vectors (seed = 32×0x01), exit."));
     QCommandLineOption nearby(QStringLiteral("nearby"), QStringLiteral("List places near the fix: <what> is a category (police, fire, health, urgent, pharmacy, library, playground, park, dogpark, pool, …), a group (civic, kids, services), 'emergency' for the nearest help, or 'all'; exit."), QStringLiteral("what"));
     QCommandLineOption radius(QStringLiteral("radius"), QStringLiteral("With --nearby: only places within <km>."), QStringLiteral("km"));
@@ -92,13 +129,21 @@ int main(int argc, char **argv)
     QCommandLineOption applyOs(QStringLiteral("apply-os"), QStringLiteral("Apply the OS integration now (time zone, GeoClue, Night Light) and print the report, exit."));
     QCommandLineOption dryRun(QStringLiteral("dry-run"), QStringLiteral("With --apply-os: only report what would change."));
     QCommandLineOption syncToken(QStringLiteral("sync-token"), QStringLiteral("Bearer token for --sync (remembered for that peer once given)."), QStringLiteral("token"));
+    QCommandLineOption anchorsOpt(QStringLiteral("anchors"), QStringLiteral("Print the anchors (surveyed transmitters / places, docs/RANGING.md §4) as JSON, exit."));
+    QCommandLineOption anchorSet(QStringLiteral("anchor-set"), QStringLiteral("Create or update an anchor from <json> or b64:<standard base64 of the UTF-8 JSON>; prints its id, exit."), QStringLiteral("json"));
+    QCommandLineOption anchorRemove(QStringLiteral("anchor-remove"), QStringLiteral("Remove the anchor <id>, exit."), QStringLiteral("id"));
+    QCommandLineOption grantControl(QStringLiteral("grant-control"), QStringLiteral("Add the control scope to the paired device <name-or-id>'s existing token (no new token), exit."), QStringLiteral("name-or-id"));
+    QCommandLineOption rangingOpt(QStringLiteral("ranging"), QStringLiteral("Print the device ranging state (responder, BLE, every ranged device) as JSON, exit."));
+    QCommandLineOption rangingCal(QStringLiteral("ranging-calibrate"), QStringLiteral("Calibrate ranging with a device lying at a known distance: <device>@<metres>[@<seconds>], e.g. \"Pixel 10@0.61\", exit."), QStringLiteral("device@metres"));
+    p.addOptions({anchorsOpt, anchorSet, anchorRemove, grantControl, rangingOpt, rangingCal});
     p.addOptions({tray, once, json, refresh, snapshot, gpx, copy, newTrip, prefetch, apiStatus, devices, approve, deny, revoke, token, control, pairing,
-                  homeAdd, homeRemove, homeList, homeSync, homeToken, homeImport, knownImport, knownList, knownAdd, knownName, knownRemove, dbStats, dbExport, dbImport, refit, sync, syncToken,
+                  homeAdd, homeRemove, homeList, homeSync, homeToken, homeImport, knownImport, knownList, knownAdd, knownName, knownRemove, dbStats, dbExport, dbImport, importOpt, importFrom, importTo, importWhat, refit, sync, syncToken, noMdns, peers, scan, allPeers,
                   identity, identityNew, identityExport, identityFile, identityWords, identityPass, identityImport, identityLinkQr, identitySelftest, tz, applyOs, dryRun, nearby, radius});
     p.process(app);
 
     QTextStream out(stdout);
     QDBusConnection bus = QDBusConnection::sessionBus();
+    if (p.isSet(noMdns)) qputenv("BEACONFIX_NO_MDNS", "1");
 
     if (p.isSet(identitySelftest)) { out << QJsonDocument(Identity::selftest()).toJson(QJsonDocument::Indented); out.flush(); return 0; }
 
@@ -151,7 +196,18 @@ int main(int argc, char **argv)
         }
         if (p.isSet(identityLinkQr)) {
             if (!idn->exists()) { fprintf(stderr, "beaconfix: no identity here\n"); return 1; }
-            const QString payload = QStringLiteral("BFLNK1:") + QString::fromLatin1(Identity::base64url(QJsonDocument(idn->linkPayload()).toJson(QJsonDocument::Compact)));
+            // The tray co-signs only statements bound to an offer IT displayed, so the payload must come from the tray when it runs
+            QString payload;
+            if (bus.isConnected() && bus.interface() && bus.interface()->isServiceRegistered(SVC)) {
+                QDBusInterface iface(SVC, PATH, SVC, bus);
+                QDBusReply<QString> r = iface.call(QStringLiteral("IdentityLinkPayload"));
+                if (r.isValid()) payload = r.value();
+                if (payload.isEmpty()) { fprintf(stderr, "beaconfix: the running BeaconFix has no identity (or could not answer)\n"); return 1; }
+                out << "(offer registered with the running BeaconFix; valid 10 minutes)\n";
+            } else {
+                payload = Identity::encodeUri(QStringLiteral("link"), idn->linkPayload());
+                out << "(no BeaconFix running: this offer is only valid for links completed by this command's process — start the tray and run again to link a device)\n";
+            }
             out << payload << "\n\n"; qr(payload);
         }
         if (p.isSet(identity) || rc == 0) {
@@ -223,6 +279,42 @@ int main(int argc, char **argv)
         return z.isEmpty() ? 1 : 0;
     }
 
+    if (p.isSet(importOpt)) {
+        QDBusInterface iface(SVC, PATH, SVC, bus);
+        if (!iface.isValid()) { fprintf(stderr, "beaconfix: --import needs the running instance (beaconfix --tray)\n"); return 1; }
+        const QString file = QFileInfo(p.value(importOpt)).absoluteFilePath();
+        if (!QFileInfo::exists(file)) { fprintf(stderr, "beaconfix: no such file: %s\n", qPrintable(file)); return 1; }
+        QJsonObject opts;
+        if (p.isSet(importFrom)) opts["from"] = p.value(importFrom);
+        if (p.isSet(importTo)) opts["to"] = p.value(importTo);
+        if (p.isSet(importWhat)) opts["what"] = QJsonArray::fromStringList(p.value(importWhat).split(QLatin1Char(','), Qt::SkipEmptyParts));
+        for (const QString &d : {p.value(importFrom), p.value(importTo)}) if (!d.isEmpty() && !QDateTime::fromString(d, Qt::ISODate).isValid() && !QDate::fromString(d, Qt::ISODate).isValid()) { fprintf(stderr, "beaconfix: bad date: %s (use ISO 8601)\n", qPrintable(d)); return 1; }
+        if (opts["from"].isString() && QDate::fromString(opts["from"].toString(), Qt::ISODate).isValid()) opts["from"] = QDate::fromString(opts["from"].toString(), Qt::ISODate).startOfDay().toString(Qt::ISODate);
+        if (opts["to"].isString() && QDate::fromString(opts["to"].toString(), Qt::ISODate).isValid()) opts["to"] = QDate::fromString(opts["to"].toString(), Qt::ISODate).endOfDay().toString(Qt::ISODate);
+        // Progress arrives as a signal while the (long) call is in flight
+        const bool tty = isatty(2);
+        ImportProgressPrinter printer(tty, file);
+        bus.connect(SVC, PATH, SVC, QStringLiteral("importProgress"), &printer, SLOT(onProgress(QString)));
+        iface.setTimeout(30 * 60 * 1000);
+        QDBusPendingCall call = iface.asyncCall(QStringLiteral("Import"), file, QString::fromUtf8(QJsonDocument(opts).toJson(QJsonDocument::Compact)));
+        QEventLoop loop;
+        QDBusPendingCallWatcher w(call);
+        QObject::connect(&w, &QDBusPendingCallWatcher::finished, &loop, &QEventLoop::quit);
+        loop.exec();
+        QDBusPendingReply<QString> r = call;
+        if (tty) fprintf(stderr, "\r\033[K");
+        if (!r.isValid()) { fprintf(stderr, "beaconfix: import failed: %s\n", qPrintable(r.error().message())); return 1; }
+        const QJsonObject o = QJsonDocument::fromJson(r.value().toUtf8()).object(), sum = o["summary"].toObject();
+        if (!o["ok"].toBool()) { fprintf(stderr, "beaconfix: import failed: %s\n", qPrintable(o["error"].toString())); return 1; }
+        if (p.isSet(json)) { out << QJsonDocument(sum).toJson(QJsonDocument::Indented); out.flush(); return 0; }
+        out << "Imported " << QFileInfo(file).fileName() << " (" << sum["format"].toString() << ", " << QLocale().formattedDataSize(qint64(sum["bytes"].toDouble())) << ") in " << QString::number(sum["seconds"].toDouble(), 'f', 1) << " s\n"
+            << "  positions " << sum["positions"].toInt() << " · track points " << sum["tracks"].toInt() << " · Wi-Fi scans " << sum["wifiScans"].toInt() << " → observations " << sum["observations"].toInt()
+            << " on " << sum["beaconsTouched"].toInt() << " beacons · visits " << sum["visits"].toInt() << " · skipped " << sum["skipped"].toInt() << (sum["errors"].toInt() ? QStringLiteral(" · errors %1").arg(sum["errors"].toInt()) : QString()) << "\n";
+        if (sum["first"].isString()) out << "  from " << sum["first"].toString().left(10) << " to " << sum["last"].toString().left(10) << " (device \"" << sum["device"].toString() << "\"; positions become history only, never the live fix)\n";
+        out.flush();
+        return 0;
+    }
+
     if (p.isSet(once)) {
         Locator loc(true);
         QObject::connect(&loc, &Locator::probeFinished, &app, [&](bool ok, const QString &msg) {
@@ -289,6 +381,60 @@ int main(int argc, char **argv)
         return app.exec();
     }
 
+    // ── anchors / ranging / grant-control: through the running tray (D-Bus activation starts it) ──
+    if (p.isSet(anchorsOpt) && !p.isSet(anchorSet) && !p.isSet(anchorRemove)) {
+        QDBusInterface iface(SVC, PATH, SVC, bus);
+        if (iface.isValid()) { QDBusReply<QString> r = iface.call(QStringLiteral("Anchors")); if (r.isValid()) { out << QJsonDocument::fromJson(r.value().toUtf8()).toJson(QJsonDocument::Indented); out.flush(); return 0; } }
+        Locator loc(true);
+        out << QJsonDocument(loc.anchorsJson()).toJson(QJsonDocument::Indented); out.flush();
+        return 0;
+    }
+    if (p.isSet(anchorSet) || p.isSet(anchorRemove) || p.isSet(grantControl) || p.isSet(rangingOpt) || p.isSet(rangingCal)) {
+        QDBusInterface iface(SVC, PATH, SVC, bus);
+        if (!iface.isValid()) { fprintf(stderr, "beaconfix: no running instance and D-Bus activation failed\n"); return 1; }
+        int rc = 0;
+        if (p.isSet(anchorSet)) {
+            QString arg = p.value(anchorSet).trimmed();
+            if (arg.startsWith(QLatin1String("b64:"))) {
+                const auto dec = QByteArray::fromBase64Encoding(arg.mid(4).toLatin1(), QByteArray::AbortOnBase64DecodingErrors);
+                if (!dec) { fprintf(stderr, "beaconfix: --anchor-set: invalid base64\n"); return 1; }
+                arg = QString::fromUtf8(*dec);
+            } else if (QFile::exists(arg)) { QFile f(arg); if (f.open(QIODevice::ReadOnly)) arg = QString::fromUtf8(f.readAll()); }
+            // A JSON array sets several at once
+            const QJsonDocument d = QJsonDocument::fromJson(arg.toUtf8());
+            QList<QJsonObject> items;
+            if (d.isArray()) for (const QJsonValue &v : d.array()) items << v.toObject(); else items << d.object();
+            if (!d.isArray() && !d.isObject()) { fprintf(stderr, "beaconfix: --anchor-set: not JSON\n"); return 1; }
+            for (const QJsonObject &o : items) {
+                QDBusReply<QString> r = iface.call(QStringLiteral("SetAnchor"), QString::fromUtf8(QJsonDocument(o).toJson(QJsonDocument::Compact)));
+                if (!r.isValid()) { fprintf(stderr, "beaconfix: %s\n", qPrintable(r.error().message())); rc = 1; continue; }
+                if (r.value().startsWith(QLatin1String("error:"))) { fprintf(stderr, "beaconfix: %s\n", qPrintable(r.value())); rc = 1; continue; }
+                out << r.value() << "\n";
+            }
+        }
+        if (p.isSet(anchorRemove)) { QDBusReply<bool> r = iface.call(QStringLiteral("RemoveAnchor"), p.value(anchorRemove)); out << (r.isValid() && r.value() ? "removed\n" : "no such anchor\n"); if (!(r.isValid() && r.value())) rc = 1; }
+        if (p.isSet(grantControl)) {
+            QDBusReply<bool> r = iface.call(QStringLiteral("GrantControl"), p.value(grantControl));
+            out << (r.isValid() && r.value() ? QStringLiteral("control granted to %1\n").arg(p.value(grantControl)) : QStringLiteral("no such device\n"));
+            if (!(r.isValid() && r.value())) rc = 1;
+        }
+        if (p.isSet(rangingCal)) {
+            const QStringList parts = p.value(rangingCal).split(QLatin1Char('@'));
+            if (parts.size() < 2) { fprintf(stderr, "beaconfix: --ranging-calibrate <device>@<metres>[@<seconds>]\n"); return 1; }
+            QDBusReply<QString> r = iface.call(QStringLiteral("RangingCalibrate"), parts[0], parts[1].toDouble(), parts.size() > 2 ? parts[2].toInt() : 20);
+            out << (r.isValid() ? r.value() : r.error().message()) << "\n";
+        }
+        if (p.isSet(rangingOpt)) {
+            QDBusReply<QString> info = iface.call(QStringLiteral("RangingInfo")), list = iface.call(QStringLiteral("Ranging"));
+            QJsonObject o = QJsonDocument::fromJson(list.value().toUtf8()).object();
+            o["info"] = QJsonDocument::fromJson(info.value().toUtf8()).object();
+            out << QJsonDocument(o).toJson(QJsonDocument::Indented);
+        }
+        if (p.isSet(anchorsOpt)) { QDBusReply<QString> r = iface.call(QStringLiteral("Anchors")); out << QJsonDocument::fromJson(r.value().toUtf8()).toJson(QJsonDocument::Indented); }
+        out.flush();
+        return rc;
+    }
+
     if (p.isSet(json)) {
         QDBusInterface iface(SVC, PATH, SVC, bus);
         if (iface.isValid()) {
@@ -327,9 +473,36 @@ int main(int argc, char **argv)
         return 0;
     }
 
+    if (p.isSet(peers)) {
+        QDBusInterface iface(SVC, PATH, SVC, bus);
+        QJsonObject o;
+        if (iface.isValid() && !p.isSet(allPeers)) { iface.setTimeout(20000); QDBusReply<QString> r = iface.call(QStringLiteral("Peers"), p.isSet(scan)); o = QJsonDocument::fromJson(r.value().toUtf8()).object(); }
+        else {                                               // no tray (or --all): browse for a moment ourselves
+            Mdns m; QEventLoop loop; QTimer::singleShot(2500, &loop, &QEventLoop::quit);
+            if (p.isSet(scan)) m.scanSubnets(47822, [&loop] { loop.quit(); });
+            loop.exec();
+            const QJsonArray arr = m.peersJson(p.isSet(allPeers));
+            o = QJsonObject{{"peers", arr}, {"count", arr.size()}, {"scanned", p.isSet(scan)}, {"mdns", m.available()}};
+        }
+        const QJsonArray arr = o["peers"].toArray();
+        if (arr.isEmpty()) { out << (o["mdns"].toBool() || iface.isValid() ? "No other BeaconFix on this network" : "No other BeaconFix found (Avahi not reachable — try --scan)") << "\n"; out.flush(); return 0; }
+        out << arr.size() << " BeaconFix device(s) on this network" << (o["scanned"].toBool() ? " (mDNS + scan)" : "") << ":\n";
+        for (const QJsonValue &v : arr) {
+            const QJsonObject q = v.toObject();
+            QString rel = q["self"].toBool() ? QStringLiteral("this computer") : q["sameIdentity"].toBool() ? QStringLiteral("same identity") : q["linked"].toBool() ? QStringLiteral("linked identity") : q["identityId"].toString().isEmpty() ? QStringLiteral("no identity") : QStringLiteral("other identity");
+            out << QStringLiteral("  %1  %2  %3  v%4 %5  %6%7\n").arg(q["host"].toString(), -18).arg(q["url"].toString(), -34).arg(q["identityName"].toString().isEmpty() ? QStringLiteral("—") : q["identityName"].toString(), -16)
+                       .arg(q["version"].toString(), q["kind"].toString(), rel, q["pairing"].toBool() ? QStringLiteral(" · pairing open") : QString());
+            QStringList more; for (const QJsonValue &a : q["addresses"].toArray()) more << a.toString();
+            if (more.size() > 1) out << "      also: " << more.mid(1).join(QStringLiteral(", ")) << "\n";
+        }
+        out.flush();
+        return 0;
+    }
+
     if (p.isSet(refit) || p.isSet(sync)) {
         QDBusInterface iface(SVC, PATH, SVC, bus);
         if (!iface.isValid()) { fprintf(stderr, "beaconfix: %s needs the running instance\n", p.isSet(refit) ? "--refit" : "--sync"); return 1; }
+        if (p.isSet(sync) && p.value(sync).trimmed().isEmpty()) { fprintf(stderr, "beaconfix: --sync needs a peer (name, host or URL); see --peers\n"); return 2; }
         int rc = 0;
         if (p.isSet(refit)) { QDBusReply<int> r = iface.call(QStringLiteral("Refit")); if (!r.isValid()) { fprintf(stderr, "beaconfix: refit failed\n"); rc = 1; } else out << "Positioned " << r.value() << " beacon(s) from their samples\n"; }
         if (p.isSet(sync)) {
@@ -481,6 +654,7 @@ int main(int argc, char **argv)
 
     // Single instance: hand off to a running one
     if (!bus.registerService(SVC)) {
+        if (qEnvironmentVariableIsSet("BEACONFIX_DEBUG")) fprintf(stderr, "beaconfix: another instance owns %s (%s) — handing off\n", SVC, qPrintable(bus.lastError().message()));
         QDBusInterface iface(SVC, PATH, SVC, bus);
         if (!p.isSet(tray)) iface.call(QStringLiteral("ShowWindow"));
         return 0;
@@ -493,6 +667,8 @@ int main(int argc, char **argv)
     if (tiles->listen()) loc->setTileBase(tiles->baseUrl());   // the Plasma widget fetches its map from here
     auto *api = new ApiServer(loc, &app);                       // LAN API for other devices (frame, phone, laptop)
     loc->setApiServer(api);
+    auto *ranging = new RangingService(loc, &app);              // device ranging: BLE advert + scan, RTT reports, fusion (docs/RANGING.md)
+    loc->setRanging(ranging);
     MainWindow win(loc, tiles);
     Tray trayIcon(loc, &app);
     auto showWin = [&win] { win.show(); win.raise(); win.activateWindow(); };
@@ -500,6 +676,12 @@ int main(int argc, char **argv)
     QObject::connect(&trayIcon, &Tray::openIdentityRequested, &app, [&win] { win.showIdentity(); });
     QObject::connect(&trayIcon, &Tray::openEmergencyRequested, &app, [&win] { win.showEmergency(); });
     QObject::connect(loc, &Locator::showWindowRequested, &app, showWin);
+    // Pairing: a request opens its picture-match dialog; the notification's buttons land there too
+    QObject::connect(loc, &Locator::pairingRequested, &app, [&win](const QString &json) {
+        const QJsonObject o = QJsonDocument::fromJson(json.toUtf8()).object();
+        if (o["status"].toString() == QLatin1String("pending")) win.showPairRequest(o["id"].toString());
+    });
+    QObject::connect(loc, &Locator::pairingOpenRequested, &app, [&win](const QString &id) { win.showPairRequest(id); });
     QObject::connect(&trayIcon, &Tray::quitRequested, &app, &QCoreApplication::quit);
     // Offline map: warm the tile cache around every new stop (and on request)
     auto doPrefetch = [loc, tiles](bool force) {
@@ -517,5 +699,10 @@ int main(int argc, char **argv)
     if (!p.isSet(tray)) showWin();
 
     loc->start();
+    // Test instances (their own XDG_CONFIG_HOME, maybe a copy of the identity) never advertise over BLE
+    const bool defaultConfig = QDir::cleanPath(QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation)) == QDir::cleanPath(QDir::homePath() + QStringLiteral("/.config"));
+    if (defaultConfig && !qEnvironmentVariableIsSet("BEACONFIX_NO_BLE")) ranging->start();
     return app.exec();
 }
+
+#include "main.moc"

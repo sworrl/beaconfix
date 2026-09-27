@@ -1,5 +1,6 @@
 #pragma once
 #include "locator.h"
+#include "ranging/anchors.h"
 #include <QHash>
 #include <QJsonObject>
 #include <QList>
@@ -71,13 +72,22 @@ public:
 
     // Positions and self-location (offline: places we have been before)
     QList<ApPos> positions(const QStringList &bssids, double maxAcc = 0) const;   // all when bssids is empty
+    // GET /api/v1/aps?all=1: every positioned beacon, bssid order, keyset-paged (after = last bssid of the previous page)
+    QJsonArray positionsPage(const QString &after, int limit, QString *next) const;
+    void setPins(const QHash<QString, ApPos> &pins) { m_pins = pins; }             // anchored BSSIDs (upper-case): override stored positions
     bool estimate(const QList<QPair<QString, int>> &heard, double *lat, double *lon, double *acc, int *used, QStringList *usedBssids = nullptr,
                   int minAps = 2, double maxAcc = 150) const;
     int  addObservations(const QJsonArray &observations, const QString &device, QString *error = nullptr,
                          QHash<QString, QList<ApObservation>> *added = nullptr);   // from another BeaconFix / device; dedup (bssid, time, device)
     int  mergePeerAps(const QJsonArray &aps, const QString &device, QStringList *touched = nullptr);   // positions another device worked out
     int  appendPeerFixes(const QJsonArray &fixes, const QString &device);
+    QJsonArray latestFixesByDevice() const;              // newest fix per peer device (device != "")
     QList<Fix> peerFixes(const QString &device = QString()) const;
+    // Anchors (docs/RANGING.md §4): surveyed transmitters/places, synced through /db/changes like everything else
+    QList<Anchors::Anchor> loadAnchors(bool includeDeleted = false) const;
+    // Store one anchor (or tombstone). force = a local edit (always wins, new seq); otherwise a synced row that
+    // only replaces what we have when it is newer (placedAt / deletedAt). Returns true when the table changed.
+    bool putAnchor(Anchors::Anchor a, bool force, Anchors::Anchor *stored = nullptr);
     QJsonObject exportJson() const;
     int  importJson(const QJsonObject &dump, QString *error = nullptr);
 
@@ -104,6 +114,11 @@ private:
     QByteArray m_key;
     QSqlDatabase m_db;
     bool m_readOnly = false, m_dirty = false;
+    bool m_batch = false;                 // inside saveApRecords: markDirty() only sets the flag
     qint64 m_seq = 0;
     QTimer m_flushTimer;
+    mutable QHash<QString, quint64> m_recSig;
+    quint64 m_flagsSig = 0;
+    QHash<QString, ApPos> m_pins;   // per-record signature of what is stored: saveApRecords skips unchanged records
+    static quint64 recordSignature(const ApRecord &r, int flags);
 };

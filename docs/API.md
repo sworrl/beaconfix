@@ -27,26 +27,73 @@ TLS instead of plain HTTP.
 All responses are JSON with `Cache-Control: no-store`. Errors: `401` (`WWW-Authenticate: Bearer`),
 `403`, `404`, `405` (`Allow:`), `413`, `429`, `503`.
 
-## Pairing
+## Pairing (v2: pictures + proximity)
 
 ```
-device                                  BeaconFix
-  |  GET /api/v1/hello                     |   {"pairing": true|false, ...}
-  |--------------------------------------->|
-  |  POST /api/v1/pair {"name","scopes"}   |   202 {"id","code":"4831","expires","poll"}
-  |--------------------------------------->|   (only while pairing is open; ≤5 pending; 10 min)
-  |         shows the code on its screen   |   the same code appears in Devices / notification
-  |  GET /api/v1/pair/<id>   (every 5 s)   |   {"status":"pending"}
-  |--------------------------------------->|   … user approves (or: auto-approved, known device)
-  |  GET /api/v1/pair/<id>                 |   {"status":"approved","scopes":[...],"token":"…"}
-  |--------------------------------------->|   the token is returned exactly once
-  |  GET /api/v1/location  (Bearer token)  |   200
+device                                            BeaconFix (desktop)
+  |  GET /api/v1/hello                               |   {"pairing":true, "api":2, "identity":{…}|null, "mdns":true, …}
+  |------------------------------------------------->|
+  |  POST /api/v1/pair                               |   202 {"id","code","expires","poll",
+  |    {"name","kind","scopes",                      |        "proximity":{…verdict…},"sas":{"pub":<their X25519 pub>}}
+  |     "identity":{id,pub,name}?,                   |   (only while pairing is open; ≤5 pending; 10 min)
+  |     "sas":{"pub":<our X25519 pub>},              |
+  |     "proximity":{"beacons":[{bssid,dbm}…],       |
+  |                  lat,lon,acc,source,ts}}         |
+  |------------------------------------------------->|
+  |  both sides: shared = X25519(priv, otherPub)     |   the desktop shows THREE rows of three pictures:
+  |  sas = HKDF-SHA256(shared, info="beaconfix-pair-sas-v1|"+id, 32 bytes)   one real, two decoys
+  |  pictures = sas[0]%48, sas[2]%48, sas[4]%48      |   the device shows its (real) three pictures
+  |  GET /api/v1/pair/<id>   (every 5 s)             |   {"status":"pending","proximity":{…},"sas":{"picked":false}}
+  |------------------------------------------------->|   … the user taps the row that matches the device's screen
+  |  GET /api/v1/pair/<id>                           |   {"status":"approved","scopes":[…],"token":"…"}   (token once)
+  |------------------------------------------------->|   or {"status":"denied","reason":"wrong pictures"} / "cancelled"
+  |  POST /api/v1/pair/<id>/cancel                   |   the device gave up: {"status":"cancelled"}
 ```
+
+**SAS pictures.** 48 fixed icons (`Pairing::ICON_NAMES`, same order in both apps: anchor, apple,
+balloon, banana, bell, bicycle, boat, book, butterfly, cactus, camera, candle, car, castle, cat,
+cherry, clock, cloud, crown, diamond, dog, drum, elephant, feather, fish, flag, flower, fox, guitar,
+hammer, heart, house, key, kite, leaf, lemon, lightbulb, moon, mushroom, owl, pencil, pizza, rocket,
+star, sun, tree, umbrella, zebra). A wrong pick **denies** the request (`reason: "wrong pictures"`)
+and raises an `error` event: only someone who sees both screens can pair. The 4-digit code still
+exists (*Use the code instead…*) for devices without a screen.
+
+**Proximity.** The request carries what the device hears; the desktop compares it with **every**
+beacon of its own latest scan (home and travelling networks included: two radios in the same RV hear
+its router at nearly the same level, which is the best co-location evidence there is) and the two
+fixes:
+
+| field | meaning |
+|---|---|
+| `shared`, `theirs`, `ours` | beacons heard by both / by the device / by us |
+| `gainOffsetDb` | median of (their dBm − our dBm) over the shared beacons: one radio simply hears everything louder |
+| `rssiDelta` | median absolute residual after removing that offset (dB) — how differently the two see the same room |
+| `distanceM` | between the two fixes (absent when either is IP-based) |
+| `strongestShared` | up to three names, by the device's level |
+| `verdict` | `adjacent`: shared ≥ 4 and rssiDelta ≤ 4 dB · `room`: shared ≥ 2 and ≤ 7 dB · `near`: ≥ 1 shared or fixes ≤ 150 m · `far`: nothing shared and > 500 m apart (or > 5 beacons each side, none shared) · `unknown` otherwise. **3.7:** when ranging evidence exists the posterior's class replaces this rule (below) |
+| `ranging` | 3.7: `{"class","distanceM","lowM","highM","sigmaM","method":["ble","wifi-diff","fix"],"sharedGroups","evidence","scoreVerdict"?}` — the requesting device's BLE advert (found through its identity's rotating tag), the shared-beacon fingerprint and both fixes, fused as in [RANGING.md](RANGING.md) §5.5; `class` is `adjacent` (84th percentile ≤ 2 m), `room` (≤ 6 m), `near` (≤ 30 m), `far` (16th percentile > 30 m) or `unknown`; `scoreVerdict` keeps the rule-of-thumb verdict it replaced |
+
+Policy `apiPairProximity` (Devices tab, default `required`): `required` lets only
+`adjacent` / `room` / `near` requests be picture-matched or auto-approved (*Pair anyway* needs the
+word "pair" typed); `warn` shows the verdict and allows everything; `off` ignores it.
+**Known devices** (`beaconfix-known.json`, address match) are auto-approved without pictures only
+when the verdict is allowed; the response then has `"autoApproved":true` and the dialog shows
+*Auto-approved (read access)* with **Allow control too**, which adds the control scope to the
+token that request produced (`grantControl`). A device whose identity is linked to yours does not
+need that: identity sign-in (`/identity/auth`) already yields a read + control token.
 
 Open pairing from the Devices tab, the tray menu ("Allow a device to pair"), or
 `beaconfix --pairing 10` (minutes; `0` closes). Manual tokens: *Create token…* in the Devices
 tab, or `beaconfix --token "Photo frame"` (add `--control` for the control scope). Revoke with
 `beaconfix --revoke <name-or-id>`; list with `--devices`; status with `--api-status`.
+**Upgrade an existing device to control** without a new token: `beaconfix --grant-control
+<name-or-id>` (D-Bus `GrantControl(nameOrId)`); the device keeps its token and gains
+`[read,control]` — e.g. so a phone can push its observations through `/db/sync`.
+
+**Device kind.** `kind` (`android`, `laptop`, `desktop`, `pi`, `gnss`, `device`) comes from the
+pairing request, the identity sign-in or `POST /devices/position`; for tokens paired before the
+kind was recorded the desktop infers it from the client's `User-Agent` (OkHttp / Android →
+`android`) and from the kind bits of the device's BLE advert, and remembers it.
 
 ## Endpoints
 
@@ -54,13 +101,27 @@ Identity endpoints (challenge sign-in, linking, bundle hand-off) are specified i
 
 | method | path | scope | response |
 |---|---|---|---|
-| GET | `/api/v1/hello` | none | `{"name","version","hostname","pairing","tls","ts","api":2,"features":["sync","locate","home","events","stream","estimates","identity"]}` |
-| POST | `/api/v1/pair` body `{"name":"…","scopes":["read"]}` | none | `202 {"id","code","expires","poll"}`; `403` when pairing is closed; `429` when five are pending |
-| GET | `/api/v1/pair/<id>` | none | `{"status":"pending"}` · `{"status":"denied"}` · `{"status":"approved","scopes":[…],"token":"…"}` (token once); `404` unknown/expired |
+| GET | `/api/v1/hello` | none | `{"name","version","hostname","pairing","tls","ts","api":2,"kind":"desktop","mdns":<bool>,"identity":{"id","name"}|null,"features":["sync","locate","home","events","stream","estimates","identity","peers","anchors","ranging","aps-paging","grant-control"]}` |
+| POST | `/api/v1/pair` body `{"name","kind","scopes":["read"],"identity":{id,pub,name}?,"sas":{"pub"},"proximity":{beacons[],lat,lon,acc,source,ts}}` | none | `202 {"id","code","expires","poll","proximity":{…},"sas":{"pub"},"autoApproved"?}`; `403` when pairing is closed; `429` when five are pending |
+| GET | `/api/v1/pair/<id>` | none | `{"status":"pending","proximity":{…},"sas":{"picked":<bool>}}` · `{"status":"denied","reason":"wrong pictures"?}` · `{"status":"cancelled"}` · `{"status":"approved","scopes":[…],"token":"…"}` (token once); `404` unknown/expired |
+| POST | `/api/v1/pair/<id>/cancel` | none | the device withdraws its request → `{"status":"cancelled"}` |
+| GET | `/api/v1/peers` | read | BeaconFix devices on this network (mDNS `_beaconfix._tcp` + hello): `{"peers":[{"name","host","addresses":[…],"port","url","identityId","identityName","version","kind","api","features":[…],"pairing","tls","self","interface","lastSeen","source":"mdns"|"scan","sameIdentity","linked","ours"}],"count","scanned","mdns","self":{"host","addresses":[…],"port"},"ts"}` |
+| GET | `/api/v1/peers?scan=1` | control | the same after probing every host of the local /24s (networks that block multicast); answers when the scan is done |
+| GET | `/api/v1/devices/positions` | read | our other devices on the map: `{"devices":[{"device","kind","identityId","identityName","lat","lon","acc","time","ageS","source","place","online","beacons","lastSeen","distanceM"?,"range"?}],"count","ts"}` (newest synced fix per peer device, plus what they POST below). `range` (3.7) is the **measured** distance when ranging has data for that device — the object of `GET /ranging` below; `distanceM` stays the fix-to-fix distance |
+| POST | `/api/v1/devices/position` body `{"lat","lon","acc","time"?,"source"?,"beacons"?:<int or array>,"kind"?,"place"?,"events"?:[{"type","text","time"?,"lat"?,"lon"?,…}]}` | read | the calling device's own position now → `{"ok":true,"device","events":<n>,"ts"}`; raises `device` / `device_online` events. `events[]` (3.7, ≤ 20 per call): things the device noticed (a Pi agent: GNSS lock gained/lost, PPS, a jump) become events of type **`device`** in our feed — `text` prefixed with the device name, `type` kept as `deviceEvent`, other fields kept, `device` + `kind` added. A `kind` in the body is remembered for the token when it had none. A `pi` / `gnss` device reporting `acc ≤ 5` m while we hear a home network feeds the **rv-gnss** positioning tier ([RANGING.md](RANGING.md) §4.3.7) |
 | GET | `/api/v1/location` | read | the fix, see below |
 | GET | `/api/v1/state` | read | everything the tray knows (same as D-Bus `StateJson()` / `beaconfix --json`) |
 | GET | `/api/v1/events?since=<id>` | read | `{"events":[…],"lastEventId"}` newer than `id` |
-| GET | `/api/v1/aps` | read | `{"aps":[…]}` beacons with estimates and security |
+| GET | `/api/v1/aps?offset=<n>&limit=<n>` | read | the beacons heard now with estimates and security, paged (3.7): `{"aps":[…],"count","total","offset","next"}` (`limit` 1–5000, default 1000; `next` = the next offset or `null`). No longer builds the whole state, so it answers fast with ~100k beacons in the database |
+| GET | `/api/v1/aps?all=1&after=<bssid>&limit=<n>` | read | every beacon in the map database, BSSID order, keyset-paged: `{"aps":[{"bssid","ssid","freq","lat"?,"lon"?,"acc"?,"source","home","travelling","ignored","security","seq"}],"count","next"}` — pass `next` as `after` until it is `null`; anchored BSSIDs report the anchor's position with `source:"anchor"` |
+| GET | `/api/v1/anchors` | read | `[anchor…]` — surveyed transmitters / places, the frozen object of [RANGING.md](RANGING.md) §4.1 plus `headingAssumed` and `seq` |
+| POST | `/api/v1/anchors` body: an anchor | control | create or update by `id` (absent → a new UUID) → the stored anchor. Validated and normalised (BSSIDs upper-cased, `accM` clamped to 0.05–500, unknown kinds rejected with `400`). The **newest `placedAt` wins**: omit `placedAt` to stamp "now"; an older one leaves the stored anchor as is. `placedBy` defaults to the calling device's kind. `rv:true` anchors get their `rvOffset` measured from the RV reference |
+| GET | `/api/v1/anchors/<id>` | read | one anchor; `404` |
+| DELETE | `/api/v1/anchors/<id>` | control | `{"deleted": id}` — a tombstone `{"id","deleted":true,"deletedAt","seq"}` travels through `/db/changes` so every device drops it; `404` when unknown |
+| GET | `/api/v1/ranging/info` | read | what a peer needs to range with us: `{"rtt":{"bssid","freqMHz","centerFreq0MHz","bandwidthMHz","channel","preamble","enabled","txPowerDbm","anchorId"?}|null,"ble":{"serviceUuid","txPower","txPowerConfirmed","enabled","scanning","intervalMs","error"},"anchor":<this-computer anchor>|null}` — `rtt.enabled` is true only while the responder AP is actually up; `ble.txPower` is our advert's byte 8 and `ble.txPowerConfirmed` says BlueZ reported it as the level the controller selected (not just the request) |
+| POST | `/api/v1/ranging` body `{"device","time","rtt":[{"bssid","distMm","stdMm","rssi","burst","n","time"}],"ble":[{"rssi","channel"?,"txPower","time"}],"wifi":[{"bssid","rssi","freq"}],"baro"?,"moving","fix"?:{"lat","lon","acc","time","source"},"rttState"?}` | read | the peer's measurements (times in epoch ms; `ble` = what it heard of **our** advert) → that device's estimate (below). The authenticated device is who it is about. `rttState` = why `rtt` is (not) empty: `ok`, `doze` (Android has RTT off in deep Doze until the phone is unlocked, charged or moved), `wifi-off`, `location-off`, `unavailable`, `unsupported`, `no-permission`, `no-response`, `not-80211mc`, `timeout`, `bad-config`, `no-responder`, `idle`, `away`, `backoff`, `failed:<code>` (RANGING.md §7). `rtt`, `ble`, `wifi`, `moving`, `ble[].txPower` and `fix.source` are always present from Android 1.3.2 on (older apps omit empty/default values) |
+| GET | `/api/v1/ranging` | read | `{"updated","anchor","devices":[{"device","kind","distanceM","sigmaM","lowM","highM","method":["rtt","ble","wifi-diff","wifi-geo","fix"],"bearingDeg","bearingSigmaDeg","dz","class","updated","samples":{"rtt","ble","bleDown","bleUp","wifiDiff","since","total":{"rtt","bleDown","bleUp"}},"lastRtt","rttState","rttStateAt","calib":{"rttOffsetM","rttOffsetSigmaM","bleP0","bleN","bleP0Up","bleNUp","calibrated","calibratedAt","distanceM"},"calibrating","lat"?,"lon"?}]}` — `distanceM` is the posterior median, `lowM`/`highM` the 16th/84th percentiles; `lat`/`lon` only when the bearing is observable; `samples` count since the tray started (`since`), `total` includes earlier runs; `rttState` is the peer's last word on its RTT |
+| POST | `/api/v1/ranging/calibrate` body `{"device"?,"distanceM","durationS"?}` | control | "these two are `distanceM` apart": collects `durationS` (default 20, 5–120) of RTT + BLE, then fixes the RTT pair offset and both BLE `P0`s ([RANGING.md](RANGING.md) §8) → `202 {"device","calibrating":true,"distanceM","until","hint"}`; `device` defaults to the caller |
 | GET | `/api/v1/pois` | read | `{"pois":[…]}` places (each with `cat`, `group`, `address`, `phone`, `hours`, `website`, `wheelchair`, `emergency`, `d`, `brg`) |
 | GET | `/api/v1/pois?cat=police,fire&group=kids&radius=<km>` | read | filtered places: categories and/or groups (`civic`, `kids`, `services`), within `radius` km |
 | GET | `/api/v1/emergency` | read | nearest `police`, `fire`, `hospital` (ER preferred), `urgent`, `pharmacy`, `vet` with distance / bearing / phone / address, and `number` — the local emergency number |
@@ -71,16 +132,39 @@ Identity endpoints (challenge sign-in, linking, bundle hand-off) are specified i
 | POST | `/api/v1/locate` body `{"wifiAccessPoints":[{"macAddress","signalStrength"}]}` | read | `{"location":{"lat","lng"},"accuracy","used"}` from the internal map, or `404` |
 | GET | `/api/v1/db/stats` | read | database statistics |
 | POST | `/api/v1/db/observations` body `{"observations":[{"bssid","ssid","dbm","lat","lon","acc","time"}]}` | control | merges another device's observations into the map |
-| GET | `/api/v1/db/changes?since=<seq>&limit=<n>` | read | sync feed: `{since,cursor,more,count,device,identity,aps[],observations[],fixes[]}` after a cursor, oldest first (every row carries `identity`) |
-| POST | `/api/v1/db/sync` body `{"device","identity"?,"observations":[…],"aps":[…],"fixes":[…],"sinceCursor"?}` | control | merges a peer's data (1 MB bodies), queues refits, returns `{accepted,cursor,refitQueued,identity,changes?}`; `403 identity not linked` when the peer names an identity that is not yours or linked |
+| GET | `/api/v1/db/changes?since=<seq>&limit=<n>` | read | sync feed: `{since,cursor,more,count,device,identity,aps[],observations[],fixes[],anchors[]}` after a cursor, oldest first (every row carries `identity`; `anchors` holds anchors and tombstones, 3.7) |
+| POST | `/api/v1/db/sync` body `{"device","identity"?,"observations":[…],"aps":[…],"fixes":[…],"anchors"?:[…],"sinceCursor"?}` | control | merges a peer's data (1 MB bodies), queues refits, returns `{accepted:{observations,aps,fixes,anchors},cursor,refitQueued,identity,changes?}`; anchors merge by newest `placedAt` / `deletedAt`; `403 identity not linked` when the peer names an identity that is not yours or linked |
 | GET | `/api/v1/db/export` | control | JSON dump of the database |
+| POST | `/api/v1/db/import?name=<file>&from=<ISO>&to=<ISO>&what=positions,wifi,places` body: the raw file (≤ 200 MB, streamed to a temporary file) | control | imports your history — Google `Timeline.json` / `Records.json` / Semantic Location History, WiGLE CSV, GPX, KML or a BeaconFix export ([DATABASE.md](DATABASE.md)) → the summary object with `"ok"`; `400 {"ok":false,"error"}` when unreadable; `409` while another import runs; `413` above the limit |
 | GET | `/api/v1/identity` | none | the public identity record + `linkedIds`, `grouped`, `unlocked`; `404` until one exists |
 | GET | `/api/v1/identity/challenge` | none | `{"nonce","host","expires","id"}` — 60 s, single use |
 | POST | `/api/v1/identity/auth` body `{"id","pub","device":{"name","kind"},"nonce","sig"}` | none | `{"token","scopes":["read","control"],"identity":{id,name},"device"}` when the identity is yours or linked; `403 unknown identity` (listed for linking) otherwise |
-| POST | `/api/v1/identity/link` body: a link statement (`a`,`b`,`ts`,`sigA`,`sigB`, optional `pubA`/`pubB`) | none | verifies, co-signs if we are a party, stores when complete → `{"statement","linkedIds"}` |
+| POST | `/api/v1/identity/link` body: a link statement (`a`,`b`,`ts`,`sigA`,`sigB`, optional `pubA`/`pubB`), or `{"statement":"beaconfix://statement/…"}` | none | verifies, co-signs **only when `ts` is a link offer this BeaconFix displayed in the last 10 minutes** (single use), stores when complete → `{"statement","linkedIds"}`; `403` otherwise |
 | POST | `/api/v1/identity/export` body `{"passphrase"?}` | control | holds our encrypted bundle 10 min under a one-time code → `{"code","expires","fetch","words"?}` (`words` = generated 6-word code when no passphrase was given) |
-| GET | `/api/v1/identity/export/<code>` | none | `{"bundle":"BFID1:…"}` once; `404` afterwards or after 5 wrong codes |
+| GET | `/api/v1/identity/export/<code>` | none | `{"bundle":"beaconfix://identity/…"}` once; `404` afterwards or after 5 wrong codes |
 | GET | `/api/v1/stream` | read | Server-Sent Events: `event: fix`, `event: beacon` (one event JSON), `event: ping` every 30 s |
+
+Events (`/events`, the stream, D-Bus `eventLogged`) added in 3.6: `ap_refit` — a beacon's estimate
+moved (> max(5 m, 10 % of the old accuracy)) or tightened (> 15 %): `bssid`, `ssid`, `lat`/`lon`
+(new), `fromLat`/`fromLon` (old), `kind:"trilat"`, `acc`, `prevAcc`, `n`, `vantage`, `rms`,
+`movedM`, `vantagePoints:[{lat,lon,dbm,device}]` (≤ 6, at least one per contributing device), text
+"Refined <ssid>: ±140 m → ±38 m (24 samples, 5 vantage points)"; `device` — one of your devices
+moved > 100 m (`device`, `kind`, `movedM`, `distanceM`, `acc`, position); `device_online` /
+`device_offline` (`device`; a device is online while it was heard from in the last 10 minutes);
+`import` — a history import finished (the summary as fields). Added in 3.7: `anchor` — an anchor
+was placed, moved, removed, or the RV's anchors were re-projected after a move (`anchor`, `kind`,
+`placedBy`, `reprojected`, `headingAssumed`); `device` also carries the events a device reports in
+`POST /devices/position` (`deviceEvent`) and ranging calibrations (`calibrated`, `distanceM`,
+`rttOffsetM`).
+
+**Anchors and ranging from the command line / D-Bus (3.7).** `beaconfix --anchors`,
+`--anchor-set <json | b64:<standard base64 of the UTF-8 JSON>>` (a JSON array sets several; prints
+each id), `--anchor-remove <id>`, `--ranging` (info + every ranged device), `--ranging-calibrate
+"<device>@<metres>[@<seconds>]"`, `--grant-control <name-or-id>`. D-Bus (`org.sworrl.BeaconFix`):
+`Anchors()` → JSON array, `SetAnchor(json)` → id or `"error: …"`, `RemoveAnchor(id)`,
+`Ranging()`, `RangingInfo()`, `RangingCalibrate(device, metres, seconds)`, `GrantControl(nameOrId)`.
+`--json` / `StateJson()` carry `anchors:[…]`, `features:[…]` and `environment` (the per-band
+path-loss fit learned from anchors: `{"2.4"|"5"|"6": {"p0","n","sigmaP0","sigmaN","samples"}}`).
 | POST | `/api/v1/refresh` | control | re-check the position now (`202`) |
 | POST | `/api/v1/prefetch` | control | save map tiles around the fix (`202`) |
 
@@ -91,7 +175,7 @@ Identity endpoints (challenge sign-in, linking, bundle hand-off) are specified i
   "valid": true, "lat": 40.00293, "lon": -75.06806, "accuracy": 40,
   "source": "wifi", "provider": "internal",
   "place": "Example, Somewhere", "city": "Example", "region": "Somewhere", "country": "…",
-  "elevation": 317, "time": "2026-09-26T17:13:46", "age_s": 42,
+  "elevation": 120, "time": "2026-09-26T17:13:46", "age_s": 42,
   "sun": {"sunrise": "…", "sunset": "…", "solarNoon": "…", "goldenEveningStart": "…", "civilDawn": "…", "civilDusk": "…", "dayLength": 43200},
   "geo": "geo:40.00293,-75.06806;u=40",
   "links": {"osm": "https://www.openstreetmap.org/?mlat=…", "google": "…", "apple": "…"},

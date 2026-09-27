@@ -1,0 +1,22 @@
+[Unit]
+StartLimitIntervalSec=600
+StartLimitBurst=30
+Description=BeaconFix Wi-Fi RTT responder (802.11mc FTM on a hidden access point)
+Documentation=https://github.com/sworrl/beaconfix/blob/master/docs/RANGING.md
+After=NetworkManager.service
+Wants=NetworkManager.service
+
+[Service]
+Type=simple
+ExecStartPre=/usr/local/libexec/beaconfix-rtt-responder --iface-up
+ExecStart=/usr/sbin/hostapd /etc/beaconfix/rtt-responder.conf
+ExecStartPost=/usr/local/libexec/beaconfix-rtt-responder --post-start
+ExecStopPost=/usr/local/libexec/beaconfix-rtt-responder --iface-down
+# hostapd exits 0 when the radio is busy during start-up, so restart on any exit.
+Restart=always
+RestartSec=10
+# --iface-up waits up to 90 s for the radio (boot, hot-plug); udev also starts us when one appears.
+TimeoutStartSec=180
+
+[Install]
+WantedBy=multi-user.target

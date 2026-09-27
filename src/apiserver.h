@@ -6,18 +6,23 @@
 #include <QList>
 #include <QObject>
 #include <QPointer>
+#include <QJsonArray>
 #include <QProcess>
 #include <QStringList>
 #include <QTimer>
+#include <functional>
 
 class Locator;
+class Mdns;
 class QTcpServer;
 class QTcpSocket;
+class QTemporaryFile;
 
 // LAN API: a small HTTP/1.1 + JSON server on every interface so other devices
 // on the local network (a photo frame, a phone, a script) can ask "where are we?".
 //
-//   GET  /api/v1/hello                 no auth · name, version, hostname, pairing open?
+//   GET  /api/v1/hello                 no auth · name, version, hostname, identity {id,name}, kind, mdns, pairing open?
+//   GET  /api/v1/peers[?scan=1]        read    · BeaconFix devices on this network (mDNS; scan=1 probes the /24s too — control scope)
 //   POST /api/v1/pair                  no auth · {"name","scopes"} → 202 {id, code, expires}  (only while pairing is open)
 //   GET  /api/v1/pair/<id>             no auth · {status: pending|denied|approved[, token — once]}
 //   GET  /api/v1/location              read    · the fix, place, elevation, sun, geo: URI, map links
@@ -49,15 +54,25 @@ public:
         QByteArray hash;                  // SHA-256 of the token, hex
         bool revoked = false;
         QString identity;                 // set when the token was issued through identity auth (docs/IDENTITY.md)
+        QString kind;                     // android | laptop | desktop | device (from the pairing request / identity sign-in)
         QJsonObject toJson(bool full = true) const;
     };
     struct Pending {
-        enum State { Waiting, Approved, Denied };
-        QString id, name, code, ip;
+        enum State { Waiting, Approved, Denied, Cancelled };
+        QString id, name, code, ip, kind;
         QStringList scopes;
         QDateTime created, expires;
         State state = Waiting;
         QString token;                    // approved: handed out once, then cleared
+        // pairing v2 (pairing.h): picture match + proximity
+        QString identityId, identityName; QByteArray identityPub;
+        QByteArray sasPriv, sasPub, theirSasPub, sas;
+        QList<int> icons;                 // the real triple
+        QList<QList<int>> triples;        // shown on the desktop: real + decoys, shuffled
+        int realIndex = -1;
+        QJsonObject proximity, theirPosition;
+        bool picked = false, wrongPick = false, lifted = false, knownDevice = false, autoApproved = false;
+        QString deviceId;                 // approved: the Device the token went to (grantControl)
         QJsonObject toJson() const;
     };
     struct AccessEntry { QDateTime time; QString ip, method, path; int status = 0; };
@@ -93,11 +108,24 @@ public:
     QList<AccessEntry> accessLog() const { return m_log; }
     bool      approve(const QString &id);
     bool      deny(const QString &id);
+    bool      approveByPick(const QString &id, int tripleIndex);   // picture match: right triple → approved, wrong → denied
+    void      liftProximity(const QString &id);                     // "pair anyway": drop the proximity gate for this request
+    bool      cancelPending(const QString &id);
+    bool      grantControl(const QString &pendingId);              // approved request: add control to the token it produced
+    bool      grantControlDevice(const QString &nameOrId);         // a paired device (id or name): add control to its existing token
+    QJsonObject pendingDetail(const QString &id) const;             // everything the pairing dialog shows (no secrets)
+    QString   pairPolicy() const { return m_pairPolicy; }           // required | warn | off  (apiPairProximity)
+    void      setPairPolicy(const QString &p);
     bool      revoke(const QString &nameOrId);
     bool      remove(const QString &id);
     QString   createToken(const QString &name, const QStringList &scopes, const QString &identity = QString());   // returns the token (shown once)
     QString   holdIdentityExport(const QString &bundle);   // LAN hand-off: keeps the bundle 10 min under a one-time 6-digit code
     QJsonObject statusJson() const;
+
+    // Discovery (mdns.h): the other BeaconFix instances on this network, with our identity's view of them
+    Mdns       *mdns() const { return m_mdns; }
+    QJsonArray  peersJson(bool includeSelf = false) const;  // + sameIdentity / linked flags
+    void        scanPeers(std::function<void()> done);      // probe the local /24s for /api/v1/hello, then done()
 
     // Known devices (allowlist)
     bool      knownOnly() const { return m_knownOnly; }
@@ -116,9 +144,11 @@ public:
 
 signals:
     void changed();                                          // devices / pending / listening state
+    void peersChanged();                                     // mDNS / scan results changed
     void accessLogged();
     void pairingRequested(const QString &json);
     void deviceApproved(const QString &name);
+    void openPairRequested(const QString &id);               // the notification's button / body was clicked
 
 private:
     struct Request {
@@ -127,6 +157,7 @@ private:
         QByteArray body;
     };
     struct Stream { QPointer<QTcpSocket> sock; QString device; };
+    struct Upload { Request request; QTemporaryFile *file = nullptr; qint64 left = 0; };   // POST /db/import body on its way to disk
 
     void restart();
     void onConnection();
@@ -146,6 +177,7 @@ private:
     void loadKnown();
     void saveKnown();
     void updateDiscovery();
+    static bool mdnsAllowed();               // false for test instances (non-default XDG_CONFIG_HOME), --no-mdns, apiMdns=false
     static QString randomId(int bytes);
     static QString newToken();
     static QString clientIp(QTcpSocket *s);
@@ -161,14 +193,16 @@ private:
     QList<AccessEntry> m_log;
     QList<Known> m_known;
     bool m_knownOnly = true;
+    QString m_pairPolicy = QStringLiteral("required");
     QHash<QString, QPair<QString, qint64>> m_neigh;            // ip → (mac, ms looked up)
     QHash<QString, QList<qint64>> m_hits;                     // ip → request timestamps (ms) in the last minute
     QList<Stream> m_streams;
+    QHash<QTcpSocket *, Upload> m_uploads;
     QHash<QString, QDateTime> m_nonces;                       // identity challenges: nonce (b64) → expiry
     struct ExportHold { QString bundle; QDateTime expires; int tries = 0; };
     QHash<QString, ExportHold> m_exports;                     // one-time codes → bundle
     QTimer m_pingTimer, m_saveTimer, m_sweepTimer;
     bool m_dirty = false;
-    QProcess *m_avahi = nullptr;
+    Mdns *m_mdns = nullptr;
     int m_open = 0;
 };

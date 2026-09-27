@@ -1,5 +1,7 @@
 #pragma once
 #include <QMainWindow>
+#include <QJsonObject>
+#include <QHash>
 
 class Locator;
 class BeaconView;
@@ -37,10 +39,15 @@ private:
 public:
     void showIdentity();
     void showEmergency();
+    void showPairRequest(const QString &id);   // the pairing dialog for one pending request (raised if already open)
+    void importHistoryDialog();               // Settings → Map database → Import…
 private:
 
     Locator *m_loc;
+    TileSource *m_tiles = nullptr;
     BeaconView *m_map;
+    QHash<QString, class PairDialog *> m_pairDialogs;
+    class QComboBox *m_pairPolicy = nullptr;
     QLabel *m_place, *m_coords, *m_meta, *m_status, *m_chip;
     QPushButton *m_refresh;
     QTableWidget *m_aps, *m_history, *m_pois;
@@ -63,5 +70,8 @@ private:
     QCheckBox *m_osTz, *m_osGeo, *m_osNight, *m_osLocale; QLabel *m_osStatus;
     // Identity
     QWidget *m_identityTab = nullptr; QLabel *m_idSummary, *m_idQr; QPushButton *m_idCreate, *m_idImport, *m_idExport, *m_idLink, *m_idForget; QPlainTextEdit *m_idDetails;
+    QTableWidget *m_peerTable = nullptr; QPushButton *m_peerLink = nullptr, *m_peerSync = nullptr, *m_peerScan = nullptr; QLabel *m_peerNote = nullptr;
+    void refreshPeers();
+    void linkWithPeer(const QJsonObject &peer);
     QLabel *m_emergency = nullptr;
 };

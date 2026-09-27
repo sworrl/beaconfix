@@ -1,6 +1,10 @@
 #include "beaconview.h"
 #include "locator.h"
 #include "tilesource.h"
+#include "anchordialog.h"
+#include "ranging/rangingservice.h"
+#include <QMessageBox>
+#include <QFontMetrics>
 #include <QActionGroup>
 #include <QApplication>
 #include <QClipboard>
@@ -8,6 +12,7 @@
 #include <QDesktopServices>
 #include <QIcon>
 #include <QJsonDocument>
+#include <QJsonArray>
 #include <QJsonObject>
 #include <QDateTime>
 #include <QMenu>
@@ -44,11 +49,20 @@ BeaconView::BeaconView(Locator *loc, TileSource *tiles, QWidget *parent) : QWidg
     setFocusPolicy(Qt::StrongFocus);
     setAutoFillBackground(false);
 
+    if (RangingService *rs = m_loc->ranging()) {            // measured distances to our devices (docs/RANGING.md)
+        connect(rs, &RangingService::estimateChanged, this, [this, rs](const QString &device) {
+            const QJsonObject e = rs->estimateJson(device);
+            if (e.isEmpty()) m_ranges.remove(device); else m_ranges.insert(device, e);
+            update();
+        });
+    }
     QSettings s;
     m_layer = Layer(qBound(0, s.value("map/layer", int(Dark)).toInt(), int(Topo)));
     const QStringList hidden = s.value("map/hiddenCategories", QStringList{QStringLiteral("toilets")}).toStringList();
     m_hiddenCats = QSet<QString>(hidden.begin(), hidden.end());
     m_showNames = s.value("map/showNames", true).toBool();
+    m_showDevices = s.value("map/showDevices", true).toBool();
+    m_showImported = s.value("map/showImported", true).toBool();
 
     m_anim.setInterval(33);
     connect(&m_anim, &QTimer::timeout, this, [this] {
@@ -104,6 +118,9 @@ QString BeaconView::compass(double deg)
 }
 QString BeaconView::distText(double m)
 {
+    if (m < 3) return QStringLiteral("%1 m").arg(m, 0, 'f', 2);          // measured ranges: centimetres matter
+    if (m < 20) return QStringLiteral("%1 m").arg(m, 0, 'f', 1);
+    if (m < 100) return QStringLiteral("%1 m").arg(qRound(m));
     if (m < 950) return QStringLiteral("%1 m").arg(qRound(m / 10.0) * 10);
     if (m < 9950) return QStringLiteral("%1 km").arg(m / 1000.0, 0, 'f', 1);
     return QStringLiteral("%1 km").arg(qRound(m / 1000.0));
@@ -334,11 +351,14 @@ void BeaconView::paintEvent(QPaintEvent *)
 
     const Fix &fix = m_loc->fix();
     if (fix.valid) {
+        if (m_showImported) drawImportedTrack(p);
         drawTrack(p);
         drawPois(p);
         drawBeacons(p);
+        drawAnchors(p);
         drawMe(p);
         drawLabels(p);
+        if (m_showDevices) drawDevices(p);
         drawEvents(p);
     } else {
         p.setPen(C_TEXT);
@@ -352,6 +372,33 @@ void BeaconView::paintEvent(QPaintEvent *)
     drawTicker(p);
     drawAttribution(p);
     drawCard(p);
+}
+
+// Where you have been according to an imported export: a thin dotted trail under the live
+// track, visits as hollow rings. Thinned to the screen so a decade of Timeline stays quick.
+void BeaconView::drawImportedTrack(QPainter &p)
+{
+    const auto &h = m_loc->importedHistory();
+    if (h.isEmpty()) return;
+    const QRectF view = QRectF(rect()).adjusted(-20, -20, 20, 20);
+    const QColor trail(0xd8, 0xb4, 0x6a, 120), visit(0xf2, 0xc9, 0x7a, 200);
+    QPen pen(trail, 1.4, Qt::DotLine, Qt::RoundCap); p.setPen(pen);
+    QPointF last; bool haveLast = false; qint64 lastT = 0;
+    QList<QPointF> visits;
+    for (const Fix &f : h) {
+        const QPointF s = toScreen(f.lat, f.lon);
+        const bool isVisit = f.source == QLatin1String("visit");
+        if (isVisit) { if (view.contains(s)) visits << s; continue; }
+        const qint64 t = f.time.toSecsSinceEpoch();
+        if (haveLast) {
+            const bool gap = t - lastT > 6 * 3600;           // a new day / a flight: don't join across it
+            if (!gap && (view.contains(s) || view.contains(last)) && QLineF(last, s).length() >= 2) p.drawLine(last, s);
+            else if (!gap && QLineF(last, s).length() < 2) continue;   // same pixel: keep the earlier anchor
+        }
+        last = s; lastT = t; haveLast = true;
+    }
+    p.setPen(QPen(visit, 1.3)); p.setBrush(Qt::NoBrush);
+    for (const QPointF &s : visits) p.drawEllipse(s, 3.5, 3.5);
 }
 
 void BeaconView::drawTrack(QPainter &p)
@@ -659,6 +706,10 @@ static QString eventGlyph(const QString &type)
     if (type == QLatin1String("ap_up")) return QStringLiteral("▲");
     if (type == QLatin1String("ap_down")) return QStringLiteral("▼");
     if (type == QLatin1String("ap_placed")) return QStringLiteral("💎");
+    if (type == QLatin1String("ap_refit")) return QStringLiteral("🎯");
+    if (type == QLatin1String("device")) return QStringLiteral("📱");
+    if (type == QLatin1String("device_online")) return QStringLiteral("🟢");
+    if (type == QLatin1String("device_offline")) return QStringLiteral("⚫");
     if (type == QLatin1String("fix")) return QStringLiteral("◎");
     if (type == QLatin1String("stop")) return QStringLiteral("📍");
     if (type == QLatin1String("achievement")) return QStringLiteral("🏆");
@@ -672,7 +723,8 @@ static QColor eventColor(const QString &type)
     if (type == QLatin1String("ap_up") || type == QLatin1String("achievement") || type == QLatin1String("region")) return C_ACTIVE;
     if (type == QLatin1String("ap_down")) return QColor(0xff, 0xa5, 0x3d);
     if (type == QLatin1String("ap_lost") || type == QLatin1String("error")) return C_IGNORED;
-    if (type == QLatin1String("ap_placed") || type == QLatin1String("stop")) return C_LOCATED;
+    if (type == QLatin1String("ap_placed") || type == QLatin1String("stop") || type == QLatin1String("ap_refit")) return C_LOCATED;
+    if (type == QLatin1String("device") || type == QLatin1String("device_online")) return C_ACTIVE;
     return C_ME;
 }
 
@@ -687,7 +739,12 @@ void BeaconView::onEvent(const QString &json)
     a.hasPos = o.contains("lat"); a.lat = o["lat"].toDouble(); a.lon = o["lon"].toDouble();
     a.hasFrom = o.contains("fromLat"); a.fromLat = o["fromLat"].toDouble(); a.fromLon = o["fromLon"].toDouble();
     a.r = o["r"].toDouble(); a.bearing = o["bearing"].toDouble(); a.delta = o["delta"].toInt();
-    a.durationMs = a.type == QLatin1String("ap_new") ? 2500 : a.type == QLatin1String("ap_lost") ? 2000
+    if (a.type == QLatin1String("ap_refit")) {                 // precompute everything the animation needs: nothing allocates per frame
+        a.acc = o["acc"].toDouble(); a.prevAcc = o["prevAcc"].toDouble(); a.n = o["n"].toInt(); a.vantage = o["vantage"].toInt();
+        for (const QJsonValue &v : o["vantagePoints"].toArray()) { const QJsonObject q = v.toObject(); a.vp << QPointF(q["lat"].toDouble(), q["lon"].toDouble()); a.vpDbm << q["dbm"].toInt(); a.vpDev << q["device"].toString(); }
+        m_lastRefit = a; m_haveRefit = true;
+    }
+    a.durationMs = a.type == QLatin1String("ap_new") ? 2500 : a.type == QLatin1String("ap_lost") ? 2000 : a.type == QLatin1String("ap_refit") ? 3200
                  : a.type == QLatin1String("ap_up") || a.type == QLatin1String("ap_down") ? 3000
                  : a.type == QLatin1String("ap_placed") ? 1600 : a.type == QLatin1String("fix") ? 1800
                  : a.type == QLatin1String("stop") ? 1400 : 4000;
@@ -752,6 +809,8 @@ void BeaconView::drawEvents(QPainter &p)
             p.setPen(Qt::NoPen); p.setBrush(c); p.drawPath(tri);
             p.setFont(small); p.setPen(c);
             p.drawText(QRectF(at.x() + 7, at.y() - 9, 70, 18), Qt::AlignLeft | Qt::AlignVCenter, QStringLiteral("%1%2 dB").arg(a.delta > 0 ? QStringLiteral("+") : QString()).arg(a.delta));
+        } else if (a.type == QLatin1String("ap_refit") && a.hasPos) {
+            drawRefit(p, a, t, mpp);
         } else if (a.type == QLatin1String("ap_placed") && a.hasPos) {
             const QPointF to = toScreen(a.lat, a.lon);
             const QPointF from = a.hasFrom ? (a.r > 0 ? offsetM(toScreen(a.fromLat, a.fromLon), a.bearing, a.r, mpp) : toScreen(a.fromLat, a.fromLon)) : me;
@@ -1120,6 +1179,152 @@ void BeaconView::keyPressEvent(QKeyEvent *e)
     }
 }
 
+void BeaconView::setShowDevices(bool on)
+{
+    m_showDevices = on; QSettings().setValue("map/showDevices", on); update();
+}
+
+void BeaconView::setShowImported(bool on)
+{
+    m_showImported = on; QSettings().setValue("map/showImported", on); update();
+}
+
+void BeaconView::replayLastRefit()
+{
+    if (!m_haveRefit) return;
+    Anim a = m_lastRefit; a.start = QDateTime::currentMSecsSinceEpoch();
+    m_anims.append(a); while (m_anims.size() > 24) m_anims.removeFirst();
+    if (!m_anim.isActive()) m_anim.start();
+    update();
+}
+
+QColor BeaconView::deviceColor(const QString &device)
+{
+    if (device.isEmpty()) return C_ME;
+    uint h = 2166136261u; for (const QChar &c : device) { h ^= c.unicode(); h *= 16777619u; }
+    return QColor::fromHsvF((h % 360) / 360.0, 0.75, 1.0);
+}
+
+// Linked devices: 📱 / 💻 / 🖥 + name + age, dashed line to us with the distance when it is close
+void BeaconView::drawDevices(QPainter &p)
+{
+    const QList<DevicePos> devs = m_loc->devicePositions();
+    const Fix &fix = m_loc->fix();
+    const QPointF me = toScreen(fix.lat, fix.lon);
+    const double mpp = metersPerPixel(fix.valid ? fix.lat : 0);
+    QFont emoji = font(); emoji.setPointSizeF(font().pointSizeF() * 1.4);
+    QFont small = font(); small.setPointSizeF(font().pointSizeF() * 0.85); small.setBold(true);
+    const qint64 now = QDateTime::currentSecsSinceEpoch();
+    // Measured ranges (RTT / BLE / differential Wi-Fi): a ring around us at the distance, the band is the 16–84 % interval
+    QList<QJsonObject> close;
+    QSet<QString> ranged;
+    for (auto it = m_ranges.constBegin(); it != m_ranges.constEnd(); ++it) {
+        const QJsonObject &r = it.value();
+        const QDateTime upd = QDateTime::fromString(r["updated"].toString(), Qt::ISODateWithMs);
+        if (!fix.valid || !r["distanceM"].isDouble() || !upd.isValid() || upd.secsTo(QDateTime::currentDateTime()) > 600) continue;
+        ranged.insert(it.key());
+        const double D = r["distanceM"].toDouble(), lo = r["lowM"].toDouble(D), hi = r["highM"].toDouble(D);
+        const QColor col = deviceColor(it.key());
+        if (D / mpp < 8) { close << r; continue; }
+        QColor band = col; band.setAlphaF(0.14);
+        QPainterPath ring; ring.addEllipse(me, hi / mpp, hi / mpp); ring.addEllipse(me, lo / mpp, lo / mpp);
+        p.setPen(Qt::NoPen); p.setBrush(band); p.drawPath(ring);
+        p.setPen(QPen(col, 1.6, Qt::DashLine)); p.setBrush(Qt::NoBrush); p.drawEllipse(me, D / mpp, D / mpp);
+        QPointF lab = me + QPointF(0, D / mpp + 20);                  // below the ring: the inset sits above-right
+        if (r["lat"].isDouble()) {                                  // bearing known: the device itself sits on the ring
+            const QPointF at = toScreen(r["lat"].toDouble(), r["lon"].toDouble());
+            glowDot(p, at, 6, col, 3); lab = at;
+        }
+        p.setFont(small); p.setPen(col);
+        p.drawText(QRectF(lab.x() - 120, lab.y() - 18, 240, 14), Qt::AlignCenter,
+                   QStringLiteral("%1 · %2 measured (%3–%4) · %5").arg(it.key(), distText(D), distText(lo), distText(hi), r["class"].toString()));
+    }
+    drawRangeInset(p, close);
+    if (devs.isEmpty()) return;
+    for (const DevicePos &d : devs) {
+        if (!d.time.isValid()) continue;
+        const QPointF at = toScreen(d.lat, d.lon);
+        if (!rect().adjusted(-120, -120, 120, 120).contains(at.toPoint())) continue;
+        const QColor col = deviceColor(d.device);
+        if (fix.valid) {
+            const double dist = Locator::distanceM(fix.lat, fix.lon, d.lat, d.lon);
+            if (dist < 2000 && dist > 3 && !ranged.contains(d.device)) {   // fix-to-fix only when nothing was measured
+                QColor c = col; c.setAlphaF(d.online ? 0.7 : 0.35);
+                p.setPen(QPen(c, 1.3, Qt::DashLine)); p.drawLine(me, at);
+                p.setFont(small); p.setPen(c);
+                p.drawText(QRectF((me + at) / 2 - QPointF(50, 18), QSizeF(100, 14)), Qt::AlignCenter, distText(dist));
+            }
+        }
+        if (d.acc > 0) { QColor c = col; c.setAlphaF(0.10); p.setPen(QPen(col, 1, Qt::DotLine)); p.setBrush(c); p.drawEllipse(at, d.acc / mpp, d.acc / mpp); }
+        p.setFont(emoji); p.setPen(Qt::NoPen);
+        QColor fill = col; fill.setAlphaF(d.online ? 0.95 : 0.45);
+        p.setBrush(fill); p.drawEllipse(at, 12, 12);
+        p.setPen(Qt::black);
+        p.drawText(QRectF(at.x() - 12, at.y() - 12, 24, 24), Qt::AlignCenter, d.kind == QLatin1String("android") ? QStringLiteral("📱") : d.kind == QLatin1String("desktop") ? QStringLiteral("🖥") : QStringLiteral("💻"));
+        p.setFont(small); p.setPen(d.online ? C_TEXT : C_DIM);
+        const qint64 age = now - d.time.toSecsSinceEpoch();
+        const QString ageText = age < 90 ? QStringLiteral("now") : age < 3600 ? QStringLiteral("%1 min").arg(age / 60) : age < 86400 ? QStringLiteral("%1 h").arg(age / 3600) : QStringLiteral("%1 d").arg(age / 86400);
+        p.drawText(QRectF(at.x() - 90, at.y() + 13, 180, 16), Qt::AlignCenter, QStringLiteral("%1 · %2%3").arg(d.device, ageText, d.online ? QString() : QStringLiteral(" · offline")));
+    }
+}
+
+// The refit animation (3.2 s): vantage points pop in, dashed range rings expand from each to its
+// distance to the new position (so they visibly intersect at the answer), the marker glides from the
+// old estimate along a dashed trail while its uncertainty circle shrinks, then a crosshair locks on,
+// pulses twice and the "±38 m · 24 samples" label rises. Rings are coloured by the device that heard it.
+void BeaconView::drawRefit(QPainter &p, const Anim &a, double t, double mpp)
+{
+    const QPointF to = toScreen(a.lat, a.lon), from = a.hasFrom ? toScreen(a.fromLat, a.fromLon) : to;
+    QFont small = font(); small.setPointSizeF(font().pointSizeF() * 0.85); small.setBold(true);
+    // 1. vantage points pop in (0 – 0.25), each with its ring growing (0.15 – 0.65)
+    for (int i = 0; i < a.vp.size(); ++i) {
+        const double pop = qBound(0.0, (t - 0.04 * i) / 0.2, 1.0);
+        if (pop <= 0) continue;
+        const QPointF v = toScreen(a.vp[i].x(), a.vp[i].y());
+        const QColor col = deviceColor(a.vpDev.value(i));
+        const double s = easeOut(pop) * 7;
+        QPainterPath tri; tri.moveTo(v.x(), v.y() - s); tri.lineTo(v.x() + s * 0.9, v.y() + s * 0.6); tri.lineTo(v.x() - s * 0.9, v.y() + s * 0.6); tri.closeSubpath();
+        QColor fc = col; fc.setAlphaF(0.9 * (t < 0.85 ? 1.0 : (1 - t) / 0.15));
+        p.setPen(QPen(Qt::white, 1)); p.setBrush(fc); p.drawPath(tri);
+        const double ring = qBound(0.0, (t - 0.15 - 0.03 * i) / 0.5, 1.0);
+        if (ring > 0) {
+            const double full = Locator::distanceM(a.vp[i].x(), a.vp[i].y(), a.lat, a.lon) / mpp;
+            const double r = full * easeOut(ring);
+            QColor rc = col; rc.setAlphaF((0.85 - 0.5 * ring) * (t < 0.85 ? 1.0 : (1 - t) / 0.15));
+            p.setPen(QPen(rc, 1.4, Qt::DashLine)); p.setBrush(Qt::NoBrush); p.drawEllipse(v, r, r);
+            if (ring < 1) { p.setFont(small); p.setPen(rc); p.drawText(QRectF(v.x() + 8, v.y() - 8, 90, 14), Qt::AlignLeft | Qt::AlignVCenter, QStringLiteral("%1 dBm").arg(a.vpDbm.value(i))); }
+        }
+    }
+    // 2. marker glides old → new (0.3 – 0.7) while the uncertainty circle shrinks
+    const double g = qBound(0.0, (t - 0.3) / 0.4, 1.0), e = easeOut(g);
+    const QPointF at = from + (to - from) * e;
+    if (a.hasFrom && g > 0 && g < 1.2) {
+        QColor trail = C_LOCATED; trail.setAlphaF(0.5 * (1 - qMax(0.0, t - 0.7) / 0.3));
+        p.setPen(QPen(trail, 1.5, Qt::DashLine)); p.drawLine(from, at);
+    }
+    const double accNow = (a.prevAcc + (a.acc - a.prevAcc) * e) / mpp;
+    QColor ac = C_LOCATED; ac.setAlphaF(0.18); p.setPen(QPen(C_LOCATED, 1, Qt::DotLine)); p.setBrush(ac); p.drawEllipse(at, accNow, accNow);
+    glowDot(p, at, 5, C_LOCATED, 4);
+    // 3. lock: crosshair pulses twice (0.7 – 1.0), label rises, sparkle
+    if (t > 0.7) {
+        const double l = (t - 0.7) / 0.3;
+        const double pulse = 0.5 + 0.5 * std::cos(l * M_PI * 4);
+        QColor c = C_ACTIVE; c.setAlphaF(0.4 + 0.6 * pulse);
+        p.setPen(QPen(c, 1.5)); p.setBrush(Qt::NoBrush);
+        const double R = 14 + 6 * pulse;
+        p.drawEllipse(at, R, R);
+        for (int k = 0; k < 4; ++k) { const double ang = k * M_PI / 2; p.drawLine(at + QPointF(std::cos(ang) * (R - 5), std::sin(ang) * (R - 5)), at + QPointF(std::cos(ang) * (R + 6), std::sin(ang) * (R + 6))); }
+        p.setFont(small); p.setPen(c);
+        p.drawText(QRectF(at.x() - 90, at.y() - 34 - 10 * l, 180, 16), Qt::AlignCenter, QStringLiteral("±%1 m · %2 samples").arg(qRound(a.acc)).arg(a.n));
+        if (l < 0.5) {                                          // sparkle
+            const double sp = l / 0.5;
+            QColor sc = Qt::white; sc.setAlphaF(1 - sp);
+            p.setPen(QPen(sc, 1.2));
+            for (int k = 0; k < 6; ++k) { const double ang = k * M_PI / 3 + sp; const double r0 = 6 + 10 * sp, r1 = r0 + 6 * (1 - sp); p.drawLine(at + QPointF(std::cos(ang) * r0, std::sin(ang) * r0), at + QPointF(std::cos(ang) * r1, std::sin(ang) * r1)); }
+        }
+    }
+}
+
 void BeaconView::showEvent(QShowEvent *) { m_anim.start(); if (m_autoZoom) fitBeacons(); }
 void BeaconView::hideEvent(QHideEvent *) { m_anim.stop(); }
 void BeaconView::leaveEvent(QEvent *) { m_hover = -1; m_tickerHover = false; m_tickerPausedAt = 0; update(); }
@@ -1128,12 +1333,25 @@ void BeaconView::resizeEvent(QResizeEvent *) { if (m_autoZoom) fitBeacons(); }
 void BeaconView::mousePressEvent(QMouseEvent *e)
 {
     if (e->button() != Qt::LeftButton) return;
+    const int hi = hitAt(e->position());
+    if (hi >= 0 && m_hits[hi].kind == HitAnchor) {           // drag an anchor to where it really is
+        m_anchorDrag = m_hits[hi].items.first(); m_anchorMoved = false; m_anchorDragPos = e->position();
+        m_dragStart = e->position();
+        return;
+    }
     m_dragging = true; m_dragMoved = false;
     m_dragStart = e->position(); m_dragCenter = m_center;
 }
 
 void BeaconView::mouseMoveEvent(QMouseEvent *e)
 {
+    if (m_anchorDrag >= 0) {
+        if (!m_anchorMoved && (e->position() - m_dragStart).manhattanLength() < 4) return;
+        m_anchorMoved = true; m_anchorDragPos = e->position();
+        setCursor(Qt::ClosedHandCursor);
+        update();
+        return;
+    }
     if (m_dragging) {
         const QPointF d = e->position() - m_dragStart;
         if (!m_dragMoved && d.manhattanLength() < 4) return;
@@ -1157,6 +1375,23 @@ void BeaconView::mouseMoveEvent(QMouseEvent *e)
 
 void BeaconView::mouseReleaseEvent(QMouseEvent *e)
 {
+    if (m_anchorDrag >= 0) {
+        const int idx = m_anchorDrag; const bool moved = m_anchorMoved;
+        m_anchorDrag = -1; m_anchorMoved = false; unsetCursor();
+        const QList<BfAnchor> all = m_loc->anchors();
+        if (idx >= all.size()) { update(); return; }
+        if (!moved) { editAnchor(idx); return; }              // a click: edit it
+        double lat, lon; unmerc(toMerc(e->position()), &lat, &lon);
+        QJsonObject o = all[idx].toJson(false);
+        o["lat"] = lat; o["lon"] = lon; o.remove(QStringLiteral("rvOffset"));
+        o["placedBy"] = QStringLiteral("desktop"); o["source"] = QStringLiteral("map-pick");
+        o["placedAt"] = QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs);
+        bool ok = false; QString err;
+        m_loc->setAnchor(o, QStringLiteral("desktop"), &ok, &err);
+        if (!ok) QMessageBox::warning(this, QStringLiteral("Anchor"), err);
+        update();
+        return;
+    }
     const bool click = m_dragging && !m_dragMoved;
     m_dragging = false;
     unsetCursor();
@@ -1172,6 +1407,7 @@ void BeaconView::mouseReleaseEvent(QMouseEvent *e)
         if (h.items.size() == 1) { m_selKind = HitBeacon; m_selItem = h.items.first(); }
         else if (m_zoom < 18) zoomAt(2, h.pos);
         break;
+    case HitAnchor: break;
     case HitNone: break;
     }
     update();
@@ -1257,9 +1493,21 @@ void BeaconView::contextMenuEvent(QContextMenuEvent *e)
     menu.addAction(QIcon::fromTheme(QStringLiteral("internet-web-browser")), QStringLiteral("Open here in OpenStreetMap"), this, [lat, lon] {
         QDesktopServices::openUrl(QUrl(QStringLiteral("https://www.openstreetmap.org/?mlat=%1&mlon=%2#map=17/%1/%2").arg(lat).arg(lon))); });
     menu.addAction(QIcon::fromTheme(QStringLiteral("mark-location")), QStringLiteral("Centre here"), this, [this, lat, lon] { focusOn(lat, lon, m_zoom); });
+    menu.addAction(QIcon::fromTheme(QStringLiteral("network-wireless")), QStringLiteral("Place an antenna here…"), this, [this, lat, lon] { placeAnchorAt(lat, lon); });
     QAction *names = menu.addAction(QStringLiteral("Show Wi-Fi names"));
     names->setCheckable(true); names->setChecked(m_showNames);
     connect(names, &QAction::toggled, this, &BeaconView::setShowNames);
+    QAction *devs = menu.addAction(QStringLiteral("Show my other devices"));
+    devs->setCheckable(true); devs->setChecked(m_showDevices);
+    connect(devs, &QAction::toggled, this, &BeaconView::setShowDevices);
+    if (!m_loc->importedHistory().isEmpty()) {
+        QAction *imp = menu.addAction(QStringLiteral("Show imported history"));
+        imp->setCheckable(true); imp->setChecked(m_showImported);
+        connect(imp, &QAction::toggled, this, &BeaconView::setShowImported);
+    }
+    QAction *replay = menu.addAction(QIcon::fromTheme(QStringLiteral("media-playback-start")), QStringLiteral("Replay last refit"));
+    replay->setEnabled(m_haveRefit);
+    connect(replay, &QAction::triggered, this, &BeaconView::replayLastRefit);
     if (m_loc->fix().valid) {
         menu.addSeparator();
         QMenu *share = menu.addMenu(QIcon::fromTheme(QStringLiteral("document-share")), QStringLiteral("Share my fix"));
@@ -1275,6 +1523,23 @@ void BeaconView::showItemMenu(const Hit &h, const QPoint &globalPos)
 {
     QMenu menu(this);
     const Fix &fix = m_loc->fix();
+    if (h.kind == HitAnchor) {
+        const int idx = h.items.first();
+        const QList<BfAnchor> all = m_loc->anchors();
+        if (idx >= all.size()) return;
+        const BfAnchor a = all[idx];
+        const QString coords = QStringLiteral("%1, %2").arg(a.lat, 0, 'f', 7).arg(a.lon, 0, 'f', 7);
+        menu.addSection(a.name.isEmpty() ? a.kind : a.name);
+        menu.addAction(QIcon::fromTheme(QStringLiteral("document-edit")), QStringLiteral("Edit anchor…"), this, [this, idx] { editAnchor(idx); });
+        menu.addAction(QIcon::fromTheme(QStringLiteral("edit-copy")), QStringLiteral("Copy %1").arg(coords), this, [coords] { QApplication::clipboard()->setText(coords); });
+        menu.addAction(QIcon::fromTheme(QStringLiteral("edit-delete")), QStringLiteral("Remove anchor"), this, [this, a] {
+            if (QMessageBox::question(this, QStringLiteral("Remove anchor"), QStringLiteral("Remove “%1”? Every synced device drops it too.").arg(a.name.isEmpty() ? a.kind : a.name)) == QMessageBox::Yes)
+                m_loc->removeAnchor(a.id);
+            update();
+        });
+        menu.exec(globalPos);
+        return;
+    }
     if (h.kind == HitPoi || (h.kind == HitCluster && h.items.size() == 1)) {
         const Poi pt = m_loc->pois()[h.items.first()];
         const QString dest = QStringLiteral("%1,%2").arg(pt.lat, 0, 'f', 6).arg(pt.lon, 0, 'f', 6);
@@ -1314,4 +1579,111 @@ void BeaconView::showItemMenu(const Hit &h, const QPoint &globalPos)
         return;
     }
     menu.exec(globalPos);
+}
+
+// ── Anchors + measured ranges (docs/RANGING.md) ──────────────────────────────
+static QColor anchorColor(const QString &kind)
+{
+    if (kind == QLatin1String("this-computer")) return C_ME;
+    if (kind == QLatin1String("wifi-ap")) return C_LOCATED;
+    if (kind == QLatin1String("gnss")) return C_ACTIVE;
+    if (kind == QLatin1String("rtt-responder")) return C_TRAVEL;
+    if (kind == QLatin1String("ble")) return QColor(0x9d, 0x8c, 0xff);
+    return C_IGNORED;
+}
+
+void BeaconView::drawAnchors(QPainter &p)
+{
+    const QList<BfAnchor> all = m_loc->anchors();
+    if (all.isEmpty()) return;
+    const double mpp = metersPerPixel(all.first().lat);
+    QFont small = font(); small.setPointSizeF(font().pointSizeF() * 0.8); small.setBold(true);
+    for (int i = 0; i < all.size(); ++i) {
+        const BfAnchor &a = all[i];
+        const QPointF at = (i == m_anchorDrag && m_anchorMoved) ? m_anchorDragPos : toScreen(a.lat, a.lon);
+        if (!rect().adjusted(-40, -40, 40, 40).contains(at.toPoint())) continue;
+        const QColor col = anchorColor(a.kind);
+        const double r = a.accM / mpp;
+        if (r > 4) { QColor c = col; c.setAlphaF(0.10); p.setPen(QPen(col, 1, Qt::DotLine)); p.setBrush(c); p.drawEllipse(at, r, r); }
+        QPainterPath d; d.moveTo(at.x(), at.y() - 8); d.lineTo(at.x() + 7, at.y()); d.lineTo(at.x(), at.y() + 8); d.lineTo(at.x() - 7, at.y()); d.closeSubpath();
+        p.setPen(QPen(Qt::black, 1.5)); p.setBrush(col); p.drawPath(d);
+        p.setPen(QPen(Qt::white, 1)); p.setBrush(Qt::NoBrush); p.drawPath(d);
+        if (a.ref) { p.setPen(QPen(col, 1.4)); p.drawEllipse(at, 11, 11); }
+        if (a.headingAssumed) { p.setFont(small); p.setPen(C_TRAVEL); p.drawText(QRectF(at.x() + 7, at.y() - 16, 14, 14), Qt::AlignCenter, QStringLiteral("?")); }
+        const bool hovered = m_hover >= 0 && m_hover < m_hits.size() && m_hits[m_hover].kind == HitAnchor && m_hits[m_hover].items.value(0) == i;
+        if (m_zoom >= 16 || hovered || (i == m_anchorDrag && m_anchorMoved)) {
+            p.setFont(small); p.setPen(C_TEXT);
+            const QString label = (a.name.isEmpty() ? a.kind : a.name) + (hovered ? QStringLiteral(" · ±%1 m%2").arg(a.accM, 0, 'g', 2).arg(a.rv ? QStringLiteral(" · RV") : QString()) : QString());
+            p.drawText(QRectF(at.x() - 100, at.y() + 9, 200, 14), Qt::AlignCenter, label);
+        }
+        m_hits.append({HitAnchor, at, 9, {i}});
+    }
+}
+
+// Devices closer than a few pixels at this zoom (the phone 60 cm from the desktop): drawn in a to-scale inset
+void BeaconView::drawRangeInset(QPainter &p, const QList<QJsonObject> &close)
+{
+    if (close.isEmpty()) return;
+    const Fix &fix = m_loc->fix();
+    const QPointF me = toScreen(fix.lat, fix.lon);
+    double span = 0.5;
+    for (const QJsonObject &r : close) span = std::max(span, r["highM"].toDouble(r["distanceM"].toDouble()) * 1.25);
+    static const double nice[] = {0.5, 1, 2, 3, 5, 10, 20};
+    for (double n : nice) if (n >= span) { span = n; break; }
+    QFont small = font(); small.setPointSizeF(font().pointSizeF() * 0.8);
+    QFont bold = small; bold.setBold(true);
+    auto rowText = [this](const QJsonObject &r) {
+        const double D = r["distanceM"].toDouble(), lo = r["lowM"].toDouble(D), hi = r["highM"].toDouble(D);
+        QStringList m; for (const QJsonValue &v : r["method"].toArray()) m << v.toString().toUpper();
+        return QStringLiteral("%1 %2  %3 (%4–%5) · %6 · %7").arg(r["kind"].toString() == QLatin1String("android") ? QStringLiteral("📱") : QStringLiteral("💻"),
+                                                                 r["device"].toString().left(18), distText(D), distText(lo), distText(hi), r["class"].toString(), m.join(QLatin1Char('+')));
+    };
+    double textW = 0;
+    for (const QJsonObject &r : close) textW = std::max(textW, double(QFontMetrics(small).horizontalAdvance(rowText(r))));
+    const double w = std::max(250.0, textW + 36), rowH = 34, h = 30 + rowH * close.size();
+    QRectF box(me.x() + 26, me.y() - h - 14, w, h);
+    if (box.right() > width() - 6) box.moveRight(me.x() - 26);
+    if (box.top() < 6) box.moveTop(me.y() + 20);
+    p.setPen(QPen(QColor(255, 255, 255, 60), 1)); p.setBrush(C_PANEL); p.drawRoundedRect(box, 8, 8);
+    p.setPen(QPen(QColor(255, 255, 255, 50), 1, Qt::DotLine)); p.drawLine(me, box.left() < me.x() ? box.topRight() + QPointF(0, 14) : box.topLeft() + QPointF(0, 14));
+    p.setFont(bold); p.setPen(C_DIM);
+    p.drawText(box.adjusted(10, 4, -10, 0), Qt::AlignLeft | Qt::AlignTop, QStringLiteral("Measured distance · to scale (%1 m)").arg(span, 0, 'g', 2));
+    const double x0 = box.left() + 16, x1 = box.right() - 16;
+    for (int i = 0; i < close.size(); ++i) {
+        const QJsonObject &r = close[i];
+        const double y = box.top() + 30 + rowH * i + 8;
+        auto xAt = [&](double m) { return x0 + (x1 - x0) * qBound(0.0, m / span, 1.0); };
+        p.setPen(QPen(QColor(255, 255, 255, 40), 1)); p.drawLine(QPointF(x0, y), QPointF(x1, y));
+        for (int t = 0; t <= 4; ++t) { const double x = x0 + (x1 - x0) * t / 4.0; p.drawLine(QPointF(x, y - 3), QPointF(x, y + 3)); }
+        const QColor col = deviceColor(r["device"].toString());
+        const double D = r["distanceM"].toDouble(), lo = r["lowM"].toDouble(D), hi = r["highM"].toDouble(D);
+        QColor band = col; band.setAlphaF(0.35);
+        p.setPen(Qt::NoPen); p.setBrush(band); p.drawRoundedRect(QRectF(QPointF(xAt(lo), y - 4), QPointF(xAt(hi), y + 4)), 3, 3);
+        glowDot(p, QPointF(x0, y), 4, C_ME, 2);
+        glowDot(p, QPointF(xAt(D), y), 5, col, 3);
+        p.setFont(small); p.setPen(C_TEXT);
+        p.drawText(QRectF(x0 - 6, y + 5, x1 - x0 + 12, 14), Qt::AlignLeft | Qt::AlignVCenter, rowText(r));
+    }
+}
+
+void BeaconView::editAnchor(int index)
+{
+    const QList<BfAnchor> all = m_loc->anchors();
+    if (index < 0 || index >= all.size()) return;
+    AnchorDialog d(m_loc, all[index].lat, all[index].lon, all[index].toJson(false), this);
+    if (d.exec() != QDialog::Accepted) return;
+    bool ok = false; QString err;
+    m_loc->setAnchor(d.anchor(), QStringLiteral("desktop"), &ok, &err);
+    if (!ok) QMessageBox::warning(this, QStringLiteral("Anchor"), err);
+    update();
+}
+
+void BeaconView::placeAnchorAt(double lat, double lon)
+{
+    AnchorDialog d(m_loc, lat, lon, QJsonObject(), this);
+    if (d.exec() != QDialog::Accepted) return;
+    bool ok = false; QString err;
+    m_loc->setAnchor(d.anchor(), QStringLiteral("desktop"), &ok, &err);
+    if (!ok) QMessageBox::warning(this, QStringLiteral("Anchor"), err);
+    update();
 }

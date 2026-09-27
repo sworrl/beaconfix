@@ -32,7 +32,8 @@ LINKED later (merged) in any direction.
   ct = AES-256-GCM(key = scrypt(passphrase_utf8, salt), nonce, plaintext, aad = `"beaconfix-identity-v1"`);
   plaintext = `{"record":<record>,"seed":<b64 32B>}`. Passphrase: user-chosen (≥ 8 chars) OR an
   auto-generated 6-word code (EFF short wordlist) shown once.
-  Text form: `"BFID1:" + base64url(json bundle)`. QR: the text form.
+  Text form: `beaconfix://identity/<base64url(json bundle)>` (3.6; `BFID1:` + base64url is
+  still read). QR: the text form — a URI, so a phone camera offers to open it in the app.
 - **LAN hand-off** (no QR): the sender app calls its own API `POST /api/v1/identity/export`
   (control scope or local UI) → the server holds the bundle for 10 min under a one-time 6-digit
   code; the receiver calls `GET /api/v1/identity/export/<code>` on the sender (LAN only, code
@@ -69,9 +70,13 @@ LINKED later (merged) in any direction.
 ### Implementation notes (both apps follow these)
 
 - **Link flow, made precise.** A's *link payload* carries no signature, because the canonical
-  string needs both ids: `BFLNK1:` + base64url of `{"v":1,"t":"beaconfix-link","id","name","pub","ts"}`.
+  string needs both ids: `beaconfix://link/` + base64url of `{"v":1,"t":"beaconfix-link","id","name","pub","ts"}`
+  (`BFLNK1:` + base64url still read). Since 3.6.0 `ts` carries nine random fractional digits and is
+  a single-use **offer**: the device that displayed the QR remembers it for 10 minutes and co-signs
+  only a statement whose `ts` is that offer. `startLink(otherId, otherPub, ts)` must therefore use
+  the `ts` of the payload that was scanned, never its own clock.
   B builds the statement (`a`/`b` in either order), signs its own side and sends it — either by
-  `POST /api/v1/identity/link` to A's API, or as a `BFLINK1:` + base64url(statement JSON) text /
+  `POST /api/v1/identity/link` to A's API, or as a `beaconfix://statement/` + base64url(statement JSON) text (`BFLINK1:` still read) /
   QR that A pastes. A statement may carry `pubA` / `pubB` while it is being completed so the
   receiver can verify the other side before signing. A stores a link only when both signatures
   verify against public keys whose ids match; a half-signed statement from a stranger is refused.
@@ -108,9 +113,9 @@ your BeaconFix identity") and otherwise creates nothing on its own.
 |---|---|
 | `beaconfix --identity` | id (grouped), name, key state, devices, links, pending link requests, file |
 | `beaconfix --identity-new "<name>"` | create (refuses if one exists; forget it from the app first) |
-| `beaconfix --identity-export [--words] [--passphrase <p>] [--file <f>]` | encrypted `BFID1:` bundle as text, a QR in the terminal (`qrencode`), optionally a file. `--words` makes a 6-word code and prints it once |
-| `beaconfix --identity-import <file-or-BFID1-text> [--passphrase <p>]` | import (asks for the passphrase / word code otherwise) |
-| `beaconfix --identity-link-qr` | our `BFLNK1:` link payload as text + QR |
+| `beaconfix --identity-export [--words] [--passphrase <p>] [--file <f>]` | encrypted `beaconfix://identity/…` bundle as text, a QR in the terminal (`qrencode`), optionally a file. `--words` makes a 6-word code and prints it once |
+| `beaconfix --identity-import <file-or-text> [--passphrase <p>]` | import a `beaconfix://identity/…` / `BFID1:` bundle (asks for the passphrase / word code otherwise) |
+| `beaconfix --identity-link-qr` | our `beaconfix://link/…` payload as text + QR — asked from the running tray (which is the process that must recognise the offer); without a tray the offer is only good for that command's process |
 | `beaconfix --identity-selftest` | the fixed-seed vectors above |
 
 The CLI works on the file directly and tells a running tray to reload. Before the tray has ever

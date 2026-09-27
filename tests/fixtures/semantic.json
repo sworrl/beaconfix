@@ -1,0 +1,8 @@
+{"timelineObjects": [
+  {"placeVisit": {"location": {"latitudeE7": 400030000, "longitudeE7": -750680000, "placeId": "ChIJx", "address": "1 Main St", "name": "Home", "semanticType": "TYPE_HOME"},
+                  "duration": {"startTimestamp": "2022-02-02T07:00:00Z", "endTimestamp": "2022-02-02T09:00:00Z"}}},
+  {"activitySegment": {"startLocation": {"latitudeE7": 400030000, "longitudeE7": -750680000}, "endLocation": {"latitudeE7": 400200000, "longitudeE7": -750800000},
+                       "duration": {"startTimestamp": "2022-02-02T09:00:00Z", "endTimestamp": "2022-02-02T09:20:00Z"}, "activityType": "IN_PASSENGER_VEHICLE",
+                       "simplifiedRawPath": {"points": [{"latE7": 400100000, "lngE7": -750700000, "accuracyMeters": 20, "timestamp": "2022-02-02T09:10:00Z"}, {"latE7": 400150000, "lngE7": -750750000, "accuracyMeters": 20, "timestampMs": "1643793300000"}]}}},
+  {"placeVisit": {"location": {"latitudeE7": 400200000, "longitudeE7": -750800000, "name": "Office"}, "duration": {"startTimestampMs": "1643793600000", "endTimestampMs": "1643800800000"}}}
+]}

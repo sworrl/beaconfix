@@ -1,0 +1,8 @@
+{"locations": [
+  {"latitudeE7": 400030000, "longitudeE7": -750680000, "accuracy": 10, "altitude": 121, "source": "WIFI", "timestamp": "2021-06-01T12:00:00Z",
+   "wifiScan": {"accessPoints": [{"mac": "1234567890123", "strength": -48, "frequencyMhz": 2437}, {"mac": "98765432109876", "strength": -80, "frequencyMhz": 5180}]}},
+  {"latitudeE7": 400040000, "longitudeE7": -750690000, "accuracy": 25, "timestampMs": "1622548860000"},
+  {"latitudeE7": 400050000, "longitudeE7": -750700000, "accuracy": 8, "timestamp": "2021-06-01T12:02:00Z",
+   "wifiScan": {"accessPoints": [{"mac": "1234567890123", "strength": -52}]}},
+  {"accuracy": 8, "timestamp": "2021-06-01T12:03:00Z"}
+]}

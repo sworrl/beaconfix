@@ -1,0 +1,7 @@
+WigleWifi-1.6,appRelease=2.83,model=Pixel 8,release=15,device=shiba,display=AP4A,board=shiba,brand=google,star=Sol,body=3,subBody=0
+MAC,SSID,AuthMode,FirstSeen,Channel,Frequency,RSSI,CurrentLatitude,CurrentLongitude,AltitudeMeters,AccuracyMeters,RCOIs,MfgrId,Type
+aa:bb:cc:dd:ee:01,"Home, sweet",[WPA2-PSK-CCMP][ESS],2024-05-05 10:00:00,6,2437,-45,40.003,-75.068,120,5,,,WIFI
+aa:bb:cc:dd:ee:02,Cafe,[ESS],2024-05-05 10:00:00,11,2462,-70,40.003,-75.068,120,5,,,WIFI
+aa:bb:cc:dd:ee:03,Sae,[WPA2-PSK-CCMP][RSN-SAE-CCMP][ESS],2024-05-05 10:01:00,36,5180,-60,40.004,-75.069,120,8,,,WIFI
+11:22:33:44:55:66,MyPhoneBT,Misc,2024-05-05 10:01:00,0,0,-60,40.004,-75.069,120,8,,,BT
+aa:bb:cc:dd:ee:04,Old,[WEP][ESS],2024-05-05 10:02:00,1,2412,-80,0,0,0,0,,,WIFI

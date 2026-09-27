@@ -55,6 +55,20 @@ sudo apt install ./build-pkg/beaconfix_*.deb
 Then add **BeaconFix** through *Add Widgets* on the desktop or a panel. The tray starts at
 login; the first start migrates any older JSON state into the database.
 
+### Optional: device ranging and the Pi agent
+
+- **Wi-Fi RTT responder** (the phone measures its distance to this computer to about a metre):
+  needs a Wi-Fi card whose driver supports `ENABLE_FTM_RESPONDER` (e.g. Intel AX210) and
+  `hostapd` (the script installs it). Run once as root:
+  `sudo ~/.local/share/beaconfix/setup-rtt-responder.sh` (`/usr/share/beaconfix/…` with the
+  package); add `--country CC` if BeaconFix has no fix yet. `--status` shows its state,
+  `--remove` takes out everything it installed (hostapd stays). See
+  [docs/RANGING.md](docs/RANGING.md) §6.
+- **BLE ranging** needs BlueZ with LE advertising; some kernel + BlueZ 5.7x combinations reject
+  every advertisement, BlueZ ≥ 5.8x works ([docs/RANGING.md](docs/RANGING.md) §9.1).
+- **Raspberry Pi agent** (a Pi with a GPS HAT as a precise position witness, BLE radio and NTP
+  server): `agent/install-on-pi.sh <user>@<pi>` from the desktop. See [docs/AGENT.md](docs/AGENT.md).
+
 ## How it gets a fix
 
 | tier | source | accuracy | needs |
@@ -131,7 +145,7 @@ code) are exposed for other widgets.
 | `beaconfix --tray` | the background locator and tray icon; owns the state, the database, the API and the tile server; D-Bus activated |
 | Plasma widget `org.kde.plasma.beaconfix` | panel or desktop applet with Map, Nearby, Radar and Trip tabs — [docs/WIDGET.md](docs/WIDGET.md) |
 | D-Bus `org.sworrl.BeaconFix` | properties, methods and signals for scripts and other apps — [docs/DBUS.md](docs/DBUS.md) |
-| CLI | `--once`, `--json`, `--refresh`, `--gpx`, `--copy`, `--nearby <what>`, `--tz`, `--apply-os`, `--identity…`, `--refit`, `--sync`, API / home / known-device / database management — `beaconfix --help` |
+| CLI | `--once`, `--json`, `--refresh`, `--gpx`, `--copy`, `--nearby <what>`, `--tz`, `--apply-os`, `--identity…`, `--refit`, `--sync <peer>`, `--peers`, `--import <file>`, API / home / known-device / database management — `beaconfix --help` |
 | `beaconfix-osd` | tiny root helper (pkexec) that writes `/etc/geolocation` for GeoClue; installed with its polkit action and rules by `install.sh` / the package |
 
 ## Privacy
@@ -163,12 +177,15 @@ have paired. Turn it off with `apiEnabled=false`.
 - [docs/DATABASE.md](docs/DATABASE.md) — the internal map database
 - [docs/DBUS.md](docs/DBUS.md) — the D-Bus interface
 - [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) — building, layout, adding a tier, testing
+- [docs/RANGING.md](docs/RANGING.md) — device ranging: Wi-Fi RTT, BLE, anchors, the maths
+- [docs/AGENT.md](docs/AGENT.md) — the Raspberry Pi agent (GNSS witness, BLE, NTP)
 - [CHANGELOG.md](CHANGELOG.md)
 
 ## License
 
 GPL-2.0-or-later. See [LICENSE](LICENSE). Data credits: BeaconDB, OpenStreetMap contributors
-(Nominatim, Overpass, tiles), Esri World Imagery, OpenTopoMap, Open Topo Data (SRTM), WiGLE.
+(Nominatim, Overpass, tiles), Esri World Imagery, OpenTopoMap, Open Topo Data (SRTM), WiGLE,
+and the EFF short wordlist (CC BY 3.0 US, https://www.eff.org/dice) for the identity codes.
 
 ## Contributing
 

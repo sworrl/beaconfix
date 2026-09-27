@@ -2,6 +2,7 @@
 #include <QCache>
 #include <QDateTime>
 #include <QHash>
+#include <QJsonObject>
 #include <QImage>
 #include <QPixmap>
 #include <QPointF>
@@ -35,6 +36,9 @@ public:
     void setCategoryVisible(const QString &key, bool visible);
     bool showNames() const { return m_showNames; }
     void setShowNames(bool on);
+    void setShowDevices(bool on);
+    void setShowImported(bool on);           // the imported history track (Timeline / WiGLE / GPX / KML)
+    void replayLastRefit();
 
 protected:
     void paintEvent(QPaintEvent *) override;
@@ -51,7 +55,7 @@ protected:
     void resizeEvent(QResizeEvent *) override;
 
 private:
-    enum HitKind { HitNone, HitBeacon, HitPoi, HitCluster, HitButton };
+    enum HitKind { HitNone, HitBeacon, HitPoi, HitCluster, HitButton, HitAnchor };
     struct Hit { HitKind kind; QPointF pos; double radius; QList<int> items; int button = -1; };
 
     // Web-Mercator, normalised to [0,1]²
@@ -69,6 +73,7 @@ private:
     void    ensureTile(Layer l, int z, int x, int y, bool labels);
     void    drawTiles(QPainter &p, bool labels);
     void    drawTrack(QPainter &p);
+    void    drawImportedTrack(QPainter &p);
     void    drawPois(QPainter &p);
     void    drawBeacons(QPainter &p);
     void    drawMe(QPainter &p);
@@ -124,7 +129,22 @@ private:
         bool    hasPos = false, hasFrom = false;
         double  lat = 0, lon = 0, fromLat = 0, fromLon = 0, r = 0, bearing = 0;
         int     delta = 0; QColor col;
+        // ap_refit: the vantage points that made the fit (lat, lon, dbm, device) and the numbers to show
+        QList<QPointF> vp; QList<int> vpDbm; QStringList vpDev;
+        double  acc = 0, prevAcc = 0; int n = 0, vantage = 0;
     };
+    Anim    m_lastRefit; bool m_haveRefit = false;              // "Replay last refit"
+    bool    m_showDevices = true;
+    bool    m_showImported = true;
+    void    drawDevices(QPainter &p);
+    void    drawAnchors(QPainter &p);
+    void    drawRangeInset(QPainter &p, const QList<QJsonObject> &close);   // sub-pixel gaps: a to-scale inset next to us
+    void    editAnchor(int index);                              // index into m_loc->anchors()
+    void    placeAnchorAt(double lat, double lon);
+    QHash<QString, QJsonObject> m_ranges;                       // device → its ranging estimate (RangingService)
+    int     m_anchorDrag = -1; QPointF m_anchorDragPos; bool m_anchorMoved = false;
+    void    drawRefit(QPainter &p, const Anim &a, double t, double mpp);
+    static QColor deviceColor(const QString &device);
     QList<Anim> m_anims;                                        // in flight (≤ 24)
     QList<Anim> m_ticker;                                       // last 5 events, newest first
     QHash<QString, qint64> m_labelBorn;                         // bssid → when its label should slide in

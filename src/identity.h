@@ -5,6 +5,7 @@
 #include <QJsonObject>
 #include <QList>
 #include <QObject>
+#include <QPair>
 #include <QString>
 #include <QStringList>
 
@@ -88,7 +89,9 @@ public:
     static QByteArray authCanon(const QString &host, const QByteArray &nonceB64, const QString &id, const QString &deviceName);
 
     // Links
-    LinkStatement startLink(const QString &otherId, const QByteArray &otherPub) const;   // our signature added
+    // Our half of a link statement. ts must be the ts of the link payload the OTHER device displayed (its offer):
+    // that device co-signs only statements bound to an offer it showed. Empty ts (legacy) uses the current time.
+    LinkStatement startLink(const QString &otherId, const QByteArray &otherPub, const QString &ts = QString()) const;
     bool    acceptLink(LinkStatement st, QString *error, LinkStatement *completed = nullptr);   // verify; co-sign if we are a party; store when complete
     bool    hasLinkWith(const QString &id) const;
 
@@ -100,6 +103,11 @@ public:
     static QJsonObject selftest();                   // fixed-seed vectors (seed = 32×0x01)
     static QByteArray base64url(const QByteArray &b);
     static QByteArray fromBase64url(const QByteArray &s);
+    // Payload texts for QRs / paste boxes / the API. URIs, so a phone's camera offers to open them in the app:
+    //   beaconfix://link/<b64url>  (link payload)   beaconfix://statement/<b64url>  (link statement)   beaconfix://identity/<b64url>  (export bundle)
+    // decodePayload() also still reads the older BFLNK1: / BFLINK1: / BFID1: texts and raw JSON.
+    static QString     encodeUri(const QString &kind, const QJsonObject &o);
+    static QJsonObject decodePayload(const QString &text, QString *kind = nullptr);   // kind: link | statement | identity | json | "" (unparsable)
 
 signals:
     void changed();
@@ -116,5 +124,8 @@ private:
     QDateTime m_created;
     QList<IdentityDevice> m_devices;
     QList<LinkStatement> m_links;
+    // Link QRs this process displayed: {ts nonce, expiry}. A statement that asks us to co-sign must carry one of
+    // these timestamps (see acceptLink), which proves the other device saw our screen. Kept in memory only.
+    mutable QList<QPair<QString, QDateTime>> m_offers;
     QList<PendingLink> m_pending;
 };

@@ -83,9 +83,26 @@ dbus-monitor "interface='org.sworrl.BeaconFix',member='FixChanged'"
 | `TimeZoneForFix()` | string | the IANA zone resolved for the fix |
 | `IdentityJson()` | string (JSON) | public identity record, linked ids, pending link requests |
 | `IdentityCreate(name)` / `IdentityImport(textOrPath, passphrase)` / `IdentityForget()` / `IdentityReload()` | bool / — | manage the identity |
-| `IdentityExport(passphrase)` | string | `BFID1:` bundle (empty on error) |
-| `IdentityLinkPayload()` | string | `BFLNK1:` link payload |
+| `IdentityExport(passphrase)` | string | `beaconfix://identity/…` bundle (empty on error) |
+| `IdentityLinkPayload()` | string | `beaconfix://link/…` link payload; registers a 10-minute single-use offer that a link statement must be bound to (3.6) |
 | `IdentityAcceptLink(statementJson)` | string (JSON) | verify / co-sign / store a link statement |
+
+### Added in 3.6
+
+| method | returns | what |
+|---|---|---|
+| `Peers(scan)` | string (JSON) | BeaconFix devices on this network (mDNS; `scan=true` also probes the local /24s) — same object as `GET /api/v1/peers` |
+| `LinkedDevices()` | string (JSON array) | newest position of each of our other devices (`GET /api/v1/devices/positions`) |
+| `Import(path, optsJson)` | string (JSON) | import a history file (`{"from","to","what":[…]}` options) → `{"ok","summary":{…},"error"?}`; see [DATABASE.md](DATABASE.md) |
+| `Sync(peer, token)` | string (JSON) | `peer` may now be a name / host / address from `Peers()`; with an empty token our identity signs in when it is the peer's or linked |
+
+| signal | payload | when |
+|---|---|---|
+| `importProgress(json)` | string | `{"file","percent","stage"}` during an import, then `{"done":true,"ok","summary"}` |
+| `peersChanged()` | — | the mDNS peer list changed |
+| `pairingOpenRequested(id)` | string | the pairing notification was clicked: the window shows that request |
+
+Events added in 3.6 (`eventLogged`): `ap_refit`, `device`, `device_online`, `device_offline`, `import`.
 
 Every slot, property and signal is exported (`ExportAllSlots | ExportAllProperties |
 ExportAllSignals`), so `qdbus6 org.sworrl.BeaconFix /org/sworrl/BeaconFix` lists them all.

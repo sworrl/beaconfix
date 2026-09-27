@@ -279,8 +279,19 @@ QJsonObject Identity::publicJson() const
 
 QJsonObject Identity::linkPayload() const
 {
+    // The timestamp doubles as a one-time nonce: nine random fractional digits make it unguessable, and a
+    // statement arriving over the network is only co-signed when its ts matches a link QR shown here in the
+    // last 10 minutes (acceptLink). Without that, anyone on the LAN could mint an identity, sign a statement
+    // linking it to ours, and get it co-signed — then sign in with full control. It stays a valid ISO-8601
+    // instant, and both apps treat ts as an opaque string inside the canonical form.
+    const QDateTime now = QDateTime::currentDateTimeUtc();
+    const QString ts = now.toString(QStringLiteral("yyyy-MM-dd'T'HH:mm:ss"))
+                     + QStringLiteral(".%1Z").arg(QRandomGenerator::system()->bounded(1000000000u), 9, 10, QLatin1Char('0'));
+    for (int i = m_offers.size() - 1; i >= 0; --i) if (m_offers[i].second < now) m_offers.removeAt(i);
+    while (m_offers.size() >= 64) m_offers.removeFirst();
+    m_offers.append(qMakePair(ts, now.addSecs(600)));
     return QJsonObject{{"v", 1}, {"t", "beaconfix-link"}, {"id", m_id}, {"name", m_name}, {"pub", QString::fromLatin1(m_pub.toBase64())},
-                       {"ts", QDateTime::currentDateTimeUtc().toString(Qt::ISODate)}};
+                       {"ts", ts}};
 }
 
 QStringList Identity::linkedIds() const
@@ -333,7 +344,35 @@ QString Identity::exportBundle(const QString &passphrase, QString *error) const
                              {"kdf", QJsonObject{{"name", "scrypt"}, {"n", 32768}, {"r", 8}, {"p", 1}, {"salt", QString::fromLatin1(salt.toBase64())}}},
                              {"aead", QJsonObject{{"name", "aes-256-gcm"}, {"nonce", QString::fromLatin1(nonce.toBase64())}}},
                              {"ct", QString::fromLatin1(ct.toBase64())}};
-    return QStringLiteral("BFID1:") + QString::fromLatin1(base64url(QJsonDocument(bundle).toJson(QJsonDocument::Compact)));
+    return encodeUri(QStringLiteral("identity"), bundle);
+}
+
+QString Identity::encodeUri(const QString &kind, const QJsonObject &o)
+{
+    return QStringLiteral("beaconfix://%1/%2").arg(kind, QString::fromLatin1(base64url(QJsonDocument(o).toJson(QJsonDocument::Compact))));
+}
+
+QJsonObject Identity::decodePayload(const QString &text, QString *kind)
+{
+    QString t = text.trimmed();
+    if (kind) kind->clear();
+    auto b64 = [&](const QString &body, const char *k) { if (kind) *kind = QString::fromLatin1(k); return QJsonDocument::fromJson(fromBase64url(body.trimmed().toLatin1())).object(); };
+    if (t.startsWith(QLatin1String("beaconfix://"), Qt::CaseInsensitive)) {
+        const QString rest = t.mid(12);
+        const int slash = rest.indexOf(QLatin1Char('/'));
+        if (slash < 0) return {};
+        const QString k = rest.left(slash).toLower(); QString body = rest.mid(slash + 1);
+        const int q = body.indexOf(QLatin1Char('?')); if (q >= 0) body = body.left(q);   // tolerate trailing query / fragment
+        const int h = body.indexOf(QLatin1Char('#')); if (h >= 0) body = body.left(h);
+        if (k == QLatin1String("link") || k == QLatin1String("statement") || k == QLatin1String("identity")) return b64(body, k.toLatin1().constData());
+        return {};
+    }
+    if (t.startsWith(QLatin1String("BFLNK1:"))) return b64(t.mid(7), "link");
+    if (t.startsWith(QLatin1String("BFLINK1:"))) return b64(t.mid(8), "statement");
+    if (t.startsWith(QLatin1String("BFID1:"))) return b64(t.mid(6), "identity");
+    const QJsonObject o = QJsonDocument::fromJson(t.toUtf8()).object();
+    if (!o.isEmpty() && kind) *kind = QStringLiteral("json");
+    return o;
 }
 
 bool Identity::importBundle(const QString &textOrJson, const QString &passphrase, const QString &deviceName, const QString &deviceKind, QString *error)
@@ -341,8 +380,7 @@ bool Identity::importBundle(const QString &textOrJson, const QString &passphrase
     if (m_dbKey.isEmpty()) { if (error) *error = QStringLiteral("no map-database key to seal the identity with"); return false; }
     QString t = textOrJson.trimmed();
     QJsonObject bundle;
-    if (t.startsWith(QLatin1String("BFID1:"))) bundle = QJsonDocument::fromJson(fromBase64url(t.mid(6).toLatin1())).object();
-    else bundle = QJsonDocument::fromJson(t.toUtf8()).object();
+    bundle = decodePayload(t);                       // beaconfix://identity/…, BFID1:… or the bundle JSON itself
     if (bundle["t"].toString() != QLatin1String("beaconfix-identity") || bundle["v"].toInt() != 1) { if (error) *error = QStringLiteral("not a BeaconFix identity bundle"); return false; }
     const QJsonObject kdf = bundle["kdf"].toObject(), aead = bundle["aead"].toObject();
     if (kdf["name"].toString() != QLatin1String("scrypt") || aead["name"].toString() != QLatin1String("aes-256-gcm")) { if (error) *error = QStringLiteral("unsupported bundle algorithms"); return false; }
@@ -395,9 +433,9 @@ bool Identity::forget()
     return ok;
 }
 
-LinkStatement Identity::startLink(const QString &otherId, const QByteArray &otherPub) const
+LinkStatement Identity::startLink(const QString &otherId, const QByteArray &otherPub, const QString &ts) const
 {
-    LinkStatement s; s.a = m_id; s.b = otherId; s.ts = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
+    LinkStatement s; s.a = m_id; s.b = otherId; s.ts = ts.isEmpty() ? QDateTime::currentDateTimeUtc().toString(Qt::ISODate) : ts;
     s.pubA = m_pub; s.pubB = otherPub;
     s.sigA = sign(s.canon());
     return s;
@@ -414,7 +452,8 @@ bool Identity::acceptLink(LinkStatement st, QString *error, LinkStatement *compl
     if (!exists()) { if (error) *error = QStringLiteral("no identity on this device"); return false; }
     if (st.a.isEmpty() || st.b.isEmpty() || st.ts.isEmpty() || st.a == st.b) { if (error) *error = QStringLiteral("malformed link statement"); return false; }
     const bool weAreA = st.a == m_id, weAreB = st.b == m_id;
-    if (weAreA) st.pubA = m_pub; if (weAreB) st.pubB = m_pub;
+    if (weAreA) st.pubA = m_pub;
+    if (weAreB) st.pubB = m_pub;
     // Verify whatever signatures are present against the pubs we know (the id must match its pub)
     auto check = [&](const QString &id, const QByteArray &pub, const QByteArray &sig) -> int {   // 1 ok, 0 absent, -1 bad
         if (sig.isEmpty()) return 0;
@@ -425,12 +464,26 @@ bool Identity::acceptLink(LinkStatement st, QString *error, LinkStatement *compl
     if (okA < 0 || okB < 0) { if (error) *error = QStringLiteral("a signature does not verify"); return false; }
     if (!weAreA && !weAreB) {                                   // third-party statement: store only when both signed
         if (okA == 1 && okB == 1) { if (!hasLinkWith(st.a) || !hasLinkWith(st.b)) { m_links << st; save(); } if (completed) *completed = st; return true; }
-        if (error) *error = QStringLiteral("statement incomplete and we are not a party to it"); return false;
+        if (error) *error = QStringLiteral("statement incomplete and we are not a party to it");
+        return false;
     }
     // We are a party: the other side must have signed (or be about to); add ours
     const int other = weAreA ? okB : okA;
     if (other != 1) { if (error) *error = QStringLiteral("the other identity has not signed this statement"); return false; }
     if (!unlocked()) { if (error) *error = QStringLiteral("identity is locked on this device"); return false; }
+    // Adding our signature links the other identity to ours: it can then sign in and sync as us. Only do that
+    // for a statement bound to a link QR we displayed (its ts is that QR's one-time nonce), once. Statements that
+    // already carry our valid signature (we started them) need no offer.
+    if ((weAreA && st.sigA.isEmpty()) || (weAreB && st.sigB.isEmpty())) {
+        const QDateTime now = QDateTime::currentDateTimeUtc();
+        int hit = -1;
+        for (int i = 0; i < m_offers.size(); ++i) if (m_offers[i].first == st.ts && m_offers[i].second >= now) { hit = i; break; }
+        if (hit < 0) {
+            if (error) *error = QStringLiteral("this link was not started from a link QR shown on this device, or that QR expired: show the link QR again and scan it");
+            return false;
+        }
+        m_offers.removeAt(hit);
+    }
     if (weAreA && st.sigA.isEmpty()) st.sigA = sign(st.canon());
     if (weAreB && st.sigB.isEmpty()) st.sigB = sign(st.canon());
     if (completed) *completed = st;

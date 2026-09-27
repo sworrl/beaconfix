@@ -11,8 +11,9 @@ neighbour on an open segment) tries to read your position, or to make BeaconFix 
 | known-device allowlist (`apiKnownOnly`, default on) | tokens presented from an address that is not one of your devices; the request fails with `403` even with a valid token |
 | bearer tokens: 256-bit random, stored as SHA-256 only, constant-time compare, shown once | token theft from the config file; timing side channels |
 | scopes `read` / `control` | a read-only device triggering refreshes, prefetches, home-list changes or database writes |
-| pairing: only while a window is open (10 min), at most 5 pending, 4-digit code shown on both ends, expiry, manual approval for unknown devices | silent pairing |
-| 60 req/min per address (401/403 count double), 32 connections, 8 streams, 4 KB bodies | brute force, flooding |
+| pairing v2: only while a window is open (10 min), at most 5 pending, picture match (three rows, one real) or the 4-digit code, proximity verdict, expiry, manual approval for unknown devices | silent pairing, pairing from another room, a guess at the code |
+| 60 req/min per address (401/403 count double), 32 connections, 8 streams, 4 KB bodies (1 MB `/db/sync`, 256 KB `/db/observations`, 200 MB `/db/import` streamed to disk) | brute force, flooding, memory exhaustion |
+| identity links are co-signed only for an offer this BeaconFix displayed (single use, 10 min) | a LAN host minting an identity, linking it to yours and signing in for control |
 | access log (last 100) in the Devices tab | invisible probing |
 | optional TLS (`~/.config/sworrl/beaconfix.crt` + `beaconfix.key`) | passive sniffing of tokens on the LAN |
 
@@ -21,6 +22,56 @@ answer to a device that is not pinned to a certificate), or resist an attacker w
 root on this machine (the token hashes and the decrypted database are readable by that user).
 
 Turn it off entirely with `apiEnabled=false`; pairing is closed by default.
+
+### Pairing v2: pictures and proximity
+
+The 4-digit code of earlier versions proves that the person approving can read the device's
+screen — but a 1-in-10 000 guess, or a shoulder-surfed code, was enough. 3.6 adds two things:
+
+- **Short-authentication-string pictures.** Both ends make an ephemeral X25519 key, exchange the
+  public halves in the pairing request/response and derive `HKDF-SHA256(shared, info =
+  "beaconfix-pair-sas-v1|<request id>")`. Bytes 0, 2 and 4 of that pick three of 48 fixed
+  pictures. The device shows its three; the desktop shows *three rows* (the real one and two
+  decoys that never repeat a picture in the same position) and the user taps the matching row.
+  A wrong tap denies the request and logs an `error` event. An attacker who only sees the
+  desktop learns nothing (two of the rows are wrong); one who only sees the device cannot tap.
+  The secret never leaves either process and is forgotten with the request.
+- **Proximity.** The request carries the beacons the device hears and its fix. The desktop
+  compares them against everything it hears: with Δ = their dBm − our dBm over the shared
+  beacons, the median Δ is the two radios' gain offset and the median absolute residual around it
+  says whether they see the same room (≤ 4 dB with ≥ 4 shared → *adjacent*, ≤ 7 dB → *room*).
+  Home and travelling networks are included on purpose: they are the strongest evidence of being in
+  the same place. `apiPairProximity=required` (default) refuses pictures and auto-approval unless
+  the verdict is adjacent / room / near; overriding it needs the word "pair" typed. Proximity
+  is evidence, not proof (RSSI can be replayed), which is why it gates but never replaces the
+  picture match.
+- **Known devices** are still auto-approved (read scope unless the known list grants more), but
+  only when they are near — and the dialog says so and offers *Allow control too*.
+
+### Identity links (fixed in 3.6.0)
+
+`POST /api/v1/identity/link` is unauthenticated by design (the statement carries its own
+signatures). Before 3.6.0, `acceptLink` co-signed **any** statement the other party had signed —
+so any host on the LAN could create an identity, sign a statement linking it to yours, get it
+co-signed, and then obtain a read + control token through identity sign-in, bypassing pairing and
+proximity entirely. Now every link starts with a link QR (or `--identity-link-qr`, which asks the
+running tray) whose `ts` carries nine random fractional digits; the tray remembers its offers for
+10 minutes, and a statement is co-signed only if its `ts` is one of them (then forgotten). A forged
+statement gets `403 this link was not started from a link QR shown on this device…`. The other
+device must therefore *scan our screen* (or we scan its QR and it co-signs a statement bound to
+*its* offer); a statement built from a pending sign-in can no longer be completed by itself.
+
+### Payload URIs
+
+QR codes and paste boxes carry URIs (`beaconfix://link/…`, `beaconfix://statement/…`,
+`beaconfix://identity/…`), so a phone camera offers to open them in the app instead of "no app
+can open this". The older `BFLNK1:` / `BFLINK1:` / `BFID1:` texts are still accepted everywhere.
+
+### Test instances
+
+A second BeaconFix started with a non-default `XDG_CONFIG_HOME` (or with `--no-mdns`, or
+`apiMdns=false`) never advertises itself over mDNS: a test copy of your identity must not show
+up on your phone next to the real machine.
 
 ## The map database
 

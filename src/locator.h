@@ -1,6 +1,8 @@
 #pragma once
 #include "wifiscanner.h"
 #include "estimator.h"
+#include "ranging/anchors.h"
+#include "ranging/rangemath.h"
 #include <QColor>
 #include <QDateTime>
 #include <QHash>
@@ -38,6 +40,9 @@ struct ApObservation {
     bool    dirty = false;            // changed in memory since it was stored
 };
 
+using BfAnchor = Anchors::Anchor;     // (Locator has a D-Bus method called Anchors(): the alias keeps the type reachable)
+class RangingService;
+
 // A place an AP was heard, at whatever precision the fix had (IP fixes included):
 // two sightings further apart than their combined error mean the AP travels with us.
 struct ApSighting { double lat = 0, lon = 0; double acc = 0; QDateTime time; };
@@ -64,7 +69,7 @@ struct ApRecord {
 
 // Where we think an AP is, for the map
 struct ApEstimate {
-    enum Kind { None, Ring, Centroid, Wigle, Observed, Trilat, Peer } kind = None;   // Observed: one place we heard it · Trilat: our fit · Peer: synced from another device
+    enum Kind { None, Ring, Centroid, Wigle, Observed, Trilat, Peer, Anchor } kind = None;   // Observed: one place we heard it · Trilat: our fit · Peer: synced from another device · Anchor: surveyed (docs/RANGING.md §4)
     double lat = 0, lon = 0;          // Centroid / Wigle / Trilat / Peer: the estimate. Ring: our own position.
     double radiusM = 0;               // Ring: RSSI distance. Others: uncertainty.
     double bearingDeg = 0;            // Ring only: stable pseudo-bearing (bearing is unknown)
@@ -72,7 +77,7 @@ struct ApEstimate {
     Estimator::Fit fit;               // Trilat: the fit statistics
     // When a placement (WiGLE / Apple) and our own fit disagree by more than 3× their accuracy, both are reported
     bool   hasAlt = false; Kind altKind = None; double altLat = 0, altLon = 0, altAcc = 0;
-    static const char *kindName(Kind k) { switch (k) { case Ring: return "ring"; case Centroid: return "centroid"; case Wigle: return "wigle"; case Observed: return "observed"; case Trilat: return "trilat"; case Peer: return "peer"; default: return "none"; } }
+    static const char *kindName(Kind k) { switch (k) { case Ring: return "ring"; case Centroid: return "centroid"; case Wigle: return "wigle"; case Observed: return "observed"; case Trilat: return "trilat"; case Peer: return "peer"; case Anchor: return "anchor"; default: return "none"; } }
 };
 
 // Point-of-interest category (OpenStreetMap tags → icon, colour, label)
@@ -135,6 +140,18 @@ struct BeaconEvent {
     double    r = 0, bearing = 0;     // ap_* with kind "ring": RSSI distance + pseudo-bearing from the fix
     QString   kind, status;           // ap_*: ring|centroid|wigle · used|travelling|ignored|active|nomap
     QString   security;               // ap_*: open|wep|wpa1|wpa2-tkip|wpa2|…
+    QJsonObject extra;                // type-specific fields merged into the JSON (ap_refit: acc, prevAcc, n, vantage, rms, vantagePoints[]; device: distanceM …)
+    QJsonObject toJson() const;
+};
+
+// The newest known position of one of OUR other devices (phone, laptop, another desktop):
+// from synced fixes, from POST /api/v1/devices/position, or from a peer BeaconFix.
+struct DevicePos {
+    QString device, kind, identityId, identityName, source, place;
+    double lat = 0, lon = 0, acc = 0;
+    QDateTime time, lastSeen;
+    int beacons = 0;
+    bool online = false;
     QJsonObject toJson() const;
 };
 
@@ -171,6 +188,7 @@ struct Stats {
 class ApiServer;
 class MapDb;
 class Identity;
+class Notifier;
 class OsIntegration;
 
 class Locator : public QObject {
@@ -223,6 +241,8 @@ public:
     bool    geocodePending() const { return m_geocodePending; }
     const QList<AccessPoint> &accessPoints() const { return m_aps; }
     const QList<Fix> &history() const { return m_history; }
+    const QList<Fix> &importedHistory() const { return m_imported; }   // positions/visits from imported exports (device timeline/wigle/gpx/kml), never the live fix
+    bool importing() const { return m_importing; }
     QString wifiInterface() const { return m_scanner.interfaceName(); }
 
     QString    apStatus(const AccessPoint &ap) const;   // used | active | ignored | travelling | nomap
@@ -290,6 +310,9 @@ public:
     void setUseElevation(bool b);
     void notePrefetchDone(int tiles);                   // TileSource tells us (achievement + note)
     void notify(const QString &summary, const QString &body, const QString &icon = QString());
+    // With buttons: actions = key, label pairs; onAction gets the key ("default" = the body was clicked)
+    void notifyWithActions(const QString &summary, const QString &body, const QString &icon, const QStringList &actions, std::function<void(const QString &)> onAction, int timeoutMs = 15000);
+    void logEvent(BeaconEvent e);                    // append to the event log (also used by the API server)
     void setMoveThresholdM(int m);
     void setUseStarlink(bool b);
     void setStarlinkHost(const QString &h);
@@ -330,6 +353,29 @@ public:
     int     mergePeerAps(const QJsonArray &aps, const QString &device);
     int     appendPeerFixes(const QJsonArray &fixes, const QString &device);
     void    queueRefit(const QString &bssid);
+    // Anchors (docs/RANGING.md §4): surveyed transmitters / places
+    QList<BfAnchor> anchors() const { return m_anchors; }
+    QJsonArray anchorsJson() const;
+    // Create / update by id (validated + normalised); placedByDefault fills an empty placedBy. ok=false → *error says why.
+    BfAnchor setAnchor(const QJsonObject &o, const QString &placedByDefault, bool *ok, QString *error);
+    bool    removeAnchor(const QString &id);
+    int     mergeAnchors(const QJsonArray &rows);          // from a peer's /db/sync (newest placedAt / deletedAt wins)
+    const BfAnchor *pinnedAnchor(const QString &bssid) const;   // wifi-ap / rtt-responder / this-computer anchor carrying this BSSID
+    // Environment calibration from anchors (§4.3.3): per band P0 / n of the path-loss model, and the n the AP fits start from
+    double  environmentN(int freqMHz) const;
+    QJsonObject environmentJson() const;
+    // Device ranging (docs/RANGING.md §5–§8); set by the tray
+    void    setRanging(RangingService *r) { m_ranging = r; }
+    RangingService *ranging() const { return m_ranging; }
+    QString kindForDevice(const QString &device, const QString &hint = QString()) const;   // android | laptop | desktop | pi | gnss | device
+    static QStringList features();                       // what this build can do (hello / StateJson)
+    // Our other devices on the map (docs/API.md "Devices")
+    QJsonArray linkedDevices() const;
+    QJsonArray apsJson() const;                          // the beacons heard now, as in StateJson "aps" (GET /api/v1/aps pages it)
+    QList<DevicePos> devicePositions() const { return m_devicePos.values(); }
+    void    noteDevicePosition(const QString &device, const QString &kind, double lat, double lon, double acc, const QDateTime &time, const QString &source, int beacons,
+                               const QString &identityId = QString(), const QString &identityName = QString(), const QString &place = QString());
+    void    noteDeviceSeen(const QString &device, const QString &kind = QString());
     int     refitCount() const;                          // records with a valid fit of our own
     // Sync with another BeaconFix (a laptop feeding the RV desktop, or the other way round)
     struct SyncPeer { QString url, token, name; int minutes = 15; QDateTime last; QString lastResult; bool ok = false; };
@@ -364,7 +410,12 @@ public slots:
     int     KnownImport(const QString &path);
     void    SetHomeNetworks(const QStringList &patterns) { setHomeNetworks(patterns); }
     int     Refit();                                     // full refit of every beacon with enough samples; returns valid fits
-    QString Sync(const QString &url, const QString &token);   // one sync round with another BeaconFix; JSON result
+    QString Sync(const QString &url, const QString &token);   // one sync round with another BeaconFix; JSON result.
+                                                              // url may be a peer's name / hostname / address (resolved through mDNS);
+                                                              // token may be empty when our identity is the peer's or linked to it
+    QString Peers(bool scan);                             // JSON: BeaconFix devices on this network (scan=true probes the /24s too)
+    QString LinkedDevices() const;                       // JSON array: newest position of each of our other devices
+    QString Import(const QString &path, const QString &optsJson);   // history importers (docs/DATABASE.md): JSON summary; progress via importProgress()
     // Identity (docs/IDENTITY.md)
     QString IdentityJson() const;                        // public record + linkedIds + pending link requests
     bool    IdentityCreate(const QString &name);
@@ -374,6 +425,14 @@ public slots:
     QString IdentityAcceptLink(const QString &statementJson);   // completed statement JSON, or {"error":…}
     bool    IdentityForget();
     void    IdentityReload();                            // re-read the file (after a CLI change)
+    // Anchors + ranging (docs/RANGING.md)
+    QString Anchors() const;                             // JSON array of the anchors
+    QString SetAnchor(const QString &json);              // create / update → the anchor id, or "error: <why>"
+    bool    RemoveAnchor(const QString &id);
+    QString Ranging() const;                             // JSON: GET /api/v1/ranging
+    QString RangingInfo() const;                         // JSON: GET /api/v1/ranging/info
+    QString RangingCalibrate(const QString &device, double distanceM, int durationS);
+    bool    GrantControl(const QString &nameOrId);       // add the control scope to a paired device's existing token
     // OS integration
     QString ApplyOs(bool dryRun);                        // JSON: what was (or would be) applied
     QString TimeZoneForFix() const;
@@ -395,16 +454,19 @@ signals:
     void syncFinished(const QString &url, bool ok, const QString &message);
     void refitDone(int refitted);
     void pairingRequested(const QString &json);     // LAN API: a device asked for access (id, name, ip, code)
+    void pairingOpenRequested(const QString &id);   // the pairing notification was clicked: show the dialog for that request
+    void peersChanged();                            // mDNS: the list of BeaconFix devices on this network changed
+    void importProgress(const QString &json);       // {"file","percent","stage"} while an import runs, then {"done":true,"summary":{…}}
     void deviceApproved(const QString &name);
 
 private:
     void tryStarlink();
+    void loadImported();
     void onScan(const QList<AccessPoint> &aps);
     void onScanFinished(const QList<AccessPoint> &aps);   // dispatcher: diff → probe path or live path
     void liveScan();
     void startProbeScan();
     void diffScan(const QList<AccessPoint> &aps);
-    void logEvent(BeaconEvent e);
     BeaconEvent apEvent(const QString &type, const AccessPoint &ap) const;
     void queryBeaconDb(const QList<AccessPoint> &usable);
     void tryApple(const QList<AccessPoint> &usable, const QString &why);
@@ -447,12 +509,28 @@ private:
     MapDb *m_db = nullptr;
     bool m_dbUsable = false;              // open and writable: persistence goes through it
     Identity *m_identity = nullptr;
+    Notifier *m_notifier = nullptr;
+    QHash<QString, DevicePos> m_devicePos;
+    QTimer m_deviceTimer;
     OsIntegration *m_os = nullptr;
     QString m_countryCode;
     void loadFromDb();
     void migrateJsonToDb();
     bool tryInternal(const QList<AccessPoint> &usable);
     QHash<QString, int> apFlags() const;    // bit0 home, bit1 travelling, bit2 ignored, per known BSSID
+    int apFlag(const QString &bssid) const;  // the same for one BSSID (saveRecord: no pass over every record)
+    // Anchors
+    QList<BfAnchor> m_anchors;
+    QHash<QString, BfAnchor> m_pins;         // BSSID → anchor
+    void loadAnchors();
+    void anchorsChanged();                   // rebuild pins, tell the map database, repaint
+    bool anchorFix(Fix &cand) const;         // this-computer anchor within 100 m replaces the fix
+    void maybeReproject(const Fix &cand);    // the RV moved: re-project the RV anchors (§4.3.5)
+    void noteAnchorCalibration(const QList<AccessPoint> &aps);   // RSSI at known distance → environment P0 / n
+    bool tryRvGnss();                        // §4.3.7
+    QHash<QString, RangeMath::Rls2> m_envRls;   // band ("2.4" | "5" | "6") → path-loss fit
+    QHash<QString, int> m_envSamples;
+    RangingService *m_ranging = nullptr;
     WifiScanner m_scanner;
     QNetworkAccessManager m_nam;
     QTimer m_timer;
@@ -474,6 +552,8 @@ private:
     QString m_lastError, m_starlinkError, m_coarseNote;
     QList<AccessPoint> m_aps;
     QList<Fix> m_history;
+    QList<Fix> m_imported;                          // docs/DATABASE.md "Importing your history"
+    bool m_importing = false, m_bulkImport = false;  // bulk: no per-batch repaint, refits deferred to the end
     QHash<QString, ApRecord> m_apRecords;
     QSet<QString> m_travelling, m_notTravelling;
     QStringList m_wigleQueue;

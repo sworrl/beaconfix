@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(beaconfix VERSION 3.5.0 LANGUAGES CXX)
+project(beaconfix VERSION 3.7.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -15,12 +15,22 @@ add_executable(beaconfix
     src/beaconview.cpp
     src/tilesource.cpp
     src/apiserver.cpp
+    src/mdns.cpp
+    src/pairing.cpp
+    src/notify.cpp
+    src/pairdialog.cpp
+    src/importers.cpp
     src/mapdb.cpp
     src/estimator.cpp
     src/identity.cpp
     src/osintegration.cpp
     src/tray.cpp
     src/mainwindow.cpp
+    src/anchordialog.cpp
+    src/ranging/rangemath.cpp
+    src/ranging/anchors.cpp
+    src/ranging/blelink.cpp
+    src/ranging/rangingservice.cpp
 )
 target_compile_definitions(beaconfix PRIVATE BEACONFIX_VERSION="${PROJECT_VERSION}")
 target_link_libraries(beaconfix PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Network Qt6::DBus Qt6::Sql OpenSSL::Crypto)
@@ -55,6 +65,11 @@ if(BEACONFIX_INSTALL_POLKIT)
     install(FILES ${CMAKE_CURRENT_BINARY_DIR}/org.sworrl.beaconfix.policy DESTINATION ${CMAKE_INSTALL_DATADIR}/polkit-1/actions)
     install(FILES data/50-beaconfix.rules DESTINATION ${CMAKE_INSTALL_FULL_SYSCONFDIR}/polkit-1/rules.d)
 endif()
+
+# Wi-Fi RTT responder (docs/RANGING.md §6): opt-in, run once as root: share/beaconfix/setup-rtt-responder.sh
+install(PROGRAMS data/setup-rtt-responder.sh DESTINATION ${CMAKE_INSTALL_DATADIR}/beaconfix)
+install(FILES data/beaconfix-rtt-responder.conf.in data/beaconfix-rtt-responder.service data/90-beaconfix-rtt.nm.conf
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/beaconfix)
 
 # ── Packaging: cpack -G DEB (or RPM) in the build directory ─────────────────
 set(CPACK_PACKAGE_NAME "beaconfix")

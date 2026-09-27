@@ -1,8 +1,12 @@
 #include "locator.h"
+#include "ranging/rangingservice.h"
 #include "identity.h"
 #include "osintegration.h"
 #include "apiserver.h"
+#include "mdns.h"
+#include "notify.h"
 #include "mapdb.h"
+#include "importers.h"
 #include <QClipboard>
 #include <QCoreApplication>
 #include <QDBusConnection>
@@ -10,6 +14,7 @@
 #include <QDir>
 #include <QGuiApplication>
 #include <QFile>
+#include <QFileInfo>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QNetworkReply>
@@ -32,6 +37,8 @@
 #include <functional>
 #include <cmath>
 
+static QString ourDeviceName();
+static bool importerDevice(const QString &d);
 static const char *USER_AGENT = "BeaconFix/" BEACONFIX_VERSION " (KDE desktop locator; +https://github.com/sworrl/beaconfix)";
 
 // ── Fix ───────────────────────────────────────────────────────────────────────
@@ -72,7 +79,16 @@ QJsonObject BeaconEvent::toJson() const
     if (hasPos) { o["lat"] = lat; o["lon"] = lon; }
     if (hasFrom) { o["fromLat"] = fromLat; o["fromLon"] = fromLon; }
     if (r > 0) { o["r"] = r; o["bearing"] = bearing; }
+    for (auto it = extra.constBegin(); it != extra.constEnd(); ++it) o[it.key()] = it.value();
     return o;
+}
+
+QJsonObject DevicePos::toJson() const
+{
+    const qint64 age = time.isValid() ? time.secsTo(QDateTime::currentDateTime()) : -1;
+    return {{"device", device}, {"kind", kind}, {"identityId", identityId}, {"identityName", identityName}, {"lat", lat}, {"lon", lon}, {"acc", acc},
+            {"time", time.toString(Qt::ISODate)}, {"ageS", double(age)}, {"source", source}, {"place", place}, {"online", online}, {"beacons", beacons},
+            {"lastSeen", lastSeen.toString(Qt::ISODate)}};
 }
 
 // ── Locator ───────────────────────────────────────────────────────────────────
@@ -136,6 +152,17 @@ Locator::Locator(bool standalone, QObject *parent) : QObject(parent), m_standalo
     m_dbUsable = m_db->isOpen() && !m_db->readOnly();
     // Identity (docs/IDENTITY.md): sealed with the map-database key; the OS integration follows the fix
     m_identity = new Identity(this);
+    if (!m_standalone) { m_notifier = new Notifier(this); connect(m_notifier, &Notifier::fallback, this, &Locator::notificationFallback); }
+    m_deviceTimer.setInterval(60000);
+    connect(&m_deviceTimer, &QTimer::timeout, this, [this] {           // presence: seen through the API / mDNS in the last 10 min
+        const QDateTime now = QDateTime::currentDateTime();
+        if (m_api && m_api->mdns()) for (const Mdns::Peer &p : m_api->mdns()->peers(false)) if (!p.host.isEmpty()) { DevicePos &d = m_devicePos[p.host]; if (d.device.isEmpty()) d.device = p.host; if (d.kind.isEmpty()) d.kind = p.kind; if (p.lastSeen > d.lastSeen) d.lastSeen = p.lastSeen; if (!d.identityId.isEmpty() == false && !p.identityId.isEmpty()) { d.identityId = p.identityId; d.identityName = p.identityName; } }
+        for (DevicePos &d : m_devicePos) {
+            const bool on = d.lastSeen.isValid() && d.lastSeen.secsTo(now) < 600;
+            if (on != d.online) { d.online = on; if (d.time.isValid()) { BeaconEvent ev; ev.type = on ? QStringLiteral("device_online") : QStringLiteral("device_offline"); ev.text = QStringLiteral("%1 is %2").arg(d.device, on ? QStringLiteral("online") : QStringLiteral("offline")); ev.extra = QJsonObject{{"device", d.device}}; logEvent(ev); } }
+        }
+    });
+    if (!m_standalone) m_deviceTimer.start();
     m_identity->load(m_db->key());
     connect(m_identity, &Identity::changed, this, [this] { if (m_api) emit scanUpdated(); });
     m_os = new OsIntegration(this, this);
@@ -154,6 +181,7 @@ Locator::Locator(bool standalone, QObject *parent) : QObject(parent), m_standalo
     loadAchievements();
     if (m_dbUsable && m_db->isEmpty() && anyJson) migrateJsonToDb();
     else if (m_db->isOpen()) loadFromDb();
+    loadAnchors();
     if (m_db->isOpen()) m_countryCode = m_db->kv(QStringLiteral("countryCode"));
     for (const Fix &f : m_history) noteVisited(f, false);
     connect(this, &Locator::FixChanged, this, [this] { refreshPois(); fetchElevation(); checkAchievements(); });
@@ -194,16 +222,14 @@ void Locator::notePrefetchDone(int tiles)
 // Desktop notification through the freedesktop daemon (Plasma's), else the tray balloon
 void Locator::notify(const QString &summary, const QString &body, const QString &icon)
 {
-    if (m_standalone) return;
-    QDBusInterface n(QStringLiteral("org.freedesktop.Notifications"), QStringLiteral("/org/freedesktop/Notifications"),
-                     QStringLiteral("org.freedesktop.Notifications"), QDBusConnection::sessionBus());
-    if (n.isValid()) {
-        QVariantMap hints; hints[QStringLiteral("desktop-entry")] = QStringLiteral("beaconfix");
-        n.asyncCall(QStringLiteral("Notify"), QStringLiteral("BeaconFix"), uint(0), icon.isEmpty() ? QStringLiteral("beaconfix") : icon,
-                    summary, body, QStringList(), hints, int(8000));
-        return;
-    }
-    emit notificationFallback(summary, body);
+    if (m_standalone || !m_notifier) return;
+    m_notifier->send(summary, body, icon);
+}
+
+void Locator::notifyWithActions(const QString &summary, const QString &body, const QString &icon, const QStringList &actions, std::function<void(const QString &)> onAction, int timeoutMs)
+{
+    if (m_standalone || !m_notifier) return;
+    m_notifier->send(summary, body, icon, actions, std::move(onAction), timeoutMs);
 }
 
 void Locator::startTrip(const QDateTime &at)
@@ -222,6 +248,22 @@ void Locator::setApiServer(ApiServer *api)
     if (!api) return;
     connect(api, &ApiServer::pairingRequested, this, &Locator::pairingRequested);
     connect(api, &ApiServer::deviceApproved, this, &Locator::deviceApproved);
+    connect(api, &ApiServer::peersChanged, this, &Locator::peersChanged);
+    connect(api, &ApiServer::openPairRequested, this, &Locator::pairingOpenRequested);
+}
+
+QString Locator::Peers(bool scan)
+{
+    if (!m_api) return QStringLiteral("{\"peers\":[],\"count\":0,\"mdns\":false}");
+    if (scan) {
+        QEventLoop loop; bool finished = false;
+        m_api->scanPeers([&] { finished = true; loop.quit(); });
+        if (!finished) { QTimer::singleShot(8000, &loop, &QEventLoop::quit); loop.exec(); }
+    }
+    const QJsonArray peers = m_api->peersJson(false);
+    return QString::fromUtf8(QJsonDocument(QJsonObject{{"peers", peers}, {"count", peers.size()}, {"scanned", scan},
+                                                       {"mdns", m_api->mdns() && m_api->mdns()->published()},
+                                                       {"self", QJsonObject{{"host", QHostInfo::localHostName()}, {"addresses", QJsonArray::fromStringList(Mdns::lanAddresses())}, {"port", m_api->boundPort()}}}}).toJson(QJsonDocument::Compact));
 }
 bool    Locator::apiListening() const { return m_api && m_api->listening(); }
 QString Locator::ApiStatus() const { return m_api ? QString::fromUtf8(QJsonDocument(m_api->statusJson()).toJson(QJsonDocument::Compact)) : QStringLiteral("{\"enabled\":false,\"listening\":false}"); }
@@ -744,6 +786,7 @@ void Locator::setWigleToken(const QString &t)
 bool Locator::isTravelling(const QString &bssid) const
 {
     if (m_notTravelling.contains(bssid)) return false;
+    if (m_pins.contains(bssid.toUpper())) return false;                 // anchored: where it is is known
     if (m_travelling.contains(bssid)) return true;
     const auto it = m_apRecords.constFind(bssid);
     if (it == m_apRecords.constEnd()) return false;
@@ -797,6 +840,10 @@ double Locator::bearingDeg(double lat1, double lon1, double lat2, double lon2)
 ApEstimate Locator::estimateFor(const AccessPoint &ap) const
 {
     ApEstimate e;
+    if (const BfAnchor *a = pinnedAnchor(ap.bssid)) {  // surveyed: never estimated (docs/RANGING.md §4.3.2)
+        e.kind = ApEstimate::Anchor; e.lat = a->lat; e.lon = a->lon; e.radiusM = a->accM;
+        return e;
+    }
     const QString st = apStatus(ap);
     // Our own gear rides along: wherever it was "located" before is meaningless now
     const ApRecord *r = st == QLatin1String("travelling") || st == QLatin1String("active") ? nullptr : record(ap.bssid);
@@ -997,14 +1044,8 @@ void Locator::Refresh()
 
 void Locator::ShowWindow() { emit showWindowRequested(); }
 
-QString Locator::StateJson() const
+QJsonArray Locator::apsJson() const
 {
-    QJsonObject o = m_fix.toJson();
-    o["error"] = m_lastError;
-    o["note"] = m_coarseNote;
-    o["busy"] = m_busy;
-    o["intervalMinutes"] = m_intervalMin;
-    o["wifiInterface"] = m_scanner.interfaceName();
     QJsonArray aps;
     for (const AccessPoint &ap : m_aps) {
         const ApEstimate e = estimateFor(ap);
@@ -1027,6 +1068,18 @@ QString Locator::StateJson() const
         if (isHome(ap)) { a["home"] = true; const QString hs = m_homeSsids.value(ap.bssid.toUpper()); if (!hs.isEmpty()) a["homeSsid"] = hs; }
         aps.append(a);
     }
+    return aps;
+}
+
+QString Locator::StateJson() const
+{
+    QJsonObject o = m_fix.toJson();
+    o["error"] = m_lastError;
+    o["note"] = m_coarseNote;
+    o["busy"] = m_busy;
+    o["intervalMinutes"] = m_intervalMin;
+    o["wifiInterface"] = m_scanner.interfaceName();
+    const QJsonArray aps = apsJson();
     o["aps"] = aps;
     {
         int open = 0, wep = 0, wpa1 = 0, tkip = 0, wpa3 = 0;
@@ -1048,6 +1101,10 @@ QString Locator::StateJson() const
     QJsonArray events;
     for (const BeaconEvent &e : m_events) events.append(e.toJson());
     o["events"] = events;
+    o["linkedDevices"] = linkedDevices();
+    o["anchors"] = anchorsJson();
+    o["features"] = QJsonArray::fromStringList(features());
+    o["environment"] = environmentJson();
     o["lastEventId"] = m_eventId;
     o["liveScanSeconds"] = m_liveScanSecs;
     QJsonArray pois;
@@ -1200,6 +1257,7 @@ void Locator::liveScan()
 void Locator::onScanFinished(const QList<AccessPoint> &aps)
 {
     diffScan(aps);
+    noteAnchorCalibration(aps);
     if (m_liveScan) {
         m_liveScan = false;
         if (m_probeWantsScan) { m_probeWantsScan = false; onScan(aps); return; }
@@ -1329,6 +1387,7 @@ void Locator::onScan(const QList<AccessPoint> &aps)
 {
     m_aps = aps;
     emit scanUpdated();
+    if (tryRvGnss()) return;                            // the Pi's averaged GNSS, ahead of BeaconDB / Apple / IP (§4.3.7)
     QList<AccessPoint> usable;
     for (const AccessPoint &ap : aps)
         if (apStatus(ap) == QLatin1String("used")) usable << ap;
@@ -1420,7 +1479,7 @@ static QList<PbField> pbParse(const QByteArray &b)
     }
     return out;
 }
-// Apple writes octets without leading zeros ("f8:3e:b0:9:42:ec"); we keep "f8:3e:b0:09:42:ec"
+// Apple writes octets without leading zeros ("2:11:22:3:44:5"); we keep "02:11:22:03:44:05"
 static QString appleBssid(const QString &mac)
 {
     QStringList parts;
@@ -1582,6 +1641,8 @@ void Locator::accept(Fix cand, const QString &ipCity)
         return;
     }
     m_coarseNote.clear();
+    maybeReproject(cand);                               // the RV moved: its anchors follow (docs/RANGING.md §4.3.5)
+    anchorFix(cand);                                    // within 100 m of the this-computer anchor: the anchor IS the fix
     noteSightings(m_aps, cand);
     if (cand.source != QLatin1String("ip") && cand.accuracy >= 0 && cand.accuracy < 2000) {
         QList<AccessPoint> fixed;                       // home networks move with the RV: no vantage points from them
@@ -1866,7 +1927,7 @@ static QString poiCategoryFor(const QJsonObject &t)
     if (le == "playground") return "playground";
     if (le == "dog_park") return "dogpark";
     if (le == "park" || le == "garden") return "park";
-    if (le == "swimming_pool" || le == "swimming_area" || le == "sports_centre" && t["sport"].toString().contains("swimming")) return t["access"].toString() == "private" ? QString() : QStringLiteral("pool");
+    if (le == "swimming_pool" || le == "swimming_area" || (le == "sports_centre" && t["sport"].toString().contains("swimming"))) return t["access"].toString() == "private" ? QString() : QStringLiteral("pool");
     if (le == "water_park" || t["playground"].toString() == "splash_pad" || t["playground:splash_pad"].toString() == "yes") return "splash";
     if (tour == "zoo" || tour == "aquarium") return "zoo";
     if (tour == "museum" || tour == "gallery") return "museum";
@@ -2253,7 +2314,7 @@ void Locator::queueRefit(const QString &bssid)
 {
     if (m_standalone || bssid.isEmpty()) return;
     m_refitQueue.insert(bssid);
-    if (!m_refitTimer.isActive()) m_refitTimer.start();
+    if (!m_refitTimer.isActive() && !m_bulkImport) m_refitTimer.start();   // an import drains the queue after the last batch
 }
 
 bool Locator::refitOne(const QString &bssid, qint64 now)
@@ -2261,12 +2322,40 @@ bool Locator::refitOne(const QString &bssid, qint64 now)
     auto it = m_apRecords.find(bssid);
     if (it == m_apRecords.end()) return false;
     ApRecord &r = it.value();
+    if (m_pins.contains(bssid.toUpper())) { r.fitDirty = false; return false; }   // anchored: never refitted
     const QList<Estimator::Obs> obs = obsFor(r, bssid);
     const Estimator::Fit before = r.fit;
+    Estimator::Options opt; opt.defaultN = environmentN(r.freq);         // the environment's n from anchor calibration (§4.3.3)
     if (obs.size() < 3) { r.fit = Estimator::Fit(); r.fit.n = obs.size(); r.fit.quality = QStringLiteral("none"); }
-    else r.fit = Estimator::fitAp(obs, now);
+    else r.fit = Estimator::fitAp(obs, now, opt);
     r.fitDirty = false;
     if (m_dbUsable) { m_db->saveEstimate(bssid, r.fit); saveRecord(bssid); }
+    // "Refined": the fit moved or tightened noticeably → an ap_refit event with the vantage points that made it
+    if (r.fit.valid && before.valid) {
+        const double moved = distanceM(before.lat, before.lon, r.fit.lat, r.fit.lon);
+        const bool movedEnough = moved > qMax(5.0, 0.10 * before.acc), tighter = r.fit.acc < before.acc * 0.85;
+        if (movedEnough || tighter) {
+            BeaconEvent ev; ev.type = QStringLiteral("ap_refit"); ev.bssid = bssid; ev.ssid = r.ssid; ev.kind = QStringLiteral("trilat");
+            ev.hasPos = true; ev.lat = r.fit.lat; ev.lon = r.fit.lon; ev.hasFrom = true; ev.fromLat = before.lat; ev.fromLon = before.lon;
+            // Vantage points: strongest sample per 25 m cell, at least one per contributing device, ≤ 6
+            struct Cell { double lat, lon; int dbm; QString device; };
+            QList<Cell> cells;
+            for (const Estimator::Obs &o : obs) {
+                bool merged = false;
+                for (Cell &c : cells) if (distanceM(c.lat, c.lon, o.lat, o.lon) < 25) { if (o.dbm > c.dbm) { c.dbm = o.dbm; c.lat = o.lat; c.lon = o.lon; c.device = o.device; } merged = true; break; }
+                if (!merged) cells.append({o.lat, o.lon, o.dbm, o.device});
+            }
+            std::sort(cells.begin(), cells.end(), [](const Cell &a, const Cell &b) { return a.dbm > b.dbm; });
+            QList<Cell> pick; QSet<QString> devs;
+            for (const Cell &c : cells) if (!devs.contains(c.device)) { devs.insert(c.device); pick << c; }   // one per device first
+            for (const Cell &c : cells) { if (pick.size() >= 6) break; bool dup = false; for (const Cell &p : pick) if (p.lat == c.lat && p.lon == c.lon) dup = true; if (!dup) pick << c; }
+            if (pick.size() > 6) pick = pick.mid(0, 6);
+            QJsonArray vps; for (const Cell &c : pick) vps.append(QJsonObject{{"lat", c.lat}, {"lon", c.lon}, {"dbm", c.dbm}, {"device", c.device.isEmpty() ? ourDeviceName() : c.device}});
+            ev.extra = QJsonObject{{"acc", r.fit.acc}, {"prevAcc", before.acc}, {"n", r.fit.n}, {"vantage", r.fit.vantage}, {"rms", r.fit.rms}, {"movedM", moved}, {"vantagePoints", vps}};
+            ev.text = QStringLiteral("Refined %1: ±%2 m → ±%3 m (%4 samples, %5 vantage points)").arg(r.ssid.isEmpty() ? QStringLiteral("(hidden)") : r.ssid).arg(qRound(before.acc)).arg(qRound(r.fit.acc)).arg(r.fit.n).arg(r.fit.vantage);
+            logEvent(ev);
+        }
+    }
     if (r.fit.valid && !before.valid) {
         BeaconEvent ev; ev.type = QStringLiteral("ap_placed"); ev.bssid = bssid; ev.ssid = r.ssid; ev.kind = QStringLiteral("trilat");
         ev.hasPos = true; ev.lat = r.fit.lat; ev.lon = r.fit.lon;
@@ -2321,13 +2410,17 @@ int Locator::ingestObservations(const QJsonArray &observations, const QString &d
     QHash<QString, QList<ApObservation>> added;
     const int n = m_db->addObservations(observations, device, error, &added);
     if (n <= 0) return n;
+    QHash<QString, QPair<QString, int>> names;      // bssid → (ssid, freq) from the rows, for records that have none yet
+    for (const QJsonValue &v : observations) { const QJsonObject o = v.toObject(); const QString b = o["bssid"].toString().toUpper().trimmed(); if (!names.contains(b) && (!o["ssid"].toString().isEmpty() || o["freq"].toInt() > 0)) names.insert(b, qMakePair(o["ssid"].toString(), o["freq"].toInt())); }
     for (auto it = added.constBegin(); it != added.constEnd(); ++it) {
         ApRecord &r = m_apRecords[it.key()];
+        if (const auto nm = names.constFind(it.key()); nm != names.constEnd()) { if (r.ssid.isEmpty()) r.ssid = nm->first; if (!r.freq && nm->second > 0) r.freq = nm->second; }
         for (const ApObservation &o : it.value()) { r.obs.append(o); if (r.fit.valid) { Estimator::Obs eo; eo.lat = o.lat; eo.lon = o.lon; eo.acc = o.acc; eo.dbm = o.dbm; eo.t = o.time.toSecsSinceEpoch(); r.fit = Estimator::update(r.fit, eo); } }
         while (r.obs.size() > 500) r.obs.removeFirst();
-        r.fitDirty = true; queueRefit(it.key());
+        r.fitDirty = true;
+        if (!m_bulkImport || r.obs.size() >= 3) queueRefit(it.key());   // an import queues only beacons that can be fitted at all
     }
-    emit scanUpdated();
+    if (!m_bulkImport) emit scanUpdated();          // an import repaints once at the end, not per batch
     return n;
 }
 
@@ -2353,8 +2446,70 @@ int Locator::mergePeerAps(const QJsonArray &aps, const QString &device)
 int Locator::appendPeerFixes(const QJsonArray &fixes, const QString &device)
 {
     if (!m_dbUsable) return -1;
-    return m_db->appendPeerFixes(fixes, device);
+    const int n = m_db->appendPeerFixes(fixes, device);
+    // The newest of them is where that device is now
+    QJsonObject newest; QDateTime newestT;
+    for (const QJsonValue &v : fixes) {
+        const QJsonObject f = v.toObject();
+        const QDateTime t = QDateTime::fromString(f["time"].toString(), Qt::ISODate);
+        if (t.isValid() && (!newestT.isValid() || t > newestT) && f["lat"].isDouble()) { newest = f; newestT = t; }
+    }
+    if (!newest.isEmpty()) noteDevicePosition(newest["device"].toString().isEmpty() ? device : newest["device"].toString(), QString(), newest["lat"].toDouble(), newest["lon"].toDouble(),
+                                              newest["acc"].toDouble(), newestT, newest["source"].toString(), 0, newest["identity"].toString(), QString(), newest["place"].toString());
+    else noteDeviceSeen(device);
+    return n;
 }
+
+static bool importerDevice(const QString &d) { const QString l = d.toLower(); return l == QLatin1String("timeline") || l == QLatin1String("wigle") || l == QLatin1String("gpx") || l == QLatin1String("kml") || l.startsWith(QLatin1String("import")); }
+
+void Locator::noteDeviceSeen(const QString &device, const QString &kind)
+{
+    if (device.isEmpty() || device == ourDeviceName() || importerDevice(device)) return;
+    DevicePos &d = m_devicePos[device];
+    d.device = device; if (!kind.isEmpty()) d.kind = kind;
+    d.lastSeen = QDateTime::currentDateTime();
+    if (!d.online) { d.online = true; if (d.time.isValid()) { BeaconEvent ev; ev.type = QStringLiteral("device_online"); ev.text = QStringLiteral("%1 is online").arg(device); ev.extra = QJsonObject{{"device", device}}; logEvent(ev); } }
+}
+
+void Locator::noteDevicePosition(const QString &device, const QString &kind, double lat, double lon, double acc, const QDateTime &time, const QString &source, int beacons,
+                                 const QString &identityId, const QString &identityName, const QString &place)
+{
+    if (device.isEmpty() || device == ourDeviceName() || importerDevice(device)) return;
+    DevicePos &d = m_devicePos[device];
+    const bool had = d.time.isValid();
+    const double moved = had ? distanceM(d.lat, d.lon, lat, lon) : 0;
+    if (had && time.isValid() && time < d.time) { noteDeviceSeen(device, kind); return; }   // older than what we have
+    d.device = device; if (!kind.isEmpty()) d.kind = kind; if (!identityId.isEmpty()) d.identityId = identityId; if (!identityName.isEmpty()) d.identityName = identityName;
+    if (d.kind.isEmpty() || d.kind == QLatin1String("laptop") || d.kind == QLatin1String("device")) d.kind = kindForDevice(device, d.kind);
+    d.lat = lat; d.lon = lon; d.acc = acc; d.time = time.isValid() ? time : QDateTime::currentDateTime(); d.source = source; if (beacons) d.beacons = beacons; if (!place.isEmpty()) d.place = place;
+    noteDeviceSeen(device, d.kind);
+    if (had && moved > 100) {
+        BeaconEvent ev; ev.type = QStringLiteral("device"); ev.hasPos = true; ev.lat = lat; ev.lon = lon;
+        const double dist = m_fix.valid ? distanceM(m_fix.lat, m_fix.lon, lat, lon) : -1;
+        ev.extra = QJsonObject{{"device", device}, {"kind", d.kind}, {"movedM", moved}, {"distanceM", dist}, {"acc", acc}};
+        ev.text = QStringLiteral("%1 moved%2%3").arg(device, d.place.isEmpty() ? QString() : QStringLiteral(" to ") + d.place, dist >= 0 ? QStringLiteral(", %1 away").arg(dist < 1000 ? QStringLiteral("%1 m").arg(qRound(dist)) : QStringLiteral("%1 km").arg(dist / 1000, 0, 'f', 1)) : QString());
+        logEvent(ev);
+    }
+    emit scanUpdated();
+}
+
+QJsonArray Locator::linkedDevices() const
+{
+    QJsonArray arr;
+    QList<DevicePos> l = m_devicePos.values();
+    std::sort(l.begin(), l.end(), [](const DevicePos &a, const DevicePos &b) { return a.time > b.time; });
+    for (const DevicePos &d : l) {
+        if (!d.time.isValid()) continue;
+        QJsonObject o = d.toJson();
+        o["kind"] = kindForDevice(d.device, d.kind);
+        if (m_fix.valid) o["distanceM"] = distanceM(m_fix.lat, m_fix.lon, d.lat, d.lon);
+        if (m_ranging) { const QJsonObject r = m_ranging->estimateJson(d.device); if (!r.isEmpty()) o["range"] = r; }   // measured, not fix-to-fix
+        arr.append(o);
+    }
+    return arr;
+}
+
+QString Locator::LinkedDevices() const { return QString::fromUtf8(QJsonDocument(linkedDevices()).toJson(QJsonDocument::Compact)); }
 
 void Locator::noteSightings(const QList<AccessPoint> &aps, const Fix &at)
 {
@@ -2385,15 +2540,21 @@ void Locator::noteSightings(const QList<AccessPoint> &aps, const Fix &at)
 QHash<QString, int> Locator::apFlags() const
 {
     QHash<QString, int> flags;
-    for (auto it = m_apRecords.constBegin(); it != m_apRecords.constEnd(); ++it) {
-        AccessPoint ap; ap.bssid = it.key(); ap.ssid = it->ssid;
-        int f = 0;
-        if (isHome(ap)) f |= 1;
-        if (isTravelling(it.key()) || (!m_notTravelling.contains(it.key()) && looksMobile(it->ssid))) f |= 2;
-        if (matchesIgnore(ap) || it->ssid.endsWith(QLatin1String("_nomap")) || it->ssid.contains(QLatin1String("_optout"))) f |= 4;
-        flags.insert(it.key(), f);
-    }
+    flags.reserve(m_apRecords.size());
+    for (auto it = m_apRecords.constBegin(); it != m_apRecords.constEnd(); ++it) flags.insert(it.key(), apFlag(it.key()));
     return flags;
+}
+
+int Locator::apFlag(const QString &bssid) const
+{
+    const auto it = m_apRecords.constFind(bssid);
+    if (it == m_apRecords.constEnd()) return 0;
+    AccessPoint ap; ap.bssid = it.key(); ap.ssid = it->ssid;
+    int f = 0;
+    if (isHome(ap)) f |= 1;
+    if (!m_pins.contains(bssid.toUpper()) && (isTravelling(it.key()) || (!m_notTravelling.contains(it.key()) && looksMobile(it->ssid)))) f |= 2;
+    if (matchesIgnore(ap) || it->ssid.endsWith(QLatin1String("_nomap")) || it->ssid.contains(QLatin1String("_optout"))) f |= 4;
+    return f;
 }
 
 // ── Internal mapping database ────────────────────────────────────────────────
@@ -2404,6 +2565,7 @@ void Locator::loadFromDb()
     if (!recs.isEmpty()) { m_apRecords = recs; m_travelling = trav; m_notTravelling = notTrav; }
     const QList<Fix> fixes = m_db->loadFixes();
     if (!fixes.isEmpty()) m_history = fixes;
+    loadImported();
     QList<Poi> pois; double plat = 0, plon = 0; int prad = 0; QDateTime ptime;
     if (m_db->loadPois(&pois, &plat, &plon, &prad, &ptime)) {
         m_pois.clear(); for (const Poi &p : pois) if (poiCategory(p.cat)) m_pois << p;
@@ -2413,6 +2575,14 @@ void Locator::loadFromDb()
     for (auto it = elev.constBegin(); it != elev.constEnd(); ++it) m_elevCache.insert(it.key(), it.value());
     const QHash<QString, QDateTime> ach = m_db->loadAchievements();
     for (Achievement &a : m_achievements) if (ach.contains(a.key) && ach.value(a.key).isValid()) a.unlocked = ach.value(a.key);
+    for (const QJsonValue &v : m_db->latestFixesByDevice()) {          // where our other devices were last
+        const QJsonObject f = v.toObject();
+        const QString dev = f["device"].toString();
+        if (dev.isEmpty() || dev == ourDeviceName() || importerDevice(dev)) continue;
+        DevicePos &d = m_devicePos[dev]; d.device = dev; d.lat = f["lat"].toDouble(); d.lon = f["lon"].toDouble(); d.acc = f["acc"].toDouble();
+        d.time = QDateTime::fromString(f["time"].toString(), Qt::ISODate); d.source = f["source"].toString(); d.place = f["place"].toString();
+        d.kind = kindForDevice(dev);
+    }
 }
 
 // First run with the database: everything the JSON files held goes in, and the files are kept as *.migrated
@@ -2467,6 +2637,45 @@ bool Locator::DbExport(const QString &path)
     emit statusMessage(QStringLiteral("Database exported to %1").arg(path));
     return true;
 }
+void Locator::loadImported()
+{
+    m_imported.clear();
+    if (!m_db || !m_db->isOpen()) return;
+    for (const char *dev : {"timeline", "wigle", "gpx", "kml"}) m_imported += m_db->peerFixes(QString::fromLatin1(dev));
+    std::stable_sort(m_imported.begin(), m_imported.end(), [](const Fix &a, const Fix &b) { return a.time < b.time; });
+}
+
+QString Locator::Import(const QString &path, const QString &optsJson)
+{
+    auto json = [](const QJsonObject &o) { return QString::fromUtf8(QJsonDocument(o).toJson(QJsonDocument::Compact)); };
+    if (m_importing) return json({{"ok", false}, {"error", "an import is already running"}});
+    if (!m_dbUsable) return json({{"ok", false}, {"error", "map database not writable"}});
+    const Importers::Options opt = Importers::Options::fromJson(QJsonDocument::fromJson(optsJson.toUtf8()).object());
+    m_importing = true; m_bulkImport = true;
+    emit statusMessage(QStringLiteral("Importing %1…").arg(QFileInfo(path).fileName()));
+    Importers::Summary sum;
+    int lastPct = -1;
+    const bool ok = Importers::run(path, opt, this, [&](int pct, const QString &stage) {
+        if (pct == lastPct && pct != 100) return;
+        lastPct = pct;
+        emit importProgress(json({{"file", path}, {"percent", pct}, {"stage", stage}}));
+    }, &sum);
+    m_importing = false; m_bulkImport = false;
+    loadImported();
+    if (!m_refitQueue.isEmpty() && !m_refitTimer.isActive()) m_refitTimer.start();   // the batched refit of everything the import touched
+    if (ok) {
+        BeaconEvent ev; ev.type = QStringLiteral("import");
+        ev.text = QStringLiteral("Imported %1: %2 positions, %3 Wi-Fi observations, %4 visits").arg(QFileInfo(path).fileName()).arg(sum.positions + sum.tracks).arg(sum.observations).arg(sum.visits);
+        ev.extra = sum.toJson(); logEvent(ev);
+        emit statusMessage(ev.text);
+        emit scanUpdated(); emit FixChanged();
+    }
+    QJsonObject res{{"ok", ok}, {"summary", sum.toJson()}};
+    if (!ok) res["error"] = sum.error;
+    emit importProgress(json({{"file", path}, {"percent", 100}, {"stage", "done"}, {"done", true}, {"ok", ok}, {"summary", sum.toJson()}}));
+    return json(res);
+}
+
 int Locator::DbImport(const QString &path)
 {
     if (!m_dbUsable) return -1;
@@ -2499,7 +2708,7 @@ void Locator::saveRecord(const QString &bssid)
 {
     auto it = m_apRecords.find(bssid);
     if (it == m_apRecords.end()) return;
-    if (m_dbUsable) { m_db->saveRecord(bssid, it.value(), apFlags().value(bssid, 0)); return; }
+    if (m_dbUsable) { m_db->saveRecord(bssid, it.value(), apFlag(bssid)); return; }
     saveApRecords();
 }
 
@@ -2636,8 +2845,9 @@ void Locator::syncStep(int i)
     m_syncBusy = true;
     const SyncPeer peer = m_syncPeers[i];
     const QString base = peer.url + QStringLiteral("/api/v1/"), key = peerKey(peer.url);
-    const QByteArray auth = "Bearer " + peer.token.toUtf8();
-    struct Ctx { int pushedObs = 0, pushedFixes = 0, pulledObs = 0, pulledAps = 0, pulledFixes = 0, rounds = 0; QString peerName; };
+    auto auth = QSharedPointer<QByteArray>::create("Bearer " + peer.token.toUtf8());   // may be replaced by an identity sign-in below
+    struct Ctx { int pushedObs = 0, pushedFixes = 0, pulledObs = 0, pulledAps = 0, pulledFixes = 0, rounds = 0; bool reauth = false; QString peerName; };
+    auto identityAuth = QSharedPointer<std::function<void()>>::create();   // set below; used by push when a token is rejected
     auto ctx = QSharedPointer<Ctx>::create();
     auto done = [this, i, key](bool ok, const QString &msg) {
         m_syncBusy = false;
@@ -2647,7 +2857,8 @@ void Locator::syncStep(int i)
         emit statusMessage((ok ? QStringLiteral("Sync with %1: ") : QStringLiteral("Sync with %1 failed: ")).arg(key) + msg);
         if (ok) { emit scanUpdated(); emit FixChanged(); }
     };
-    auto request = [base, auth](const QString &ep) { QNetworkRequest r(QUrl(base + ep)); r.setRawHeader("Authorization", auth); r.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json")); r.setHeader(QNetworkRequest::UserAgentHeader, QString::fromLatin1(USER_AGENT)); r.setTransferTimeout(30000); return r; };
+    auto request = [base, auth](const QString &ep) { QNetworkRequest r(QUrl(base + ep)); r.setRawHeader("Authorization", *auth); r.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json")); r.setHeader(QNetworkRequest::UserAgentHeader, QString::fromLatin1(USER_AGENT));
+                                                     r.setTransferTimeout(ep.startsWith(QLatin1String("db/")) ? 180000 : 30000); return r; };   // a first merge of hundreds of samples can take the peer a while
 
     // Pull loop (after the push): GET db/changes?since=<pulled>
     auto pull = QSharedPointer<std::function<void()>>::create();
@@ -2666,6 +2877,7 @@ void Locator::syncStep(int i)
             ctx->pulledObs += qMax(0, ingestObservations(obs, from));
             ctx->pulledAps += qMax(0, mergePeerAps(aps, from));
             ctx->pulledFixes += qMax(0, appendPeerFixes(fixes, from));
+            mergeAnchors(o["anchors"].toArray());                                  // newest placedAt / deletedAt wins
             m_db->setKv(QStringLiteral("sync:%1:pulled").arg(key), QString::number(qint64(o["cursor"].toDouble())));
             if (o["more"].toBool() && ++ctx->rounds < 50) { (*pull)(); return; }
             done(true, QStringLiteral("pushed %1 samples + %2 stops, pulled %3 samples, %4 positions, %5 stops").arg(ctx->pushedObs).arg(ctx->pushedFixes).arg(ctx->pulledObs).arg(ctx->pulledAps).arg(ctx->pulledFixes));
@@ -2673,34 +2885,72 @@ void Locator::syncStep(int i)
     };
     // Push loop: POST db/sync with our changes since <pushed>
     auto push = QSharedPointer<std::function<void()>>::create();
-    *push = [this, ctx, key, request, done, pull, push] {
+    *push = [this, ctx, key, request, done, pull, push, identityAuth] {
         const qint64 since = m_db->kv(QStringLiteral("sync:%1:pushed").arg(key)).toLongLong();
         bool more = false; qint64 cursor = 0;
-        QJsonObject ch = m_db->changesSince(since, 2000, &more, &cursor);
+        QJsonObject ch = m_db->changesSince(since, 500, &more, &cursor);      // small pushes: the peer merges + queues refits per request
         QJsonArray obs; for (const QJsonValue &v : ch["observations"].toArray()) if (v.toObject()["device"].toString().isEmpty()) obs.append(v);   // ours only, not what peers gave us
         QJsonArray fixes; for (const QJsonValue &v : ch["fixes"].toArray()) if (v.toObject()["device"].toString().isEmpty()) fixes.append(v);
         QJsonArray aps; for (const QJsonValue &v : ch["aps"].toArray()) { const QJsonObject a = v.toObject(); if (a["source"].toString() == QLatin1String("trilat") || a["source"].toString() == QLatin1String("placed")) aps.append(a); }
-        if (obs.isEmpty() && fixes.isEmpty() && aps.isEmpty()) { m_db->setKv(QStringLiteral("sync:%1:pushed").arg(key), QString::number(cursor)); (*pull)(); return; }
-        QJsonObject body{{"device", ourDeviceName()}, {"observations", obs}, {"aps", aps}, {"fixes", fixes}, {"sinceCursor", double(m_db->kv(QStringLiteral("sync:%1:pulled").arg(key)).toLongLong())}};
+        const QJsonArray anchorsOut = ch["anchors"].toArray();
+        if (obs.isEmpty() && fixes.isEmpty() && aps.isEmpty() && anchorsOut.isEmpty()) { m_db->setKv(QStringLiteral("sync:%1:pushed").arg(key), QString::number(cursor)); (*pull)(); return; }
+        QJsonObject body{{"device", ourDeviceName()}, {"observations", obs}, {"aps", aps}, {"fixes", fixes}, {"anchors", anchorsOut}, {"sinceCursor", double(m_db->kv(QStringLiteral("sync:%1:pulled").arg(key)).toLongLong())}};
         QNetworkReply *rep = m_nam.post(request(QStringLiteral("db/sync")), QJsonDocument(body).toJson(QJsonDocument::Compact));
-        connect(rep, &QNetworkReply::finished, this, [this, rep, ctx, key, cursor, more, done, pull, push] {
+        connect(rep, &QNetworkReply::finished, this, [this, rep, ctx, key, cursor, more, done, pull, push, identityAuth] {
             rep->deleteLater();
             const QJsonObject o = QJsonDocument::fromJson(rep->readAll()).object();
-            if (rep->error() != QNetworkReply::NoError) { done(false, QStringLiteral("push: %1").arg(o["error"].toString().isEmpty() ? rep->errorString() : o["error"].toString())); return; }
+            if (rep->error() != QNetworkReply::NoError) {
+                const int status = rep->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+                if (status == 401 && !ctx->reauth && m_identity && m_identity->unlocked() && *identityAuth) { ctx->reauth = true; (*identityAuth)(); return; }   // stale token: sign in again
+                done(false, QStringLiteral("push: %1").arg(o["error"].toString().isEmpty() ? rep->errorString() : o["error"].toString())); return;
+            }
             ctx->pushedObs += o["accepted"].toObject()["observations"].toInt(); ctx->pushedFixes += o["accepted"].toObject()["fixes"].toInt();
             m_db->setKv(QStringLiteral("sync:%1:pushed").arg(key), QString::number(cursor));
             if (more && ++ctx->rounds < 50) { (*push)(); return; }
             ctx->rounds = 0; (*pull)();
         });
     };
+    // Identity sign-in (docs/IDENTITY.md): when we hold no token for this peer and our identity is the peer's
+    // (or linked to it), a challenge signature gets us a control token — no pairing code, nothing to type.
+    *identityAuth = [this, i, key, base, auth, request, done, push] {
+        QNetworkReply *ch = m_nam.get(request(QStringLiteral("identity/challenge")));
+        connect(ch, &QNetworkReply::finished, this, [this, ch, i, key, base, auth, request, done, push] {
+            ch->deleteLater();
+            const QJsonObject c = QJsonDocument::fromJson(ch->readAll()).object();
+            if (ch->error() != QNetworkReply::NoError || c["nonce"].toString().isEmpty()) { done(false, QStringLiteral("no token for %1 and its identity challenge failed: %2").arg(key, c["error"].toString().isEmpty() ? ch->errorString() : c["error"].toString())); return; }
+            const QString nonce = c["nonce"].toString(), host = c["host"].toString(), dev = ourDeviceName();
+            const QByteArray sig = m_identity->sign(Identity::authCanon(host, nonce.toLatin1(), m_identity->id(), dev));
+            QJsonObject body{{"id", m_identity->id()}, {"pub", QString::fromLatin1(m_identity->pub().toBase64())}, {"name", m_identity->name()},
+                             {"device", QJsonObject{{"name", dev}, {"kind", "desktop"}}}, {"nonce", nonce}, {"sig", QString::fromLatin1(sig.toBase64())}};
+            QNetworkReply *au = m_nam.post(request(QStringLiteral("identity/auth")), QJsonDocument(body).toJson(QJsonDocument::Compact));
+            connect(au, &QNetworkReply::finished, this, [this, au, i, key, auth, done, push] {
+                au->deleteLater();
+                const QJsonObject o = QJsonDocument::fromJson(au->readAll()).object();
+                if (au->error() != QNetworkReply::NoError || o["token"].toString().isEmpty()) {
+                    const QString why = o["error"].toString();
+                    done(false, why == QLatin1String("unknown identity") ? QStringLiteral("%1 does not know our identity — link it there (its Devices tab lists our sign-in), or pass --sync-token").arg(key)
+                                                                       : QStringLiteral("identity sign-in at %1 failed: %2").arg(key, why.isEmpty() ? au->errorString() : why));
+                    return;
+                }
+                *auth = "Bearer " + o["token"].toString().toUtf8();
+                if (i < m_syncPeers.size()) { m_syncPeers[i].token = o["token"].toString(); if (m_syncPeers[i].name.isEmpty()) m_syncPeers[i].name = o["identity"].toObject()["name"].toString(); saveSyncPeers(); }
+                (*push)();
+            });
+        });
+    };
     QNetworkReply *hello = m_nam.get(request(QStringLiteral("hello")));
-    connect(hello, &QNetworkReply::finished, this, [this, hello, ctx, done, push] {
+    connect(hello, &QNetworkReply::finished, this, [this, hello, ctx, peer, done, push, identityAuth] {
         hello->deleteLater();
         const QJsonObject o = QJsonDocument::fromJson(hello->readAll()).object();
         if (hello->error() != QNetworkReply::NoError) { done(false, QStringLiteral("hello: %1").arg(hello->errorString())); return; }
-        bool sync = false; for (const QJsonValue &v : o["features"].toArray()) if (v.toString() == QLatin1String("sync")) sync = true;
+        bool sync = false, identity = false;
+        for (const QJsonValue &v : o["features"].toArray()) { if (v.toString() == QLatin1String("sync")) sync = true; if (v.toString() == QLatin1String("identity")) identity = true; }
         if (!sync) { done(false, QStringLiteral("%1 runs BeaconFix %2 without the sync API (needs 3.4+)").arg(o["hostname"].toString(), o["version"].toString())); return; }
         ctx->peerName = o["hostname"].toString();
+        if (peer.token.isEmpty()) {
+            if (identity && m_identity && m_identity->unlocked()) { (*identityAuth)(); return; }
+            done(false, QStringLiteral("no token for %1 (pass --sync-token, or give both sides the same / a linked identity)").arg(ctx->peerName)); return;
+        }
         (*push)();
     });
 }
@@ -2710,10 +2960,19 @@ QString Locator::Sync(const QString &url, const QString &token)
     if (m_standalone || !m_dbUsable) return QStringLiteral("{\"ok\":false,\"error\":\"needs the running instance with a writable database\"}");
     if (m_syncBusy) return QStringLiteral("{\"ok\":false,\"error\":\"a sync is already running\"}");
     QString u = url.trimmed(); if (u.endsWith(QLatin1Char('/'))) u.chop(1);
+    QString peerName;
+    if (!u.contains(QLatin1String("://"))) {                  // a peer's name / hostname / address: look it up on the network
+        const Mdns::Peer *peer = m_api && m_api->mdns() ? m_api->mdns()->find(u) : nullptr;
+        if (!peer) {
+            const QHostAddress a(u.section(QLatin1Char(':'), 0, 0));
+            if (a.isNull() && !u.contains(QLatin1Char('.'))) return QString::fromUtf8(QJsonDocument(QJsonObject{{"ok", false}, {"error", QStringLiteral("no BeaconFix called \"%1\" on this network (beaconfix --peers lists them)").arg(u)}}).toJson(QJsonDocument::Compact));
+            u = QStringLiteral("http://") + u + (u.contains(QLatin1Char(':')) && !a.isNull() && a.protocol() == QAbstractSocket::IPv6Protocol ? QString() : u.contains(QLatin1Char(':')) ? QString() : QStringLiteral(":47822"));
+        } else { u = peer->url(); peerName = peer->identityName.isEmpty() ? peer->host : peer->identityName; }
+    }
     int idx = -1;
     for (int i = 0; i < m_syncPeers.size(); ++i) if (peerKey(m_syncPeers[i].url) == peerKey(u)) idx = i;
-    if (idx < 0) { SyncPeer p; p.url = u; p.token = token; p.minutes = 0; m_syncPeers << p; idx = m_syncPeers.size() - 1; saveSyncPeers(); }
-    else if (!token.isEmpty()) m_syncPeers[idx].token = token;
+    if (idx < 0) { SyncPeer p; p.url = u; p.token = token; p.name = peerName; p.minutes = 0; m_syncPeers << p; idx = m_syncPeers.size() - 1; saveSyncPeers(); }
+    else { if (!token.isEmpty()) m_syncPeers[idx].token = token; if (!peerName.isEmpty()) m_syncPeers[idx].name = peerName; }
     QEventLoop loop; QJsonObject result;
     QMetaObject::Connection c = connect(this, &Locator::syncFinished, &loop, [&](const QString &, bool ok, const QString &msg) { result = QJsonObject{{"ok", ok}, {"message", msg}}; loop.quit(); });
     QTimer::singleShot(180000, &loop, &QEventLoop::quit);
@@ -2765,7 +3024,7 @@ bool Locator::IdentityImport(const QString &textOrPath, const QString &passphras
 QString Locator::IdentityLinkPayload() const
 {
     if (!m_identity || !m_identity->exists()) return {};
-    return QStringLiteral("BFLNK1:") + QString::fromLatin1(Identity::base64url(QJsonDocument(m_identity->linkPayload()).toJson(QJsonDocument::Compact)));
+    return Identity::encodeUri(QStringLiteral("link"), m_identity->linkPayload());
 }
 QString Locator::IdentityAcceptLink(const QString &statementJson)
 {
@@ -2839,3 +3098,289 @@ QJsonObject Locator::emergencyJson() const
     o["vet"] = nearest(QStringLiteral("vet"), false);
     return o;
 }
+
+// ── Anchors (docs/RANGING.md §4) ──────────────────────────────────────────────
+void Locator::loadAnchors()
+{
+    m_anchors = m_db && m_db->isOpen() ? m_db->loadAnchors(false) : QList<BfAnchor>();
+    if (m_db && m_db->isOpen()) {                        // the environment fit survives restarts
+        const QJsonObject env = QJsonDocument::fromJson(m_db->kv(QStringLiteral("environment")).toUtf8()).object();
+        for (auto it = env.begin(); it != env.end(); ++it) {
+            const QJsonObject b = it.value().toObject();
+            RangeMath::Rls2 r(b["p0"].toDouble(-40), b["n"].toDouble(2.4));
+            const QJsonArray S = b["S"].toArray();
+            if (S.size() == 3) { r.S[0][0] = S[0].toDouble(); r.S[0][1] = r.S[1][0] = S[1].toDouble(); r.S[1][1] = S[2].toDouble(); }
+            m_envRls.insert(it.key(), r); m_envSamples.insert(it.key(), b["samples"].toInt());
+        }
+    }
+    anchorsChanged();
+}
+
+void Locator::anchorsChanged()
+{
+    m_pins.clear();
+    const QHash<QString, BfAnchor> pins = ::Anchors::pinnedBssids(m_anchors);
+    for (auto it = pins.constBegin(); it != pins.constEnd(); ++it) m_pins.insert(it.key(), it.value());
+    // Our own RTT responder sits on the this-computer anchor: it must never be "positioned" from samples
+    const QString responder = ::Anchors::normalizeBssid(RangingService::responderInfo().value(QStringLiteral("bssid")).toString());
+    if (!responder.isEmpty() && !m_pins.contains(responder)) {
+        const BfAnchor *self = nullptr;
+        for (const BfAnchor &a : m_anchors) if (a.kind == QLatin1String("this-computer") && (!self || a.placedAt > self->placedAt)) self = &a;
+        if (self) m_pins.insert(responder, *self);
+    }
+    if (m_db) {
+        QHash<QString, MapDb::ApPos> dbPins;
+        for (auto it = m_pins.constBegin(); it != m_pins.constEnd(); ++it) {
+            MapDb::ApPos p; p.bssid = it.key(); p.lat = it->lat; p.lon = it->lon; p.acc = it->accM; p.source = QStringLiteral("anchor");
+            dbPins.insert(it.key(), p);
+        }
+        m_db->setPins(dbPins);
+    }
+    // A (new) this-computer anchor next to where we are: it is our position from now on
+    if (!m_standalone && m_fix.valid) {
+        Fix f = m_fix;
+        if (anchorFix(f) && (std::fabs(f.lat - m_fix.lat) > 1e-9 || std::fabs(f.lon - m_fix.lon) > 1e-9 || f.accuracy != m_fix.accuracy)) {
+            m_fix.lat = f.lat; m_fix.lon = f.lon; m_fix.accuracy = f.accuracy; m_fix.source = f.source; m_fix.provider = f.provider;
+            saveState(); emit FixChanged();
+        }
+    }
+    emit scanUpdated();
+}
+
+QJsonArray Locator::anchorsJson() const
+{
+    QJsonArray a;
+    for (const BfAnchor &x : m_anchors) a.append(x.toJson(true));
+    return a;
+}
+
+const BfAnchor *Locator::pinnedAnchor(const QString &bssid) const
+{
+    const auto it = m_pins.constFind(bssid.toUpper());
+    return it == m_pins.constEnd() ? nullptr : &it.value();
+}
+
+BfAnchor Locator::setAnchor(const QJsonObject &o, const QString &placedByDefault, bool *ok, QString *error)
+{
+    if (ok) *ok = false;
+    QString err;
+    BfAnchor a = BfAnchor::fromJson(o, &err);
+    if (!err.isEmpty()) { if (error) *error = err; return a; }
+    if (a.deleted) { if (error) *error = QStringLiteral("use DELETE /api/v1/anchors/<id> to remove an anchor"); return a; }
+    if (!m_dbUsable) { if (error) *error = QStringLiteral("map database not writable (is the tray running?)"); return a; }
+    if (!o.contains(QStringLiteral("placedBy")) && !placedByDefault.isEmpty()) a.placedBy = placedByDefault;
+    // RV anchors store where they are relative to the RV reference (and the heading), so they can follow the RV
+    if (a.rv && !a.hasRvOffset) {
+        const BfAnchor *ref = ::Anchors::reference(m_anchors);
+        if (ref && ref->id != a.id) {
+            const Stats st = stats();
+            ::Anchors::placeRv(a, *ref, st.headingDeg >= 0, st.headingDeg);
+        } else {
+            a.hasRvOffset = true; a.rvOffset = ::Anchors::Enu{0, 0, 0};
+        }
+    }
+    BfAnchor stored;
+    const bool changed = m_db->putAnchor(a, false, &stored);
+    if (changed) {
+        // At most one ref:true per site: the newest wins, the others are demoted (and that syncs too)
+        QList<BfAnchor> all = m_db->loadAnchors(false);
+        const QList<BfAnchor> norm = ::Anchors::normalizeSet(all);
+        for (const BfAnchor &n : norm)
+            for (const BfAnchor &old : all) if (old.id == n.id && old.ref != n.ref) m_db->putAnchor(n, true);
+        loadAnchors();
+        BeaconEvent ev; ev.type = QStringLiteral("anchor"); ev.hasPos = true; ev.lat = stored.lat; ev.lon = stored.lon;
+        ev.text = QStringLiteral("Anchor placed: %1 (%2, ±%3 m)").arg(stored.name.isEmpty() ? stored.kind : stored.name, stored.kind).arg(stored.accM, 0, 'g', 2);
+        ev.extra = QJsonObject{{"anchor", stored.id}, {"kind", stored.kind}, {"placedBy", stored.placedBy}};
+        logEvent(ev);
+    }
+    if (ok) *ok = true;
+    for (const BfAnchor &x : m_anchors) if (x.id == stored.id) return x;
+    return stored;
+}
+
+bool Locator::removeAnchor(const QString &id)
+{
+    if (!m_dbUsable) return false;
+    for (const BfAnchor &a : m_anchors) {
+        if (a.id != id) continue;
+        BfAnchor t; t.id = id; t.deleted = true; t.deletedAt = QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs);
+        if (!m_db->putAnchor(t, true)) return false;
+        loadAnchors();
+        BeaconEvent ev; ev.type = QStringLiteral("anchor"); ev.text = QStringLiteral("Anchor removed: %1").arg(a.name.isEmpty() ? a.kind : a.name);
+        ev.extra = QJsonObject{{"anchor", id}, {"deleted", true}};
+        logEvent(ev);
+        return true;
+    }
+    return false;
+}
+
+int Locator::mergeAnchors(const QJsonArray &rows)
+{
+    if (!m_dbUsable || rows.isEmpty()) return 0;
+    int n = 0;
+    for (const QJsonValue &v : rows) {
+        QString err;
+        const BfAnchor a = BfAnchor::fromJson(v.toObject(), &err);
+        if (!err.isEmpty() || a.id.isEmpty()) continue;
+        if (m_db->putAnchor(a, false)) ++n;
+    }
+    if (n) loadAnchors();
+    return n;
+}
+
+bool Locator::anchorFix(Fix &cand) const
+{
+    if (!cand.valid || cand.source == QLatin1String("ip") || cand.source == QLatin1String("anchor")) return false;
+    const ::Anchors::AnchorFix af = ::Anchors::thisComputerFix(m_anchors, cand.lat, cand.lon);
+    if (!af.valid) return false;
+    cand.provider = cand.provider.isEmpty() ? cand.source : cand.source + QLatin1Char('/') + cand.provider;   // what found us, for the record
+    cand.lat = af.lat; cand.lon = af.lon; cand.accuracy = af.acc; cand.source = QStringLiteral("anchor");
+    if (af.hasAlt) cand.elevation = af.alt;
+    return true;
+}
+
+void Locator::maybeReproject(const Fix &cand)
+{
+    if (!m_dbUsable || !cand.valid || !cand.precise() || cand.source == QLatin1String("anchor")) return;
+    const BfAnchor *ref = ::Anchors::reference(m_anchors);
+    if (!ref || !ref->rv || !atHome()) return;                     // only an RV that moved (we hear its own networks)
+    if (!::Anchors::shouldReproject(ref->lat, ref->lon, cand.lat, cand.lon)) return;
+    // The RV's heading now: the bearing of the leg that brought us here, when it is a real leg
+    const bool haveHeading = m_fix.valid && m_fix.precise() && distanceM(m_fix.lat, m_fix.lon, cand.lat, cand.lon) > 250;
+    const double heading = haveHeading ? bearingDeg(m_fix.lat, m_fix.lon, cand.lat, cand.lon) : 0;
+    const QList<BfAnchor> moved = ::Anchors::reprojectAll(m_anchors, cand.lat, cand.lon, false, 0, haveHeading, heading);
+    int n = 0;
+    for (BfAnchor a : moved) {
+        if (a.deleted) continue;
+        if (a.kind == QLatin1String("gnss") && a.id != ref->id) continue;   // a GNSS anchor is re-measured, not re-projected
+        if (a.id == ref->id) { a.accM = std::max(a.accM, cand.accuracy > 0 ? cand.accuracy : a.accM); if (haveHeading) { a.hasHeading = true; a.headingDeg = heading; } }
+        a.placedAt = QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs);   // newest wins on every peer
+        a.source = a.id == ref->id ? QStringLiteral("gps-average") : a.source;
+        if (m_db->putAnchor(a, true)) ++n;
+    }
+    if (!n) return;
+    const QString refName = ref->name;
+    loadAnchors();
+    BeaconEvent ev; ev.type = QStringLiteral("anchor"); ev.hasPos = true; ev.lat = cand.lat; ev.lon = cand.lon;
+    ev.text = QStringLiteral("RV moved: %1 anchor(s) re-projected around %2%3").arg(n).arg(refName.isEmpty() ? QStringLiteral("the reference") : refName,
+                                                                                       haveHeading ? QStringLiteral(" (heading %1°)").arg(qRound(heading)) : QStringLiteral(" (heading unknown — check them in the picker)"));
+    ev.extra = QJsonObject{{"reprojected", n}, {"headingAssumed", !haveHeading}};
+    logEvent(ev);
+}
+
+// §4.3.3: the desktop, sitting on its this-computer anchor, hears a wifi-ap anchor at a known distance
+void Locator::noteAnchorCalibration(const QList<AccessPoint> &aps)
+{
+    if (m_standalone || m_anchors.isEmpty() || !m_fix.valid || m_fix.source != QLatin1String("anchor")) return;
+    const BfAnchor *self = nullptr;
+    for (const BfAnchor &a : m_anchors) if (a.kind == QLatin1String("this-computer") && (!self || a.placedAt > self->placedAt)) self = &a;
+    if (!self) return;
+    static QHash<QString, qint64> last;                              // one sample per AP per 10 min: scans of a still AP are correlated
+    const qint64 now = QDateTime::currentSecsSinceEpoch();
+    bool changed = false;
+    for (const AccessPoint &ap : aps) {
+        const BfAnchor *a = pinnedAnchor(ap.bssid);
+        if (!a || a->kind != QLatin1String("wifi-ap") || a->id == self->id) continue;
+        if (now - last.value(ap.bssid, 0) < 600) continue;
+        last.insert(ap.bssid, now);
+        const double h = distanceM(self->lat, self->lon, a->lat, a->lon);
+        const double dz = (a->hasHeight && self->hasHeight) ? a->heightM - self->heightM : (a->hasAlt && self->hasAlt) ? a->alt - self->alt : 0;
+        const double d = std::max(0.5, std::sqrt(h * h + dz * dz));
+        const int f = ap.frequency;
+        const QString band = f >= 5925 ? QStringLiteral("6") : f >= 4900 ? QStringLiteral("5") : QStringLiteral("2.4");
+        if (!m_envRls.contains(band)) m_envRls.insert(band, RangeMath::Rls2(RangeMath::priorP0Wifi(f > 0 ? f : 2437), RangeMath::kNWifi));
+        // one scan sample: Rayleigh fade + that AP's own shadowing
+        m_envRls[band].update(std::log10(d), ap.dbm, RangeMath::kRayleighDbStd * RangeMath::kRayleighDbStd + RangeMath::kShadowWifi * RangeMath::kShadowWifi);
+        m_envSamples[band] += 1;
+        changed = true;
+    }
+    if (changed && m_dbUsable) m_db->setKv(QStringLiteral("environment"), QString::fromUtf8(QJsonDocument(environmentJson()).toJson(QJsonDocument::Compact)));
+}
+
+double Locator::environmentN(int freqMHz) const
+{
+    const QString band = freqMHz >= 5925 ? QStringLiteral("6") : freqMHz >= 4900 ? QStringLiteral("5") : QStringLiteral("2.4");
+    if (m_envSamples.value(band) < 3 || !m_envRls.contains(band)) return Estimator::Options().defaultN;
+    return std::clamp(m_envRls.value(band).n, 1.5, 4.5);
+}
+
+QJsonObject Locator::environmentJson() const
+{
+    QJsonObject o;
+    for (auto it = m_envRls.constBegin(); it != m_envRls.constEnd(); ++it)
+        o[it.key()] = QJsonObject{{"p0", it->p0}, {"n", it->n}, {"S", QJsonArray{it->S[0][0], it->S[0][1], it->S[1][1]}}, {"samples", m_envSamples.value(it.key())},
+                                  {"sigmaP0", std::sqrt(std::max(0.0, it->S[0][0]))}, {"sigmaN", std::sqrt(std::max(0.0, it->S[1][1]))}};
+    return o;
+}
+
+// §4.3.7: a linked Pi / GNSS receiver in the RV knows where the RV is to a few metres
+bool Locator::tryRvGnss()
+{
+    if (!atHome()) return false;
+    const QDateTime now = QDateTime::currentDateTime();
+    const DevicePos *best = nullptr;
+    for (const DevicePos &d : m_devicePos) {
+        const QString k = kindForDevice(d.device, d.kind);
+        if ((k != QLatin1String("pi") && k != QLatin1String("gnss")) || !d.time.isValid() || d.time.secsTo(now) > 600 || !(d.acc > 0) || d.acc > 5) continue;
+        // Plausibility: a fresh precise fix of ours more than 5 km away says this receiver is not in the RV with us
+        if (m_fix.valid && m_fix.precise() && m_fix.time.isValid() && m_fix.time.secsTo(now) < 1800 && distanceM(m_fix.lat, m_fix.lon, d.lat, d.lon) > 5000) continue;
+        if (!best || d.acc < best->acc) best = &d;
+    }
+    if (!best) return false;
+    const BfAnchor *gnss = nullptr, *self = nullptr;
+    for (const BfAnchor &a : m_anchors) {
+        if (a.kind == QLatin1String("gnss") && (!gnss || a.placedAt > gnss->placedAt)) gnss = &a;
+        if (a.kind == QLatin1String("this-computer") && (!self || a.placedAt > self->placedAt)) self = &a;
+    }
+    const ::Anchors::RvGnss r = ::Anchors::rvGnssPosition(best->lat, best->lon, best->acc, gnss, self, false, 0);
+    if (!r.valid) return false;
+    Fix f; f.valid = true; f.lat = r.lat; f.lon = r.lon; f.accuracy = r.sigmaM;
+    f.source = QStringLiteral("gnss"); f.provider = QStringLiteral("rv-gnss"); f.time = now; f.apCount = m_aps.size();
+    const QString who = best->device;
+    accept(f);
+    finish(true, QStringLiteral("RV GNSS fix from %1 (±%2 m)").arg(who).arg(r.sigmaM, 0, 'f', 1));
+    return true;
+}
+
+QString Locator::kindForDevice(const QString &device, const QString &hint) const
+{
+    auto good = [](const QString &k) { return !k.isEmpty() && k != QLatin1String("device"); };
+    if (m_api) for (const ApiServer::Device &d : m_api->devices()) if (d.name == device && good(d.kind)) return d.kind;
+    if (m_identity) {
+        for (const IdentityDevice &idv : m_identity->devices()) if (idv.name == device && good(idv.kind)) return idv.kind;
+        for (const PendingLink &pl : m_identity->pending()) if (pl.deviceName == device && good(pl.deviceKind)) return pl.deviceKind;
+    }
+    if (m_ranging) { const QString k = m_ranging->kindOf(device); if (good(k)) return k; }   // its BLE advert says what it is
+    if (good(hint) && hint != QLatin1String("laptop")) return hint;      // "laptop" was the old catch-all
+    static const QRegularExpression phone(QStringLiteral("pixel|galaxy|android|phone|oneplus|motorola|moto |xiaomi|redmi|\\bsm-"), QRegularExpression::CaseInsensitiveOption);
+    if (phone.match(device).hasMatch()) return QStringLiteral("android");
+    return good(hint) ? hint : QStringLiteral("device");
+}
+
+QStringList Locator::features()
+{
+    return {QStringLiteral("sync"), QStringLiteral("locate"), QStringLiteral("home"), QStringLiteral("events"), QStringLiteral("stream"), QStringLiteral("estimates"),
+            QStringLiteral("identity"), QStringLiteral("peers"), QStringLiteral("anchors"), QStringLiteral("ranging"), QStringLiteral("aps-paging"), QStringLiteral("grant-control")};
+}
+
+// ── D-Bus ────────────────────────────────────────────────────────────────────
+QString Locator::Anchors() const { return QString::fromUtf8(QJsonDocument(anchorsJson()).toJson(QJsonDocument::Compact)); }
+
+QString Locator::SetAnchor(const QString &json)
+{
+    QJsonParseError pe;
+    const QJsonDocument d = QJsonDocument::fromJson(json.toUtf8(), &pe);
+    if (!d.isObject()) return QStringLiteral("error: not a JSON object (%1)").arg(pe.errorString());
+    bool ok = false; QString err;
+    const BfAnchor a = setAnchor(d.object(), QStringLiteral("desktop"), &ok, &err);
+    return ok ? a.id : QStringLiteral("error: ") + err;
+}
+
+bool Locator::RemoveAnchor(const QString &id) { return removeAnchor(id); }
+QString Locator::Ranging() const { return QString::fromUtf8(QJsonDocument(m_ranging ? m_ranging->list() : QJsonObject{{"devices", QJsonArray()}}).toJson(QJsonDocument::Compact)); }
+QString Locator::RangingInfo() const { return QString::fromUtf8(QJsonDocument(m_ranging ? m_ranging->info() : QJsonObject{{"rtt", RangingService::responderInfo()}}).toJson(QJsonDocument::Compact)); }
+QString Locator::RangingCalibrate(const QString &device, double distanceM, int durationS)
+{
+    return QString::fromUtf8(QJsonDocument(m_ranging ? m_ranging->calibrate(device, distanceM, durationS) : QJsonObject{{"error", "ranging not running"}}).toJson(QJsonDocument::Compact));
+}
+bool Locator::GrantControl(const QString &nameOrId) { return m_api && m_api->grantControlDevice(nameOrId); }

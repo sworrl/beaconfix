@@ -1,7 +1,13 @@
 #include "mainwindow.h"
+#include "anchordialog.h"
+#include <QTreeWidget>
 #include "locator.h"
 #include "beaconview.h"
 #include "apiserver.h"
+#include "mdns.h"
+#include "pairdialog.h"
+#include "pairing.h"
+#include <QComboBox>
 #include "mapdb.h"
 #include "identity.h"
 #include "osintegration.h"
@@ -18,6 +24,10 @@
 #include <QCloseEvent>
 #include <QDesktopServices>
 #include <QFileDialog>
+#include <QFileInfo>
+#include <QLocale>
+#include <QProgressBar>
+#include <QDateEdit>
 #include <QFormLayout>
 #include <QHBoxLayout>
 #include <QHeaderView>
@@ -59,7 +69,9 @@ static QString sourceName(const Fix &f)
     return QStringLiteral("—");
 }
 
-MainWindow::MainWindow(Locator *loc, TileSource *tiles, QWidget *parent) : QMainWindow(parent), m_loc(loc)
+static QPixmap qrPixmap(const QString &text, int scale = 5);   // qrencode → pixmap (defined with the identity tab)
+
+MainWindow::MainWindow(Locator *loc, TileSource *tiles, QWidget *parent) : QMainWindow(parent), m_loc(loc), m_tiles(tiles)
 {
     setWindowTitle(QStringLiteral("BeaconFix"));
     setWindowIcon(QIcon::fromTheme(QStringLiteral("beaconfix"), QIcon::fromTheme(QStringLiteral("mark-location"))));
@@ -427,17 +439,17 @@ QWidget *MainWindow::buildSettings()
             if (path.isEmpty()) return;
             if (m_loc->DbExport(path)) statusBar()->showMessage(QStringLiteral("Exported to %1").arg(path), 4000); else QMessageBox::warning(this, QStringLiteral("Export failed"), QStringLiteral("Could not write %1").arg(path));
         });
-        connect(imp, &QPushButton::clicked, this, [this] {
-            const QString path = QFileDialog::getOpenFileName(this, QStringLiteral("Import a map database dump"), QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation), QStringLiteral("JSON (*.json)"));
-            if (path.isEmpty()) return;
-            const int n = m_loc->DbImport(path);
-            if (n < 0) QMessageBox::warning(this, QStringLiteral("Import failed"), QStringLiteral("Not a BeaconFix database export, or the database is read-only.")); else statusBar()->showMessage(QStringLiteral("Imported %1 row(s)").arg(n), 4000);
-        });
+        imp->setToolTip(QStringLiteral("Import your location history: Google Timeline.json / Records.json / Semantic Location History, WiGLE CSV, GPX, KML or a BeaconFix export (docs/DATABASE.md)."));
+        connect(imp, &QPushButton::clicked, this, [this] { importHistoryDialog(); });
         connect(rebuild, &QPushButton::clicked, this, [this] {
             const int n = m_loc->rebuildDbFromJson();
             statusBar()->showMessage(n > 0 ? QStringLiteral("Rebuilt from %1 JSON file(s)").arg(n) : n == 0 ? QStringLiteral("No *.migrated JSON files to rebuild from") : QStringLiteral("Database is not writable"), 5000);
         });
-        if (MapDb *db = m_loc->mapDb()) connect(db, &MapDb::changed, this, refreshDb);
+        if (MapDb *db = m_loc->mapDb()) {                   // stats() counts whole tables: coalesce bursts of changed() (imports, syncs, scans)
+            auto *statsTimer = new QTimer(this); statsTimer->setSingleShot(true); statsTimer->setInterval(1500);
+            connect(statsTimer, &QTimer::timeout, this, refreshDb);
+            connect(db, &MapDb::changed, statsTimer, [statsTimer] { statsTimer->start(); });
+        }
         refreshDb();
         form->addRow(QStringLiteral("Map database:"), dbBox);
     }
@@ -564,6 +576,66 @@ QWidget *MainWindow::buildSettings()
     });
     homeRow->addWidget(suggest, 0, Qt::AlignTop);
     form->addRow(QStringLiteral("Home networks:"), homeBox);
+
+    // Anchors (docs/RANGING.md §4): the surveyed antennas / places, with edit + remove; new ones come from the map
+    auto *anchorList = new QTreeWidget;
+    anchorList->setHeaderLabels({QStringLiteral("Anchor"), QStringLiteral("Kind"), QStringLiteral("Where"), QStringLiteral("±"), QStringLiteral("RV"), QStringLiteral("Placed")});
+    anchorList->setRootIsDecorated(false); anchorList->setMaximumHeight(150); anchorList->setAlternatingRowColors(true);
+    anchorList->setToolTip(QStringLiteral("Right-click the map → “Place an antenna here…” to add one; drag a diamond on the map to move it."));
+    auto fillAnchors = [this, anchorList] {
+        anchorList->clear();
+        for (const BfAnchor &a : m_loc->anchors()) {
+            auto *it = new QTreeWidgetItem({a.name.isEmpty() ? QStringLiteral("(unnamed)") : a.name, a.kind, QStringLiteral("%1, %2").arg(a.lat, 0, 'f', 6).arg(a.lon, 0, 'f', 6),
+                                            QStringLiteral("%1 m").arg(a.accM, 0, 'g', 2), a.rv ? (a.ref ? QStringLiteral("ref") : a.headingAssumed ? QStringLiteral("yes ?") : QStringLiteral("yes")) : QString(),
+                                            QStringLiteral("%1 · %2").arg(a.placedBy, a.placedAt.left(16).replace(QLatin1Char('T'), QLatin1Char(' ')))});
+            it->setData(0, Qt::UserRole, a.id);
+            if (!a.bssids.isEmpty()) it->setToolTip(0, a.bssids.join(QStringLiteral(", ")));
+            anchorList->addTopLevelItem(it);
+        }
+        for (int c = 0; c < anchorList->columnCount(); ++c) anchorList->resizeColumnToContents(c);
+    };
+    fillAnchors();
+    connect(m_loc, &Locator::scanUpdated, anchorList, fillAnchors);
+    auto *anchorBtns = new QVBoxLayout;
+    auto *anchorEdit = new QPushButton(QIcon::fromTheme(QStringLiteral("document-edit")), QStringLiteral("Edit…"));
+    auto *anchorDel = new QPushButton(QIcon::fromTheme(QStringLiteral("edit-delete")), QStringLiteral("Remove"));
+    auto *anchorHere = new QPushButton(QIcon::fromTheme(QStringLiteral("mark-location")), QStringLiteral("At my position…"));
+    anchorHere->setToolTip(QStringLiteral("Place an anchor at the current fix (then drag it on the map to the exact spot)."));
+    auto selectedIndex = [this, anchorList]() -> int {
+        const QTreeWidgetItem *it = anchorList->currentItem(); if (!it) return -1;
+        const QList<BfAnchor> all = m_loc->anchors();
+        for (int i = 0; i < all.size(); ++i) if (all[i].id == it->data(0, Qt::UserRole).toString()) return i;
+        return -1;
+    };
+    auto editSelected = [this, selectedIndex, fillAnchors] {
+        const int i = selectedIndex(); if (i < 0) return;
+        const BfAnchor a = m_loc->anchors()[i];
+        AnchorDialog d(m_loc, a.lat, a.lon, a.toJson(false), this);
+        if (d.exec() != QDialog::Accepted) return;
+        bool ok = false; QString err; m_loc->setAnchor(d.anchor(), QStringLiteral("desktop"), &ok, &err);
+        if (!ok) QMessageBox::warning(this, QStringLiteral("Anchor"), err);
+        fillAnchors();
+    };
+    connect(anchorEdit, &QPushButton::clicked, this, editSelected);
+    connect(anchorList, &QTreeWidget::itemDoubleClicked, this, editSelected);
+    connect(anchorDel, &QPushButton::clicked, this, [this, selectedIndex, fillAnchors] {
+        const int i = selectedIndex(); if (i < 0) return;
+        const BfAnchor a = m_loc->anchors()[i];
+        if (QMessageBox::question(this, QStringLiteral("Remove anchor"), QStringLiteral("Remove “%1”? Every synced device drops it too.").arg(a.name.isEmpty() ? a.kind : a.name)) != QMessageBox::Yes) return;
+        m_loc->removeAnchor(a.id); fillAnchors();
+    });
+    connect(anchorHere, &QPushButton::clicked, this, [this, fillAnchors] {
+        if (!m_loc->fix().valid) { QMessageBox::information(this, QStringLiteral("Anchor"), QStringLiteral("No fix yet.")); return; }
+        AnchorDialog d(m_loc, m_loc->fix().lat, m_loc->fix().lon, QJsonObject(), this);
+        if (d.exec() != QDialog::Accepted) return;
+        bool ok = false; QString err; m_loc->setAnchor(d.anchor(), QStringLiteral("desktop"), &ok, &err);
+        if (!ok) QMessageBox::warning(this, QStringLiteral("Anchor"), err);
+        fillAnchors();
+    });
+    anchorBtns->addWidget(anchorHere); anchorBtns->addWidget(anchorEdit); anchorBtns->addWidget(anchorDel); anchorBtns->addStretch(1);
+    auto *anchorRow = new QHBoxLayout; auto *anchorBox = new QWidget; anchorBox->setLayout(anchorRow); anchorRow->setContentsMargins(0, 0, 0, 0);
+    anchorRow->addWidget(anchorList, 1); anchorRow->addLayout(anchorBtns);
+    form->addRow(QStringLiteral("Anchors:"), anchorBox);
 
     m_ignore = new QPlainTextEdit(m_loc->ignorePatterns().join('\n'));
     m_ignore->setPlaceholderText(QStringLiteral("One glob per line, matched against BSSID and SSID, e.g.\nAA:BB:CC:??:EE:FF\nMyHotspot*"));
@@ -787,6 +859,13 @@ QWidget *MainWindow::buildDevices()
     m_pairBtn->setToolTip(QStringLiteral("While pairing is open, a device can POST /api/v1/pair. Each request shows up below with a 4-digit code that the device also displays — approve the one whose code matches."));
     connect(m_pairBtn, &QPushButton::clicked, this, [api] { if (api->pairingOpen()) api->closePairing(); else api->openPairing(10); });
     m_pairLabel = new QLabel;
+    m_pairPolicy = new QComboBox;
+    m_pairPolicy->addItem(QStringLiteral("Proximity required (only adjacent / nearby devices can pair)"), QStringLiteral("required"));
+    m_pairPolicy->addItem(QStringLiteral("Proximity warns only"), QStringLiteral("warn"));
+    m_pairPolicy->addItem(QStringLiteral("Proximity off"), QStringLiteral("off"));
+    m_pairPolicy->setCurrentIndex(qMax(0, m_pairPolicy->findData(api->pairPolicy())));
+    m_pairPolicy->setToolTip(QStringLiteral("A device asking to pair sends the Wi-Fi beacons it hears and its position. \"Adjacent\" = it hears mostly the same beacons at similar levels; \"near\" = a few shared beacons or within 150 m; \"far\" = nothing in common. With \"required\", far/unknown devices need the explicit override in the dialog."));
+    connect(m_pairPolicy, &QComboBox::currentIndexChanged, this, [this, api](int i) { api->setPairPolicy(m_pairPolicy->itemData(i).toString()); });
     auto *tokenBtn = new QPushButton(QIcon::fromTheme(QStringLiteral("dialog-password")), QStringLiteral("Create token…"));
     tokenBtn->setToolTip(QStringLiteral("For devices that cannot pair on their own (scripts, curl): make a token now and paste it into them."));
     connect(tokenBtn, &QPushButton::clicked, this, [this, api] {
@@ -812,6 +891,7 @@ QWidget *MainWindow::buildDevices()
         show.exec();
     });
     pairRow->addWidget(m_pairBtn); pairRow->addWidget(m_pairLabel, 1); pairRow->addWidget(tokenBtn);
+    pairRow->addWidget(m_pairPolicy);
     v->addLayout(pairRow);
 
     v->addWidget(new QLabel(QStringLiteral("<b>Pending requests</b> — the device shows the same code; approve only a code you recognise")));
@@ -921,12 +1001,16 @@ void MainWindow::refreshDevices()
         m_pendingTable->setItem(i, 4, new QTableWidgetItem(p.state == ApiServer::Pending::Waiting ? p.created.toString(QStringLiteral("HH:mm:ss")) : p.state == ApiServer::Pending::Approved ? QStringLiteral("approved — waiting for the device to fetch its token") : QStringLiteral("denied")));
         auto *cell = new QWidget; auto *h = new QHBoxLayout(cell); h->setContentsMargins(2, 0, 2, 0);
         if (p.state == ApiServer::Pending::Waiting) {
-            auto *ok = new QPushButton(QIcon::fromTheme(QStringLiteral("dialog-ok")), QStringLiteral("Approve"));
-            auto *no = new QPushButton(QIcon::fromTheme(QStringLiteral("dialog-cancel")), QStringLiteral("Deny"));
             const QString id = p.id;
+            auto *pics = new QPushButton(QIcon::fromTheme(QStringLiteral("view-preview")), QStringLiteral("Pictures…"));
+            pics->setToolTip(QStringLiteral("Match the three pictures the device shows (with its position and the beacons it hears)"));
+            connect(pics, &QPushButton::clicked, this, [this, id] { showPairRequest(id); });
+            auto *ok = new QPushButton(QIcon::fromTheme(QStringLiteral("dialog-ok")), QStringLiteral("Approve by code"));
+            ok->setEnabled(p.lifted || Pairing::verdictAllowed(p.proximity["verdict"].toString(), api->pairPolicy()));
+            auto *no = new QPushButton(QIcon::fromTheme(QStringLiteral("dialog-cancel")), QStringLiteral("Deny"));
             connect(ok, &QPushButton::clicked, this, [api, id] { api->approve(id); });
             connect(no, &QPushButton::clicked, this, [api, id] { api->deny(id); });
-            h->addWidget(ok); h->addWidget(no);
+            h->addWidget(pics); h->addWidget(ok); h->addWidget(no);
         }
         m_pendingTable->setCellWidget(i, 5, cell);
     }
@@ -945,23 +1029,21 @@ void MainWindow::refreshDevices()
             auto *link = new QPushButton(QIcon::fromTheme(QStringLiteral("insert-link")), QStringLiteral("Link this identity"));
             auto *drop = new QPushButton(QIcon::fromTheme(QStringLiteral("dialog-cancel")), QStringLiteral("Dismiss"));
             const QString id = p.id; const QByteArray pub = p.pub; const QString devName = p.deviceName;
-            connect(link, &QPushButton::clicked, this, [this, id, pub, devName] {
+            connect(link, &QPushButton::clicked, this, [this, id, devName] {
                 Identity *idn = m_loc->identity();
                 if (!idn->unlocked()) { QMessageBox::warning(this, QStringLiteral("Identity"), QStringLiteral("This identity is locked (map-database key missing)")); return; }
-                const LinkStatement st = idn->startLink(id, pub);
-                const QString text = QStringLiteral("BFLINK1:") + QString::fromLatin1(Identity::base64url(QJsonDocument(st.toJson(true)).toJson(QJsonDocument::Compact)));
+                // A device co-signs only a statement bound to a link QR it displayed itself, so the link starts on ITS
+                // screen: it scans our offer (valid 10 min), signs, and POSTs the statement to /api/v1/identity/link.
+                const QString payload = Identity::encodeUri(QStringLiteral("link"), idn->linkPayload());
                 QDialog dlg(this); dlg.setWindowTitle(QStringLiteral("Link with %1").arg(Identity::groupId(id)));
                 auto *lay = new QVBoxLayout(&dlg);
-                lay->addWidget(new QLabel(QStringLiteral("Our half of the link statement is signed. The other device (%1) must co-sign it:\n"
-                                                         "scan this QR or paste the text there (Identity → Link), or let it sign in again — it will POST the completed statement to /api/v1/identity/link.").arg(devName)));
-                auto *img = new QLabel; img->setAlignment(Qt::AlignCenter);
-                const QString bin = QStandardPaths::findExecutable(QStringLiteral("qrencode"));
-                if (!bin.isEmpty()) { QProcess q; q.start(bin, {QStringLiteral("-o"), QStringLiteral("-"), QStringLiteral("-t"), QStringLiteral("PNG"), QStringLiteral("-s"), QStringLiteral("5"), QStringLiteral("-m"), QStringLiteral("2"), text}); q.waitForFinished(5000); QPixmap px; if (px.loadFromData(q.readAllStandardOutput(), "PNG")) img->setPixmap(px); }
-                lay->addWidget(img);
-                auto *ed = new QPlainTextEdit(text); ed->setReadOnly(true); ed->setMaximumHeight(90); lay->addWidget(ed);
+                auto *lbl = new QLabel(QStringLiteral("On <b>%1</b>, open Identity → Link and scan this QR (or paste the text). That device signs the link and sends it back here; both identities then become one owner set.<br>"
+                                                      "This QR is valid for 10 minutes and links only with the device that scans it.").arg(devName.toHtmlEscaped()));
+                lbl->setWordWrap(true); lay->addWidget(lbl);
+                auto *img = new QLabel; img->setAlignment(Qt::AlignCenter); img->setPixmap(qrPixmap(payload, 4)); if (img->pixmap().isNull()) img->setText(QStringLiteral("(install qrencode for a QR code)")); lay->addWidget(img);
+                auto *ed = new QPlainTextEdit(payload); ed->setReadOnly(true); ed->setMaximumHeight(80); lay->addWidget(ed);
                 auto *bb = new QDialogButtonBox(QDialogButtonBox::Close); auto *cp = bb->addButton(QStringLiteral("Copy"), QDialogButtonBox::ActionRole);
-                connect(cp, &QPushButton::clicked, &dlg, [text] { QApplication::clipboard()->setText(text); });
-                connect(bb, &QDialogButtonBox::rejected, &dlg, &QDialog::reject); lay->addWidget(bb);
+                connect(cp, &QPushButton::clicked, &dlg, [payload] { QApplication::clipboard()->setText(payload); }); connect(bb, &QDialogButtonBox::rejected, &dlg, &QDialog::reject); lay->addWidget(bb);
                 dlg.exec();
             });
             connect(drop, &QPushButton::clicked, this, [this, id] { m_loc->identity()->removePending(id); refreshDevices(); });
@@ -1009,7 +1091,7 @@ void MainWindow::refreshDevices()
 }
 
 // ── Identity tab (docs/IDENTITY.md) ────────────────────────────────────────────
-static QPixmap qrPixmap(const QString &text, int scale = 5)
+static QPixmap qrPixmap(const QString &text, int scale)
 {
     const QString bin = QStandardPaths::findExecutable(QStringLiteral("qrencode"));
     QPixmap px;
@@ -1042,6 +1124,52 @@ QWidget *MainWindow::buildIdentity()
     { QFont mono = m_idDetails->font(); mono.setFamily(QStringLiteral("monospace")); mono.setStyleHint(QFont::Monospace); m_idDetails->setFont(mono); }
     mid->addWidget(m_idDetails, 1); mid->addWidget(m_idQr);
     v->addLayout(mid, 1);
+
+    // ── BeaconFix devices on this network (mDNS + optional subnet scan) ──
+    auto *peerHead = new QHBoxLayout;
+    auto *peerTitle = new QLabel(QStringLiteral("<b>BeaconFix devices on this network</b>")); peerHead->addWidget(peerTitle);
+    m_peerNote = new QLabel; m_peerNote->setStyleSheet(QStringLiteral("color: palette(mid)")); peerHead->addWidget(m_peerNote, 1);
+    m_peerLink = new QPushButton(QIcon::fromTheme(QStringLiteral("insert-link")), QStringLiteral("Link…")); m_peerLink->setEnabled(false);
+    m_peerLink->setToolTip(QStringLiteral("Link our identity with the selected device's in one step over the network: we sign first, it co-signs, both keep the statement. If you are on the same LAN it is most likely your own device."));
+    m_peerSync = new QPushButton(QIcon::fromTheme(QStringLiteral("view-refresh")), QStringLiteral("Sync now")); m_peerSync->setEnabled(false);
+    m_peerSync->setToolTip(QStringLiteral("One sync round with the selected device. With the same or a linked identity no token is needed."));
+    m_peerScan = new QPushButton(QIcon::fromTheme(QStringLiteral("edit-find")), QStringLiteral("Scan the network"));
+    m_peerScan->setToolTip(QStringLiteral("Probe every host of the local /24 networks for the BeaconFix API — for networks that block multicast DNS."));
+    peerHead->addWidget(m_peerLink); peerHead->addWidget(m_peerSync); peerHead->addWidget(m_peerScan);
+    v->addLayout(peerHead);
+    m_peerTable = new QTableWidget(0, 6);
+    m_peerTable->setHorizontalHeaderLabels({QStringLiteral("Device"), QStringLiteral("Identity"), QStringLiteral("Relation"), QStringLiteral("Address"), QStringLiteral("Version"), QStringLiteral("Seen")});
+    m_peerTable->horizontalHeader()->setStretchLastSection(true); m_peerTable->verticalHeader()->setVisible(false);
+    m_peerTable->setSelectionBehavior(QAbstractItemView::SelectRows); m_peerTable->setSelectionMode(QAbstractItemView::SingleSelection); m_peerTable->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    m_peerTable->setMaximumHeight(150);
+    v->addWidget(m_peerTable);
+    connect(m_peerTable, &QTableWidget::itemSelectionChanged, this, [this] {
+        const int row = m_peerTable->currentRow();
+        const QJsonObject peer = row >= 0 && m_peerTable->item(row, 0) ? QJsonDocument::fromJson(m_peerTable->item(row, 0)->data(Qt::UserRole).toByteArray()).object() : QJsonObject();
+        Identity *idn = m_loc->identity();
+        m_peerLink->setEnabled(!peer.isEmpty() && idn && idn->unlocked() && !peer["identityId"].toString().isEmpty() && !peer["sameIdentity"].toBool() && !peer["linked"].toBool());
+        m_peerSync->setEnabled(!peer.isEmpty() && peer["features"].toArray().contains(QJsonValue(QStringLiteral("sync"))));
+    });
+    connect(m_peerTable, &QTableWidget::cellDoubleClicked, this, [this](int row, int) { if (m_peerTable->item(row, 0)) linkWithPeer(QJsonDocument::fromJson(m_peerTable->item(row, 0)->data(Qt::UserRole).toByteArray()).object()); });
+    connect(m_peerLink, &QPushButton::clicked, this, [this] { const int row = m_peerTable->currentRow(); if (row >= 0 && m_peerTable->item(row, 0)) linkWithPeer(QJsonDocument::fromJson(m_peerTable->item(row, 0)->data(Qt::UserRole).toByteArray()).object()); });
+    connect(m_peerSync, &QPushButton::clicked, this, [this] {
+        const int row = m_peerTable->currentRow(); if (row < 0 || !m_peerTable->item(row, 0)) return;
+        const QJsonObject peer = QJsonDocument::fromJson(m_peerTable->item(row, 0)->data(Qt::UserRole).toByteArray()).object();
+        m_peerSync->setEnabled(false); statusBar()->showMessage(QStringLiteral("Syncing with %1…").arg(peer["host"].toString()));
+        QApplication::processEvents();
+        const QJsonObject r = QJsonDocument::fromJson(m_loc->Sync(peer["url"].toString(), QString()).toUtf8()).object();
+        statusBar()->showMessage((r["ok"].toBool() ? QStringLiteral("Synced with %1: %2") : QStringLiteral("Sync with %1 failed: %2")).arg(peer["host"].toString(), r["message"].toString().isEmpty() ? r["error"].toString() : r["message"].toString()), 8000);
+        if (!r["ok"].toBool()) QMessageBox::warning(this, QStringLiteral("Sync"), r["message"].toString().isEmpty() ? r["error"].toString() : r["message"].toString());
+        m_peerSync->setEnabled(true);
+    });
+    connect(m_peerScan, &QPushButton::clicked, this, [this] {
+        if (!m_loc->apiServer()) return;
+        m_peerScan->setEnabled(false); m_peerNote->setText(QStringLiteral("scanning the local networks…"));
+        m_loc->apiServer()->scanPeers([this] { m_peerScan->setEnabled(true); refreshPeers(); });
+    });
+    connect(m_loc, &Locator::peersChanged, this, &MainWindow::refreshPeers);
+    QTimer::singleShot(0, this, &MainWindow::refreshPeers);
+
     auto *note = new QLabel(QStringLiteral("An identity is an Ed25519 key pair plus a name. Its private key is sealed with the map-database key and never leaves this machine unencrypted; "
                                            "exports are scrypt + AES-256-GCM bundles (QR, text or file) protected by a passphrase or a 6-word code. Devices that hold the same identity, "
                                            "or one linked to it, sign in to the LAN API with a challenge signature — no pairing codes. See docs/IDENTITY.md."));
@@ -1062,7 +1190,7 @@ QWidget *MainWindow::buildIdentity()
     connect(m_idImport, &QPushButton::clicked, this, [this, idn] {
         QDialog dlg(this); dlg.setWindowTitle(QStringLiteral("Import an identity"));
         auto *lay = new QFormLayout(&dlg);
-        auto *text = new QPlainTextEdit; text->setPlaceholderText(QStringLiteral("Paste the BFID1:… text here, or use the buttons below")); text->setMinimumSize(520, 120);
+        auto *text = new QPlainTextEdit; text->setPlaceholderText(QStringLiteral("Paste the beaconfix://identity/… (or BFID1:…) text here, or use the buttons below")); text->setMinimumSize(520, 120);
         auto *fileBtn = new QPushButton(QIcon::fromTheme(QStringLiteral("document-open")), QStringLiteral("Open a bundle file…"));
         connect(fileBtn, &QPushButton::clicked, &dlg, [text, this] { const QString p = QFileDialog::getOpenFileName(this, QStringLiteral("Open identity bundle")); if (p.isEmpty()) return; QFile f(p); if (f.open(QIODevice::ReadOnly)) text->setPlainText(QString::fromUtf8(f.readAll()).trimmed()); });
         auto *lanRow = new QHBoxLayout; auto *host = new QLineEdit; host->setPlaceholderText(QStringLiteral("other-beaconfix:47822")); auto *code = new QLineEdit; code->setPlaceholderText(QStringLiteral("6-digit code")); code->setMaximumWidth(110);
@@ -1120,20 +1248,21 @@ QWidget *MainWindow::buildIdentity()
         if (!idn->unlocked()) { QMessageBox::warning(this, QStringLiteral("Identity"), QStringLiteral("No unlocked identity here.")); return; }
         QDialog dlg(this); dlg.setWindowTitle(QStringLiteral("Link with another identity"));
         auto *lay = new QVBoxLayout(&dlg);
-        lay->addWidget(new QLabel(QStringLiteral("Paste what the other device shows: its <b>link payload</b> (BFLNK1:…) to start a link, or a <b>link statement</b> (BFLINK1:… / JSON) it already signed to complete one.")));
+        lay->addWidget(new QLabel(QStringLiteral("Paste what the other device shows: its <b>link payload</b> (beaconfix://link/…) to start a link, or a <b>link statement</b> (beaconfix://statement/… / JSON) it already signed to complete one. The older BFLNK1: / BFLINK1: texts still work.")));
         auto *text = new QPlainTextEdit; text->setMinimumSize(520, 110); lay->addWidget(text);
         auto *bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel); lay->addWidget(bb);
         connect(bb, &QDialogButtonBox::accepted, &dlg, &QDialog::accept); connect(bb, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
         if (dlg.exec() != QDialog::Accepted) return;
-        QString t = text->toPlainText().trimmed(); QJsonObject o;
-        if (t.startsWith(QLatin1String("BFLNK1:"))) o = QJsonDocument::fromJson(Identity::fromBase64url(t.mid(7).toLatin1())).object();
-        else if (t.startsWith(QLatin1String("BFLINK1:"))) o = QJsonDocument::fromJson(Identity::fromBase64url(t.mid(8).toLatin1())).object();
-        else o = QJsonDocument::fromJson(t.toUtf8()).object();
+        const QString t = text->toPlainText().trimmed();
+        QString kind; QJsonObject o = Identity::decodePayload(t, &kind);
+        if (o.isEmpty()) { QMessageBox::warning(this, QStringLiteral("Link"), QStringLiteral("That is not a BeaconFix link payload or statement.")); return; }
+        if (kind == QLatin1String("identity")) { QMessageBox::warning(this, QStringLiteral("Link"), QStringLiteral("That is an identity export bundle, not a link: use Import… for it.")); return; }
         if (o["t"].toString() == QLatin1String("beaconfix-link") || (o.contains("pub") && o.contains("id") && !o.contains("a"))) {
             const QByteArray pub = QByteArray::fromBase64(o["pub"].toString().toLatin1()); const QString id = o["id"].toString();
             if (pub.size() != 32 || Identity::idFor(pub) != id) { QMessageBox::warning(this, QStringLiteral("Link"), QStringLiteral("That payload's id does not match its key.")); return; }
-            const LinkStatement st = idn->startLink(id, pub);
-            const QString out = QStringLiteral("BFLINK1:") + QString::fromLatin1(Identity::base64url(QJsonDocument(st.toJson(true)).toJson(QJsonDocument::Compact)));
+            if (o["ts"].toString().isEmpty()) { QMessageBox::warning(this, QStringLiteral("Link"), QStringLiteral("That link payload carries no offer timestamp; show the link QR on the other device again.")); return; }
+            const LinkStatement st = idn->startLink(id, pub, o["ts"].toString());   // bound to the offer that device displayed
+            const QString out = Identity::encodeUri(QStringLiteral("statement"), st.toJson(true));
             QDialog show(this); show.setWindowTitle(QStringLiteral("Half-signed link statement")); auto *sv = new QVBoxLayout(&show);
             sv->addWidget(new QLabel(QStringLiteral("Signed by us. Give this to %1 to co-sign (scan / paste on that device, Identity → Link); once it does, both sides are one owner set.").arg(o["name"].toString().isEmpty() ? Identity::groupId(id) : o["name"].toString())));
             auto *img = new QLabel; img->setAlignment(Qt::AlignCenter); img->setPixmap(qrPixmap(out, 4)); sv->addWidget(img);
@@ -1146,7 +1275,7 @@ QWidget *MainWindow::buildIdentity()
         QString err; LinkStatement done;
         if (!idn->acceptLink(LinkStatement::fromJson(o.contains("statement") ? o["statement"].toObject() : o), &err, &done)) { QMessageBox::warning(this, QStringLiteral("Link failed"), err); return; }
         if (done.complete()) {
-            const QString out = QStringLiteral("BFLINK1:") + QString::fromLatin1(Identity::base64url(QJsonDocument(done.toJson(true)).toJson(QJsonDocument::Compact)));
+            const QString out = Identity::encodeUri(QStringLiteral("statement"), done.toJson(true));
             QApplication::clipboard()->setText(out);
             QMessageBox::information(this, QStringLiteral("Linked"), QStringLiteral("Identities %1 and %2 are now linked here. The completed statement is on the clipboard — paste it on the other device too (or it will pick it up on its next sync).").arg(Identity::groupId(done.a), Identity::groupId(done.b)));
         }
@@ -1184,11 +1313,153 @@ void MainWindow::refreshIdentity()
     for (const LinkStatement &l : idn->links()) d += QStringLiteral("  %1 ⇄ %2  (%3)\n").arg(Identity::groupId(l.a), Identity::groupId(l.b), l.ts);
     if (!idn->pending().isEmpty()) { d += QStringLiteral("\nSign-ins waiting to be linked (Devices tab):\n"); for (const PendingLink &p : idn->pending()) d += QStringLiteral("  %1  %2 (%3) from %4\n").arg(Identity::groupId(p.id), p.deviceName, p.deviceKind, p.ip); }
     m_idDetails->setPlainText(d);
-    const QString payload = QStringLiteral("BFLNK1:") + QString::fromLatin1(Identity::base64url(QJsonDocument(idn->linkPayload()).toJson(QJsonDocument::Compact)));
+    const QString payload = Identity::encodeUri(QStringLiteral("link"), idn->linkPayload());   // registers the offer: only statements bound to it get co-signed
     QPixmap px = qrPixmap(payload, 4);
     if (px.isNull()) m_idQr->setText(QStringLiteral("link QR needs qrencode")); else m_idQr->setPixmap(px);
     if (m_linkTable) refreshDevices();
 }
 
+void MainWindow::refreshPeers()
+{
+    if (!m_peerTable || !m_loc->apiServer()) return;
+    const QJsonArray peers = m_loc->apiServer()->peersJson(false);
+    const QString sel = m_peerTable->currentRow() >= 0 && m_peerTable->item(m_peerTable->currentRow(), 0) ? m_peerTable->item(m_peerTable->currentRow(), 0)->text() : QString();
+    m_peerTable->setRowCount(peers.size());
+    int row = 0, selRow = -1;
+    const QDateTime now = QDateTime::currentDateTime();
+    for (const QJsonValue &v : peers) {
+        const QJsonObject p = v.toObject();
+        const QString rel = p["sameIdentity"].toBool() ? QStringLiteral("same identity") : p["linked"].toBool() ? QStringLiteral("linked") : p["identityId"].toString().isEmpty() ? QStringLiteral("no identity yet") : QStringLiteral("other identity — link?");
+        const QDateTime seen = QDateTime::fromString(p["lastSeen"].toString(), Qt::ISODate);
+        const QStringList cells{p["host"].toString() + (p["kind"].toString() == QLatin1String("desktop") ? QString() : QStringLiteral(" (%1)").arg(p["kind"].toString())),
+                                p["identityName"].toString().isEmpty() ? QStringLiteral("—") : QStringLiteral("%1  %2").arg(p["identityName"].toString(), Identity::groupId(p["identityId"].toString())),
+                                rel, p["url"].toString(), p["version"].toString(), seen.isValid() ? (seen.secsTo(now) < 90 ? QStringLiteral("now") : QStringLiteral("%1 min ago").arg(seen.secsTo(now) / 60)) + (p["source"].toString() == QLatin1String("scan") ? QStringLiteral(" (scan)") : QString()) : QString()};
+        for (int c = 0; c < cells.size(); ++c) {
+            auto *it = new QTableWidgetItem(cells[c]);
+            if (c == 0) { it->setData(Qt::UserRole, QJsonDocument(p).toJson(QJsonDocument::Compact)); it->setToolTip(QStringLiteral("all addresses: %1").arg(QJsonDocument(p["addresses"].toArray()).toJson(QJsonDocument::Compact))); }
+            if (c == 2) it->setForeground(p["sameIdentity"].toBool() || p["linked"].toBool() ? QColor(0x6c, 0xff, 0x8a) : p["identityId"].toString().isEmpty() ? QColor(0x8a, 0x93, 0xa6) : QColor(0xff, 0xd1, 0x66));
+            m_peerTable->setItem(row, c, it);
+        }
+        if (!sel.isEmpty() && cells[0] == sel) selRow = row;
+        ++row;
+    }
+    m_peerTable->resizeColumnsToContents();
+    if (selRow >= 0) m_peerTable->selectRow(selRow);
+    else { m_peerLink->setEnabled(false); m_peerSync->setEnabled(false); }
+    const bool mdns = m_loc->apiServer()->mdns() && m_loc->apiServer()->mdns()->published();
+    m_peerNote->setText(peers.isEmpty() ? (mdns ? QStringLiteral("none seen yet — devices on the same LAN are most likely yours; a phone with the app shows up here as soon as it is on the network")
+                                                : QStringLiteral("mDNS not available (Avahi) — use Scan"))
+                                         : QStringLiteral("%1 device%2 · %3").arg(peers.size()).arg(peers.size() == 1 ? QString() : QStringLiteral("s"), mdns ? QStringLiteral("advertised over mDNS") : QStringLiteral("mDNS off")));
+}
+
+// One-step link with a device on the LAN: fetch its public identity, sign a link statement, POST it for
+// co-signing, keep the completed statement. The other side needs no manual action beyond accepting.
+void MainWindow::linkWithPeer(const QJsonObject &peer)
+{
+    Identity *idn = m_loc->identity();
+    if (!idn || !idn->unlocked()) { QMessageBox::warning(this, QStringLiteral("Link"), QStringLiteral("No unlocked identity here — create or import one first.")); return; }
+    const QString url = peer["url"].toString(), who = peer["identityName"].toString().isEmpty() ? peer["host"].toString() : peer["identityName"].toString();
+    if (url.isEmpty()) return;
+    QNetworkAccessManager nam;
+    auto call = [&](const QString &ep, const QByteArray &body = QByteArray()) {
+        QNetworkRequest req(QUrl(url + QStringLiteral("/api/v1/") + ep)); req.setTransferTimeout(10000); req.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json"));
+        QNetworkReply *rep = body.isNull() ? nam.get(req) : nam.post(req, body);
+        QEventLoop loop; connect(rep, &QNetworkReply::finished, &loop, &QEventLoop::quit); loop.exec();
+        QJsonObject o = QJsonDocument::fromJson(rep->readAll()).object();
+        if (rep->error() != QNetworkReply::NoError && o["error"].toString().isEmpty()) o["error"] = rep->errorString();
+        rep->deleteLater(); return o;
+    };
+    const QJsonObject other = call(QStringLiteral("identity"));
+    const QString id = other["id"].toString(); const QByteArray pub = QByteArray::fromBase64(other["pub"].toString().toLatin1());
+    if (id.isEmpty() || pub.size() != 32) { QMessageBox::warning(this, QStringLiteral("Link"), QStringLiteral("%1 has no identity yet (%2). Create one there first.").arg(who, other["error"].toString())); return; }
+    if (Identity::idFor(pub) != id) { QMessageBox::warning(this, QStringLiteral("Link"), QStringLiteral("%1's identity record is inconsistent (id does not match its key).").arg(who)); return; }
+    if (id == idn->id()) { QMessageBox::information(this, QStringLiteral("Link"), QStringLiteral("%1 already holds the same identity — nothing to link.").arg(who)); return; }
+    if (idn->isOwner(id)) { QMessageBox::information(this, QStringLiteral("Link"), QStringLiteral("%1's identity is already linked with ours.").arg(who)); return; }
+    if (QMessageBox::question(this, QStringLiteral("Link identities?"),
+                              QStringLiteral("Link our identity <b>%1</b> (%2) with <b>%3</b> (%4) on %5?<br><br>Both become one owner set: either signs in to the other without pairing, and their map data merges. Only do this for your own devices.")
+                                  .arg(idn->name().toHtmlEscaped(), idn->groupedId(), other["name"].toString().toHtmlEscaped(), Identity::groupId(id), peer["host"].toString().toHtmlEscaped())) != QMessageBox::Yes) return;
+    const LinkStatement half = idn->startLink(id, pub);
+    const QJsonObject res = call(QStringLiteral("identity/link"), QJsonDocument(QJsonObject{{"statement", half.toJson(true)}}).toJson(QJsonDocument::Compact));
+    const QJsonObject stJson = res["statement"].toObject();
+    if (stJson.isEmpty()) { QMessageBox::warning(this, QStringLiteral("Link failed"), QStringLiteral("%1 did not co-sign: %2").arg(who, res["error"].toString())); return; }
+    QString err; LinkStatement done;
+    if (!idn->acceptLink(LinkStatement::fromJson(stJson), &err, &done)) { QMessageBox::warning(this, QStringLiteral("Link failed"), QStringLiteral("The returned statement did not verify: %1").arg(err)); return; }
+    statusBar()->showMessage(QStringLiteral("Linked with %1 (%2)").arg(who, Identity::groupId(id)), 6000);
+    refreshIdentity(); refreshPeers();
+}
+
 void MainWindow::showIdentity() { if (m_identityTab) m_tabs->setCurrentWidget(m_identityTab); show(); raise(); activateWindow(); }
+
+// Settings → Map database → Import…: file, time window, what to take; progress; summary (docs/DATABASE.md)
+void MainWindow::importHistoryDialog()
+{
+    const QString path = QFileDialog::getOpenFileName(this, QStringLiteral("Import your location history"), QStandardPaths::writableLocation(QStandardPaths::DownloadLocation),
+                                                      QStringLiteral("History exports (*.json *.csv *.gpx *.kml);;Google Timeline / Records (*.json);;WiGLE CSV (*.csv);;GPX tracks (*.gpx);;KML (*.kml);;All files (*)"));
+    if (path.isEmpty()) return;
+    QDialog dlg(this); dlg.setWindowTitle(QStringLiteral("Import %1").arg(QFileInfo(path).fileName())); dlg.setMinimumWidth(460);
+    auto *lay = new QVBoxLayout(&dlg);
+    auto *info = new QLabel(QStringLiteral("<b>%1</b> · %2<br>Positions become history (a dotted trail on the map), Wi-Fi scans become samples for the beacons heard, visits become stops. Nothing here ever moves the live fix.")
+                            .arg(QFileInfo(path).fileName(), QLocale().formattedDataSize(QFileInfo(path).size())));
+    info->setWordWrap(true); lay->addWidget(info);
+    auto *form = new QFormLayout;
+    auto *from = new QDateEdit; from->setCalendarPopup(true); from->setDisplayFormat(QStringLiteral("yyyy-MM-dd")); from->setDate(QDate(2010, 1, 1)); from->setSpecialValueText(QStringLiteral("(beginning)")); from->setMinimumDate(QDate(2000, 1, 1)); from->setDate(from->minimumDate());
+    auto *to = new QDateEdit; to->setCalendarPopup(true); to->setDisplayFormat(QStringLiteral("yyyy-MM-dd")); to->setMaximumDate(QDate::currentDate().addDays(1)); to->setSpecialValueText(QStringLiteral("(today)")); to->setMinimumDate(QDate(2000, 1, 1)); to->setDate(to->minimumDate());
+    form->addRow(QStringLiteral("From:"), from); form->addRow(QStringLiteral("To:"), to);
+    auto *positions = new QCheckBox(QStringLiteral("Positions (history trail)")); positions->setChecked(true);
+    auto *wifi = new QCheckBox(QStringLiteral("Wi-Fi scans (beacon samples)")); wifi->setChecked(true);
+    auto *places = new QCheckBox(QStringLiteral("Visits / places (stops)")); places->setChecked(true);
+    form->addRow(QStringLiteral("Take:"), positions); form->addRow(QString(), wifi); form->addRow(QString(), places);
+    lay->addLayout(form);
+    auto *bar = new QProgressBar; bar->setRange(0, 100); bar->setValue(0); bar->setTextVisible(true); bar->setFormat(QStringLiteral("%p%")); lay->addWidget(bar);
+    auto *stage = new QLabel; stage->setWordWrap(true); lay->addWidget(stage);
+    auto *bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+    bb->button(QDialogButtonBox::Ok)->setText(QStringLiteral("Import"));
+    lay->addWidget(bb);
+    bool running = false, done = false; QJsonObject summary; bool ok = false;
+    connect(bb, &QDialogButtonBox::rejected, &dlg, [&] { if (!running) dlg.reject(); });
+    connect(m_loc, &Locator::importProgress, &dlg, [&](const QString &json) {
+        const QJsonObject o = QJsonDocument::fromJson(json.toUtf8()).object();
+        if (o["file"].toString() != path) return;
+        bar->setValue(o["percent"].toInt()); stage->setText(o["stage"].toString());
+    });
+    connect(bb, &QDialogButtonBox::accepted, &dlg, [&] {
+        if (running) return;
+        if (done) { dlg.accept(); return; }
+        QJsonObject opts;
+        if (from->date() > from->minimumDate()) opts["from"] = from->date().startOfDay().toString(Qt::ISODate);
+        if (to->date() > to->minimumDate()) opts["to"] = to->date().endOfDay().toString(Qt::ISODate);
+        QStringList what; if (positions->isChecked()) what << QStringLiteral("positions"); if (wifi->isChecked()) what << QStringLiteral("wifi"); if (places->isChecked()) what << QStringLiteral("places");
+        if (what.isEmpty()) { QMessageBox::information(&dlg, QStringLiteral("Nothing to import"), QStringLiteral("Tick at least one of positions, Wi-Fi scans or visits.")); return; }
+        opts["what"] = QJsonArray::fromStringList(what);
+        running = true; bb->button(QDialogButtonBox::Ok)->setEnabled(false); bb->button(QDialogButtonBox::Cancel)->setEnabled(false);
+        for (QWidget *w : QList<QWidget *>{from, to, positions, wifi, places}) w->setEnabled(false);
+        stage->setText(QStringLiteral("Reading…"));
+        const QJsonObject res = QJsonDocument::fromJson(m_loc->Import(path, QString::fromUtf8(QJsonDocument(opts).toJson(QJsonDocument::Compact))).toUtf8()).object();
+        running = false; done = true; ok = res["ok"].toBool(); summary = res["summary"].toObject();
+        bar->setValue(100);
+        if (!ok) { stage->setText(QStringLiteral("<span style='color:#e06c75'>Import failed: %1</span>").arg(res["error"].toString().toHtmlEscaped())); }
+        else stage->setText(QStringLiteral("Done: %1 positions, %2 track points, %3 Wi-Fi scans → %4 samples on %5 beacons, %6 visits, %7 skipped, from %8 to %9, in %10 s.")
+                            .arg(summary["positions"].toInt()).arg(summary["tracks"].toInt()).arg(summary["wifiScans"].toInt()).arg(summary["observations"].toInt()).arg(summary["beaconsTouched"].toInt())
+                            .arg(summary["visits"].toInt()).arg(summary["skipped"].toInt()).arg(summary["first"].toString().left(10), summary["last"].toString().left(10)).arg(summary["seconds"].toDouble(), 0, 'f', 1));
+        bb->button(QDialogButtonBox::Ok)->setText(QStringLiteral("Close")); bb->button(QDialogButtonBox::Ok)->setEnabled(true);
+    });
+    dlg.exec();
+    if (ok) statusBar()->showMessage(QStringLiteral("Imported %1: %2 samples, %3 positions, %4 visits").arg(QFileInfo(path).fileName()).arg(summary["observations"].toInt()).arg(summary["positions"].toInt() + summary["tracks"].toInt()).arg(summary["visits"].toInt()), 8000);
+}
+
+void MainWindow::showPairRequest(const QString &id)
+{
+    ApiServer *api = m_loc->apiServer();
+    if (!api || id.isEmpty()) return;
+    // Land on the Devices tab too, so the request is visible even after the dialog closes
+    for (int i = 0; i < m_tabs->count(); ++i) if (m_tabs->tabText(i).startsWith(QStringLiteral("Devices"))) m_tabs->setCurrentIndex(i);
+    show(); raise(); activateWindow();
+    PairDialog *dlg = m_pairDialogs.value(id);
+    if (!dlg) {
+        dlg = new PairDialog(api, m_loc, m_tiles, id, this);
+        m_pairDialogs.insert(id, dlg);
+        connect(dlg, &QObject::destroyed, this, [this, id] { m_pairDialogs.remove(id); });
+    }
+    dlg->show(); dlg->raise(); dlg->activateWindow();
+}
 void MainWindow::showEmergency() { m_tabs->setCurrentIndex(1); show(); raise(); activateWindow(); }
