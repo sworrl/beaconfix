@@ -10,8 +10,11 @@ import android.content.Intent
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import org.sworrl.beaconfix.nav.IncomingLink
 import org.sworrl.beaconfix.ui.BeaconFixRoot
+import org.sworrl.beaconfix.ui.map.MapFocus
 import org.sworrl.beaconfix.ui.theme.BeaconFixTheme
 
 @AndroidEntryPoint
@@ -26,16 +29,49 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         // Automation hooks (adb / tests): `am start -n org.sworrl.beaconfix/.MainActivity --es pair_host <host> [--ei pair_port 47822] [--es action sync|scan|identity|…]`
-        launch.value = LaunchArgs.from(intent); rttHook(intent)
+        launch.value = incoming(intent, LaunchArgs.from(intent)); rttHook(intent); simHook(intent)
         // Screenshot automation over adb only (`--ez show_when_locked true`): lets the activity draw over the lock screen for this launch.
         if (intent.getBooleanExtra("show_when_locked", false) && android.os.Build.VERSION.SDK_INT >= 27) { setShowWhenLocked(true); setTurnScreenOn(true) }
         setContent { val args by launch; BeaconFixTheme { BeaconFixRoot(args) } }
     }
     @javax.inject.Inject lateinit var prefs: org.sworrl.beaconfix.data.Prefs
+    /**
+     * Test hook: `--ez sim_offline true|false --ez sim_no_desktop true|false` sets the offline-simulation prefs (DevFlags).
+     * The activity is exported, so this is honoured only on a debug build or with Settings → Developer automation on.
+     */
+    private fun simHook(i: Intent) {
+        if (!i.hasExtra("sim_offline") && !i.hasExtra("sim_no_desktop")) return
+        lifecycleScope.launch {
+            if (!BuildConfig.DEBUG && !prefs.devAutomation.first()) return@launch
+            if (i.hasExtra("sim_offline")) prefs.setSimOffline(i.getBooleanExtra("sim_offline", false))
+            if (i.hasExtra("sim_no_desktop")) prefs.setSimNoDesktop(i.getBooleanExtra("sim_no_desktop", false))
+        }
+    }
+    /**
+     * Positions other apps hand us: Share → BeaconFix with plain text (a maps link, geo: URI or "lat, lon") and
+     * `beaconfix://map?lat=&lon=&label=` open the map on that spot; `beaconfix://help` opens Help. Files still go to Import.
+     */
+    private fun incoming(i: Intent, args: LaunchArgs): LaunchArgs {
+        val data = i.data
+        if (i.action == Intent.ACTION_VIEW && data?.scheme.equals("beaconfix", ignoreCase = true)) when (data?.host?.lowercase()) {
+            "help" -> return args.copy(action = "help")
+            "map" -> return focusOn(IncomingLink.parse(data.toString()), args)
+        }
+        if (i.action == Intent.ACTION_SEND && args.file == null && (i.type ?: "text/plain").startsWith("text/")) {
+            val text = i.getCharSequenceExtra(Intent.EXTRA_TEXT)?.toString().orEmpty()
+            return focusOn(IncomingLink.parse(text), args)
+        }
+        return args
+    }
+    private fun focusOn(p: IncomingLink.Parsed?, args: LaunchArgs): LaunchArgs {
+        if (p == null) { android.widget.Toast.makeText(this, "No location in shared text", android.widget.Toast.LENGTH_SHORT).show(); return args }
+        MapFocus.target.value = MapFocus.Target(p.lat, p.lon, label = p.label.ifBlank { "Shared place" })
+        return args.copy(action = "map")
+    }
     override fun onResume() { super.onResume(); lifecycleScope.launch { org.sworrl.beaconfix.collector.CollectorService.ensure(this@MainActivity, prefs) } }
     private val launch = mutableStateOf(LaunchArgs())
     override fun onNewIntent(intent: Intent) {
-        super.onNewIntent(intent); setIntent(intent); launch.value = LaunchArgs.from(intent); rttHook(intent)
+        super.onNewIntent(intent); setIntent(intent); launch.value = incoming(intent, LaunchArgs.from(intent)); rttHook(intent); simHook(intent)
         if (intent.getBooleanExtra("show_when_locked", false) && android.os.Build.VERSION.SDK_INT >= 27) { setShowWhenLocked(true); setTurnScreenOn(true) }
     }
 }

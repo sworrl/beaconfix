@@ -31,6 +31,8 @@ import org.sworrl.beaconfix.ui.Emergency
 import org.sworrl.beaconfix.ui.InfoCard
 import org.sworrl.beaconfix.ui.KeyValue
 import org.sworrl.beaconfix.ui.Permissions
+import org.sworrl.beaconfix.ui.SystemHealthCard
+import org.sworrl.beaconfix.ui.help.HomeHelpCard
 import org.sworrl.beaconfix.ui.hasRanging
 import org.sworrl.beaconfix.ui.ranging
 import org.sworrl.beaconfix.ui.ago
@@ -47,7 +49,7 @@ import org.sworrl.beaconfix.ui.vm.LiveViewModel
 import org.sworrl.beaconfix.widget.WidgetUpdater
 
 @Composable
-fun HomeScreen(onPair: () -> Unit, onIdentity: () -> Unit = {}, vm: HomeViewModel = hiltViewModel(), live: LiveViewModel = hiltViewModel()) {
+fun HomeScreen(onPair: () -> Unit, onIdentity: () -> Unit = {}, onHelp: () -> Unit = {}, onMap: () -> Unit = {}, vm: HomeViewModel = hiltViewModel(), live: LiveViewModel = hiltViewModel()) {
     val ui by vm.ui.collectAsState(); val views by live.views.collectAsState(); val phone by live.phone.collectAsState()
     val refreshing by live.refreshing.collectAsState()
     val ctx = LocalContext.current
@@ -60,6 +62,9 @@ fun HomeScreen(onPair: () -> Unit, onIdentity: () -> Unit = {}, vm: HomeViewMode
             Column(Modifier.weight(1f)) { Text("BeaconFix", style = MaterialTheme.typography.headlineMedium); Text("Wi-Fi beacons, mapped as you move", color = Slate) }
             TextButton(onClick = { live.refresh() }) { Text(if (refreshing) "…" else "↻") }
         }
+        SystemHealthCard(compact = true)
+        HomeHelpCard(onOpen = onHelp)
+        RvCard(onMap = onMap)
 
         // ── this phone ──────────────────────────────────────────────────
         val f = phone.fix
@@ -133,6 +138,7 @@ fun HomeScreen(onPair: () -> Unit, onIdentity: () -> Unit = {}, vm: HomeViewMode
             KeyValue("Beacons known", "${ui.aps}"); KeyValue("With a position", "${ui.positioned}"); KeyValue("Observations", "${ui.obs}"); KeyValue("Waiting to sync", "${ui.unsynced}")
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) { OutlinedButton(onClick = onPair) { Text("Desktops") }; OutlinedButton(onClick = onIdentity) { Text("Identity") } }
         }
+        CurrentWifiCard()
     }
 }
 

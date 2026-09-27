@@ -26,7 +26,9 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.navigation.NavDestination.Companion.hierarchy
@@ -36,9 +38,14 @@ import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import androidx.window.core.layout.WindowWidthSizeClass
+import dagger.hilt.android.EntryPointAccessors
+import kotlinx.coroutines.flow.first
+import org.sworrl.beaconfix.BuildConfig
 import org.sworrl.beaconfix.LaunchArgs
+import org.sworrl.beaconfix.share.ShareViewModel
 import org.sworrl.beaconfix.ui.screens.BeaconsScreen
 import org.sworrl.beaconfix.ui.screens.EventsScreen
+import org.sworrl.beaconfix.ui.screens.HelpScreen
 import org.sworrl.beaconfix.ui.screens.HomeScreen
 import org.sworrl.beaconfix.ui.screens.IdentityScreen
 import org.sworrl.beaconfix.ui.screens.MapScreen
@@ -54,6 +61,7 @@ import org.sworrl.beaconfix.ui.screens.WidgetGalleryScreen
 import org.sworrl.beaconfix.ui.screens.ImportScreen
 import org.sworrl.beaconfix.ui.vm.IdentityViewModel
 import org.sworrl.beaconfix.ui.vm.RootViewModel
+import org.sworrl.beaconfix.widget.WidgetEntryPoint
 
 data class Dest(val route: String, val label: String, val icon: ImageVector, val phoneTab: Boolean)
 val DESTS = listOf(
@@ -68,15 +76,21 @@ fun BeaconFixRoot(launch: LaunchArgs = LaunchArgs()) {
     val idVm: IdentityViewModel = hiltViewModel()
     val rootVm: RootViewModel = hiltViewModel()
     val hasIdentity by rootVm.hasIdentity.collectAsState()
+    val ctx = LocalContext.current
+    val prefs = remember { EntryPointAccessors.fromApplication(ctx.applicationContext, WidgetEntryPoint::class.java).prefs() }
     LaunchedEffect(launch.seq) {
-        if (!launch.importHost.isNullOrBlank() && !launch.importCode.isNullOrBlank()) { if (launch.importDryRun) idVm.checkImportFromCode(launch.importHost, launch.importCode, launch.importPass ?: "") else idVm.importFromCodeAndPass(launch.importHost, launch.importCode, launch.importPass ?: "") }
-        if (launch.action == "forget_identity") idVm.forgetAll()
+        // MainActivity is exported, so any app can send these extras: identity import and wipe are adb automation only
+        // (a debug build, or Settings → Developer automation on).
+        val dev = BuildConfig.DEBUG || prefs.devAutomation.first()
+        if (dev && !launch.importHost.isNullOrBlank() && !launch.importCode.isNullOrBlank()) { if (launch.importDryRun) idVm.checkImportFromCode(launch.importHost, launch.importCode, launch.importPass ?: "") else idVm.importFromCodeAndPass(launch.importHost, launch.importCode, launch.importPass ?: "") }
+        if (dev && launch.action == "forget_identity") idVm.forgetAll()
         if (!launch.linkPayload.isNullOrBlank() && launch.linkPayload.startsWith(org.sworrl.beaconfix.identity.IdentityOps.PREFIX)) idVm.handleScanned(launch.linkPayload)
     }
     // No identity yet → onboarding takes over the whole screen (any app: create or import)
     if (hasIdentity == false) { OnboardingScreen(initialName = launch.identityName, onImportHistory = {}, vm = idVm); return }
     if (hasIdentity == null) return
     val nav = rememberNavController()
+    val shareVm: ShareViewModel = hiltViewModel()
     LaunchedEffect(launch.seq) {
         if (!launch.pairHost.isNullOrBlank()) nav.navigate("pair?host=${launch.pairHost}&port=${launch.pairPort}")
         if (!launch.linkPayload.isNullOrBlank()) { if (!launch.linkPayload.startsWith(org.sworrl.beaconfix.identity.IdentityOps.PREFIX)) idVm.handleScanned(launch.linkPayload); nav.navigate("identity") }
@@ -84,6 +98,8 @@ fun BeaconFixRoot(launch: LaunchArgs = LaunchArgs()) {
         if (launch.importDryRun) nav.navigate("identity")
         when (launch.action) {
             "sync" -> rootVm.syncNow(); "scan" -> rootVm.scanOnce(); "collector_on" -> rootVm.collector(true); "collector_off" -> rootVm.collector(false)
+            "help" -> nav.navigate("help?focus="); "help_peds" -> nav.navigate("help?focus=peds"); "find_rv" -> nav.navigate("home") { popUpTo("home"); launchSingleTop = true }
+            "share_location" -> shareVm.shareLocation(ctx)
             "identity", "widgets", "import", "map", "beacons", "survey", "settings", "trip", "events", "nearby", "more", "sync_tab", "anchors" -> nav.navigate(if (launch.action == "sync_tab") "sync" else launch.action)
         }
     }
@@ -103,12 +119,13 @@ fun BeaconFixRoot(launch: LaunchArgs = LaunchArgs()) {
 @Composable
 private fun Graph(nav: NavHostController, idVm: IdentityViewModel, modifier: Modifier, incomingFile: android.net.Uri? = null) {
     NavHost(nav, startDestination = "home", modifier = modifier) {
-        composable("home") { HomeScreen(onPair = { nav.navigate("pair") }, onIdentity = { nav.navigate("identity") }) }
+        composable("home") { HomeScreen(onPair = { nav.navigate("pair") }, onIdentity = { nav.navigate("identity") }, onHelp = { nav.navigate("help?focus=") }, onMap = { nav.navigate("map") }) }
         composable("map") { MapScreen() }
         composable("beacons") { BeaconsScreen() }
-        composable("nearby") { NearbyScreen() }
+        composable("nearby") { NearbyScreen(onHelp = { nav.navigate("help?focus=") }, onMap = { nav.navigate("map") }) }
         composable("more") { MoreScreen(onGo = { nav.navigate(it) }) }
-        composable("trip") { TripScreen() }
+        composable("trip") { TripScreen(onMap = { nav.navigate("map") }) }
+        composable("help?focus={focus}") { e -> HelpScreen(focus = e.arguments?.getString("focus"), onBack = { nav.popBackStack() }, onMap = { nav.navigate("map") }) }
         composable("events") { EventsScreen() }
         composable("survey") { SurveyScreen() }
         composable("sync") { SyncScreen(onPair = { nav.navigate("pair") }) }

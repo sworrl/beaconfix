@@ -4,9 +4,156 @@ All notable changes to BeaconFix are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
-## [3.8.0] — unreleased
+## [3.8.0] — 2026-09-27
 
-### 3.8.0 - Ranging (desktop, Pi agent 1.1.0, Android 1.4.0)
+Desktop 3.8.0, Plasma widget 3.8.0, Android 1.4.0 and Pi agent 1.1.0: finding the right emergency
+room for a child far from home, and an Android app that keeps working when the connection to the RV
+drops.
+
+### Desktop
+
+#### Added
+- **Pediatric ERs.** Two civic categories, `peds_er` (Pediatric ER) and `peds_urgent` (Pediatric
+  urgent care), from a separate, rarer Overpass search out to the pediatric radius (default 150 km,
+  50–300: `pedsRadiusKm`, or the map's "Pediatric ER search" submenu). Each place gets a tier: 1
+  dedicated pediatric ER, 2 children's hospital with the ER not confirmed, 3 general ER with a
+  pediatrics department, 4 pediatric urgent care (not an ER). A children's hospital with an ER
+  hospital within 600 m reads "ER on campus: <name> — call ahead"; the same place mapped twice under
+  one name is merged. The classifier (`src/poiclassify.{h,cpp}`) is shared with the Android app line
+  by line, and both are tested against `tests/fixtures/pediatric_tags.json` (real OpenStreetMap tags
+  plus traps: pediatric dentists, behavioural health, Shriners, `emergency=no`, clinics that are not
+  urgent care).
+- `GET /api/v1/emergency` gains `pediatric` (the nearest confirmed pediatric ER or children's
+  hospital with an ER on campus; else the nearest children's hospital or ER with a pediatrics
+  department), `pediatricCloser` (a nearer but less certain site), `pediatricUrgent` (`notEr:
+  true`), `pediatricNote`, `pediatricSearchKm`, `pediatricTime` and `origin`. `hospital` is now the nearest *general* ER. Every place gains
+  `website`, `osm` and an estimated drive time (`driveS`, `driveM`, `driveEst`: the straight line ×
+  1.4 at 70 km/h, rounded to 5 minutes).
+- `/api/v1/pois` items gain `osmType`, `osmId`, `peds`, `er`, `campusEr`, `scope` (`near`/`far`) and
+  the drive time; the top level gains `categories` (each with `reachKm`), `note`, `origin` and
+  `pedsOrigin`; `hello` lists the `pediatric` feature. All additive: 1.3 phones and 3.7 widgets
+  ignore the new fields.
+- Nearby tab: Pediatric ER, Closer and Pediatric urgent care (not an ER) rows below the general ER,
+  each with its confidence, distance, drive estimate and a clickable phone number, and the pediatric
+  note in italics. Map clusters show their most urgent member (pediatric ER, then ER, then police or
+  fire) and pediatric ERs draw on top. Tray: "Nearest help (police, fire, ER, pediatric ER)…".
+  `beaconfix --nearby emergency` prints the pediatric lines; `--nearby pediatric` lists them with
+  their tier.
+
+#### Fixed
+- A hospital tagged only `healthcare=hospital` (no `amenity=hospital`) was not treated as a
+  hospital.
+- Overpass etiquette: the near and the pediatric query run one at a time, 5 s apart, with a minute's
+  pause after HTTP 429/504. A failed pediatric search backs off 10 minutes and keeps the saved
+  answer ("Saved … — may be incomplete"); it is skipped for IP-only fixes.
+
+#### Changed
+- The map database keeps near and far places in `pois` with a `scope` column plus `peds`, `er`,
+  `campus`, `drive_s` and `drive_m` (added columns, no migration step) and `peds_*` kv keys. The
+  window's Reload and the map's "Reload places" refresh both searches.
+
+### Plasma widget 3.8.0
+
+#### Added
+- The Nearby help card lists the nearest pediatric ER after the general ER (which always keeps its
+  row), a closer but less certain site and pediatric urgent care marked "Not an ER", each with
+  distance, drive estimate, call button and a confidence line, plus the desktop's pediatric note. A
+  **Kids ER** chip narrows the list to pediatric ERs and pediatric urgent care. Map clusters take
+  the icon of the most urgent help inside them; the place card adds the ER status, campus ER, drive
+  time and address. New categories reach the Places menu without re-adding the widget; with a 3.7
+  desktop nothing new shows.
+
+#### Fixed
+- Fast zoom-outs uncovered the map's edges between overlay paints: the overlay now covers half a
+  view beyond each edge (up to 512 px) and repaints at once when the zoom leaves [0.8, 1.25].
+- With Follow off, tours, event glides and re-fits (also after a resize) still moved the camera.
+- A press on a place marker, a map button, the security chip or panel, or a card button did not stop
+  a running tour or glide (the Cinematic button still flies home when switched off mid-tour).
+- The automatic zoom ran more often than the documented once per 10 minutes; synthesised beacon
+  refits fired on moves inside the fit's own error.
+- After a desktop restart (event ids start again at 1) new events were ignored until the ids caught
+  up.
+- The context menu did not hold automatic motion while opening and closing, and the Places menu
+  logged "Menu.qml:30:26: TypeError: Cannot read property 'width' of null" at start.
+
+### Android 1.4.0
+
+#### Added
+- **Help** ("Nearest help"): the local emergency number first (always the dialer, never an automatic
+  call), then what a dispatcher asks (coordinates with accuracy and age, address, town, county,
+  state; Copy and Share), the nearest children's ER with its confidence in words and "call ahead"
+  where the ER is not confirmed, a closer but less certain one, the nearest general ER (never hidden
+  behind a pediatric one), urgent care marked "Not an ER" with open/closed, police, fire, Poison
+  Control in the US, pharmacy and vet, and where the answer came from and how old it is. Distances
+  and drive estimates are measured from you when your fix is fresh and precise, else from the RV.
+  Works with a 3.7 desktop (children's hospitals then come from their names). Rows expose "Call …"
+  and "Directions to …" to TalkBack.
+- **Quick access**: a Help widget (Glance, 110×48 to 320×260), Quick Settings tiles for nearest help
+  and the collector (both unlock first), launcher shortcuts (Help now, Kids ER: <name>, Share my
+  location, Find the RV) with a pin-the-Kids-ER button, `beaconfix://help`, and an optional heads-up
+  with the nearest help after a move of more than 25 km (at most every 3 h, never 22:00–07:00).
+- **Offline mirror**: every desktop answer (location, trip, track, places, nearest help, devices,
+  hello, home) is kept in the database per desktop, and screens start from it — marked as saved,
+  with its age — while the desktop is out of reach. A failed or empty fetch never deletes saved
+  data.
+- **Phone-side help search**: with no desktop answering, opening Help or Places searches
+  OpenStreetMap from the phone for the help categories only (the desktop's classifier, ported), one
+  request at a time with back-off; never in the background, and it can be limited to Wi-Fi or
+  switched off.
+- **Places** rebuilt on the offline cache (every desktop and this phone): chips that match the
+  desktop's groups (Help & medical, Kids ER, Civic, Kids & fun, Services, Open now), badges (ER, no
+  ER, kids ER tier, wheelchair, Wi-Fi, open / closed / closes at), and Call / Directions / Share /
+  Website / Show on map on every row.
+- **Map**: places from the offline cache with pediatric ERs on top, a place sheet with the
+  confidence line and drive time, a filter row, four keyless styles (streets, dark, topo, satellite
+  with labels), the RV's last known position, "Show on map" from any screen, and "Ask the RV to save
+  map tiles here" (control access).
+- **Where's the RV** card (distance, direction and age, Navigate back, Share RV spot, our other
+  devices) and **Share my location** as plain text with `geo:`, OpenStreetMap, Google and Apple
+  links; positions shared *to* BeaconFix (maps links, `geo:`, "lat, lon",
+  `beaconfix://map?lat=&lon=&label=`) open on the map.
+- **Trip journal**: the trip live or as saved ("as of HH:MM"), the phone's own day, and stops
+  grouped by day from the desktop's track or the phone's fixes; tap a stop to see it on the map; GPX
+  1.1 export through the system file picker.
+- **Backup**: the phone's own beacons, observations, fixes and anchors to a file, or straight to the
+  RV's desktop (`/api/v1/db/import`, control access), in the desktop's export format; never the
+  identity, tokens, paired desktops or settings. Restore through Import.
+- **Connected Wi-Fi** card graded like the beacon audit (open, WEP and TKIP are not safe), with an
+  optional alert for an open network (once per network per day, never for home networks).
+- **Units** (auto from the desktop trip's country or the phone's region, metric, imperial) and a
+  **System health** card (precise and background location, notifications, nearby Wi-Fi, battery
+  optimisation, battery saver); the compact Home version appears only when something needs fixing.
+
+#### Fixed
+- **An update could wipe the identity**: the database fell back to a destructive migration. 1.4
+  migrates 1 → 2 → 3 → 4 for real (the SQL is checked on the JVM against the exported schemas) and
+  has no destructive fallback.
+- **Desktop fixes were stored again on every sync**, so the fixes count grew by the track's length
+  each time; each desktop fix is stored once per timestamp now, and existing duplicates collapse in
+  the migration and after every sync.
+- **Home networks edited on the phone were overwritten** by the next sync; they are now pushed to a
+  desktop with control access first (an empty list too) and never pulled over before that.
+- **The Places help card never showed an ER** (it looked for a `hospital` category the desktop does
+  not have), and the Help, Food, Camping and Fuel & EV chips never matched the desktop's groups.
+- The status notification offered four actions but Android shows three, so "Map" never appeared: now
+  Help, Scan now and Pause/Resume, with the nearest help in the expanded text and only "BeaconFix ·
+  running" on the lock screen.
+- Desktop refresh: a timeout was reported as success, a second paired desktop discarded the first
+  one's answers, one unreadable endpoint failed the whole refresh, and cancellation was swallowed.
+
+#### Security
+- `MainActivity` is exported, so any app could send `--es action forget_identity` (wiping the
+  identity) or the `import_host` / `import_code` extras. Those, and the new `sim_offline` /
+  `sim_no_desktop` test switches, now work only on a debug build or with Settings → Developer
+  automation on. `show_when_locked` is unchanged.
+
+#### Changed
+- No new permissions; background location is asked for only from the System health card. Predictive
+  back is on (`enableOnBackInvokedCallback`).
+- Database version 4: `pois` becomes a per-source place cache and `snapshots` is new; the other
+  tables keep their schema.
+
+### Ranging (desktop, Pi agent 1.1.0, Android 1.4.0)
 
 #### Fixed
 - **Long-running range filters were overconfident** (a desktop that had ranged for hours read 1.0 m

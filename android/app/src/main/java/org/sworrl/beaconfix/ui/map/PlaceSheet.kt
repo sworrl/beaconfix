@@ -64,11 +64,8 @@ object PlaceSheetModel {
         else -> Tier.ER_UNKNOWN
     }
 
-    /** Minutes for a drive: straight-line × 1.4 at 70 km/h, rounded to 5 minutes, at least 5 (the desktop's estimate). */
-    fun driveMinutes(straightM: Double): Int {
-        val min = straightM * 1.4 / (70_000.0 / 60.0)
-        return ((min / 5.0).roundToInt() * 5).coerceAtLeast(5)
-    }
+    /** Minutes for a drive: straight-line × 1.4 at 70 km/h, rounded to 5 minutes, at least 5 (the shared [org.sworrl.beaconfix.help.DriveEstimate]). */
+    fun driveMinutes(straightM: Double): Int = org.sworrl.beaconfix.help.DriveEstimate.seconds(straightM) / 60
 
     /** A drive time and whether it is measured from this phone ([fromYou]) or from the RV (the desktop's search origin). */
     data class Eta(val minutes: Int, val estimate: Boolean, val fromYou: Boolean)

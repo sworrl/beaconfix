@@ -92,16 +92,20 @@ multilaterated position (gold dot with a dashed ring), observed position (hollow
 a signal-distance orbit (cyan); Wi-Fi names beside the beacons with collision avoidance and band
 badges; places of interest from OpenStreetMap aimed at life on the road (fuel, propane, camping,
 water, dump stations, laundry, groceries, Wi-Fi, rest areas), **emergency & civic** places
-(police, fire stations, hospitals with an ER, urgent care, pharmacies, dentists, vets, libraries,
-town halls, courthouses, DMV, schools, community centres) and **kids & fun** places (playgrounds,
-parks, dog parks, pools, splash pads, zoos, museums, theme parks, ice cream, cinemas, bowling,
-arcades, trampoline and skate parks, beaches, picnic sites, trailheads) — each with its address,
-phone number (tap to call), hours and wheelchair access where OpenStreetMap has them — grouped
-and filterable, with a **Nearby** list and a **nearest help** card (police, fire, ER, urgent
-care and the local emergency number). Events animate: ripples for new beacons, fade-outs for
-lost ones, chevrons for level changes, a glide when a beacon gets placed, an arrow for a new
-fix, a pin for a new stop; a ticker keeps the last five. **Cinematic mode** glides to events
-and periodically zooms out to city and state scale.
+(police, fire stations, hospitals with an ER, **pediatric ERs** — searched out to 150 km, each with
+its confidence: dedicated pediatric ER, children's hospital with an ER on campus or not confirmed
+("call ahead"), general ER with a pediatrics department — **pediatric urgent care** (marked "not
+an ER"), urgent care, pharmacies, dentists, vets, libraries, town halls, courthouses, DMV,
+schools, community centres) and **kids & fun** places (playgrounds, parks, dog parks, pools,
+splash pads, zoos, museums, theme parks, ice cream, cinemas, bowling, arcades, trampoline and
+skate parks, beaches, picnic sites, trailheads) — each with its address, phone number (tap to
+call), hours and wheelchair access where OpenStreetMap has them — grouped and filterable, with a
+**Nearby** list and a **nearest help** card (police, fire, ER, the nearest pediatric ER and a
+closer one when it is less certain, urgent care, estimated drive times and the local emergency
+number; the general ER is never hidden behind a pediatric one). Events animate: ripples for new
+beacons, fade-outs for lost ones, chevrons for level changes, a glide when a beacon gets placed,
+an arrow for a new fix, a pin for a new stop; a ticker keeps the last five. **Cinematic mode**
+glides to events and periodically zooms out to city and state scale.
 
 **Security**: every beacon carries NetworkManager's RSN/WPA flags and is graded (open, WEP,
 WPA1, WPA2 with TKIP, WPA2-PSK, WPA2-Enterprise, WPA2/3 transition, WPA3-SAE, WPA3-192, OWE).

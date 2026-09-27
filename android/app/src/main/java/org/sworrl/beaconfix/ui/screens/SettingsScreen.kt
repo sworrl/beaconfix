@@ -39,6 +39,7 @@ fun SettingsScreen(onPair: () -> Unit, onIdentity: () -> Unit = {}, onWidgets: (
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(vertical = 8.dp)) {
         SettingsPlacesSection(placesVm)
         SystemHealthCard(compact = false)
+        org.sworrl.beaconfix.backup.BackupCard(onRestore = onImport, onIdentity = onIdentity)
         InfoCard("Collector") {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) { Text("Collect in the background"); Switch(ui.collectorOn, { vm.setCollector(it) }) }
             Text("Scan every ${ui.interval} s", style = MaterialTheme.typography.bodyMedium)

@@ -6,6 +6,21 @@ places, events, beacon audit), measures the distance to your desktop in metres, 
 ways with every BeaconFix desktop or laptop that shares your identity.
 
 - **Works offline.** Everything lands in a local Room database; the estimator runs on the phone.
+  Every answer a desktop gives (its fix, trip, track, places, nearest help, devices) is mirrored
+  there too, so Home, Places, the map, the trip journal and Help show the last known picture —
+  with its age — when the RV's desktop is out of reach.
+- **Nearest help.** One screen for an emergency on the road: the local emergency number first
+  (always the dialer, never an automatic call), your position and address as a dispatcher asks
+  for them, the nearest **children's ER** with its confidence in words (dedicated pediatric ER;
+  children's hospital with an ER on campus, or not confirmed — call ahead; ER with a pediatrics
+  department), a closer but less certain one, the nearest general ER (never hidden), urgent care
+  marked "Not an ER", police, fire and Poison Control (US), each with distance, an estimated drive
+  time, Call, Directions and Share. Measured from you when your fix is fresh, else from the RV.
+  With no desktop in reach the phone searches OpenStreetMap itself (help categories only, only
+  when you open Help or Places, never in the background; it can be switched off).
+- **Quick access.** A Help widget, Quick Settings tiles (nearest help, collector), launcher
+  shortcuts (Help now, Kids ER, Share my location, Find the RV) and an optional heads-up with the
+  nearest help after a move of more than 25 km.
 - **One identity, every device.** An Ed25519 key pair moved between apps with an encrypted
   bundle (`BFID1:` QR / text / file / a 6-digit LAN code), or two identities *linked* by scanning
   a `beaconfix://link/…` QR. Same identity ⇒ no pairing code, ever (challenge/response auth).
@@ -27,24 +42,39 @@ ways with every BeaconFix desktop or laptop that shares your identity.
   Stored locally, synced with desktops that have `/api/v1/anchors`.
 - **Import your history.** Google Timeline / Takeout, WiGLE CSV, GPX/KML, BeaconFix exports —
   via the file picker or *Share to BeaconFix*; nothing is fetched from Google.
-- **Home-screen widgets** (Location, Beacons, Sync, Map) and a permanent, silent **status
-  notification** that shows what BeaconFix knows and is doing, with Scan / Sync / Pause / Map
-  buttons — it cannot be swiped away for good (Android 14+ lets you try; it comes straight back).
+- **Where's the RV, share my location.** A Home card with the RV's distance, direction and age
+  (Navigate back, Share RV spot), one-time location sharing as plain text with map links, and
+  locations shared *to* BeaconFix (Google / Apple / OpenStreetMap links, `geo:`, "lat, lon")
+  open on the map.
+- **Trip journal** of stops by day (from the desktop's track, or the phone's own fixes), with
+  GPX export through the system file picker.
+- **Backup** of the phone's own beacons, observations, fixes and anchors to a file or straight
+  to the RV's desktop (never the identity, tokens or settings).
+- **Connected Wi-Fi safety**: the network you are on, graded like the beacon audit, with an
+  optional alert for open networks.
+- **Home-screen widgets** (Help, Location, Beacons, Sync, Map) and a permanent, silent **status
+  notification** that shows what BeaconFix knows and is doing, with Help / Scan now / Pause
+  buttons (the lock screen shows only "BeaconFix · running") — it cannot be swiped away for good
+  (Android 14+ lets you try; it comes straight back).
+- **Units**: metric, imperial, or automatic (the desktop trip's country, else the phone's region).
 - **Honest positions.** A beacon gets a position only after samples from at least two places
   (robust weighted least squares on a log-distance path-loss model, Huber weights); the phone
   locates itself from known beacons when GPS is silent, and says so. Refits are animated on the map.
-- No analytics, no crash reporting, no servers other than your desktops and OpenStreetMap tiles.
+- No analytics, no crash reporting, no servers other than your desktops, OpenStreetMap tiles and,
+  for Help with no desktop in reach, OpenStreetMap's Overpass (places); the address for the
+  dispatcher comes from the system geocoder, else one Nominatim lookup.
 
 ## Screens
 
 | | |
 |---|---|
-| **Home** — this phone's fix (place, accuracy, sun, time zone, emergency number, home distance), each desktop's card with elevation / trip / rank and the **measured range**, the collector switch | **Map** — beacons with security colours and labels, both tracks, places, linked devices, anchors (⌖, draggable), ranging rings, refit animations, satellite layer; long-press places an antenna |
-| **Beacons** — the security audit (same wording as the desktop's `security.js`), sparklines from the survey | **Places** — the desktop's OSM places grouped, with address, call and directions |
-| **Trip / Events** — `/api/v1/trip` and the live event stream (SSE) | **Survey** — continuous scanning with live signal strengths |
+| **Home** — permission problems (hidden when all is well), the nearest help, where the RV is, this phone's fix (place, accuracy, sun, time zone, emergency number, home distance), each desktop's card with elevation / trip / rank and the **measured range**, the collector switch, the connected Wi-Fi | **Map** — beacons with security colours and labels, both tracks, places from the offline cache (pediatric ERs on top) with a place sheet, a filter row, linked devices and the RV, anchors (⌖, draggable), ranging rings, refit animations; streets / dark / topo / satellite; long-press places an antenna |
+| **Beacons** — the security audit (same wording as the desktop's `security.js`), sparklines from the survey | **Places** — every desktop's and this phone's places, offline, with Help & medical / Kids ER / Civic / Kids & fun / Services / Open now chips, badges (ER, no ER, kids ER tier, open / closed), and Call / Directions / Share / Website / Map |
+| **Help** — the emergency number, position for the dispatcher, the children's ER, ER, urgent care, police, fire, Poison Control, where the answer came from and how old it is | **Trip / Events** — the trip live or as saved, the journal of stops with GPX export; the live event stream (SSE) |
+| **Survey** — continuous scanning with live signal strengths | |
 | **Sync** — every desktop, push/pull counts, errors, identity sign-in | **Identity** — id, name, devices, links; export (QR / text / file / LAN code); link (QR both ways); forget |
 | **Anchors** — the list; edit / delete; "at my position" | **Import** — file → fixes, beacons and stops on this phone |
-| **Widgets** — gallery with live previews, pin to the home screen | **Settings** — collector cadence, home networks, desktops, status notification, import |
+| **Widgets** — gallery with live previews, pin to the home screen (and the Kids ER shortcut) | **Settings** — units and places, system health, backup, collector cadence, home networks, desktops, status notification, import, developer automation |
 
 ## Identity, linking and the QR codes
 
@@ -104,18 +134,23 @@ Create a keystore once with `keytool -genkeypair -v -keystore release.jks -alias
 ```
 am start -n org.sworrl.beaconfix/.MainActivity --es action sync|scan|collector_on|collector_off|map|identity|anchors|…
 am start … --es pair_host <desktop-ip> [--ei pair_port 47822]          # identity sign-in / pairing
+am start … --es action help|help_peds|share_location|find_rv|nearby|trip|…
 am start … --es import_host <host> --es import_code 123456 --es import_pass '<six words>'
+am start … --ez sim_offline true|false --ez sim_no_desktop true|false   # offline simulation
 am start -a android.intent.action.VIEW -d 'beaconfix://link/<payload>'   # what the camera app does
+am start -a android.intent.action.VIEW -d 'beaconfix://map?lat=40.0&lon=-75.0&label=Test'   # or beaconfix://help
 ```
 
-`--ez show_when_locked true` lets a launch draw over the lock screen for screenshots.
+`--ez show_when_locked true` lets a launch draw over the lock screen for screenshots. The activity
+is exported, so on a release build `import_*`, `action forget_identity` and the `sim_*` switches
+work only with *Settings → Developer automation* on.
 
 ## Permissions
 
 Fine location (Wi-Fi scan results are location on Android), background location (for the
-collector while the screen is off), nearby Wi-Fi devices (Android 13+, scans and Wi-Fi RTT),
-Nearby devices / Bluetooth scan+advertise+connect (Android 12+, BLE ranging), notifications, camera
-(QR scanning only). Android 10+ throttles foreground scans to 4 per 2 minutes; for a survey turn
+collector while the screen is off; asked for only from the System health card), nearby Wi-Fi
+devices (Android 13+, scans and Wi-Fi RTT), Nearby devices / Bluetooth scan+advertise+connect
+(Android 12+, BLE ranging), notifications, camera (QR scanning only). 1.4 adds none. Android 10+ throttles foreground scans to 4 per 2 minutes; for a survey turn
 off *Developer options → Networking → Wi-Fi scan throttling*.
 
 ## Screenshots

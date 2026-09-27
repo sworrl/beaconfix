@@ -9,6 +9,9 @@ import dagger.hilt.android.HiltAndroidApp
 import org.osmdroid.config.Configuration as OsmConfig
 import org.sworrl.beaconfix.sync.SyncScheduler
 import javax.inject.Inject
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 
 @HiltAndroidApp
@@ -18,6 +21,13 @@ class BeaconFixApp : Application(), Configuration.Provider {
     @Inject lateinit var widgets: org.sworrl.beaconfix.widget.WidgetUpdater
     @Inject lateinit var notifier: org.sworrl.beaconfix.widget.StatusNotifier
     @Inject lateinit var prefs: org.sworrl.beaconfix.data.Prefs
+    @Inject lateinit var cache: org.sworrl.beaconfix.data.DesktopCache
+    @Inject lateinit var help: org.sworrl.beaconfix.help.HelpRepository
+    @Inject lateinit var helpAlerts: org.sworrl.beaconfix.notify.HelpAlerts
+    @Inject lateinit var wifiMonitor: org.sworrl.beaconfix.wifi.CurrentNetworkMonitor
+
+    /** Lives as long as the process: pref mirrors, the help heads-up, launcher shortcuts. */
+    private val appScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
     override val workManagerConfiguration: Configuration
         get() = Configuration.Builder().setWorkerFactory(workerFactory).build()
@@ -40,6 +50,10 @@ class BeaconFixApp : Application(), Configuration.Provider {
         widgets.ensurePeriodic()
         widgets.touch("start")
         kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Main).launch { org.sworrl.beaconfix.collector.CollectorService.ensure(this@BeaconFixApp, prefs) }
+        org.sworrl.beaconfix.data.DevFlags.bind(prefs, appScope); org.sworrl.beaconfix.ui.Units.bind(prefs, appScope, cache)
+        helpAlerts.ensureChannel(this); helpAlerts.start(appScope)
+        org.sworrl.beaconfix.quick.Shortcuts.install(this, help, appScope)
+        wifiMonitor.start()
     }
 
     companion object { const val CHANNEL_COLLECTOR = "collector" }

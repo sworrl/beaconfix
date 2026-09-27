@@ -20,6 +20,7 @@ import org.sworrl.beaconfix.ui.theme.Slate
 
 data class MoreItem(val route: String, val icon: String, val title: String, val body: String)
 val MORE = listOf(
+    MoreItem("help?focus=", "🏥", "Help & nearest ER", "The emergency number, your position for the dispatcher, the nearest children's ER, ER, urgent care, police and fire"),
     MoreItem("trip", "🧭", "Trip", "Distances, stops, places visited, the rank ladder and milestones"),
     MoreItem("events", "📻", "Events", "What the desktop hears, live"),
     MoreItem("survey", "◎", "Survey", "Scan continuously and watch signal strengths"),
