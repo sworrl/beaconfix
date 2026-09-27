@@ -102,7 +102,7 @@ fun HelpScreen(focus: String?, onBack: () -> Unit, onMap: () -> Unit, vm: HelpVi
                     Section(stringResource(R.string.help_peds_title)) {
                         val peds = ui.peds
                         if (peds != null) HelpPlaceRow(peds, snap.origin, onMap, guessed = guessed)
-                        else Text(snap.pedsNote.takeIf { it.startsWith("No pediatric ER") } ?: stringResource(R.string.help_peds_none), style = MaterialTheme.typography.bodyLarge)
+                        else Text(snap.pedsNote.ifBlank { stringResource(R.string.help_peds_none) }, style = MaterialTheme.typography.bodyLarge)
                         ui.closer?.let { c ->
                             HorizontalDivider(Modifier.padding(vertical = 4.dp))
                             Text(stringResource(R.string.help_closer), style = MaterialTheme.typography.labelLarge, color = Slate)

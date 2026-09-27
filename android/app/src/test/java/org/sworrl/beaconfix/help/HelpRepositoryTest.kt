@@ -102,6 +102,26 @@ class HelpRepositoryTest {
         assertEquals(AddressLine("1 Test St", "Testville", "Test County", "PA"), s.address)
     }
 
+    @Test fun anUnfinishedPediatricSearchIsNotNoneMapped() = runBlocking {
+        // the desktop's pediatric search never completed (Overpass busy): no pick, no search time
+        val root = kotlinx.serialization.json.Json.parseToJsonElement(res("emergency_peds.json")).let { it as kotlinx.serialization.json.JsonObject }.toMutableMap()
+        root["pediatric"] = kotlinx.serialization.json.JsonNull; root["pediatricCloser"] = kotlinx.serialization.json.JsonNull
+        root["pediatricUrgent"] = kotlinx.serialization.json.JsonNull
+        root["pediatricNote"] = kotlinx.serialization.json.JsonPrimitive("Overpass busy — will retry")
+        root["pediatricTime"] = kotlinx.serialization.json.JsonPrimitive("")
+        val s = HelpRepository(Fake().apply { emergencyJson = kotlinx.serialization.json.JsonObject(root).toString(); rows = listOf(general, police) }).refresh()
+        assertNull(s.first(HelpKind.PEDS_ER))
+        assertEquals("Test General Hospital", s.first(HelpKind.ER)!!.name)
+        assertFalse(s.pedsNote, s.pedsNote.startsWith("No pediatric ER mapped"))
+        assertTrue(s.pedsNote, s.pedsNote.startsWith("Children's ER search didn't finish — go to the nearest ER"))
+        assertTrue(s.pedsNote, s.pedsNote.contains("Overpass busy"))
+        // a search that finished and found nothing may say so
+        root["pediatricNote"] = kotlinx.serialization.json.JsonPrimitive("No pediatric ER mapped within 150 km — go to the nearest ER")
+        root["pediatricTime"] = kotlinx.serialization.json.JsonPrimitive("2026-09-27T09:00:00")
+        val done = HelpRepository(Fake().apply { emergencyJson = kotlinx.serialization.json.JsonObject(root).toString(); rows = listOf(general, police) }).refresh()
+        assertEquals("No pediatric ER mapped within 150 km — go to the nearest ER", done.pedsNote)
+    }
+
     @Test fun failuresKeepThePreviousAnswer() = runBlocking {
         val io = Fake().apply { emergencyJson = res("emergency_peds.json"); rows = listOf(general, police) }
         val repo = HelpRepository(io)

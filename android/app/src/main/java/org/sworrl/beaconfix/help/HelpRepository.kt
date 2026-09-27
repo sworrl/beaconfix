@@ -8,9 +8,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonObject
-import kotlinx.serialization.json.jsonPrimitive
 import org.sworrl.beaconfix.data.DesktopCache
 import org.sworrl.beaconfix.data.api.ApiFactory
 import org.sworrl.beaconfix.data.api.EmergencyDto
@@ -19,6 +17,7 @@ import org.sworrl.beaconfix.data.api.HelpPlaceDto
 import org.sworrl.beaconfix.data.db.SnapshotEntity
 import org.sworrl.beaconfix.estimate.Geo
 import org.sworrl.beaconfix.poi.PhonePlacesResult
+import org.sworrl.beaconfix.poi.PhonePlacesState
 import org.sworrl.beaconfix.ui.Emergency
 import java.time.Instant
 import java.time.LocalDateTime
@@ -231,11 +230,16 @@ class HelpRepository(private val io: HelpInputs) {
     }
 
     private fun pedsNote(e: Emerg?, pick: HelpPlace?, pedsKm: Int, supported: Boolean, desktopData: Boolean, phoneSnap: SnapshotEntity?): String {
-        if (pick == null && pedsKm > 0) return "No pediatric ER mapped within $pedsKm km — go to the nearest ER"
+        val phoneState = phoneSnap?.let { s -> runCatching { ApiFactory.json.decodeFromString(PhonePlacesState.serializer(), s.json) }.getOrNull() }
+        val base = e?.dto?.pediatricNote?.takeIf { it.isNotBlank() } ?: phoneState?.note.orEmpty()
+        if (pick == null && pedsKm > 0) {
+            // "none mapped" only after a search that finished: a pediatric search time from the desktop, or the phone's own
+            // completed pediatric search. pedsKm is just the configured radius, not proof that anything was searched.
+            val searched = !e?.dto?.pediatricTime.isNullOrBlank() || phoneState?.peds != null
+            return if (searched) "No pediatric ER mapped within $pedsKm km — go to the nearest ER"
+            else "Children's ER search didn't finish — go to the nearest ER" + (base.takeIf { it.isNotBlank() && !it.startsWith("No pediatric ER") }?.let { " ($it)" } ?: "; will retry")
+        }
         if (desktopData && !supported) return if (pick != null) "Children's hospital found by name only (the RV desktop is older than 3.8) — call ahead" else ""
-        val base = e?.dto?.pediatricNote?.takeIf { it.isNotBlank() }
-            ?: phoneSnap?.let { s -> runCatching { ApiFactory.json.parseToJsonElement(s.json).jsonObject["note"]?.jsonPrimitive?.contentOrNull }.getOrNull() }
-            ?: ""
         // the desktop's pick-specific notes only hold when our pick agrees
         if (base.startsWith("ER not confirmed") && pick?.tier != 2) return ""
         if (base.startsWith("No pediatric ER mapped") && pick != null) return ""

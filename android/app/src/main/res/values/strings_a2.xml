@@ -19,7 +19,7 @@
     <string name="help_share_subject">My location</string>
 
     <string name="help_peds_title">Children\'s ER</string>
-    <string name="help_peds_none">No pediatric ER mapped nearby — go to the nearest ER</string>
+    <string name="help_peds_none">No children\'s ER known here yet — go to the nearest ER</string>
     <string name="help_closer">Closer:</string>
     <string name="help_er_title">Nearest ER (any)</string>
     <string name="help_er_none">No ER in the saved places yet</string>
