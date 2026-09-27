@@ -215,13 +215,16 @@ The classifier rules are in `src/poiclassify.cpp`, with the shared test fixture
   "ER not confirmed — call ahead"; otherwise "". An IP-only fix never starts a search.
 - **The search** is its own Overpass query, out to `pedsRadiusKm` (settings key, 50–300 km,
   default 150; the map's context menu sets it): every hospital in that box, children's hospitals
-  mapped only as a building, and pediatric urgent care within 50 km. It keeps the nearest 5
+  mapped only as a building, and pediatric urgent care within 50 km. Only exact key=value
+  lookups (every hospital, hospital building and clinic in the boxes, `[timeout:90]`, the client
+  waits 120 s): name regexes made the server time out, so the names are matched here. It keeps the nearest 5
   pediatric ERs, 5 pediatric urgent cares and 8 general ERs (within 80 km), merged with the
   places list (the places query wins for an object both found). It runs again only when the fix
   moved a quarter of the radius, the answer is 30 days old, the radius changed, or when asked
   (D-Bus `RefreshPlaces()`, the window's and the map's "reload places"). It never runs at the
-  same time as the places query (one Overpass query at a time, 5 s apart); a failure backs off
-  10 minutes and keeps the saved answer.
+  same time as the places query (one Overpass query at a time, 5 s apart), and only in the tray
+  (`--once`, `--snapshot` and other one-shot commands never query Overpass); failures in a row
+  back off 10, 20, 40 … minutes (at most 4 h) and keep the saved answer.
 
 `StateJson()` / `/state` add `pedsNote`, `pedsTime` and `pedsRadiusKm`, and each
 `poiCategories[]` entry has `reachKm`. `beaconfix --nearby emergency` prints the pediatric

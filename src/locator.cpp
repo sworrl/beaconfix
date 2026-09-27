@@ -1952,6 +1952,7 @@ static QString ageText(qint64 secs)
 
 void Locator::refreshPois(bool force)
 {
+    if (m_standalone) return;                             // only the tray queries Overpass (see refreshPediatric)
     if (!m_fix.valid || m_poiBusy) return;
     const int radius = m_poiRadiusKm * 1000;
     const bool coarse = m_fix.source == QLatin1String("ip");
@@ -2177,6 +2178,9 @@ void Locator::setPedsRadiusKm(int km)
 
 void Locator::refreshPediatric(bool force)
 {
+    // Only the tray talks to Overpass: a short-lived `beaconfix --once` / `--snapshot` would post the heaviest query and
+    // quit seconds later, leaving the server working on it in one of our two slots (and it ignores the tray's back-off)
+    if (m_standalone) return;
     if (!m_fix.valid || m_pedsBusy) return;
     if (m_fix.source == QLatin1String("ip") || m_fix.accuracy > 5000) {   // the ground station's city is no place to search from
         if (m_pedsSkipLogged != m_fix.time) {
@@ -2201,23 +2205,25 @@ void Locator::queryPediatric(double lat, double lon, int radiusM, int mirror)
 {
     m_pedsBusy = true;
     if (mirror == 0) { qInfo("beaconfix: pediatric ER search within %d km", radiusM / 1000); emit poisUpdated(); }
-    // Only exact-tag lookups (key=value index + bbox): value regexes and around: over a 300 km box ran into the
-    // timeout on the live server. Every hospital in the box comes back and is classified here, which also gives the
-    // general ERs (kept within 80 km) and the ER on a children's hospital's campus without an around: pass.
+    // Only exact key=value lookups over a bbox. Value regexes and around: over a 300 km box ran into the timeout, and so
+    // did the six [name~…,i] filters (a regex on "name" scans every name in the box): the live query gave up after 79 s,
+    // while the same query without them answered in 11 s. Every hospital, hospital building and clinic in the boxes comes
+    // back and PoiClassify does the name matching here, which also yields the general ERs (kept within 80 km) and a
+    // children's hospital's campus ER without an around: pass. Dense areas: ~1800 elements, ~0.7 MB, ~30 s.
     const QString far = bboxFor(lat, lon, radiusM), urg = bboxFor(lat, lon, 50000);
-    const QString kid = QStringLiteral("[name~\"pa?ediatric|kids|child\",i]"), spec = QStringLiteral("[\"healthcare:speciality\"~\"pa?ediatric\",i]");
     const QString q = QStringLiteral(
-        "[out:json][timeout:60];("
+        "[out:json][timeout:%3];("
         "nwr[amenity=hospital](%1);nwr[healthcare=hospital](%1);"
-        "nwr[building=hospital][name~\"child|pa?ediatric\",i](%1);nwr[\"emergency:paediatric\"=yes](%1);"
-        "nwr[amenity=clinic]%3(%2);nwr[amenity=doctors]%3(%2);nwr[amenity=urgent_care]%3(%2);"
-        "nwr[healthcare=clinic]%3(%2);nwr[healthcare=urgent_care]%3(%2);"
-        "nwr[healthcare=clinic]%4(%2);nwr[healthcare=urgent_care]%4(%2);nwr[healthcare=doctor]%4(%2);"
-        ");out center tags qt;").arg(far, urg, kid, spec);
+        "nwr[building=hospital](%1);nwr[\"emergency:paediatric\"=yes](%1);"
+        "nwr[amenity=clinic](%2);nwr[amenity=doctors](%2);nwr[amenity=urgent_care](%2);"
+        "nwr[healthcare=clinic](%2);nwr[healthcare=urgent_care](%2);nwr[healthcare=doctor](%2);"
+        ");out center tags qt;").arg(far, urg).arg(kPedsServerTimeoutS);
     QNetworkRequest req{QUrl(QString::fromLatin1(kOverpassMirrors[mirror]))};
     req.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/x-www-form-urlencoded"));
     req.setHeader(QNetworkRequest::UserAgentHeader, QString::fromLatin1(USER_AGENT));
-    req.setTransferTimeout(75000);
+    // Longer than the server's own limit plus queueing: hanging up first lost the server's error remark and left it
+    // running the query in our slot
+    req.setTransferTimeout((kPedsServerTimeoutS + 30) * 1000);
     QUrlQuery body; body.addQueryItem(QStringLiteral("data"), q);
     QNetworkReply *rep = m_nam.post(req, body.toString(QUrl::FullyEncoded).toUtf8());
     connect(rep, &QNetworkReply::finished, this, [this, rep, lat, lon, radiusM, mirror] {
@@ -2234,10 +2240,14 @@ void Locator::queryPediatric(double lat, double lon, int radiusM, int mirror)
             }
             const QDateTime now = QDateTime::currentDateTime();
             m_pedsBusy = false; m_pedsFailed = true;
-            m_pedsBusyUntil = now.addSecs(600);
+            // Back off 10, 20, 40 … minutes (at most 4 h) after failures in a row: every attempt costs two heavy
+            // requests (both mirrors), and a server that is busy now stays busy for a while
+            const int backoffS = pedsBackoffS(++m_pedsFailCount);
+            m_pedsBusyUntil = now.addSecs(backoffS);
             if (http == 429 || http == 504) m_overpassCoolUntil = now.addSecs(60);
             m_pedsNote = QStringLiteral("Overpass busy — will retry");
-            m_pedsRetryTimer.start(600 * 1000 + 5000);       // what we had stays: m_pedsPois and the database rows are untouched
+            qInfo("beaconfix: pediatric ER search: retry in %d min (failure %d in a row)", backoffS / 60, m_pedsFailCount);
+            m_pedsRetryTimer.start(backoffS * 1000 + 5000);   // what we had stays: m_pedsPois and the database rows are untouched
             emit poisUpdated();
             overpassDone();
             return;
@@ -2269,7 +2279,7 @@ void Locator::queryPediatric(double lat, double lon, int radiusM, int mirror)
         m_pedsPois = nearest(peds, 5) + nearest(urgent, 5) + nearest(ers, 8);
         m_pedsLat = lat; m_pedsLon = lon; m_pedsRadiusM = radiusM;
         m_pedsTime = QDateTime::currentDateTime();
-        m_pedsBusy = false; m_pedsFailed = false; m_pedsBusyUntil = QDateTime();
+        m_pedsBusy = false; m_pedsFailed = false; m_pedsBusyUntil = QDateTime(); m_pedsFailCount = 0;
         m_pedsNote.clear();
         m_pedsRetryTimer.stop();
         qInfo("beaconfix: pediatric ER search: %d pediatric ER, %d pediatric urgent care, %d ER within reach (%d elements)",
