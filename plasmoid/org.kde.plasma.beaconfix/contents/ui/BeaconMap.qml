@@ -712,7 +712,7 @@ Item {
             var key = [map.layerIndex, map.tileBase, z, x0, x1, y0, y1].join(",")
             if (key === rangeKey) return
             rangeKey = key
-            var need = {}
+            var need = {}, have = {}                // `have` instead of deleting from `need` (see Radar.qml's flashes)
             for (var x = x0; x <= x1; x++)
                 for (var y = y0; y <= y1; y++) need[z + "/" + x + "/" + y] = [x, y]
             var lk = map.layerIndex + "," + map.tileBase
@@ -721,7 +721,7 @@ Item {
             for (var i = tiles.count - 1; i >= 0; i--) {
                 var t = tiles.get(i)
                 if (t.lk !== lk) { tiles.remove(i); continue }
-                if (t.tz === z) { if (need[t.k] !== undefined) delete need[t.k]; else tiles.remove(i) }
+                if (t.tz === z) { if (need[t.k] !== undefined) have[t.k] = true; else tiles.remove(i) }
                 else {                          // other level: keep only while it still covers the view
                     var on = Math.pow(2, t.tz), ax = map.toMerc(0, 0), bx = map.toMerc(map.width, map.height)
                     var vis = (t.tx + 1) / on > ax.x && t.tx / on < bx.x && (t.ty + 1) / on > ax.y && t.ty / on < bx.y
@@ -729,6 +729,7 @@ Item {
                 }
             }
             for (var k in need) {
+                if (have[k]) continue
                 var tx = need[k][0], ty = need[k][1]
                 tiles.append({k: k, lk: lk, tz: z, tx: tx, ty: ty, stale: false, ready: false, url: map.tileUrl(z, ((tx % n) + n) % n, ty, labels)})
             }

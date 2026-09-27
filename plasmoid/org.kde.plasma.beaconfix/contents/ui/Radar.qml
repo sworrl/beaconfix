@@ -11,13 +11,29 @@ Canvas {
     property var  flashes: ({})                 // bssid → when it lit up (new / louder)
     property int  flashCount: 0
     property real now: 0
-    function flash(bssid) { if (!bssid) return; flashes[bssid] = Date.now(); flashCount++; now = Date.now() }
+    // `flashes` is never changed in place, only replaced: on Qt 6.11 adding keys to a property-var object that had keys
+    // deleted crashed the V4 engine (QV4::Object::insertMember from a StoreElement) and took plasmashell down with it,
+    // twice, each time in the burst of ap_new / ap_up flashes after a tray restart.
+    function flash(bssids) {                     // one BSSID or a list of them
+        var list = Array.isArray(bssids) ? bssids : [bssids]
+        var t = Date.now(), f = {}, n = 0
+        for (var b in radar.flashes) if (t - radar.flashes[b] <= 1600) { f[b] = radar.flashes[b]; n++ }
+        var added = false
+        for (var i = 0; i < list.length; i++) {
+            if (!list[i]) continue
+            if (f[list[i]] === undefined) n++
+            f[list[i]] = t; added = true
+        }
+        if (!added) return
+        radar.flashes = f; radar.flashCount = n; radar.now = t
+    }
     Timer {
         interval: 33; repeat: true; running: radar.flashCount > 0
         onTriggered: {
             radar.now = Date.now()
-            var live = 0
-            for (var b in radar.flashes) { if (radar.now - radar.flashes[b] > 1600) delete radar.flashes[b]; else live++ }
+            var f = {}, live = 0, gone = 0
+            for (var b in radar.flashes) { if (radar.now - radar.flashes[b] <= 1600) { f[b] = radar.flashes[b]; live++ } else gone++ }
+            if (gone) radar.flashes = f
             radar.flashCount = live
             radar.requestPaint()
         }
@@ -26,7 +42,9 @@ Canvas {
         target: radar.src
         function onNewEvents(list, animate) {
             if (!animate) return
-            for (var i = 0; i < list.length; i++) if (list[i] && (list[i].type === "ap_new" || list[i].type === "ap_up")) radar.flash(list[i].bssid)
+            var lit = []
+            for (var i = 0; i < list.length; i++) if (list[i] && (list[i].type === "ap_new" || list[i].type === "ap_up") && list[i].bssid) lit.push(list[i].bssid)
+            if (lit.length) radar.flash(lit)
         }
     }
     // The sweep follows the shared 2.4 s pulse, which ticks every frame; repaint at ≤ 20 fps and only when shown.
