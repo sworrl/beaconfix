@@ -80,6 +80,13 @@ void RangingService::start()
     updateAdvertFlags();
     connect(m_ble, &BleLink::sample, this, &RangingService::onBleSample);
     connect(m_ble, &BleLink::txPowerChanged, this, &RangingService::applyOurTx);
+    connect(m_ble, &BleLink::scanStalledChanged, this, [this](bool stalled) {
+        BeaconEvent ev; ev.type = QStringLiteral("device");
+        ev.text = stalled ? QStringLiteral("Bluetooth scan hears nothing for a minute (the adapter or bluetoothd may be stuck): restarting discovery")
+                          : QStringLiteral("Bluetooth scan hears adverts again");
+        ev.extra = QJsonObject{{"bleScan", stalled ? "stalled" : "on"}};
+        m_loc->logEvent(ev);
+    });
     m_ble->start();
     applyOurTx(m_ble->txPower());
 }
@@ -144,7 +151,9 @@ QJsonObject RangingService::info() const
     }
     o["ble"] = QJsonObject{{"serviceUuid", QString::fromLatin1(kBleServiceUuid)}, {"txPower", m_ble ? m_ble->txPower() : 127},
                            {"txPowerConfirmed", m_ble && m_ble->txPowerConfirmed()}, {"enabled", m_ble && m_ble->advertising()},
-                           {"scanning", m_ble && m_ble->scanning()}, {"intervalMs", m_ble ? m_ble->intervalMs() : 1000},
+                           {"scanning", m_ble && m_ble->scanning()},
+                           {"scanState", !m_ble ? "off" : m_ble->scanStalled() ? "stalled" : m_ble->scanning() ? "on" : "off"},
+                           {"intervalMs", m_ble ? m_ble->intervalMs() : 1000},
                            {"error", m_ble ? QJsonValue(m_ble->lastError()) : QJsonValue()}};
     o["anchor"] = self ? QJsonValue(self->toJson(true)) : QJsonValue();
     return o;
@@ -178,7 +187,7 @@ void RangingService::flushDown(Peer &p, qint64 nowMs_, bool force)
         // RTT-supervised calibration (§8 "Automatic"): a range pinned by RTT is a known distance for the BLE link —
         // but only once the RTT pair offset itself is calibrated: an uncalibrated pair read ~11 m at 0.6 m and
         // taught the BLE model that bias.
-        if (rttCalibrated(p) && std::sqrt(p.f.puu()) < 0.05 && nowMs_ - p.lastRttMs < 30000) p.rlsDown.update(p.f.u(), L.dbm, L.sigma * L.sigma);
+        if (learnOk(p, nowMs_)) p.rlsDown.update(p.f.u(), L.dbm, L.sigma * L.sigma);
         p.f.updateRssi(0, L.dbm, L.sigma, p.rlsDown.p0, p.rlsDown.n);
         p.nBleDown += L.n;
     }
@@ -195,11 +204,55 @@ void RangingService::flushUp(Peer &p, qint64 nowMs_, bool force)
     const Level L = freshLevel(p.winUp, p.winUpFresh, std::max(1.0, span), p.moving);
     if (L.valid) {
         advance(p, nowMs_);
-        if (rttCalibrated(p) && std::sqrt(p.f.puu()) < 0.05 && nowMs_ - p.lastRttMs < 30000) p.rlsUp.update(p.f.u(), L.dbm, L.sigma * L.sigma);
+        if (learnOk(p, nowMs_)) p.rlsUp.update(p.f.u(), L.dbm, L.sigma * L.sigma);
         p.f.updateRssi(1, L.dbm, L.sigma, p.rlsUp.p0, p.rlsUp.n);
         p.nBleUp += p.winUpFresh;
     }
     p.winUp.clear(); p.winUpFresh = 0; p.winUpStartMs = 0; p.firstUp = false;
+}
+
+bool RangingService::learnOk(Peer &p, qint64 now) const
+{
+    // the hold clock: restarts whenever the estimate leaves ±12 % (0.05 in log10) of where it was
+    if (!p.holdSinceMs || std::fabs(p.f.u() - p.holdU) > 0.05) { p.holdU = p.f.u(); p.holdSinceMs = now; }
+    return rttCalibrated(p) && std::sqrt(p.f.puu()) < 0.05 && now - p.lastRttMs < 30000
+        && now - p.holdSinceMs >= 30000 && (!p.lastRttOutlierMs || now - p.lastRttOutlierMs >= 30000);
+}
+
+bool RangingService::rttOffsetStale(const std::vector<double> &implied, double offsetSigmaM, double *med)
+{
+    if (int(implied.size()) < kStaleMinBursts) return false;
+    const double m = median(implied);
+    if (med) *med = m;
+    return m < -std::max(1.0, 3.0 * offsetSigmaM);
+}
+
+// One RTT burst went into the filter while the offset counts as calibrated: is the offset still right? A drifted offset
+// (the Pixel ↔ AX210 pair read 7–13 m for a 0.6 m that had read 14.4 m at calibration) makes every burst put the range
+// below zero, and the filter slid to a few centimetres with a ±6 % interval while teaching the BLE models that.
+void RangingService::noteRtt(Peer &p, double impliedM, qint64 now)
+{
+    p.rttImplied.push_back(impliedM);
+    if (int(p.rttImplied.size()) > kStaleWindow) p.rttImplied.erase(p.rttImplied.begin());
+    double med = 0;
+    if (!rttOffsetStale(p.rttImplied, std::sqrt(std::max(0.0, p.rttOffsetVar)), &med)) return;
+    p.rttStale = true; p.rttCal = false;
+    p.rttStaleByM = -med;                                   // the offset is at least this much too large
+    p.rttStaleAt = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
+    p.rttOffsetVar = kUncalRttOffsetVar;                    // back to the uncalibrated prior …
+    p.f.resetRttOffset(0, kUncalRttOffsetVar);
+    p.f.P[0][0] = std::max(p.f.P[0][0], 0.25);              // … and the range forgets what the biased bursts taught it (σ ×/÷ 3)
+    p.rttImplied.clear();
+    const QString text = QStringLiteral("Wi-Fi RTT with %1: the calibrated offset moved by about %2 m (bursts now read below zero); "
+                                        "RTT is left out until you calibrate again at a known distance").arg(p.device).arg(p.rttStaleByM, 0, 'f', 1);
+    qWarning("beaconfix: %s", qPrintable(text));
+    m_loc->logEvent([&] {
+        BeaconEvent ev; ev.type = QStringLiteral("device"); ev.text = text;
+        ev.extra = QJsonObject{{"device", p.device}, {"rttStale", true}, {"rttOffsetM", p.rttOffset}, {"rttStaleByM", p.rttStaleByM}};
+        return ev; }());
+    m_dirty = true;
+    save();
+    Q_UNUSED(now);
 }
 
 RangeMath::Level RangingService::freshLevel(const std::vector<double> &rssi, int fresh, double spanS, bool moving)
@@ -269,7 +322,13 @@ QJsonObject RangingService::report(const QString &device, const QString &kind, c
         const int n = std::max(1, s["n"].toInt(1));
         const double sigma = std::max(kRttFloor, s["stdMm"].toDouble(1000) / 1000.0 / std::sqrt(double(n)));
         if (calibrating) { p.calRtt.push_back(dist); p.calRttSigma.push_back(sigma); }
-        else { advance(p, std::min(t, now)); p.f.updateRtt(dist, sigma, p.rttOffset); }
+        else if (!p.rttStale) {                                  // a stale offset keeps RTT out until the next calibration
+            advance(p, std::min(t, now));
+            const bool cal = rttCalibrated(p);
+            const double z = p.f.updateRtt(dist, sigma, p.rttOffset);
+            if (std::fabs(z) > 3.0) p.lastRttOutlierMs = now;
+            if (cal) noteRtt(p, dist - p.rttOffset, now);
+        }
         ++p.nRtt; p.lastRttMs = std::max(p.lastRttMs, std::min(t, now));
     }
     // What it heard of OUR advert (link 0)
@@ -455,6 +514,7 @@ void RangingService::finishCalibration(Peer &p)
             p.rttOffsetVar = sc * sc + 0.05 * 0.05;
             p.f.resetRttOffset(0, p.rttOffsetVar);
             p.rttCal = true;
+            p.rttStale = false; p.rttStaleByM = 0; p.rttStaleAt.clear(); p.rttImplied.clear();
         }
         // A calibration replaces what the links learnt before: start each link that has calibration samples from its
         // TX-power prior (a link without samples keeps its previous calibration).
@@ -491,7 +551,7 @@ void RangingService::recompute(Peer &p)
     if (p.fix.valid && now - p.fixMs < 5 * 60 * 1000) in.fix = p.fix;
     p.out = relativePosterior(in);
     p.method.clear();
-    if (p.lastRttMs && now - p.lastRttMs < kFreshMs) p.method << QStringLiteral("rtt");
+    if (!p.rttStale && p.lastRttMs && now - p.lastRttMs < kFreshMs) p.method << QStringLiteral("rtt");
     if ((p.lastBleUpMs && now - p.lastBleUpMs < kFreshMs) || (p.lastBleDownMs && now - p.lastBleDownMs < kFreshMs)) p.method << QStringLiteral("ble");
     if (in.haveFp) p.method << QStringLiteral("wifi-diff");
     if (in.geo.valid) p.method << QStringLiteral("wifi-geo");
@@ -516,7 +576,9 @@ QJsonObject RangingService::toJson(const Peer &p) const
                   {"calib", QJsonObject{{"rttOffsetM", p.rttOffset}, {"rttOffsetSigmaM", std::sqrt(std::max(0.0, p.rttOffsetVar))}, {"bleP0", p.rlsDown.p0}, {"bleN", p.rlsDown.n},
                                         {"bleP0Up", p.rlsUp.p0}, {"bleNUp", p.rlsUp.n}, {"calibrated", p.calibrated},
                                         {"calibratedAt", p.calibratedAt.isEmpty() ? QJsonValue() : QJsonValue(p.calibratedAt)}, {"distanceM", p.calibrated ? QJsonValue(p.calDistM) : QJsonValue()},
-                                        {"rttCalibrated", rttCalibrated(p)}, {"last", p.lastCal.isEmpty() ? QJsonValue() : QJsonValue(p.lastCal)}}},
+                                        {"rttCalibrated", rttCalibrated(p)}, {"last", p.lastCal.isEmpty() ? QJsonValue() : QJsonValue(p.lastCal)},
+                                        {"rttStale", p.rttStale}, {"rttStaleByM", num(p.rttStaleByM, p.rttStale)},
+                                        {"rttStaleAt", p.rttStale && !p.rttStaleAt.isEmpty() ? QJsonValue(p.rttStaleAt) : QJsonValue()}}},
                   {"calibrating", p.calUntilMs > nowMs()}};
     // Where that puts it on the map: our position ⊕ (bearing, distance), only when the bearing is real
     const Fix &me = m_loc->fix();
@@ -612,6 +674,7 @@ void RangingService::save() const
         auto rls = [](const Rls2 &r) { return QJsonObject{{"p0", r.p0}, {"n", r.n}, {"S", QJsonArray{r.S[0][0], r.S[0][1], r.S[1][1]}}}; };
         peers[p.device] = QJsonObject{{"kind", p.kind}, {"rttOffset", p.rttOffset}, {"rttOffsetVar", p.rttOffsetVar}, {"calibrated", p.calibrated},
                                       {"rttCalibrated", p.rttCal}, {"lastCal", p.lastCal},
+                                      {"rttStale", p.rttStale}, {"rttStaleByM", p.rttStaleByM}, {"rttStaleAt", p.rttStaleAt},
                                       {"calibratedAt", p.calibratedAt}, {"calDistM", p.calDistM}, {"rlsDown", rls(p.rlsDown)}, {"rlsUp", rls(p.rlsUp)},
                                       {"offsetVar", QJsonArray{p.f.offsetVar(0), p.f.offsetVar(1)}},
                                       {"totals", QJsonObject{{"rtt", double(tRtt)}, {"bleDown", double(tDown)}, {"bleUp", double(tUp)},
@@ -651,6 +714,8 @@ void RangingService::load()
         p.rttOffset = o["rttOffset"].toDouble(); p.rttOffsetVar = o["rttOffsetVar"].toDouble(kUncalRttOffsetVar);
         // Files before 3.8 have no flag: an RTT-measured offset is the one whose variance is not a prior (0.25, then 4)
         p.rttCal = o.contains(QStringLiteral("rttCalibrated")) ? o["rttCalibrated"].toBool() : p.rttOffsetVar < 0.2499;
+        p.rttStale = o["rttStale"].toBool(); p.rttStaleByM = o["rttStaleByM"].toDouble(); p.rttStaleAt = o["rttStaleAt"].toString();
+        if (p.rttStale) { p.rttCal = false; p.rttOffsetVar = std::max(p.rttOffsetVar, kUncalRttOffsetVar); }
         p.f.resetRttOffset(0, p.rttOffsetVar);
         const QJsonArray ov = o["offsetVar"].toArray();
         for (int k = 0; k < 2 && k < ov.size(); ++k) p.f.resetOffset(k, 0, std::max(ov[k].toDouble(kOffsetVar0), 2.0 * kFrozenFadeVar));

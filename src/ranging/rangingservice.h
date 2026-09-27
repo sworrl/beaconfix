@@ -74,6 +74,12 @@ private:
         qint64 calUntilMs = 0, calStartMs = 0; double calTarget = 0;
         std::vector<double> calRtt, calRttSigma, calDown, calUp; int calUpFresh = 0;
         RangeMath::RelOutput out; QStringList method;
+        // Is the calibrated RTT offset still right? The last bursts' ranges minus the offset (m) while it is calibrated;
+        // a median well below zero means the offset moved (rttOffsetStale): RTT then stays out until a recalibration.
+        std::vector<double> rttImplied;
+        bool rttStale = false; double rttStaleByM = 0; QString rttStaleAt;
+        qint64 lastRttOutlierMs = 0;                         // the last RTT burst with |z| > 3 (learning waits 30 s after one)
+        double holdU = 0; qint64 holdSinceMs = 0;            // the range estimate has stayed within ±12 % since then
     };
     void onBleSample(const QByteArray &tag, int rssi, int txPower, int kind, int flags, qint64 timeMs, const QString &address, bool held);
     QString resolveTag(const QByteArray &tag, int kind, qint64 nowMs, bool *own);
@@ -89,7 +95,12 @@ private:
     void load();
     void save() const;
     // The RTT pair offset was measured by a calibration (a BLE-only calibration leaves it at the wide prior)
-    static bool rttCalibrated(const Peer &p) { return p.calibrated && p.rttCal && p.rttOffsetVar < 1.0; }
+    static bool rttCalibrated(const Peer &p) { return p.calibrated && p.rttCal && !p.rttStale && p.rttOffsetVar < 1.0; }
+    // RTT-supervised BLE learning (§8 "Automatic"): a calibrated, current RTT offset, a tight range from RTT seen in the
+    // last 30 s that has HELD (within ±12 %) for 30 s, and no RTT outlier in the last 30 s. A range sliding towards 0 m
+    // under biased bursts is tight too, and it rewrote a manual calibration's BLE models.
+    bool learnOk(Peer &p, qint64 nowMs) const;
+    void noteRtt(Peer &p, double impliedM, qint64 nowMs);
     int downTxOf(const Peer &p) const { return m_ourTx != 127 ? m_ourTx : p.downTx; }   // the TX power behind the peer's down link
 public:
     // Calibration RTT reduction: size of the densest [x, x + width] cluster, *center = its median, [*lo, *hi] = the
@@ -106,6 +117,10 @@ public:
     // (nothing changes then); with fewer bursts the BLE links alone may calibrate.
     static QString calibrationFailure(int bursts, int agreed, bool bleUsable);
     static constexpr double kCalClusterM = 2.0;
+    // The calibrated offset no longer matches: at least kStaleMinBursts of the last kStaleWindow bursts, and their
+    // median range (burst − offset) is below −max(1 m, 3·σ_offset) — a distance cannot be negative. *median = that median.
+    static constexpr int kStaleWindow = 20, kStaleMinBursts = 10;
+    static bool rttOffsetStale(const std::vector<double> &implied, double offsetSigmaM, double *median = nullptr);
 private:
     void applyOurTx(int tx);                                 // our advert's TX power changed: re-prior uncalibrated down links
     static QString agentBeaconId(const QString &desktopId, const QString &device);

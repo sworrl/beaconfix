@@ -15,6 +15,7 @@
 #include <QVariantMap>
 
 class BleAdvertisement;
+class QDBusServiceWatcher;
 
 class BleLink : public QObject {
     Q_OBJECT
@@ -36,7 +37,17 @@ public:
     void stop();
 
     bool advertising() const { return m_advertising; }
-    bool scanning() const { return m_scanning; }
+    bool scanning() const { return m_scanning && !m_scanStalled; }
+    // Discovery is on but no LE advert of any device has arrived for kScanStallMs of scanning (a wedged controller or
+    // bluetoothd): reported instead of a healthy "scanning", and discovery is restarted once a minute until one does.
+    bool scanStalled() const { return m_scanStalled; }
+    static constexpr qint64 kScanStallMs = 60 * 1000;
+    // A RegisterAdvertisement error that says the advertisement's SHAPE is wrong (too long, a property BlueZ cannot
+    // parse or refuses): only these drop the TX-power AD or the TxPower request. Everything else — NoReply (bluetoothd
+    // busy past our timeout), AlreadyExists (a registration that outlived that timeout), Failed, NotPermitted — is
+    // transient: unregister our path and retry with a back-off (2 s doubling to 60 s).
+    static bool shapeError(const QString &errorName, const QString &message);
+    static constexpr int kRetryMinMs = 2000, kRetryMaxMs = 60000;
     QString lastError() const { return m_error; }
     int advertsSeen() const { return m_advertsSeen; }
     int intervalMs() const { return m_intervalMs; }       // any LE advert event (proves scanning works)
@@ -49,6 +60,7 @@ signals:
     // held: not a report from BlueZ but holdTick's repeat of the last RSSI (no new measurement; see holdTick).
     void sample(const QByteArray &tag, int rssi, int txPower, int kind, int flags, qint64 timeMs, const QString &address, bool held = false);
     void advertisingChanged(bool on);
+    void scanStalledChanged(bool stalled);
     void txPowerChanged(int dbm);
     void error(const QString &message);
 
@@ -65,7 +77,10 @@ private:
     void probeTxPower();                                    // LEAdvertisingManager1 SupportedFeatures / SupportedCapabilities (async)
     void applyTxCaps(bool settable, int lo, int hi);
     void onTxSelected(int dbm);
-    void unregisterAdvert();
+    void unregisterAdvert(bool evenIfNotAdvertising = false);
+    void scheduleRetry();
+    void onBluezOwnerChanged(const QString &name, const QString &oldOwner, const QString &newOwner);
+    void restartDiscovery();
     void setDiscovery(bool on);
     void consider(const QString &path, const QVariantMap &props, bool fromChange);
     static QByteArray serviceDataFor(const QVariant &serviceDataProp);
@@ -75,10 +90,15 @@ private:
     bool m_started = false, m_advertising = false, m_scanning = false, m_txSettable = false, m_txConfirmed = false, m_registering = false;
     bool m_reregister = false;
     int m_probeGen = 0, m_txAdoptions = 0;
+    int m_regGen = 0;                                       // bumped per registration: a reply to an older one is ignored
+    int m_retryDelayMs = kRetryMinMs;
     int m_advertsSeen = 0;
     qint64 m_window = -1;
+    qint64 m_scanQuietMs = 0, m_lastScanRestartMs = 0;      // scanning time without any LE report; the watchdog's last restart
+    bool m_scanStalled = false;
     BleAdvertisement *m_adv = nullptr;
-    QTimer m_rotate, m_duty, m_hold;
+    QDBusServiceWatcher *m_bluezWatch = nullptr;
+    QTimer m_rotate, m_duty, m_hold, m_retry;
     int m_dutyPhase = 0;
     QHash<QString, Dev> m_devs;
 };

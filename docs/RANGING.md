@@ -523,7 +523,10 @@ answered bursts, one every ~2.65 s).
 `samples` counts since the tray started (`since`); `total` adds earlier runs (kept in
 `ranging.json`, written at most once a minute). `rttState` is the peer's last `rttState`. `calib.rttCalibrated`
 (3.8): a calibration measured the RTT pair offset (it gates the automatic BLE learning of §8); `calib.last` (3.8): the
-outcome of the last calibration, failed ones included.
+outcome of the last calibration, failed ones included. `calib.rttStale`, `calib.rttStaleByM`, `calib.rttStaleAt`
+(3.8): the calibrated offset no longer matches the bursts (§8 "A drifted offset"); RTT is then left out of the
+fusion (and out of `method`) until the next calibration. `/ranging/info` `ble.scanState` (3.8) is `on`, `off` or
+`stalled` (discovery on, but no LE advert of any device for a minute of scanning; `scanning` is then false).
 
 `POST /ranging/calibrate` (control): `{"device": "…", "distanceM": 0.61, "durationS": 20}` — §8.
 
@@ -563,7 +566,22 @@ outcome of the last calibration, failed ones included.
   step had taught both BLE links that bias. Until then `e_c` starts at `N(0, 2²)` (σ 2 m, was 0.5 m),
   which also keeps `√P_uu` above the gate. A calibration restarts each link that has samples in the
   window from its TX-power prior, and only calibrated peers' RLS state is restored at start.
+  Tight is not enough (3.8): the estimate must also have **held** within ±12 % (0.05 in `log10`)
+  for 30 s, with no RTT burst of `|z| > 3` in the last 30 s. On 2026-09-27 a drifted offset slid
+  the range 1.19 → 0.11 m in a minute with a ±6 % interval, and the gate learnt from every step
+  of it: both BLE models of a manual calibration were rewritten (`P0` −78.8 → −68.0 and
+  −93.9 → −83.0 dBm, `n` at the 1.5 clamp).
   Anchors feed §4.3.3.
+* **A drifted offset (3.8).** The pair's offset is not constant: the calibration of 14:14Z read
+  0.6 m as 14.37 m (`c` 13.77 m); three hours later the same pair read 7.1–12.9 m, i.e. a range
+  1–6.5 m *below zero*. The Schmidt–Kalman filter cannot see that (it never estimates `e_c`), so
+  every burst took the early-arrival branch and pushed `u` down while `P_uu` shrank: 0.022 m
+  [0.012, 0.055] for a true ~0.6 m. The service now keeps each calibrated peer's last 20
+  `burst − c`; when at least 10 have a median below `−max(1 m, 3·σ_c)` — a distance cannot be
+  negative — the offset is marked stale: `rttCalibrated` goes false (no more BLE learning),
+  `e_c` goes back to the uncalibrated `N(0, 2²)`, `P_uu` is raised to at least 0.25 (the interval
+  widens honestly), RTT bursts stay out of the filter and out of `method`, and the event log and
+  the phone's range card say to calibrate again. A calibration whose bursts agree clears it.
 * **The first calibration point.** On 2026-09-27 the Pixel lay 0.61 m (2 ft) from the desktop.
   That distance is the seed for `c_pair` and the BLE `P0`s (§10).
 

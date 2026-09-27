@@ -7,6 +7,7 @@
 #include <QDBusMetaType>
 #include <QDBusPendingCallWatcher>
 #include <QDBusPendingReply>
+#include <QDBusServiceWatcher>
 #include <QDateTime>
 
 using InterfaceMap = QMap<QString, QVariantMap>;
@@ -28,6 +29,46 @@ BleLink::BleLink(QObject *parent) : QObject(parent)
     connect(&m_duty, &QTimer::timeout, this, &BleLink::dutyTick);
     m_hold.setInterval(1000);
     connect(&m_hold, &QTimer::timeout, this, &BleLink::holdTick);
+    m_retry.setSingleShot(true);
+    connect(&m_retry, &QTimer::timeout, this, [this] {
+        if (m_started && !m_advertising && !m_registering) probeTxPower();   // re-read the TX caps, then register
+    });
+}
+
+bool BleLink::shapeError(const QString &name, const QString &message)
+{
+    if (name.endsWith(QLatin1String(".InvalidArguments")) || name.endsWith(QLatin1String(".InvalidLength"))) return true;
+    const QString m = message.toLower();
+    return m.contains(QLatin1String("parse")) || m.contains(QLatin1String("too long")) || m.contains(QLatin1String("length"))
+        || m.contains(QLatin1String("invalid"));
+}
+
+void BleLink::scheduleRetry()
+{
+    if (!m_started) return;
+    m_retry.start(m_retryDelayMs);
+    m_retryDelayMs = std::min(kRetryMaxMs, m_retryDelayMs * 2);
+}
+
+// bluetoothd went away or came back (a restart, a crash, the OOM killer): a new one knows nothing of our advertisement
+// or discovery session, and we cannot learn that from a reply we never get. Start both again.
+void BleLink::onBluezOwnerChanged(const QString &, const QString &, const QString &newOwner)
+{
+    if (!m_started) return;
+    qInfo("beaconfix: BlueZ %s: advertising and scanning start again", newOwner.isEmpty() ? "went away" : "(re)started");
+    ++m_regGen;                                                 // replies to the old daemon no longer count
+    const bool was = m_advertising;
+    m_advertising = m_registering = m_reregister = false;
+    m_scanning = false; m_scanQuietMs = 0;
+    m_devs.clear();
+    if (was) emit advertisingChanged(false);
+    m_retry.stop(); m_retryDelayMs = kRetryMinMs;
+    if (newOwner.isEmpty()) return;                              // wait for it to come back
+    QTimer::singleShot(2000, this, [this] {
+        if (!m_started) return;
+        setDiscovery(true);
+        if (!m_advertising && !m_registering) probeTxPower();
+    });
 }
 
 BleLink::~BleLink() { stop(); }
@@ -37,6 +78,7 @@ void BleLink::setIdentity(const QString &identityId)
     if (identityId == m_identity) return;
     m_identity = identityId;
     if (m_advertising) { unregisterAdvert(); registerAdvert(); }
+    else if (m_registering) m_reregister = true;
 }
 void BleLink::setFlags(bool rttResponder, bool apiReachable, int kind, bool calibrating)
 {
@@ -44,6 +86,7 @@ void BleLink::setFlags(bool rttResponder, bool apiReachable, int kind, bool cali
     if (f == m_flags) return;
     m_flags = f;
     if (m_advertising) { unregisterAdvert(); registerAdvert(); }
+    else if (m_registering) m_reregister = true;
 }
 void BleLink::setTxPower(int dbm)
 {
@@ -68,6 +111,15 @@ void BleLink::probeTxPower()
         if (gen != m_probeGen || !m_started) return;             // superseded by a newer probe, or stopped meanwhile
         const QDBusMessage r = c->reply();
         bool settable = false; int lo = -127, hi = 20;
+        const QString en = r.errorName();
+        if (r.type() == QDBusMessage::ErrorMessage && (en.endsWith(QLatin1String(".NoReply")) || en.endsWith(QLatin1String(".Timeout"))
+                                                       || en.endsWith(QLatin1String(".ServiceUnknown")) || en.endsWith(QLatin1String(".NameHasNoOwner"))
+                                                       || en.endsWith(QLatin1String(".Disconnected")))) {
+            // bluetoothd busy (NoReply) or not there: no answer about the caps is not "cannot set TX power"
+            m_error = QStringLiteral("LEAdvertisingManager1: %1").arg(r.errorMessage());
+            if (!m_advertising && !m_registering) scheduleRetry();
+            return;
+        }
         if (r.type() == QDBusMessage::ReplyMessage && !r.arguments().isEmpty()) {
             const QVariantMap props = qdbus_cast<QVariantMap>(r.arguments().at(0));
             settable = props.value(QStringLiteral("SupportedFeatures")).toStringList().contains(QStringLiteral("CanSetTxPower"));
@@ -112,6 +164,7 @@ void BleLink::setIntervalMs(int ms)
     if (v == m_intervalMs) return;
     m_intervalMs = v;
     if (m_advertising) { unregisterAdvert(); registerAdvert(); }   // 200 ms while someone ranges, 1 s otherwise
+    else if (m_registering) m_reregister = true;
 }
 void BleLink::setScanDuty(int onSeconds, int periodSeconds)
 {
@@ -147,7 +200,12 @@ bool BleLink::start(const QString &adapterPath)
         for (auto it = mo.begin(); it != mo.end(); ++it)
             if (it.value().contains(QStringLiteral("org.bluez.Device1"))) consider(it.key().path(), it.value().value(QStringLiteral("org.bluez.Device1")), false);
     });
+    if (!m_bluezWatch) {
+        m_bluezWatch = new QDBusServiceWatcher(kBluez, bus, QDBusServiceWatcher::WatchForOwnerChange, this);
+        connect(m_bluezWatch, &QDBusServiceWatcher::serviceOwnerChanged, this, &BleLink::onBluezOwnerChanged);
+    }
     m_started = true;
+    m_retryDelayMs = kRetryMinMs;
     m_window = nowMs() / 1000 / 900;
     probeTxPower();                                             // registers the advert when BlueZ has answered
     setDiscovery(true);
@@ -159,8 +217,8 @@ bool BleLink::start(const QString &adapterPath)
 void BleLink::stop()
 {
     if (!m_started) return;
-    ++m_probeGen;
-    m_rotate.stop(); m_duty.stop(); m_hold.stop();
+    ++m_probeGen; ++m_regGen;
+    m_rotate.stop(); m_duty.stop(); m_hold.stop(); m_retry.stop();
     setDiscovery(false);
     unregisterAdvert();
     if (m_adv) { QDBusConnection::systemBus().unregisterObject(kAdvPath); m_adv->deleteLater(); m_adv = nullptr; }
@@ -178,11 +236,14 @@ void BleLink::registerAdvert()
         m_adv = new BleAdvertisement(this);
         m_adv->setProperty("bfTx", m_txSettable);
         if (m_txSettable) new BleAdvertisementTxAdaptor(m_adv); else new BleAdvertisementAdaptor(m_adv);
-        connect(m_adv, &BleAdvertisement::released, this, [this] { m_advertising = false; emit advertisingChanged(false); });
+        connect(m_adv, &BleAdvertisement::released, this, [this] {   // BlueZ dropped it (adapter reset, daemon going down): again later
+            m_advertising = false; emit advertisingChanged(false); scheduleRetry(); });
         connect(m_adv, &BleAdvertisement::txSelected, this, &BleLink::onTxSelected, Qt::QueuedConnection);
         if (!bus.registerObject(kAdvPath, m_adv, QDBusConnection::ExportAdaptors)) {
             m_error = QStringLiteral("cannot export %1 on the system bus").arg(kAdvPath);
             emit error(m_error);
+            delete m_adv; m_adv = nullptr;
+            scheduleRetry();
             return;
         }
     }
@@ -193,31 +254,44 @@ void BleLink::registerAdvert()
     // Legacy adverts hold 31 bytes: the 128-bit service data takes 28. Try with the TX-power AD (3 bytes)
     // first; if BlueZ says it does not fit (it may add Flags), register without it — TX power is in byte 8 anyway.
     m_registering = true;
-    auto attempt = [this](bool withTx, auto &&self) -> void {
+    m_retry.stop();
+    const int gen = ++m_regGen;
+    auto attempt = [this, gen](bool withTx, auto &&self) -> void {
         m_adv->includes = withTx ? QStringList{QStringLiteral("tx-power")} : QStringList{};
         QDBusMessage call = QDBusMessage::createMethodCall(kBluez, m_adapter, QStringLiteral("org.bluez.LEAdvertisingManager1"),
                                                            QStringLiteral("RegisterAdvertisement"));
         call << QVariant::fromValue(QDBusObjectPath(kAdvPath)) << QVariantMap();
         auto *w = new QDBusPendingCallWatcher(QDBusConnection::systemBus().asyncCall(call, 10000), this);
-        connect(w, &QDBusPendingCallWatcher::finished, this, [this, withTx, self](QDBusPendingCallWatcher *c) {
+        connect(w, &QDBusPendingCallWatcher::finished, this, [this, withTx, self, gen](QDBusPendingCallWatcher *c) {
             QDBusPendingReply<> r = *c;
             c->deleteLater();
+            if (gen != m_regGen) return;                         // stopped, or bluetoothd restarted meanwhile
             if (r.isError()) {
-                if (withTx) { self(false, self); return; }
-                if (m_txSettable) {                              // this BlueZ refused the TxPower request: go without it
-                    m_txSettable = false; m_tx = 127; m_txConfirmed = false;
-                    emit txPowerChanged(m_tx);
-                    registerAdvert();
-                    return;
+                const QString name = r.error().name(), msg = r.error().message();
+                if (shapeError(name, msg)) {
+                    if (withTx) { self(false, self); return; }   // the TX-power AD did not fit: without it (byte 8 still says it)
+                    if (m_txSettable) {                          // this BlueZ refused the TxPower request: go without it
+                        m_txSettable = false; m_tx = 127; m_txConfirmed = false;
+                        emit txPowerChanged(m_tx);
+                        registerAdvert();
+                        return;
+                    }
                 }
+                // Transient (NoReply: bluetoothd busy past our 10 s — it may still register it; AlreadyExists: it did;
+                // Failed / NotPermitted): nothing about the advert's shape is wrong, so nothing is dropped. Clear our path
+                // and try again; this used to give up for good and leave a stale advert on the air.
                 m_registering = false; m_reregister = false;
-                m_error = QStringLiteral("RegisterAdvertisement: %1").arg(r.error().message());
+                m_error = QStringLiteral("RegisterAdvertisement: %1").arg(msg);
                 emit error(m_error);
+                qWarning("beaconfix: BLE advert: %s (%s); retrying in %d s", qPrintable(msg), qPrintable(name), m_retryDelayMs / 1000);
+                unregisterAdvert(true);
+                scheduleRetry();
                 return;
             }
             m_registering = false;
             m_advertising = true;
             m_error.clear();
+            m_retryDelayMs = kRetryMinMs;
             emit advertisingChanged(true);
             if (m_reregister) { m_reregister = false; unregisterAdvert(); registerAdvert(); }   // byte 8 := the selected level
         });
@@ -228,14 +302,15 @@ void BleLink::registerAdvert()
 // Asynchronous, like probeTxPower(): this runs on the tray's GUI thread (every tag rotation, interval or flag change),
 // and a busy bluetoothd must not freeze it. Messages on one connection are delivered in order and bluetoothd drops the
 // advertisement before it answers, so a RegisterAdvertisement sent right after finds the path free.
-void BleLink::unregisterAdvert()
+void BleLink::unregisterAdvert(bool evenIfNotAdvertising)
 {
-    if (!m_advertising) return;
+    if (!m_advertising && !evenIfNotAdvertising) return;      // (evenIfNotAdvertising: after an error; DoesNotExist is fine)
     QDBusMessage call = QDBusMessage::createMethodCall(kBluez, m_adapter, QStringLiteral("org.bluez.LEAdvertisingManager1"),
                                                        QStringLiteral("UnregisterAdvertisement"));
     call << QVariant::fromValue(QDBusObjectPath(kAdvPath));
     auto *w = new QDBusPendingCallWatcher(QDBusConnection::systemBus().asyncCall(call, 3000), this);
     connect(w, &QDBusPendingCallWatcher::finished, w, &QObject::deleteLater);
+    if (!m_advertising) return;
     m_advertising = false;
     emit advertisingChanged(false);
 }
@@ -268,10 +343,35 @@ void BleLink::rotate()
     if (w == m_window) return;
     m_window = w;
     if (m_advertising) { unregisterAdvert(); registerAdvert(); }   // a new 15-minute tag
+    else if (m_registering) m_reregister = true;                  // (not advertising at all: the retry registers with the new tag)
+}
+
+// Discovery restarted by the watchdog: stop, then start again a second later (filter included)
+void BleLink::restartDiscovery()
+{
+    setDiscovery(false);
+    QTimer::singleShot(1000, this, [this] { if (m_started && !m_scanning) setDiscovery(true); });
 }
 
 void BleLink::dutyTick()
 {
+    // Watchdog: BlueZ said Discovering, but for a minute of scanning not one LE advert of any device arrived (the
+    // controller or bluetoothd wedged: it heard nothing for ~50 min while we reported a healthy scan). Say so, and
+    // restart discovery once a minute until something is heard again.
+    if (m_scanning) {
+        m_scanQuietMs += 1000;
+        const qint64 now = nowMs();
+        if (m_scanQuietMs >= kScanStallMs && now - m_lastScanRestartMs >= 60000) {
+            if (!m_scanStalled) {
+                m_scanStalled = true;
+                qWarning("beaconfix: BLE scan hears nothing for %lld s of scanning: restarting discovery", m_scanQuietMs / 1000);
+                emit scanStalledChanged(true);
+            }
+            m_lastScanRestartMs = now;
+            restartDiscovery();
+            return;
+        }
+    }
     if (m_scanOn >= m_scanPeriod) { if (!m_scanning) setDiscovery(true); return; }
     m_dutyPhase = (m_dutyPhase + 1) % m_scanPeriod;
     const bool want = m_dutyPhase < m_scanOn;
@@ -333,6 +433,8 @@ void BleLink::consider(const QString &path, const QVariantMap &props, bool)
     d.rssi = props.value(QStringLiteral("RSSI")).toInt();
     d.lastEvent = nowMs();
     ++m_advertsSeen;
+    m_scanQuietMs = 0;                                          // the scanner hears (any device counts)
+    if (m_scanStalled) { m_scanStalled = false; qInfo("beaconfix: BLE scan hears adverts again"); emit scanStalledChanged(false); }
     if (!d.ours) return;
     const RangeMath::BleAdvert a = RangeMath::parseServiceData(d.serviceData);
     if (!a.valid) return;

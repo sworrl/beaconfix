@@ -5,6 +5,7 @@
 //   g++ -std=c++17 -O2 -Wall -Wextra -fPIC $(pkg-config --cflags Qt6Widgets Qt6DBus Qt6Network Qt6Sql) -Isrc tests/ranging_service_test.cpp $OBJS $MOC -o build/ranging_service_test $(pkg-config --libs Qt6Widgets Qt6DBus Qt6Network Qt6Sql) -lcrypto
 //   ./build/ranging_service_test
 #include "../src/ranging/rangingservice.h"
+#include "../src/ranging/blelink.h"
 #include <QCoreApplication>
 #include <cmath>
 #include <cstdio>
@@ -54,6 +55,33 @@ int main(int argc, char **argv)
     CHECK(!RangingService::freshLevel(r, 0, 10, false).valid, "only held repeats → no update");
     const Level ten = RangingService::freshLevel(r, 10, 10, false);
     CHECK(ten.nEff == all.nEff && ten.sigma == all.sigma, "all fresh → exactly levelFromSamples (N_eff %.2f)", ten.nEff);
+
+    // A drifted RTT offset: calibrated 13.767 m (0.6 m read 14.37 m); later bursts at 7.1–12.9 m put the range below zero
+    std::vector<double> implied;
+    for (double b : {10.9, 11.4, 7.1, 12.9, 10.2, 11.8, 9.6, 10.9, 12.1}) implied.push_back(b - 13.767);
+    double med = 0;
+    CHECK(!RangingService::rttOffsetStale(implied, 0.1, &med), "9 bursts are not enough to judge the offset");
+    implied.push_back(10.5 - 13.767);
+    CHECK(RangingService::rttOffsetStale(implied, 0.1, &med), "10 bursts, median %.2f m below zero → offset out of date", med);
+    CHECK(std::fabs(med - (10.9 - 13.767)) < 1e-9, "median range %.3f m", med);
+    // A good offset at contact distance: bursts scatter around 0 m (some negative) — not stale
+    std::vector<double> touching;
+    for (double b : {-0.4, 0.3, -0.2, 0.1, 0.6, -0.5, 0.2, 0.0, -0.1, 0.4, -0.3, 0.2}) touching.push_back(b);
+    CHECK(!RangingService::rttOffsetStale(touching, 0.1), "devices touching, noisy bursts around 0 m → still calibrated");
+    // A loosely known offset (σ 0.5 m) needs a median below −1.5 m
+    std::vector<double> loose(12, -1.2);
+    CHECK(!RangingService::rttOffsetStale(loose, 0.5), "−1.2 m with σ_offset 0.5 m is within 3σ");
+    CHECK(RangingService::rttOffsetStale(loose, 0.1), "−1.2 m with σ_offset 0.1 m is not");
+
+    // BLE advert registration errors: only a wrong shape drops the TX-power AD / TxPower; the rest retry
+    CHECK(BleLink::shapeError(QStringLiteral("org.bluez.Error.InvalidLength"), QStringLiteral("Advertising data too long")), "too long → shape");
+    CHECK(BleLink::shapeError(QStringLiteral("org.bluez.Error.Failed"), QStringLiteral("Failed to parse advertisement.")), "cannot parse (TxPower refused) → shape");
+    CHECK(BleLink::shapeError(QStringLiteral("org.bluez.Error.InvalidArguments"), QStringLiteral("Invalid arguments in method call")), "invalid arguments → shape");
+    CHECK(!BleLink::shapeError(QStringLiteral("org.freedesktop.DBus.Error.NoReply"), QStringLiteral("Did not receive a reply. Possible causes include: the remote application did not send a reply")),
+          "NoReply (bluetoothd busy) → transient, keep TX power");
+    CHECK(!BleLink::shapeError(QStringLiteral("org.bluez.Error.AlreadyExists"), QStringLiteral("Already Exists")), "AlreadyExists → transient: unregister and retry");
+    CHECK(!BleLink::shapeError(QStringLiteral("org.bluez.Error.NotPermitted"), QStringLiteral("Maximum advertisements reached")), "no free instance → transient");
+    CHECK(!BleLink::shapeError(QStringLiteral("org.bluez.Error.Failed"), QStringLiteral("Failed to register advertisement")), "plain Failed → transient");
 
     std::printf("%s (%d failure%s)\n", fails ? "FAILED" : "ALL PASS", fails, fails == 1 ? "" : "s");
     return fails ? 1 : 0;
