@@ -23,17 +23,46 @@ class MainActivity : ComponentActivity() {
     override fun onStart() { super.onStart(); ranging.foreground(true) }
     /** Test hook: `--es rtt_bssid 4E:… --ei rtt_freq 5180 --ei rtt_bw 80 --ei rtt_center 5210 --es rtt_preamble vht` ranges that responder before the desktop serves /ranging/info. */
     private fun rttHook(i: Intent) { i.getStringExtra("rtt_bssid")?.let { b -> ranging.overrideRtt(if (b == "off") null else org.sworrl.beaconfix.data.api.RttInfo(bssid = b.uppercase(), freqMHz = i.getIntExtra("rtt_freq", 2412), centerFreq0MHz = i.getIntExtra("rtt_center", 0), bandwidthMHz = i.getIntExtra("rtt_bw", 20), preamble = i.getStringExtra("rtt_preamble") ?: "ht", enabled = true)) } }
-    override fun onStop() { super.onStop(); ranging.foreground(false) }
+    override fun onStop() {
+        super.onStop(); ranging.foreground(false)
+        // Shown over the keyguard for an adb capture and now off screen (the screen went off, another app came up):
+        // go away. Waking the phone must show the keyguard, not BeaconFix; and a stopped activity cannot be brought
+        // back over the keyguard (its next intent would wait for a resume that never comes), so the next capture
+        // starts a fresh one.
+        if (shownOverKeyguard && !isChangingConfigurations) { lockScreen(false); finish() }
+    }
+    override fun onSaveInstanceState(outState: Bundle) { super.onSaveInstanceState(outState); outState.putBoolean(KEY_OVER_KEYGUARD, overKeyguard) }
     override fun onCreate(savedInstanceState: Bundle?) {
         installSplashScreen()
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        // Automation hooks (adb / tests): `am start -n org.sworrl.beaconfix/.MainActivity --es pair_host <host> [--ei pair_port 47822] [--es action sync|scan|identity|…]`
-        launch.value = incoming(intent, LaunchArgs.from(intent)); rttHook(intent); simHook(intent)
-        // Screenshot automation over adb only (`--ez show_when_locked true`): lets the activity draw over the lock screen for this launch.
-        if (intent.getBooleanExtra("show_when_locked", false) && android.os.Build.VERSION.SDK_INT >= 27) { setShowWhenLocked(true); setTurnScreenOn(true) }
+        // A launch is handled once. A recreated activity (rotation, dark theme at sunset, font scale, restore after the
+        // process died) or a relaunch from Recents gets the same intent again: replaying it pushed another Help screen,
+        // jumped to the map or reopened the share sheet.
+        val fresh = savedInstanceState == null && (intent.flags and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY) == 0
+        if (fresh) {
+            // Automation hooks (adb / tests): `am start -n org.sworrl.beaconfix/.MainActivity --es pair_host <host> [--ei pair_port 47822] [--es action sync|scan|identity|…]`
+            launch.value = incoming(intent, LaunchArgs.from(intent)); rttHook(intent); simHook(intent)
+        }
+        // Screenshot automation over adb only (`--ez show_when_locked true`): lets the activity draw over the lock screen for this launch
+        // (a rotation or theme change keeps it for that launch).
+        lockScreen(if (fresh) intent.getBooleanExtra("show_when_locked", false) else savedInstanceState?.getBoolean(KEY_OVER_KEYGUARD) == true)
         setContent { val args by launch; BeaconFixTheme { BeaconFixRoot(args) } }
     }
+    /**
+     * One-shot: drawing over the keyguard holds for the launch that asked for it and ends with the next intent without
+     * the extra or when the activity stops (see onStop). It used to stay on until the activity was destroyed, so a
+     * locked phone left on BeaconFix by an adb capture opened Help, Settings and Identity export to whoever picked it up.
+     */
+    private var overKeyguard = false
+    private var shownOverKeyguard = false                   // this instance was drawn over the keyguard at some point
+    private fun lockScreen(on: Boolean) {
+        overKeyguard = on
+        if (on) shownOverKeyguard = true
+        if (android.os.Build.VERSION.SDK_INT < 27) return
+        setShowWhenLocked(on); setTurnScreenOn(on)
+    }
+    private companion object { const val KEY_OVER_KEYGUARD = "bf_over_keyguard" }
     @javax.inject.Inject lateinit var prefs: org.sworrl.beaconfix.data.Prefs
     /**
      * Test hook: `--ez sim_offline true|false --ez sim_no_desktop true|false` sets the offline-simulation prefs (DevFlags).
@@ -72,7 +101,7 @@ class MainActivity : ComponentActivity() {
     private val launch = mutableStateOf(LaunchArgs())
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent); setIntent(intent); launch.value = incoming(intent, LaunchArgs.from(intent)); rttHook(intent); simHook(intent)
-        if (intent.getBooleanExtra("show_when_locked", false) && android.os.Build.VERSION.SDK_INT >= 27) { setShowWhenLocked(true); setTurnScreenOn(true) }
+        lockScreen(intent.getBooleanExtra("show_when_locked", false))
     }
 }
 
