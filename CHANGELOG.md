@@ -4,6 +4,50 @@ All notable changes to BeaconFix are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [3.8.0] — unreleased
+
+### 3.8.0 - Ranging (desktop, Pi agent 1.1.0, Android 1.4.0)
+
+#### Fixed
+- **Long-running range filters were overconfident** (a desktop that had ranged for hours read 1.0 m
+  [0.87, 1.15] for a true 0.6 m). A still BLE link's offset was allowed to drift only 0.6 dB per √hour;
+  it is now 3 dB per √hour (`P_bb += 2.5·10⁻³·Δt`), identically in C++ and Kotlin. In a new 2-hour
+  simulation (RTT for 10 min, then BLE only, links drifting) the 16–84 % interval now holds the truth
+  in 82 % of runs (38 % before) and the RMS error drops from 0.238 m to 0.137 m. The shared test vectors
+  are regenerated (`filter` changes, `filter_drift` is new; RANGING.md §11).
+- **Calibration: the RTT offset's uncertainty came from the outliers.** It used the largest burst σ of
+  the whole window, rejected bursts included; it now uses the cluster's bursts only (the larger of their
+  RMS reported σ and their scatter). When three or more bursts do not agree (fewer than 3, or under
+  30 %, in one 2 m cluster) the calibration **fails and changes nothing** — no offset, no BLE model, not
+  marked calibrated — instead of calibrating the BLE links against a distance RTT disputed; the event
+  log and the new `calib.last` say why. Fewer than 3 bursts (a phone in Doze) still calibrate BLE alone.
+- **Automatic BLE learning** is gated on an explicit `calib.rttCalibrated` (kept in `ranging.json`)
+  instead of inferring it from the offset's variance.
+- **Pi agent: no TX power in its advert** (byte 8 was 127, no TX-power AD), so the desktop's up link
+  from it used the −59 dBm "unknown" reference. The agent now requests 7 dBm through BlueZ when
+  `CanSetTxPower` is offered, carries the level (or the one BlueZ reports as selected) in byte 8, and
+  always asks for the TX-power AD so scanners can fall back to it. Its kind bits come from its config
+  (`gnss` → 4, else 3) and are never a desktop's. Agent version 1.1.0; redeploy it with
+  `agent/install-on-pi.sh --keep-token`.
+- **The desktop dropped an old agent's advert as its own**: an advert with a desktop's tag now counts as
+  that desktop (or as us) only when its kind bits say desktop or laptop; an agent from before 3.7 (our
+  tag, kind pi) is resolved like an unknown advert and bound to the Pi that is posting `/ranging`.
+- **Down-link TX reference without `CanSetTxPower`**: while the desktop's byte 8 says 127, its down-link
+  prior uses the TX power the peer reports for our advert (its TX-power AD fallback) instead of −59 dBm.
+- **BLE on the desktop**: `UnregisterAdvertisement` (every tag rotation, interval or flag change) was a
+  3 s blocking D-Bus call on the tray's GUI thread; it is asynchronous now. The once-a-second repeat of a
+  held RSSI (BlueZ reports only changes) no longer counts as a new sample: it weights the level by time
+  but `N_eff` counts reported samples only, and a window of repeats alone is no update.
+
+#### Changed
+- **Android 1.4.0: RTT bursts are paced.** With the app open or the collector on, 1.3.x fired a burst every
+  2.5 s for as long as the session lasted. Once the fused distance has held for 2 min with neither side
+  moving, the phone now sends one burst every 30 s (`rttState` `slow`), and posts with each burst and at
+  least every 10 s (BLE samples in between are kept for the next post). Back to a burst every tick when the
+  phone or the desktop moves, the desktop's BLE level moves by more than 6 dB, the distance leaves its band,
+  or the user opens the app or a ranging view. Unit-tested (`RttPacerTest`).
+- `GET /api/v1/ranging` `calib` gains `rttCalibrated` and `last` (additive).
+
 ## [Android 1.3.2] — 2026-09-27
 
 ### Fixed
