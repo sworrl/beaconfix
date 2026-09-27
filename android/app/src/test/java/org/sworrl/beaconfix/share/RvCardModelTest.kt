@@ -94,5 +94,7 @@ class RvCardModelTest {
         assertNull(ShareViewModel.addressNear(snap, 40.01, -75.0))                  // 1.1 km away
         assertNull(ShareViewModel.addressNear(snap.copy(origin = "none"), 40.0, -75.0))
         assertNull(ShareViewModel.addressNear(snap.copy(address = null), 40.0, -75.0))
+        // a saved address (resolved earlier, not for this spot) is never put into a shared location
+        assertNull(ShareViewModel.addressNear(snap.copy(address = snap.address!!.copy(fromCache = true)), 40.0, -75.0))
     }
 }

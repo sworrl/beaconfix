@@ -173,15 +173,28 @@ private fun DispatcherCard(s: HelpSnapshot, meta: HelpMeta, now: Long) {
             val saved = if (a.fromCache) " " + stringResource(R.string.help_saved) else ""
             if (place.isNotBlank() || saved.isNotBlank()) Text(place + saved, style = MaterialTheme.typography.bodyMedium)
         } else Text(stringResource(R.string.help_dispatcher_no_address), color = Slate, style = MaterialTheme.typography.bodySmall)
-        val text = ShareText.location(s.originLat, s.originLon, meta.originAccM.takeIf { it > 0 }, s.address?.oneLine())
-        val subject = stringResource(R.string.help_share_subject)
+        // What is sent says what the screen says: the RV's position is labelled as such, an old fix carries its time,
+        // and a saved address (resolved nearby, not for this exact spot) is marked
+        val subject = if (s.origin == Origin.RV) ShareText.RV_POSITION else stringResource(R.string.help_share_subject)
+        fun text(at: Long) = ShareText.location(
+            s.originLat, s.originLon, meta.originAccM.takeIf { it > 0 }, dispatcherAddress(s.address),
+            label = if (s.origin == Origin.RV) ShareText.RV_POSITION else null,
+            fixAtMs = if (s.originAgeMs > 0 && meta.lastRunAt > 0) meta.lastRunAt - s.originAgeMs else 0L, nowMs = at,
+        )
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            OutlinedButton(onClick = { clip.setText(AnnotatedString(text)); copied = true }, modifier = Modifier.heightIn(min = 48.dp)) {
+            OutlinedButton(onClick = { clip.setText(AnnotatedString(text(System.currentTimeMillis()))); copied = true }, modifier = Modifier.heightIn(min = 48.dp)) {
                 Text(if (copied) stringResource(R.string.help_copied) else stringResource(R.string.help_copy))
             }
-            OutlinedButton(onClick = { Intents.shareText(ctx, text, subject) }, modifier = Modifier.heightIn(min = 48.dp)) { Text(stringResource(R.string.help_share)) }
+            OutlinedButton(onClick = { Intents.shareText(ctx, text(System.currentTimeMillis()), subject) }, modifier = Modifier.heightIn(min = 48.dp)) { Text(stringResource(R.string.help_share)) }
         }
     }
+}
+
+/** The address line for the share text: a saved one is marked, since it was resolved near here, not for this spot. */
+internal fun dispatcherAddress(a: org.sworrl.beaconfix.help.AddressLine?): String? {
+    if (a == null) return null
+    val line = a.oneLine().takeIf { it.isNotBlank() } ?: return null
+    return if (a.fromCache) "Saved address nearby (check it): $line" else line
 }
 
 @Composable

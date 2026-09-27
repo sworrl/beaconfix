@@ -29,9 +29,11 @@ import kotlin.coroutines.resume
 
 /**
  * A street address for the dispatcher. Order: Android's Geocoder (asynchronous on API 33+; `subAdminArea` is the
- * county), then one Nominatim reverse lookup, then the newest saved `address` snapshot. A lookup happens only when the
- * spot is more than [MOVED_M] from the last resolved address; results are saved as snapshot kind `address`, source
- * `phone`. With [resolve]'s `allowNetwork` false (background refreshes) only the saved address is used.
+ * county), then one Nominatim reverse lookup, then a saved `address` snapshot — but only one that was resolved within
+ * [SAVED_NEAR_M] of the spot ([savedUsable]). A lookup happens only when the spot is more than [MOVED_M] from the last
+ * resolved address; results are saved as snapshot kind `address`, source `phone`. With [resolve]'s `allowNetwork` false
+ * (background refreshes) only a saved address is used. No address at all is better than the last campground's street
+ * read out to 911: then the card says to read the coordinates.
  */
 @Singleton
 class AddressResolver @Inject constructor(@ApplicationContext private val ctx: Context, private val cache: DesktopCache) {
@@ -52,8 +54,11 @@ class AddressResolver @Inject constructor(@ApplicationContext private val ctx: C
                 return found.copy(fromCache = false)
             }
         }
+        // Offline (the usual case on arrival at a new site): a saved address only when it was resolved right here
         val newest = runCatching { cache.snapshotNow(KIND) }.getOrNull()
-        return (cache.decode<AddressLine>(newest) ?: mineLine)?.copy(fromCache = true)
+        return listOf(newest, mine).firstNotNullOfOrNull { s ->
+            s?.takeIf { savedUsable(it.lat, it.lon, lat, lon) }?.let { cache.decode<AddressLine>(it) }?.takeUnless { it.isEmpty() }
+        }?.copy(fromCache = true)
     }
 
     private suspend fun geocoder(lat: Double, lon: Double): AddressLine? {
@@ -91,6 +96,12 @@ class AddressResolver @Inject constructor(@ApplicationContext private val ctx: C
     companion object {
         const val KIND = "address"
         const val MOVED_M = 200.0
+        /** How far from where it was resolved a saved address may still be shown (marked "saved"). */
+        const val SAVED_NEAR_M = 500.0
+
+        /** A saved address resolved at ([savedLat], [savedLon]) may stand for ([lat], [lon]): known spot, within [SAVED_NEAR_M]. */
+        fun savedUsable(savedLat: Double, savedLon: Double, lat: Double, lon: Double): Boolean =
+            Origin.valid(savedLat, savedLon) && Geo.distanceM(savedLat, savedLon, lat, lon) <= SAVED_NEAR_M
         private const val NOMINATIM_GAP_MS = 60_000L
         private const val TAG = "BfHelp"
         val USER_AGENT = "BeaconFix-Android/${BuildConfig.VERSION_NAME} (+https://github.com/sworrl/beaconfix)"

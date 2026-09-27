@@ -73,13 +73,17 @@ class ShareViewModel @Inject constructor(
         viewModelScope.launch {
             try {
                 val fresh = withContext(Dispatchers.IO) { runCatching { location.current(FRESH_FIX_MS) }.getOrNull() }
-                val (lat, lon, acc) = fresh?.let { Triple(it.latitude, it.longitude, if (it.hasAccuracy()) it.accuracy.toDouble() else null) }
-                    ?: withContext(Dispatchers.IO) { db.fixes().lastPhone() }?.let { Triple(it.lat, it.lon, it.acc) }
+                // (lat, lon, accuracy, when): a fresh fix, else the last one the phone took — which may be hours old
+                val spot = fresh?.let { Spot(it.latitude, it.longitude, if (it.hasAccuracy()) it.accuracy.toDouble() else null, System.currentTimeMillis()) }
+                    ?: withContext(Dispatchers.IO) { db.fixes().lastPhone() }?.let { Spot(it.lat, it.lon, it.acc, it.time) }
                     ?: run { Toast.makeText(app, app.getString(R.string.share_no_fix), Toast.LENGTH_LONG).show(); return@launch }
-                val text = ShareText.location(lat, lon, acc, addressNear(help.snapshot.value, lat, lon))
+                val (lat, lon, acc) = spot
+                val now = System.currentTimeMillis()
+                val text = ShareText.location(lat, lon, acc, addressNear(help.snapshot.value, lat, lon),
+                    label = if (fresh == null) ShareText.LAST_KNOWN else null, fixAtMs = spot.at, nowMs = now)
                 Log.i(TAG, "share location (${if (fresh != null) "fresh" else "last"} fix)")
                 val target = ctx.takeUnless { it.finishing() } ?: app
-                Intents.shareText(target, text, app.getString(R.string.share_subject))
+                Intents.shareText(target, text, if (fresh == null) ShareText.LAST_KNOWN else app.getString(R.string.share_subject))
             } finally {
                 sharing.value = false
             }
@@ -97,15 +101,20 @@ class ShareViewModel @Inject constructor(
         else -> false
     }
 
+    private data class Spot(val lat: Double, val lon: Double, val acc: Double?, val at: Long)
+
     companion object {
         private const val TAG = "BfShare"
         const val FRESH_FIX_MS = 8_000L
         /** Help's address is for its origin; it is only added when the shared spot is that close to it. */
         const val ADDRESS_NEAR_M = 300.0
 
-        /** "1 Test Street, Testville, PA", when [s] resolved an address within [ADDRESS_NEAR_M] of the spot; else null. */
+        /**
+         * "1 Test Street, Testville, PA", when [s] resolved an address within [ADDRESS_NEAR_M] of the spot; else null.
+         * A saved address (resolved earlier, near but not at Help's origin) is never added: it may belong elsewhere.
+         */
         fun addressNear(s: HelpSnapshot, lat: Double, lon: Double): String? {
-            val a = s.address ?: return null
+            val a = s.address?.takeUnless { it.fromCache } ?: return null
             if (s.origin == "none" || (s.originLat == 0.0 && s.originLon == 0.0)) return null
             if (Geo.distanceM(s.originLat, s.originLon, lat, lon) > ADDRESS_NEAR_M) return null
             return listOf(a.line, a.locality, a.state).map { it.trim() }.filter { it.isNotEmpty() }.distinct().joinToString(", ").ifBlank { null }
