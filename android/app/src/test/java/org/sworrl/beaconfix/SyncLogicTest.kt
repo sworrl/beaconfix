@@ -10,7 +10,7 @@ import org.sworrl.beaconfix.estimate.ScanSample
 import org.sworrl.beaconfix.sync.SyncRepository
 
 class SyncLogicTest {
-    private fun obs(i: Int) = ObservationEntity(id = i.toLong(), bssid = "AA:BB:CC:DD:EE:%02X".format(i), time = 1_700_000_000_000L + i, lat = 39.7, lon = -80.07, acc = 8.0, dbm = -60, source = "phone-gps")
+    private fun obs(i: Int) = ObservationEntity(id = i.toLong(), bssid = "AA:BB:CC:DD:EE:%02X".format(i), time = 1_700_000_000_000L + i, lat = 40.0, lon = -75.07, acc = 8.0, dbm = -60, source = "phone-gps")
 
     @Test fun pushBatchesStayUnderTheDesktopBodyLimit() {
         val rows = (0 until 200).map { obs(it) }

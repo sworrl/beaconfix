@@ -15,5 +15,12 @@ import javax.inject.Singleton
 object AppModule {
     @Provides @Singleton
     fun database(@ApplicationContext ctx: Context): AppDatabase =
-        Room.databaseBuilder(ctx, AppDatabase::class.java, "beaconfix.db").fallbackToDestructiveMigration().build()
+        Room.databaseBuilder(ctx, AppDatabase::class.java, "beaconfix.db").addMigrations(MIGRATION_2_3).fallbackToDestructiveMigration().build()
+
+    /** 1.2 → 1.3: the anchors table (docs/RANGING.md §4). Everything else is untouched, so no data is lost on update. */
+    private val MIGRATION_2_3 = object : androidx.room.migration.Migration(2, 3) {
+        override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+            db.execSQL("CREATE TABLE IF NOT EXISTS `anchors` (`id` TEXT NOT NULL, `json` TEXT NOT NULL, `name` TEXT NOT NULL, `kind` TEXT NOT NULL, `lat` REAL NOT NULL, `lon` REAL NOT NULL, `rv` INTEGER NOT NULL, `ref` INTEGER NOT NULL, `deleted` INTEGER NOT NULL, `placedAt` TEXT NOT NULL, `seq` INTEGER NOT NULL, `dirty` INTEGER NOT NULL, PRIMARY KEY(`id`))")
+        }
+    }
 }

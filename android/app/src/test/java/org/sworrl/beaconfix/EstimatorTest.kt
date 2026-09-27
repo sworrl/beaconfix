@@ -15,7 +15,7 @@ import kotlin.math.sin
 import kotlin.random.Random
 
 class EstimatorTest {
-    private val lat0 = 40.0; private val lon0 = -75.0
+    private val lat0 = 40.00; private val lon0 = -75.07
     private fun rssi(d: Double, p0: Double = -38.0, n: Double = 2.7, noise: Double, rnd: Random) = (p0 - 10 * n * log10(maxOf(1.0, d)) + rnd.nextDouble(-noise, noise)).toInt()
 
     /** 40 samples on a walk around an AP 60 m across, 4 dB noise, 6 m GPS error → position within 15 m. */

@@ -30,7 +30,8 @@ import org.sworrl.beaconfix.ui.theme.Slate
 import org.sworrl.beaconfix.ui.vm.SettingsViewModel
 
 @Composable
-fun SettingsScreen(onPair: () -> Unit, vm: SettingsViewModel = hiltViewModel()) {
+fun SettingsScreen(onPair: () -> Unit, onIdentity: () -> Unit = {}, onWidgets: () -> Unit = {}, onImport: () -> Unit = {}, vm: SettingsViewModel = hiltViewModel()) {
+    val ctx = androidx.compose.ui.platform.LocalContext.current
     val ui by vm.ui.collectAsState()
     var home by remember(ui.home) { mutableStateOf(ui.home.joinToString("\n")) }
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(vertical = 8.dp)) {
@@ -47,7 +48,34 @@ fun SettingsScreen(onPair: () -> Unit, vm: SettingsViewModel = hiltViewModel()) 
             OutlinedTextField(home, { home = it }, Modifier.fillMaxWidth(), minLines = 3, placeholder = { Text("MyRouter*\nAA:BB:CC:?D:EE:F?") })
             OutlinedButton(onClick = { vm.setHome(home) }) { Text("Save") }
         }
+        InfoCard("Status in the shade") {
+            val on by vm.statusNotification.collectAsState()
+            Text("BeaconFix keeps one silent, permanent card in the shade while it runs: your fix, beacons in range, sync state and the range to your desktop, with Scan / Sync / Pause / Map buttons. Swiping it away only puts it back.", color = Slate, style = MaterialTheme.typography.bodySmall)
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) { Column(Modifier.weight(1f)) { Text("Hide the status notification"); Text("Not recommended: the card is the foreground service that keeps BeaconFix alive. Without it Android may stop background collection and device ranging.", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }; Switch(!on, { vm.setStatusNotification(!it) }) }
+        }
+        InfoCard("Import your history") {
+            Text("Google Timeline exports, Takeout, WiGLE CSV, GPX/KML tracks and BeaconFix exports become fixes, beacons and stops on this phone. Nothing is fetched from Google — you export the file, the app reads it.", color = Slate, style = MaterialTheme.typography.bodySmall)
+            OutlinedButton(onClick = onImport) { Text("Import a file") }
+        }
+        InfoCard("Identity") {
+            Text("Your key pair and name — the same identity across the desktop, laptop and phone. Export it, link it, or move it here.", color = Slate, style = MaterialTheme.typography.bodySmall)
+            OutlinedButton(onClick = onIdentity) { Text("Manage identity") }
+        }
         InfoCard("Desktops") { OutlinedButton(onClick = onPair) { Text("Pair / manage desktops") } }
+        InfoCard("Home-screen widgets") {
+            Text("Location · Beacons · Sync · Map. They refresh every 15 minutes and after each scan or sync.", color = Slate, style = MaterialTheme.typography.bodySmall)
+            OutlinedButton(onClick = onWidgets) { Text("Preview the widgets") }
+            val pin = org.sworrl.beaconfix.widget.WidgetPinner.supported(ctx)
+            if (!pin) Text("Your launcher does not support pinning from apps — long-press the home screen → Widgets → BeaconFix.", color = Slate, style = MaterialTheme.typography.bodySmall)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(enabled = pin, onClick = { org.sworrl.beaconfix.widget.WidgetPinner.pin(ctx, org.sworrl.beaconfix.widget.LocationWidgetReceiver::class.java) }) { Text("Location") }
+                OutlinedButton(enabled = pin, onClick = { org.sworrl.beaconfix.widget.WidgetPinner.pin(ctx, org.sworrl.beaconfix.widget.BeaconsWidgetReceiver::class.java) }) { Text("Beacons") }
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(enabled = pin, onClick = { org.sworrl.beaconfix.widget.WidgetPinner.pin(ctx, org.sworrl.beaconfix.widget.SyncWidgetReceiver::class.java) }) { Text("Sync") }
+                OutlinedButton(enabled = pin, onClick = { org.sworrl.beaconfix.widget.WidgetPinner.pin(ctx, org.sworrl.beaconfix.widget.MapWidgetReceiver::class.java) }) { Text("Map") }
+            }
+        }
         InfoCard("Privacy") {
             Text("Everything stays on this phone and on the desktops you pair with. No analytics, no crash reporting, no third-party servers. The only other network traffic is map tiles (OpenStreetMap). Tokens are stored in Android's Keystore-backed encrypted preferences; the database is in app-private storage and excluded from backups.", color = Slate, style = MaterialTheme.typography.bodySmall)
             Text("BeaconFix Android ${BuildConfig.VERSION_NAME} · GPL-2.0-or-later", color = Slate, style = MaterialTheme.typography.bodySmall)

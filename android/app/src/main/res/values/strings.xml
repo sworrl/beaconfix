@@ -11,4 +11,14 @@
     <string name="nav_sync">Sync</string>
     <string name="nav_settings">Settings</string>
     <string name="cd_map">Map of beacons and positions</string>
+    <string name="widget_location_desc">Where you are: place, coordinates, accuracy, source, and whether you are home.</string>
+    <string name="widget_beacons_desc">Wi-Fi beacons in range with their security grades.</string>
+    <string name="widget_sync_desc">Paired desktop, last sync, the collector switch, and a sync button.</string>
+    <string name="widget_map_desc">A map of the beacons around your position.</string>
+    <string name="widget_location_label">BeaconFix · Location</string>
+    <string name="widget_beacons_label">BeaconFix · Beacons</string>
+    <string name="widget_sync_label">BeaconFix · Sync</string>
+    <string name="widget_map_label">BeaconFix · Map</string>
+    <string name="notif_channel_status">BeaconFix status</string>
+    <string name="notif_channel_status_desc">Where you are, what BeaconFix hears, and what it is doing — silent, always available in the shade</string>
 </resources>

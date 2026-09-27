@@ -1,71 +1,122 @@
 package org.sworrl.beaconfix.ui
 
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Explore
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Map
+import androidx.compose.material.icons.filled.MoreHoriz
+import androidx.compose.material.icons.filled.Place
 import androidx.compose.material.icons.filled.Radar
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Sync
 import androidx.compose.material.icons.filled.Wifi
+import androidx.compose.material.icons.filled.RssFeed
 import androidx.compose.material3.Icon
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
+import androidx.compose.material3.NavigationRail
+import androidx.compose.material3.NavigationRailItem
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.adaptive.currentWindowAdaptiveInfo
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
-import androidx.compose.ui.res.stringResource
+import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.navigation.NavDestination.Companion.hierarchy
+import androidx.navigation.NavHostController
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
-import org.sworrl.beaconfix.R
+import androidx.window.core.layout.WindowWidthSizeClass
+import org.sworrl.beaconfix.LaunchArgs
 import org.sworrl.beaconfix.ui.screens.BeaconsScreen
+import org.sworrl.beaconfix.ui.screens.EventsScreen
 import org.sworrl.beaconfix.ui.screens.HomeScreen
+import org.sworrl.beaconfix.ui.screens.IdentityScreen
 import org.sworrl.beaconfix.ui.screens.MapScreen
+import org.sworrl.beaconfix.ui.screens.MoreScreen
+import org.sworrl.beaconfix.ui.screens.NearbyScreen
+import org.sworrl.beaconfix.ui.screens.OnboardingScreen
 import org.sworrl.beaconfix.ui.screens.PairScreen
 import org.sworrl.beaconfix.ui.screens.SettingsScreen
 import org.sworrl.beaconfix.ui.screens.SurveyScreen
 import org.sworrl.beaconfix.ui.screens.SyncScreen
+import org.sworrl.beaconfix.ui.screens.TripScreen
+import org.sworrl.beaconfix.ui.screens.WidgetGalleryScreen
+import org.sworrl.beaconfix.ui.screens.ImportScreen
+import org.sworrl.beaconfix.ui.vm.IdentityViewModel
+import org.sworrl.beaconfix.ui.vm.RootViewModel
 
-enum class Tab(val route: String, val label: Int, val icon: ImageVector) {
-    Home("home", R.string.nav_home, Icons.Default.Home),
-    Map("map", R.string.nav_map, Icons.Default.Map),
-    Beacons("beacons", R.string.nav_beacons, Icons.Default.Wifi),
-    Survey("survey", R.string.nav_survey, Icons.Default.Radar),
-    Sync("sync", R.string.nav_sync, Icons.Default.Sync),
-    Settings("settings", R.string.nav_settings, Icons.Default.Settings),
+data class Dest(val route: String, val label: String, val icon: ImageVector, val phoneTab: Boolean)
+val DESTS = listOf(
+    Dest("home", "Home", Icons.Default.Home, true), Dest("map", "Map", Icons.Default.Map, true), Dest("beacons", "Beacons", Icons.Default.Wifi, true),
+    Dest("nearby", "Places", Icons.Default.Place, true), Dest("more", "More", Icons.Default.MoreHoriz, true),
+    Dest("trip", "Trip", Icons.Default.Explore, false), Dest("events", "Events", Icons.Default.RssFeed, false), Dest("survey", "Survey", Icons.Default.Radar, false),
+    Dest("sync", "Sync", Icons.Default.Sync, false), Dest("settings", "Settings", Icons.Default.Settings, false),
+)
+
+@Composable
+fun BeaconFixRoot(launch: LaunchArgs = LaunchArgs()) {
+    val idVm: IdentityViewModel = hiltViewModel()
+    val rootVm: RootViewModel = hiltViewModel()
+    val hasIdentity by rootVm.hasIdentity.collectAsState()
+    LaunchedEffect(launch.seq) {
+        if (!launch.importHost.isNullOrBlank() && !launch.importCode.isNullOrBlank()) { if (launch.importDryRun) idVm.checkImportFromCode(launch.importHost, launch.importCode, launch.importPass ?: "") else idVm.importFromCodeAndPass(launch.importHost, launch.importCode, launch.importPass ?: "") }
+        if (launch.action == "forget_identity") idVm.forgetAll()
+        if (!launch.linkPayload.isNullOrBlank() && launch.linkPayload.startsWith(org.sworrl.beaconfix.identity.IdentityOps.PREFIX)) idVm.handleScanned(launch.linkPayload)
+    }
+    // No identity yet → onboarding takes over the whole screen (any app: create or import)
+    if (hasIdentity == false) { OnboardingScreen(initialName = launch.identityName, onImportHistory = {}, vm = idVm); return }
+    if (hasIdentity == null) return
+    val nav = rememberNavController()
+    LaunchedEffect(launch.seq) {
+        if (!launch.pairHost.isNullOrBlank()) nav.navigate("pair?host=${launch.pairHost}&port=${launch.pairPort}")
+        if (!launch.linkPayload.isNullOrBlank()) { if (!launch.linkPayload.startsWith(org.sworrl.beaconfix.identity.IdentityOps.PREFIX)) idVm.handleScanned(launch.linkPayload); nav.navigate("identity") }
+        if (launch.file != null) nav.navigate("import")
+        if (launch.importDryRun) nav.navigate("identity")
+        when (launch.action) {
+            "sync" -> rootVm.syncNow(); "scan" -> rootVm.scanOnce(); "collector_on" -> rootVm.collector(true); "collector_off" -> rootVm.collector(false)
+            "identity", "widgets", "import", "map", "beacons", "survey", "settings", "trip", "events", "nearby", "more", "sync_tab", "anchors" -> nav.navigate(if (launch.action == "sync_tab") "sync" else launch.action)
+        }
+    }
+    val wide = currentWindowAdaptiveInfo().windowSizeClass.windowWidthSizeClass != WindowWidthSizeClass.COMPACT
+    val entry by nav.currentBackStackEntryAsState()
+    val dest = entry?.destination
+    fun go(route: String) = nav.navigate(route) { popUpTo(nav.graph.startDestinationId) { saveState = true }; launchSingleTop = true; restoreState = true }
+    val selected: (Dest) -> Boolean = { t -> dest?.hierarchy?.any { it.route == t.route } == true }
+    if (wide) {
+        Row(Modifier.fillMaxSize()) {
+            NavigationRail { for (t in DESTS.filter { it.route != "more" }) NavigationRailItem(selected = selected(t), onClick = { go(t.route) }, icon = { Icon(t.icon, contentDescription = t.label) }, label = { Text(t.label) }) }
+            Graph(nav, idVm, Modifier.fillMaxSize(), launch.file)
+        }
+    } else Scaffold(bottomBar = { NavigationBar { for (t in DESTS.filter { it.phoneTab }) NavigationBarItem(selected = selected(t), onClick = { go(t.route) }, icon = { Icon(t.icon, contentDescription = t.label) }, label = { Text(t.label) }) } }) { pad -> Graph(nav, idVm, Modifier.padding(pad), launch.file) }
 }
 
 @Composable
-fun BeaconFixRoot() {
-    val nav = rememberNavController()
-    val entry by nav.currentBackStackEntryAsState()
-    val dest = entry?.destination
-    Scaffold(bottomBar = {
-        NavigationBar {
-            Tab.entries.forEach { t ->
-                NavigationBarItem(
-                    selected = dest?.hierarchy?.any { it.route == t.route } == true,
-                    onClick = { nav.navigate(t.route) { popUpTo(nav.graph.startDestinationId) { saveState = true }; launchSingleTop = true; restoreState = true } },
-                    icon = { Icon(t.icon, contentDescription = stringResource(t.label)) },
-                    label = { Text(stringResource(t.label)) },
-                )
-            }
-        }
-    }) { pad ->
-        NavHost(nav, startDestination = Tab.Home.route, modifier = Modifier.padding(pad)) {
-            composable(Tab.Home.route) { HomeScreen(onPair = { nav.navigate("pair") }) }
-            composable(Tab.Map.route) { MapScreen() }
-            composable(Tab.Beacons.route) { BeaconsScreen() }
-            composable(Tab.Survey.route) { SurveyScreen() }
-            composable(Tab.Sync.route) { SyncScreen(onPair = { nav.navigate("pair") }) }
-            composable(Tab.Settings.route) { SettingsScreen(onPair = { nav.navigate("pair") }) }
-            composable("pair") { PairScreen(onDone = { nav.popBackStack() }) }
-        }
+private fun Graph(nav: NavHostController, idVm: IdentityViewModel, modifier: Modifier, incomingFile: android.net.Uri? = null) {
+    NavHost(nav, startDestination = "home", modifier = modifier) {
+        composable("home") { HomeScreen(onPair = { nav.navigate("pair") }, onIdentity = { nav.navigate("identity") }) }
+        composable("map") { MapScreen() }
+        composable("beacons") { BeaconsScreen() }
+        composable("nearby") { NearbyScreen() }
+        composable("more") { MoreScreen(onGo = { nav.navigate(it) }) }
+        composable("trip") { TripScreen() }
+        composable("events") { EventsScreen() }
+        composable("survey") { SurveyScreen() }
+        composable("sync") { SyncScreen(onPair = { nav.navigate("pair") }) }
+        composable("settings") { SettingsScreen(onPair = { nav.navigate("pair") }, onIdentity = { nav.navigate("identity") }, onWidgets = { nav.navigate("widgets") }, onImport = { nav.navigate("import") }) }
+        composable("pair?host={host}&port={port}") { entry -> PairScreen(onDone = { nav.popBackStack() }, autoHost = entry.arguments?.getString("host"), autoPort = entry.arguments?.getString("port")?.toIntOrNull() ?: 47822) }
+        composable("identity") { IdentityScreen(onBack = { nav.popBackStack() }, vm = idVm) }
+        composable("anchors") { org.sworrl.beaconfix.ui.screens.AnchorsScreen(onBack = { nav.popBackStack() }, onMap = { nav.navigate("map") }) }
+        composable("widgets") { WidgetGalleryScreen(onBack = { nav.popBackStack() }) }
+        composable("import") { ImportScreen(onBack = { nav.popBackStack() }, incoming = incomingFile) }
     }
 }

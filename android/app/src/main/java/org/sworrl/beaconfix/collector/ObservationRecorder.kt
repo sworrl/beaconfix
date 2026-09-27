@@ -20,13 +20,30 @@ class ObservationRecorder @Inject constructor(
     private val estimates: EstimateRepository,
     private val status: CollectorStatus,
     private val prefs: Prefs,
+    private val widgets: org.sworrl.beaconfix.widget.WidgetUpdater,
+    private val desktops: org.sworrl.beaconfix.data.DesktopStore,
 ) {
+    private val noPositionEndpoint = HashSet<String>()
+    private var lastReport = 0L
+    /** Lightweight position report (`POST /api/v1/devices/position`) at most once a minute; a 404 marks the desktop as not having it. */
+    private suspend fun reportPosition(fix: FixEntity, beacons: Int) {
+        if (System.currentTimeMillis() - lastReport < 60_000) return
+        lastReport = System.currentTimeMillis()
+        for (d in desktops.paired()) {
+            if (d.id in noPositionEndpoint) continue
+            val auth = desktops.auth(d) ?: continue
+            val r = runCatching { desktops.api(d).devicePosition(auth, org.sworrl.beaconfix.data.api.DevicePositionBody(fix.lat, fix.lon, fix.acc, org.sworrl.beaconfix.sync.SyncRepository.iso(fix.time), beacons, if (fix.source == "phone-wifi") "wifi" else "gps")) }.getOrNull() ?: continue
+            if (r.code() == 404) noPositionEndpoint += d.id
+        }
+    }
     suspend fun scanAndRecord(fresh: Boolean): Int {
         val scan = if (fresh) scanner.scan() else scanner.latest()
         val now = System.currentTimeMillis()
         val history = HashMap(status.state.value.history)
         for (s in scan) history[s.bssid] = ((history[s.bssid] ?: emptyList()) + s.dbm).takeLast(40)
         status.update { it.copy(lastScanAt = now, apsInScan = scan.size, scan = scan, history = history, throttled = scanner.throttlingOn(), error = "") }
+        widgets.note("scan: ${scan.size} beacons heard")
+        widgets.touch("scan")
         if (scan.isEmpty()) return 0
         val homePatterns = prefs.homePatterns.first()
         val connected = scanner.connectedBssid()
@@ -49,6 +66,7 @@ class ObservationRecorder @Inject constructor(
             return 0
         }
         db.fixes().insert(fix)
+        reportPosition(fix, scan.size)
         val maxAcc = prefs.maxFixAccM.first()
         if (fix.acc > maxAcc) { status.update { it.copy(lastFixAt = now, lastFixAcc = fix.acc, lastFixSource = "gps too coarse (${fix.acc.toInt()} m)") }; return 0 }
         val rows = scan.map { s -> ObservationEntity(bssid = s.bssid, time = now, lat = fix.lat, lon = fix.lon, acc = fix.acc, dbm = s.dbm, freq = s.freq, source = "phone-gps") }

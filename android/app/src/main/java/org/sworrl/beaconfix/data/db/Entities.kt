@@ -98,3 +98,31 @@ data class DesktopEntity(
     val pulledAps: Long = 0,
     val cursor: String = "",             // incremental-sync cursor when the desktop supports it
 )
+
+/** Our identity record (JSON as the spec defines it); the Ed25519 seed lives in EncryptedSharedPreferences, never here. */
+@Entity(tableName = "identity")
+data class IdentityEntity(@PrimaryKey val id: String, val name: String, val created: String, val pub: String, val recordJson: String)
+
+/**
+ * A surveyed anchor (docs/RANGING.md §4): an antenna or place whose position is ground truth. [json] holds the whole
+ * contract object (forward compatible); the columns are for queries. [dirty] = changed here, not yet pushed to a desktop.
+ */
+@Entity(tableName = "anchors")
+data class AnchorEntity(
+    @PrimaryKey val id: String,
+    val json: String,
+    val name: String,
+    val kind: String,
+    val lat: Double,
+    val lon: Double,
+    val rv: Boolean,
+    val ref: Boolean,
+    val deleted: Boolean,
+    val placedAt: String,
+    val seq: Long,
+    val dirty: Boolean,
+)
+
+/** A link that is not complete yet: the other identity's offer (id, pub, name, ts) and our half-signed statement, if any. */
+@Entity(tableName = "pending_links")
+data class PendingLinkEntity(@PrimaryKey val id: String, val pub: String, val name: String, val ts: String, val statementJson: String = "")

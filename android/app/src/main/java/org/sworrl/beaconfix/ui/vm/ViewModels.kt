@@ -53,7 +53,7 @@ class HomeViewModel @Inject constructor(private val store: DesktopStore, private
             else desktopError.value = "desktop answered ${r.code()}"
         } catch (e: Exception) { desktopError.value = "desktop unreachable" }
     }
-    fun toggleCollector(on: Boolean) = viewModelScope.launch { prefs.setCollectorOn(on); if (on) CollectorService.start(ctx) else CollectorService.stop(ctx) }
+    fun toggleCollector(on: Boolean) = viewModelScope.launch { prefs.setCollectorOn(on); CollectorService.ensure(ctx, prefs) }
 }
 
 @HiltViewModel
@@ -79,7 +79,7 @@ class SurveyViewModel @Inject constructor(val status: CollectorStatus, private v
     val throttleHintSeen = prefs.throttleHintSeen.stateIn(viewModelScope, SharingStarted.Eagerly, true)
     fun throttled() = scanner.throttlingOn()
     fun surveyOn() { CollectorService.start(ctx, CollectorService.ACTION_SURVEY_ON) }
-    fun surveyOff() { if (status.state.value.running) ctx.startService(android.content.Intent(ctx, CollectorService::class.java).setAction(CollectorService.ACTION_SURVEY_OFF)) }
+    fun surveyOff() { if (status.state.value.presence) runCatching { ctx.startService(android.content.Intent(ctx, CollectorService::class.java).setAction(CollectorService.ACTION_SURVEY_OFF)) } }
     fun dismissHint() = viewModelScope.launch { prefs.setThrottleHintSeen() }
 }
 
@@ -101,24 +101,42 @@ class SyncViewModel @Inject constructor(private val store: DesktopStore, db: App
 data class SettingsUi(val collectorOn: Boolean = false, val interval: Int = 60, val maxAcc: Int = 60, val home: Set<String> = emptySet())
 
 @HiltViewModel
-class SettingsViewModel @Inject constructor(private val prefs: Prefs, @ApplicationContext private val ctx: Context) : ViewModel() {
+class SettingsViewModel @Inject constructor(private val prefs: Prefs, @ApplicationContext private val ctx: Context, private val widgets: org.sworrl.beaconfix.widget.WidgetUpdater, private val notifier: org.sworrl.beaconfix.widget.StatusNotifier) : ViewModel() {
+    val statusNotification: StateFlow<Boolean> = prefs.statusNotification.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), true)
+    /** show = the presence service comes up (and its permanent card); hide = the service stops and the card goes. */
+    fun setStatusNotification(v: Boolean) = viewModelScope.launch { prefs.setStatusNotification(v); if (v) runCatching { CollectorService.start(ctx) } else { CollectorService.stop(ctx); notifier.clear() }; widgets.refresh(renderMap = false) }
     val ui: StateFlow<SettingsUi> = combine(prefs.collectorOn, prefs.collectIntervalSec, prefs.maxFixAccM, prefs.homePatterns) { a, b, c, d -> SettingsUi(a, b, c, d) }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), SettingsUi())
-    fun setCollector(on: Boolean) = viewModelScope.launch { prefs.setCollectorOn(on); if (on) CollectorService.start(ctx) else CollectorService.stop(ctx) }
+    fun setCollector(on: Boolean) = viewModelScope.launch { prefs.setCollectorOn(on); CollectorService.ensure(ctx, prefs) }
     fun setInterval(s: Int) = viewModelScope.launch { prefs.setCollectInterval(s) }
     fun setMaxAcc(m: Int) = viewModelScope.launch { prefs.setMaxFixAcc(m) }
     fun setHome(text: String) = viewModelScope.launch { prefs.setHomePatterns(text.lines().map { it.trim() }.filter { it.isNotEmpty() }.toSet()) }
 }
 
 @HiltViewModel
-class PairViewModel @Inject constructor(private val discovery: Discovery, private val pairing: PairingRepository) : ViewModel() {
+class PairViewModel @Inject constructor(private val discovery: Discovery, private val pairing: PairingRepository, private val ranging: org.sworrl.beaconfix.ranging.RangingRepository) : ViewModel() {
+    fun ranged(desktopId: String) = ranging.ranged(desktopId)?.best
     val state = MutableStateFlow<PairState>(PairState.Idle)
     val found = MutableStateFlow<List<DiscoveredDesktop>>(emptyList())
     init { viewModelScope.launch { runCatching { discovery.discover().collect { found.value = it } } } }
     fun probe(host: String, port: Int, tls: Boolean) = viewModelScope.launch { state.value = PairState.Probing(host); state.value = pairing.probe(host.trim(), port, tls) }
     fun pair() = viewModelScope.launch {
-        val d = (state.value as? PairState.Found)?.desktop ?: return@launch
-        state.value = pairing.pair(d) { state.value = it }
+        val found = state.value as? PairState.Found ?: return@launch
+        // identity login first (no code, no prompt) when the desktop speaks identity and knows us; else the pairing code
+        pairing.loginWithIdentity(found.desktop, found.hello)?.let { if (it is PairState.Paired) { state.value = it; return@launch } else if (it is PairState.Failed) { identityNote.value = it.message } }
+        state.value = pairing.pair(found.desktop) { state.value = it }
     }
+    val identityNote = MutableStateFlow("")
     fun reset() { state.value = PairState.Idle }
+    fun cancel() = viewModelScope.launch { pairing.cancel(); state.value = PairState.Idle }
+}
+
+
+/** App-level state: is there an identity yet, plus the automation hooks (sync now, one scan). */
+@HiltViewModel
+class RootViewModel @Inject constructor(identity: org.sworrl.beaconfix.identity.IdentityStore, private val sync: SyncRepository, private val recorder: org.sworrl.beaconfix.collector.ObservationRecorder, private val prefs: Prefs, @ApplicationContext private val ctx: Context) : ViewModel() {
+    val hasIdentity: StateFlow<Boolean?> = kotlinx.coroutines.flow.combine(identity.current, kotlinx.coroutines.flow.flowOf(Unit)) { r, _ -> r != null && identity.seed() != null }.stateIn(viewModelScope, SharingStarted.Eagerly, null)
+    fun syncNow() = viewModelScope.launch { runCatching { sync.syncAll() } }
+    fun scanOnce() = viewModelScope.launch { runCatching { recorder.scanAndRecord(fresh = true) } }
+    fun collector(on: Boolean) = viewModelScope.launch { prefs.setCollectorOn(on); org.sworrl.beaconfix.collector.CollectorService.ensure(ctx, prefs) }
 }

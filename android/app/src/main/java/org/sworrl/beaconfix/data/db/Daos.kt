@@ -65,3 +65,28 @@ interface DesktopDao {
     @Query("SELECT * FROM desktops WHERE id = :id") suspend fun get(id: String): DesktopEntity?
     @Query("DELETE FROM desktops WHERE id = :id") suspend fun delete(id: String)
 }
+
+@Dao
+interface AnchorDao {
+    @Upsert suspend fun upsert(a: AnchorEntity)
+    @Query("SELECT * FROM anchors WHERE deleted = 0 ORDER BY name") fun all(): Flow<List<AnchorEntity>>
+    @Query("SELECT * FROM anchors WHERE deleted = 0") suspend fun allNow(): List<AnchorEntity>
+    @Query("SELECT * FROM anchors") suspend fun allIncludingDeleted(): List<AnchorEntity>
+    @Query("SELECT * FROM anchors WHERE id = :id") suspend fun get(id: String): AnchorEntity?
+    @Query("SELECT * FROM anchors WHERE dirty = 1") suspend fun dirty(): List<AnchorEntity>
+    @Query("UPDATE anchors SET dirty = 0 WHERE id IN (:ids)") suspend fun clean(ids: List<String>)
+    @Query("DELETE FROM anchors WHERE id = :id") suspend fun purge(id: String)
+}
+
+@Dao
+interface IdentityDao {
+    @Upsert suspend fun upsert(e: IdentityEntity)
+    @Query("SELECT * FROM identity LIMIT 1") fun current(): Flow<IdentityEntity?>
+    @Query("SELECT * FROM identity LIMIT 1") suspend fun currentNow(): IdentityEntity?
+    @Query("DELETE FROM identity") suspend fun clear()
+    @Upsert suspend fun upsertPending(e: PendingLinkEntity)
+    @Query("SELECT * FROM pending_links ORDER BY ts DESC") fun pending(): Flow<List<PendingLinkEntity>>
+    @Query("SELECT * FROM pending_links") suspend fun pendingNow(): List<PendingLinkEntity>
+    @Query("DELETE FROM pending_links WHERE id = :id") suspend fun removePending(id: String)
+    @Query("DELETE FROM pending_links") suspend fun clearPending()
+}

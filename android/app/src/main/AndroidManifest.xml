@@ -9,15 +9,27 @@
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION" />
-    <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES" android:usesPermissionFlags="neverForLocation" tools:targetApi="s" />
+    <!-- Wi-Fi scans and Wi-Fi RTT ranging: BeaconFix does derive location from them, so no neverForLocation flag -->
+    <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES" tools:targetApi="s" />
+    <!-- device ranging: BLE advertisement in both directions (Android 12+ runtime permissions; legacy ones below for 8–11) -->
+    <uses-permission android:name="android.permission.BLUETOOTH_SCAN" tools:targetApi="s" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" tools:targetApi="s" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" tools:targetApi="s" />
+    <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.CAMERA" />
 
     <uses-feature android:name="android.hardware.wifi" android:required="true" />
     <uses-feature android:name="android.hardware.location.gps" android:required="false" />
+    <uses-feature android:name="android.hardware.camera.any" android:required="false" />
+    <uses-feature android:name="android.hardware.bluetooth_le" android:required="false" />
+    <uses-feature android:name="android.hardware.wifi.rtt" android:required="false" />
 
     <application
         android:name=".BeaconFixApp"
@@ -42,12 +54,78 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+            <!-- QR codes and links: beaconfix://link/<b64url> · beaconfix://statement/<b64url> · beaconfix://identity/<b64url> · beaconfix://pair?host=&port= -->
+            <intent-filter android:autoVerify="false" tools:ignore="AppLinkUrlError">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="beaconfix" android:host="link" /><data android:scheme="beaconfix" android:host="statement" />
+                <data android:scheme="beaconfix" android:host="identity" /><data android:scheme="beaconfix" android:host="pair" />
+            </intent-filter>
+            <!-- The legacy QR texts as printed: "BFLNK1:…", "BFLINK1:…", "BFID1:…" (Android matches schemes case-sensitively, so both cases) -->
+            <intent-filter tools:ignore="AppLinkUrlError">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="BFLNK1" /><data android:scheme="bflnk1" /><data android:scheme="BFLINK1" /><data android:scheme="bflink1" /><data android:scheme="BFID1" /><data android:scheme="bfid1" />
+            </intent-filter>
+            <!-- Share → BeaconFix / Open with: history exports (Timeline.json, Records.json, WiGLE CSV, GPX, KML, BeaconFix export) -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="application/json" /><data android:mimeType="text/csv" /><data android:mimeType="text/comma-separated-values" />
+                <data android:mimeType="application/gpx+xml" /><data android:mimeType="application/vnd.google-earth.kml+xml" /><data android:mimeType="text/plain" /><data android:mimeType="application/octet-stream" />
+            </intent-filter>
+            <intent-filter tools:ignore="AppLinkUrlError">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:scheme="content" /><data android:scheme="file" />
+                <data android:mimeType="application/json" /><data android:mimeType="text/csv" /><data android:mimeType="application/gpx+xml" /><data android:mimeType="application/vnd.google-earth.kml+xml" />
+            </intent-filter>
+            <intent-filter tools:ignore="AppLinkUrlError">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:scheme="content" /><data android:scheme="file" /><data android:mimeType="*/*" />
+                <data android:pathPattern=".*\\.gpx" /><data android:pathPattern=".*\\.kml" /><data android:pathPattern=".*\\.csv" /><data android:pathPattern=".*\\.json" />
+            </intent-filter>
         </activity>
 
         <service
             android:name=".collector.CollectorService"
             android:exported="false"
-            android:foregroundServiceType="location" />
+            android:foregroundServiceType="location|connectedDevice"
+            android:stopWithTask="false" />
+
+        <!-- brings the presence service (permanent status notification) back after a reboot or an update -->
+        <receiver android:name=".collector.BootReceiver" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+
+
+        <receiver android:name=".widget.LocationWidgetReceiver" android:exported="true" android:label="@string/widget_location_label">
+            <intent-filter><action android:name="android.appwidget.action.APPWIDGET_UPDATE" /></intent-filter>
+            <meta-data android:name="android.appwidget.provider" android:resource="@xml/widget_location_info" />
+        </receiver>
+
+        <receiver android:name=".widget.BeaconsWidgetReceiver" android:exported="true" android:label="@string/widget_beacons_label">
+            <intent-filter><action android:name="android.appwidget.action.APPWIDGET_UPDATE" /></intent-filter>
+            <meta-data android:name="android.appwidget.provider" android:resource="@xml/widget_beacons_info" />
+        </receiver>
+
+        <receiver android:name=".widget.SyncWidgetReceiver" android:exported="true" android:label="@string/widget_sync_label">
+            <intent-filter><action android:name="android.appwidget.action.APPWIDGET_UPDATE" /></intent-filter>
+            <meta-data android:name="android.appwidget.provider" android:resource="@xml/widget_sync_info" />
+        </receiver>
+
+        <receiver android:name=".widget.MapWidgetReceiver" android:exported="true" android:label="@string/widget_map_label">
+            <intent-filter><action android:name="android.appwidget.action.APPWIDGET_UPDATE" /></intent-filter>
+            <meta-data android:name="android.appwidget.provider" android:resource="@xml/widget_map_info" />
+        </receiver>
+
+        <receiver android:name=".widget.NotificationActionReceiver" android:exported="false" />
 
         <!-- WorkManager: Hilt-aware initialisation (see BeaconFixApp) -->
         <provider

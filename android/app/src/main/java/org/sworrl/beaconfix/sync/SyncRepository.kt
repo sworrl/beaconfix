@@ -44,11 +44,16 @@ class SyncRepository @Inject constructor(
     private val desktops: DesktopStore,
     private val estimates: EstimateRepository,
     private val prefs: Prefs,
+    private val identity: org.sworrl.beaconfix.identity.IdentityStore,
+    private val widgets: org.sworrl.beaconfix.widget.WidgetUpdater,
+    private val anchors: org.sworrl.beaconfix.anchors.AnchorRepository,
 ) {
     suspend fun syncAll(): List<SyncReport> {
         val out = ArrayList<SyncReport>()
         for (d in desktops.paired()) out += sync(d)
         prefs.setLastSync(out.joinToString("\n") { "${it.desktop}: " + (if (it.ok) "pushed ${it.pushed}, pulled ${it.pulledAps} beacons / ${it.pulledObs} observations, refit ${it.refit}" else "failed — ${it.message}") })
+        out.forEach { widgets.note(if (it.ok) "sync ${it.desktop}: pushed ${it.pushed}, pulled ${it.pulledAps}" else "sync ${it.desktop} failed: ${it.message.take(60)}") }
+        widgets.touch("sync")
         return out
     }
 
@@ -68,7 +73,8 @@ class SyncRepository @Inject constructor(
                     val batch = db.observations().unsynced(200)
                     if (batch.isEmpty()) break
                     val chunk = sizeLimited(batch)
-                    val body = ObservationsBody(chunk.map { ObservationDto(it.bssid, "", it.dbm, it.lat, it.lon, it.acc, iso(it.time), "android") })
+                    val myId = identity.currentNow()?.id
+                    val body = ObservationsBody(chunk.map { ObservationDto(it.bssid, "", it.dbm, it.lat, it.lon, it.acc, iso(it.time), "android", myId) }, myId, identity.deviceName)
                     val r = api.pushObservations(auth, body)
                     when (r.outcome()) {
                         ApiOutcome.Ok -> { db.observations().markSynced(chunk.map { it.id }); pushed += chunk.size }
@@ -90,7 +96,7 @@ class SyncRepository @Inject constructor(
                         val old = db.aps().get(a.bssid)
                         val hasPos = a.lat != null && a.lon != null && a.kind != "ring" && a.kind != "none"
                         val theirAcc = a.r ?: 100.0
-                        val takePos = hasPos && (old?.lat == null || old.posSource != "observed" || (old.acc ?: 1e9) > theirAcc)
+                        val takePos = hasPos && old?.posSource != "anchor" && (old?.lat == null || old.posSource != "observed" || (old.acc ?: 1e9) > theirAcc)
                         db.aps().upsert((old ?: ApEntity(bssid = a.bssid, firstSeen = now)).copy(
                             ssid = a.ssid.ifEmpty { old?.ssid ?: "" }, freq = if (a.freq > 0) a.freq else old?.freq ?: 0, band = a.band.ifEmpty { old?.band ?: "" }, ch = if (a.ch > 0) a.ch else old?.ch ?: 0,
                             lastSeen = maxOf(old?.lastSeen ?: 0, now),
@@ -103,6 +109,13 @@ class SyncRepository @Inject constructor(
                 }
                 ApiOutcome.Unauthorized -> { desktops.forgetToken(d.id); return fail(d, "token rejected — pair again") }
                 else -> {}
+            }
+
+            // ── anchors: push ours, merge theirs (desktops with the endpoints; older ones keep them local) ──
+            if ("anchors" in features) {
+                anchors.forgetNoEndpoint(d.id)
+                if (canControl) runCatching { anchors.push() }
+                runCatching { api.anchors(auth) }.getOrNull()?.takeIf { it.isSuccessful }?.body()?.let { anchors.mergeDtos(it) }
             }
 
             // ── pull: home patterns (so the phone excludes the same networks) ──
@@ -125,7 +138,7 @@ class SyncRepository @Inject constructor(
             if (canControl) {
                 if ("sync" in features) {
                     val ch = api.changes(auth, d.cursor)
-                    if (ch.isSuccessful) ch.body()?.let { c -> pulledObs += importObservations(c.observations); desktops.upsert(d.copy(cursor = c.cursor)) }
+                    if (ch.isSuccessful) ch.body()?.let { c -> pulledObs += importObservations(c.observations); if (c.anchors.isNotEmpty()) anchors.merge(c.anchors); desktops.upsert(d.copy(cursor = c.cursor)) }
                 } else if (d.pulledAps == 0L || System.currentTimeMillis() - d.lastSync > 6 * 3600_000L) {
                     // full export: streamed, parsed once; cheap enough at a few MB and only every 6 h
                     val ex = api.export(auth)
@@ -137,6 +150,7 @@ class SyncRepository @Inject constructor(
             }
             val touched = db.observations().touchedSince(0).take(400)   // refit what we have data for (bounded)
             val refit = estimates.refit(touched)
+            runCatching { anchors.applyToAps() }
             desktops.upsert(d.copy(lastSync = System.currentTimeMillis(), lastError = "", pushedObs = d.pushedObs + pushed, pulledAps = d.pulledAps + pulledAps, hostname = hello.body()?.hostname ?: d.hostname, version = hello.body()?.version ?: d.version))
             return SyncReport(d.name, true, pushed, pulledAps, pulledObs, pulledFixes, refit)
         } catch (e: Exception) {

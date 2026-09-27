@@ -14,3 +14,12 @@
 -keepclasseswithmembers class org.sworrl.beaconfix.** { kotlinx.serialization.KSerializer serializer(...); }
 # osmdroid
 -dontwarn org.osmdroid.**
+# Glance action callbacks and widget classes are looked up by name
+-keep class * extends androidx.glance.appwidget.action.ActionCallback { *; }
+-keep class * extends androidx.glance.appwidget.GlanceAppWidgetReceiver { *; }
+-keep class * extends androidx.glance.appwidget.GlanceAppWidget { *; }
+# BouncyCastle lightweight API (no provider registration)
+-dontwarn org.bouncycastle.**
+-keep class org.bouncycastle.crypto.** { *; }
+# ZXing
+-dontwarn com.google.zxing.**

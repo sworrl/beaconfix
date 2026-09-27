@@ -30,6 +30,7 @@ class Prefs @Inject constructor(@ApplicationContext private val ctx: Context) {
         val lastSyncReport = stringPreferencesKey("last_sync_report")
         val lastSyncAt = longPreferencesKey("last_sync_at")
         val throttleHintSeen = booleanPreferencesKey("throttle_hint_seen")
+        val statusNotification = booleanPreferencesKey("status_notification")
     }
     val collectorOn: Flow<Boolean> = ctx.store.data.map { it[K.collectorOn] ?: false }
     val collectIntervalSec: Flow<Int> = ctx.store.data.map { it[K.collectInterval] ?: 60 }
@@ -40,6 +41,7 @@ class Prefs @Inject constructor(@ApplicationContext private val ctx: Context) {
     val lastSyncReport: Flow<String> = ctx.store.data.map { it[K.lastSyncReport] ?: "" }
     val lastSyncAt: Flow<Long> = ctx.store.data.map { it[K.lastSyncAt] ?: 0L }
     val throttleHintSeen: Flow<Boolean> = ctx.store.data.map { it[K.throttleHintSeen] ?: false }
+    val statusNotification: Flow<Boolean> = ctx.store.data.map { it[K.statusNotification] ?: true }
 
     suspend fun setCollectorOn(v: Boolean) = ctx.store.edit { it[K.collectorOn] = v }
     suspend fun setCollectInterval(s: Int) = ctx.store.edit { it[K.collectInterval] = s.coerceIn(15, 900) }
@@ -49,4 +51,5 @@ class Prefs @Inject constructor(@ApplicationContext private val ctx: Context) {
     suspend fun setUnmeteredOnly(v: Boolean) = ctx.store.edit { it[K.unmeteredOnly] = v }
     suspend fun setLastSync(report: String) = ctx.store.edit { it[K.lastSyncReport] = report; it[K.lastSyncAt] = System.currentTimeMillis() }
     suspend fun setThrottleHintSeen() = ctx.store.edit { it[K.throttleHintSeen] = true }
+    suspend fun setStatusNotification(v: Boolean) = ctx.store.edit { it[K.statusNotification] = v }
 }

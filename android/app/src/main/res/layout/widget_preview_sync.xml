@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android" android:layout_width="match_parent" android:layout_height="match_parent" android:orientation="vertical" android:padding="12dp" android:background="@drawable/widget_preview_bg">
+    <TextView android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Desktop   ● COLLECTING" android:textColor="#E6EDF7" android:textStyle="bold" android:textSize="14sp" />
+    <TextView android:layout_width="match_parent" android:layout_height="wrap_content" android:text="synced 4 min ago · 12 waiting" android:textColor="#9FB0C8" android:textSize="12sp" />
+    <TextView android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginTop="8dp" android:text="⇅ Sync now      ■ Stop collecting" android:textColor="#35D6FF" android:textSize="12sp" />
+</LinearLayout>

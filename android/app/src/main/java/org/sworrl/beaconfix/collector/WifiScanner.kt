@@ -51,6 +51,12 @@ class WifiScanner @Inject constructor(@ApplicationContext private val ctx: Conte
     } catch (e: SecurityException) { emptyList() }
     var lastFresh = false; private set
 
+    /** How long ago any scan on this phone (ours or another app's) last saw [bssid], in ms; null when the scan cache does not hold it. */
+    fun seenAgoMs(bssid: String): Long? = try {
+        @Suppress("MissingPermission")
+        wifi.scanResults.firstOrNull { it.BSSID.equals(bssid, ignoreCase = true) }?.let { (android.os.SystemClock.elapsedRealtimeNanos() / 1000 - it.timestamp) / 1000 }
+    } catch (e: SecurityException) { null }
+
     /** The BSSID of the network this phone is connected to (its own hotspot never appears in scans). */
     fun connectedBssid(): String? = try { @Suppress("DEPRECATION") wifi.connectionInfo?.bssid?.uppercase()?.takeIf { it != "02:00:00:00:00:00" } } catch (e: SecurityException) { null }
 }

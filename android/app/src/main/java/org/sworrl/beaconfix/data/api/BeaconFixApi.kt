@@ -21,6 +21,7 @@ interface BeaconFixApi {
     @GET("api/v1/hello") suspend fun hello(): Response<Hello>
     @POST("api/v1/pair") suspend fun pair(@Body body: PairRequest): Response<PairStarted>
     @GET("api/v1/pair/{id}") suspend fun pairStatus(@Path("id") id: String): Response<PairStatus>
+    @POST("api/v1/pair/{id}/cancel") suspend fun pairCancel(@Path("id") id: String): Response<ResponseBody>
     @GET("api/v1/location") suspend fun location(@Header("Authorization") auth: String): Response<LocationDto>
     @GET("api/v1/aps") suspend fun aps(@Header("Authorization") auth: String): Response<ApsDto>
     @GET("api/v1/track") suspend fun track(@Header("Authorization") auth: String): Response<TrackDto>
@@ -34,6 +35,26 @@ interface BeaconFixApi {
     @GET("api/v1/db/changes") suspend fun changes(@Header("Authorization") auth: String, @Query("since") since: String): Response<ChangesDto>
     @POST("api/v1/db/sync") suspend fun sync(@Header("Authorization") auth: String, @Body body: SyncBody): Response<ChangesDto>
     @POST("api/v1/refresh") suspend fun refresh(@Header("Authorization") auth: String): Response<ResponseBody>
+    @GET("api/v1/trip") suspend fun trip(@Header("Authorization") auth: String): Response<TripDto>
+    @GET("api/v1/events") suspend fun events(@Header("Authorization") auth: String, @Query("since") since: Long): Response<EventsDto>
+    @GET("api/v1/pois") suspend fun poisTyped(@Header("Authorization") auth: String): Response<PoisTyped>
+    @GET("api/v1/peers") suspend fun peers(): Response<PeersDto>
+    @GET("api/v1/devices/positions") suspend fun devicesPositions(@Header("Authorization") auth: String): Response<DevicesPositions>
+    @POST("api/v1/devices/position") suspend fun devicePosition(@Header("Authorization") auth: String, @Body body: DevicePositionBody): Response<ResponseBody>
+    @POST("api/v1/identity/export-request") suspend fun identityExportRequest(): Response<ResponseBody>
+    // identity (spec v1)
+    @GET("api/v1/identity") suspend fun identity(): Response<org.sworrl.beaconfix.identity.IdentityPublic>
+    @GET("api/v1/identity/challenge") suspend fun identityChallenge(): Response<org.sworrl.beaconfix.identity.Challenge>
+    @POST("api/v1/identity/auth") suspend fun identityAuth(@Body body: org.sworrl.beaconfix.identity.AuthBody): Response<org.sworrl.beaconfix.identity.AuthResult>
+    @POST("api/v1/identity/link") suspend fun identityLink(@Body body: org.sworrl.beaconfix.identity.LinkStatement): Response<org.sworrl.beaconfix.identity.LinkResponse>
+    @GET("api/v1/identity/export/{code}") suspend fun identityExport(@Path("code") code: String): Response<ResponseBody>
+    // anchors + device ranging (docs/RANGING.md; feature-detected: a 404 means an older desktop)
+    @GET("api/v1/anchors") suspend fun anchors(@Header("Authorization") auth: String): Response<List<AnchorDto>>
+    @POST("api/v1/anchors") suspend fun setAnchor(@Header("Authorization") auth: String, @Body body: AnchorDto): Response<AnchorDto>
+    @retrofit2.http.DELETE("api/v1/anchors/{id}") suspend fun deleteAnchor(@Header("Authorization") auth: String, @Path("id") id: String): Response<AnchorDeleted>
+    @GET("api/v1/ranging/info") suspend fun rangingInfo(@Header("Authorization") auth: String): Response<RangingInfo>
+    @POST("api/v1/ranging") suspend fun postRanging(@Header("Authorization") auth: String, @Body body: RangingPost): Response<DeviceRange>
+    @GET("api/v1/ranging") suspend fun ranging(@Header("Authorization") auth: String): Response<RangingList>
 }
 
 object ApiFactory {

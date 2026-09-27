@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android" android:layout_width="match_parent" android:layout_height="match_parent" android:orientation="vertical" android:padding="12dp" android:background="@drawable/widget_preview_bg">
+    <TextView android:layout_width="match_parent" android:layout_height="wrap_content" android:text="42 beacons in range   ⚠ WEAK" android:textColor="#E6EDF7" android:textStyle="bold" android:textSize="14sp" />
+    <TextView android:layout_width="match_parent" android:layout_height="wrap_content" android:text="21 WPA2 · 17 other · 4 WPA3" android:textColor="#9FB0C8" android:textSize="12sp" />
+    <TextView android:layout_width="match_parent" android:layout_height="wrap_content" android:text="🛡 Example Wi-Fi 5G  −52 dBm" android:textColor="#E6EDF7" android:textSize="12sp" />
+    <TextView android:layout_width="match_parent" android:layout_height="wrap_content" android:text="⚠ Coffee Shop  −61 dBm" android:textColor="#E6EDF7" android:textSize="12sp" />
+</LinearLayout>

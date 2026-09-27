@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android" android:layout_width="match_parent" android:layout_height="match_parent" android:orientation="vertical" android:padding="12dp" android:background="@drawable/widget_preview_bg">
+    <TextView android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Springfield, Example County" android:textColor="#E6EDF7" android:textStyle="bold" android:textSize="14sp" android:maxLines="1" />
+    <TextView android:layout_width="match_parent" android:layout_height="wrap_content" android:text="40.00294, -75.06806 · ±40 m · GPS" android:textColor="#9FB0C8" android:textSize="12sp" />
+    <TextView android:layout_width="match_parent" android:layout_height="wrap_content" android:text="🏠 at home" android:textColor="#FF4FD8" android:textSize="12sp" />
+</LinearLayout>

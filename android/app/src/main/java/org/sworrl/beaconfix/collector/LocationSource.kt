@@ -29,8 +29,8 @@ class LocationSource @Inject constructor(@ApplicationContext private val ctx: Co
     }
 
     @SuppressLint("MissingPermission")
-    fun updates(intervalMs: Long): Flow<Location> = callbackFlow {
-        val req = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, intervalMs).setMinUpdateDistanceMeters(2f).build()
+    fun updates(intervalMs: Long, minDistanceM: Float = 2f): Flow<Location> = callbackFlow {
+        val req = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, intervalMs).setMinUpdateDistanceMeters(minDistanceM).build()
         val cb = object : LocationCallback() { override fun onLocationResult(r: LocationResult) { r.lastLocation?.let { trySend(it) } } }
         fused.requestLocationUpdates(req, cb, Looper.getMainLooper())
         awaitClose { fused.removeLocationUpdates(cb) }

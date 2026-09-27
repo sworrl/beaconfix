@@ -9,11 +9,15 @@ import dagger.hilt.android.HiltAndroidApp
 import org.osmdroid.config.Configuration as OsmConfig
 import org.sworrl.beaconfix.sync.SyncScheduler
 import javax.inject.Inject
+import kotlinx.coroutines.launch
 
 @HiltAndroidApp
 class BeaconFixApp : Application(), Configuration.Provider {
     @Inject lateinit var workerFactory: HiltWorkerFactory
     @Inject lateinit var syncScheduler: SyncScheduler
+    @Inject lateinit var widgets: org.sworrl.beaconfix.widget.WidgetUpdater
+    @Inject lateinit var notifier: org.sworrl.beaconfix.widget.StatusNotifier
+    @Inject lateinit var prefs: org.sworrl.beaconfix.data.Prefs
 
     override val workManagerConfiguration: Configuration
         get() = Configuration.Builder().setWorkerFactory(workerFactory).build()
@@ -31,7 +35,11 @@ class BeaconFixApp : Application(), Configuration.Provider {
             osmdroidBasePath = getExternalFilesDir(null) ?: filesDir
             osmdroidTileCache = java.io.File(osmdroidBasePath, "tiles")
         }
+        notifier.ensureChannel()
         syncScheduler.ensurePeriodic()
+        widgets.ensurePeriodic()
+        widgets.touch("start")
+        kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Main).launch { org.sworrl.beaconfix.collector.CollectorService.ensure(this@BeaconFixApp, prefs) }
     }
 
     companion object { const val CHANNEL_COLLECTOR = "collector" }
