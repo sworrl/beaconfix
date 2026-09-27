@@ -62,7 +62,7 @@ class LiveViewModel @Inject constructor(private val live: DesktopLive, db: AppDa
         viewModelScope.launch { phoneRaw.collect { f -> phoneEnriched.value = enrich(f) } }
         refresh()
     }
-    fun refresh(what: Set<String> = setOf("location", "trip", "pois", "events")) = viewModelScope.launch { refreshing.value = true; try { live.refreshAll(what) } finally { refreshing.value = false } }
+    fun refresh(what: Set<String> = setOf("location", "trip", "pois", "events", "emergency")) = viewModelScope.launch { refreshing.value = true; try { live.refreshAll(what) } finally { refreshing.value = false } }
     fun stream(on: Boolean) { if (on) live.startStream() else live.stopStream() }
     fun toggleCollector(on: Boolean) = viewModelScope.launch { prefs.setCollectorOn(on); CollectorService.ensure(ctx, prefs) }
 
