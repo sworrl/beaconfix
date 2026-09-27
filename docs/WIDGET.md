@@ -35,7 +35,13 @@ BSSID, band and channel, level, status, how it was placed and its security notes
 
 **Cinematic mode**: events glide the camera to their location and back; every `tourMinutes`
 the map eases out to city scale with a caption, alternately continuing to state scale, then
-returns. Any drag, wheel or pinch cancels the tour and pauses it for 45 s.
+returns. All automatic zooms (tours, event glides, re-fits after a real move) share one budget
+of at most one per 10 minutes, and none starts while the pointer is over the widget, for
+3 minutes after you use the map, or while **Follow** is off: once you pan, centre elsewhere or
+pick a place, the camera stays where you left it until you press Follow again. Any press on the
+map or its controls (a drag, a place marker, a toolbar button, the security chip or panel, a
+card button) stops a running glide or tour where it is; switching Cinematic off mid-tour flies
+straight home instead.
 
 **Events**: ripples for new beacons, shrink-and-fade for lost ones, ▲/▼ chevrons with the dB
 delta, a glide with a gold flash when a beacon gets placed, a dashed arrow for a new fix, a
@@ -61,7 +67,8 @@ devices attached to that SSID.
 | `showSsids` | true | Wi-Fi names beside the beacons |
 | `showEvents` | true | event animations and ticker |
 | `animatedMap` | true | cinematic mode |
-| `tourMinutes` | 2 | minutes between overview zoom-outs (1–60) |
+| `tourMinutes` | 20 | minutes between overview zoom-outs (0 never, up to 180; under 10 means every 10) |
+| `spotlightMinutes` | 10 | at most one glide to an event per this many minutes (0 never, up to 240; under 10 means every 10) |
 | `showMapTab` / `showNearbyTab` / `showRadarTab` / `showTripTab` | true | which tabs exist |
 | `binary` | beaconfix | the executable to run |
 
@@ -81,3 +88,26 @@ show-all / hide-all. The compact tooltip adds the resolved time zone and the loc
 number.
 
 Config keys added: none (categories, groups and hidden lists reuse `hiddenCategories`).
+
+## Nearby: pediatric ER (3.8)
+
+With desktop 3.8 or later (`"pediatric"` in the features list) the help card adds, after the
+general ER row (which always stays):
+
+- **🧸 Pediatric ER**: the nearest pediatric emergency department with its distance, bearing,
+  estimated drive time ("~1 h 20 min drive (est.)", straight line × 1.4 at 70 km/h unless the
+  desktop has a road route) and call button, plus a confidence line: *Dedicated pediatric ER*,
+  *Children's hospital · ER on campus: … — call ahead*, *Children's hospital · ER not confirmed —
+  call ahead* or *ER with a pediatrics department*.
+- **🧸 Closer**: a closer but less certain site, only when the pick above is a confirmed one.
+- **🩹 Pediatric urgent care**, always marked *Not an ER*.
+- The desktop's pediatric note in italics ("No pediatric ER mapped within 150 km — go to the
+  nearest ER", "Saved 4 d ago, 38 km from here — may be incomplete", "Overpass busy — will retry").
+
+A **🧸 Kids ER** chip next to the group chips narrows the list to pediatric ERs and pediatric
+urgent care (hidden categories included). Rows show the drive-time estimate when the desktop
+sends one. On the map, a cluster takes the icon of the most urgent help inside it (pediatric ER,
+then an ER, then police or fire) before its most common category, pediatric ER markers draw over
+their neighbours, and the place card adds the ER status, campus ER, drive time and address. The
+category list is re-read whenever the desktop's changes, so new categories appear in *Places to
+show* without re-adding the widget. With an older desktop none of this shows.

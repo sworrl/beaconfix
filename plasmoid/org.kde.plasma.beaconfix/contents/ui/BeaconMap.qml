@@ -57,9 +57,10 @@ Item {
     property real lastUserInput: 0
     property real lastSpotlightAt: 0
     property real _autoAt: 0                    // when the last automatic zoom (tour, spotlight, follow re-fit) started
-    // One budget shared by every automatic zoom: at most one per 10 minutes (less only if the user set a
-    // shorter overview / spotlight interval), so tours, spotlights and re-fits never add up.
-    readonly property real autoGapMs: 60000 * Math.min(10, spotlightMinutes > 0 ? spotlightMinutes : 10, tourMinutes > 0 ? tourMinutes : 10)
+    // One budget shared by every automatic zoom: at most one per 10 minutes, whatever the overview / spotlight
+    // intervals (a shorter one only means "as often as the budget allows"), so tours, spotlights and re-fits
+    // never add up. The Cinematic help text and the settings page promise exactly this.
+    readonly property real autoGapMs: 600000
     property real _hoverEndAt: 0
     property bool _placed: false                // the view has been put on the fix once
     property var  _homeView: null               // {z, auto}: the view an automatic sequence returns to (non-null while one runs)
@@ -181,7 +182,11 @@ Item {
     // Paint without the Wi-Fi name pills only while the zoom changes: a pure pan (drag, follow glide) moves the
     // painted texture, pills included, and only re-renders when it nears the edge of the painted margin
     readonly property bool lite: zooming || draggingAnchor || pinch.active || (flying && _flyZooms)
-    readonly property int  ovMargin: Math.round(Math.max(width, height) * 0.25)   // painted beyond the edges, for pans / zoom-outs
+    // Painted beyond the edges, for pans and zoom-outs: half the width left and right, half the height above and
+    // below (at most 512 px) still cover the view at half scale, a whole zoom level out; viewUpdate() repaints at
+    // once when the scale leaves [0.8, 1.25], so a fast zoom-out no longer uncovers the edges between paints.
+    readonly property int  ovMarginX: Math.round(Math.min(width * 0.5, 512))
+    readonly property int  ovMarginY: Math.round(Math.min(height * 0.5, 512))
     property real _paintAt: 0
     property real _tilesAt: 0
     property bool _zoomDirty: false
@@ -227,12 +232,14 @@ Item {
         settleTimer.restart()
         applyXforms()
         if (now - _tilesAt >= 120) { _tilesAt = now; refreshTiles() }
-        if (now - _paintAt >= 250 && overlayStale()) overlay.requestPaint()
+        // Throttled to 4 paints a second, except when a fast zoom has scaled the painted texture out of [0.8, 1.25]:
+        // zoomed out further it would stop covering the view (edges popping in late), zoomed in it turns blurry
+        if (overlayStale() && (now - _paintAt >= 250 || pX.s < 0.8 || pX.s > 1.25)) overlay.requestPaint()
         if (fxActive()) fx.requestPaint()
         if (_zoomDirty) { _zoomDirty = false; clusterTimer.restart() }
     }
     // The painted overlay still covers the view: same zoom, and the pan has not eaten most of the margin
-    function overlayStale() { return Math.abs(pX.s - 1) > 1e-6 || Math.abs(pX.tx) > 0.7 * ovMargin || Math.abs(pX.ty) > 0.7 * ovMargin }
+    function overlayStale() { return Math.abs(pX.s - 1) > 1e-6 || Math.abs(pX.tx) > 0.7 * ovMarginX || Math.abs(pX.ty) > 0.7 * ovMarginY }
     Timer {                                     // the camera stopped: full-quality tiles, layout and paint
         id: settleTimer
         interval: 150
@@ -290,7 +297,7 @@ Item {
         if (!_placed) { recenter(); return }
         if (!follow) { _fitVote = null; return }
         if (inSequence() || holding) return        // a tour / spotlight comes home to the fix by itself
-        if (flying || zooming || editAnchor || draggingAnchor || pan.pressed || pinch.active || ctxMenu.opened) { followRetry.restart(); return }
+        if (flying || zooming || editAnchor || draggingAnchor || pan.pressed || pinch.active || ctxMenu.visible) { followRetry.restart(); return }
         var m = merc(src.lat, src.lon), z = zoom, now = Date.now()
         if (autoZoom) {
             var vz = rezoomVote(now)
@@ -332,11 +339,14 @@ Item {
         if (!a || haversine(a.lat, a.lon, src.lat, src.lon) > refitMoveM()) return true
         return !_settleSpent && now - _placedAt < 600000
     }
-    // One guard for every automatic camera sequence and re-zoom (spotlights, tours, follow re-fits)
+    // One guard for every automatic camera sequence and re-zoom (spotlights, tours, follow re-fits). With Follow
+    // off (the user panned, centred or zoomed somewhere else, or picked a place) the camera stays where it was
+    // left until Follow is switched back on. (A popup counts from the moment it starts opening: `visible`, not
+    // `opened`, which is false during its enter and exit transitions.)
     function pointerOver() { return mapHover.hovered || hostHovered }
     function mayAutoMove() {
         var now = Date.now()
-        return visible && src.valid && !editAnchor && !draggingAnchor && !secPanel && !ctxMenu.opened
+        return follow && visible && src.valid && !editAnchor && !draggingAnchor && !secPanel && !ctxMenu.visible
                && !pointerOver() && now - _hoverEndAt > 20000
                && now - lastUserInput > 180000 && !pan.pressed && !pinch.active
     }
@@ -369,7 +379,7 @@ Item {
     // or more), not when a line of text above it comes and goes: that re-fit is an instant, unbudgeted zoom.
     function resized() {
         if (!_placed) { scheduleFollow(); return }        // a fix that came while the map was too small: place it now
-        if (autoZoom && !inSequence() && Math.abs(Math.min(width, height) - _fitSide) > 0.25 * _fitSide) fit()
+        if (autoZoom && follow && !inSequence() && Math.abs(Math.min(width, height) - _fitSide) > 0.25 * _fitSide) fit()
     }
     // cinematic camera
     function stopCinema() {
@@ -380,6 +390,9 @@ Item {
         holdTimer.stop(); holdTimer.then = null; holding = false; caption = ""
         _homeView = null
     }
+    // Any hand on the map or one of its controls (a press, not a hover): a running tour / spotlight / glide stops
+    // where it is and nothing automatic starts for 3 minutes. Called on press by the pan area, place markers,
+    // map buttons (not Cinematic: switching it off flies home by itself), the security chip and panel, the card.
     function userTouched() {
         lastUserInput = Date.now()
         stopCinema()
@@ -841,8 +854,8 @@ Item {
         }
         Canvas {
             id: overlay
-            x: -map.ovMargin; y: -map.ovMargin
-            width: map.width + 2 * map.ovMargin; height: map.height + 2 * map.ovMargin
+            x: -map.ovMarginX; y: -map.ovMarginY
+            width: map.width + 2 * map.ovMarginX; height: map.height + 2 * map.ovMarginY
             renderStrategy: Canvas.Immediate     // rendered in the frame that resets the transform: no one-frame jump
             onPaint: {
                 map.rebasePaint()
@@ -850,7 +863,7 @@ Item {
                 ctx.reset()
                 var src = map.src, marks = [], umarks = []
                 if (!src.valid) { map.setMarks(marks, umarks); return }
-                ctx.translate(map.ovMargin, map.ovMargin)   // draw in map coordinates
+                ctx.translate(map.ovMarginX, map.ovMarginY)   // draw in map coordinates
                 var lite = map.lite
                 var mpp = map.mpp()
                 var me = map.merc(src.lat, src.lon), mx = map.sx(me.x), my = map.sy(me.y)
@@ -1288,17 +1301,23 @@ Item {
                 if (!groups[key]) { groups[key] = {ids: [], mx: 0, my: 0, cats: {}}; order.push(key) }
                 var g = groups[key]; g.ids.push(i); g.mx += m.x; g.my += m.y; g.cats[pt.cat] = (g.cats[pt.cat] || 0) + 1
             } else {
-                out.push({ids: [i], mx: m.x, my: m.y, icon: pt.icon, color: pt.color, count: 1, name: pt.name || "", wifi: !!pt.wifi && pt.cat !== "wifi", d: pt.d || 0})
+                out.push({ids: [i], mx: m.x, my: m.y, icon: pt.icon, color: pt.color, count: 1, name: pt.name || "", wifi: !!pt.wifi && pt.cat !== "wifi", d: pt.d || 0, pri: helpPriority(pt)})
             }
         }
+        // A cluster wears the icon of the most urgent help in it (pediatric ER, then an ER, then police / fire),
+        // else of its most common category: help must not hide behind a cluster of cafés.
         for (var o = 0; o < order.length; o++) {
             var gr = groups[order[o]], top = "", best = 0
             for (var c in gr.cats) if (gr.cats[c] > best) { best = gr.cats[c]; top = c }
-            var first = pois[gr.ids[0]]
-            for (var t = 0; t < gr.ids.length; t++) if (pois[gr.ids[t]].cat === top) { first = pois[gr.ids[t]]; break }
+            var first = null, fp = 0
+            for (var f = 0; f < gr.ids.length; f++) { var fpi = helpPriority(pois[gr.ids[f]]); if (fpi > fp) { fp = fpi; first = pois[gr.ids[f]] } }
+            if (!first) {
+                first = pois[gr.ids[0]]
+                for (var t = 0; t < gr.ids.length; t++) if (pois[gr.ids[t]].cat === top) { first = pois[gr.ids[t]]; break }
+            }
             var mixed = Object.keys(gr.cats).length > 1
             out.push({ids: gr.ids, mx: gr.mx / gr.ids.length, my: gr.my / gr.ids.length, icon: first.icon, color: first.color,
-                      count: gr.ids.length, badge: mixed ? "#e6edf7" : first.color, name: gr.ids.length === 1 ? (first.name || "") : "", wifi: false, d: first.d || 0})
+                      count: gr.ids.length, badge: mixed ? "#e6edf7" : first.color, name: gr.ids.length === 1 ? (first.name || "") : "", wifi: false, d: first.d || 0, pri: fp})
         }
         var slots = slotMarkers(markers, out)
         var js = JSON.stringify(slots)
@@ -1332,6 +1351,7 @@ Item {
         var lj = JSON.stringify(shown)
         if (lj !== _labelsJson) { _labelsJson = lj; markerLabels = shown }
     }
+    function helpPriority(p) { return !p ? 0 : p.cat === "peds_er" ? 3 : p.cat === "health" && p.emergency ? 2 : p.cat === "police" || p.cat === "fire" ? 1 : 0 }
     // A marker keeps the delegate that showed it last time (same places); a new one takes a free delegate that
     // showed the same icon (its emoji is already laid out), else any free one; the pool only grows when full.
     // A delegate with nothing to show keeps its last marker, hidden, so its texts stay laid out.
@@ -1507,7 +1527,7 @@ Item {
                 scale: map.invS
                 // generous bounds: the layer is only re-laid-out every 0.3 zoom levels while moving
                 visible: live && x > -map.width * 0.6 && x < map.width * 1.6 && y > -map.height * 0.6 && y < map.height * 1.6
-                z: hot ? 10 : 1
+                z: hot ? 10 : md.pri === 3 ? 2 : 1       // a pediatric ER is drawn over its neighbours
                 // the delegate now shows another place (or none) under the pointer: the card follows
                 onMdChanged: if (pinArea.containsMouse) map.hover = !md.hid ? {kind: md.count > 1 ? "cluster" : "poi", ids: md.ids} : null
                 Rectangle {
@@ -1545,6 +1565,7 @@ Item {
                     x: -14; y: -14; width: 28; height: 28
                     hoverEnabled: true
                     cursorShape: Qt.PointingHandCursor
+                    onPressed: map.userTouched()             // a place click during a tour / spotlight stops it there
                     onContainsMouseChanged: map.hover = containsMouse ? {kind: mk.md.count > 1 ? "cluster" : "poi", ids: mk.md.ids}
                                                                       : (map.hover && map.hover.kind !== "beacon" ? null : map.hover)
                     onClicked: {
@@ -1562,6 +1583,8 @@ Item {
     component MapButton: PC3.ToolButton {
         id: mb
         property string tip: ""
+        property bool touches: true              // a press counts as input (stops a tour / spotlight)
+        onPressed: if (touches) map.userTouched()
         width: Kirigami.Units.gridUnit * 1.7; height: width
         display: QQC2.AbstractButton.IconOnly
         icon.color: "#e6edf7"
@@ -1597,7 +1620,8 @@ Item {
             onToggled: { map.secFocus = checked; map.secPanel = checked }
         }
         MapButton {
-            icon.name: "media-playback-start"; text: "Cinematic"; tip: "Cinematic mode: glide to significant events, now and then zoom out to show the city and state, and re-fit the zoom once you have moved somewhere new, never while parked (at most one automatic zoom every 10 minutes). Off: the map only pans to keep you in view"
+            icon.name: "media-playback-start"; text: "Cinematic"; tip: "Cinematic mode: glide to significant events, now and then zoom out to show the city and state, and re-fit the zoom once you have moved somewhere new, never while parked (at most one automatic zoom every 10 minutes, none while Follow is off). Off: the map only pans to keep you in view"
+            touches: false                          // switching it off mid-tour flies home (onCinematicChanged)
             checkable: true; checked: map.cinematic
             onToggled: map.cinematicToggled(checked)
         }
@@ -1611,7 +1635,7 @@ Item {
         implicitWidth: secLabel.implicitWidth + 16; implicitHeight: secLabel.implicitHeight + 8
         PC3.Label { id: secLabel; anchors.centerIn: parent; font.pixelSize: Kirigami.Theme.smallFont.pixelSize; color: "#e6edf7"
                     text: (map.secSummary.critical ? "☠ " : map.secSummary.weak ? "⚠ " : "🛡 ") + Sec.summaryText(map.secSummary) }
-        TapHandler { onTapped: { map.secPanel = !map.secPanel; if (map.secPanel) map.secFocus = true } }
+        TapHandler { onTapped: { map.userTouched(); map.secPanel = !map.secPanel; if (map.secPanel) map.secFocus = true } }
         HoverHandler { cursorShape: Qt.PointingHandCursor }
     }
     Rectangle {                                 // security panel: every beacon graded, worst first, in full nerdspeak
@@ -1626,12 +1650,13 @@ Item {
                 Layout.fillWidth: true
                 PC3.Label { text: "Radio security audit"; font.bold: true; color: "#e6edf7"; Layout.fillWidth: true }
                 PC3.Label { text: `${map.secSummary.total} BSS · ${map.secSummary.critical} insecure · ${map.secSummary.weak} weak · ${map.secSummary.strong} strong`; font.pixelSize: Kirigami.Theme.smallFont.pixelSize; color: "#9fb0c8" }
-                PC3.ToolButton { icon.name: "window-close"; onClicked: { map.secPanel = false; map.secFocus = false } }
+                PC3.ToolButton { icon.name: "window-close"; onPressed: map.userTouched(); onClicked: { map.secPanel = false; map.secFocus = false } }
             }
             ListView {
                 id: secList
                 Layout.fillWidth: true; Layout.fillHeight: true
                 clip: true; spacing: 6
+                onMovementStarted: map.userTouched()
                 model: {
                     var aps = map.src.aps || [], rows = []
                     for (var i = 0; i < aps.length; i++) {
@@ -1678,7 +1703,7 @@ Item {
                             color: "#9fb0c8"; font.pixelSize: Kirigami.Theme.smallFont.pixelSize; wrapMode: Text.Wrap; Layout.fillWidth: true
                         }
                     }
-                    TapHandler { onTapped: { map.selectedBeacon = modelData.ap.bssid; overlay.requestPaint(); fx.requestPaint() } }
+                    TapHandler { onTapped: { map.userTouched(); map.selectedBeacon = modelData.ap.bssid; overlay.requestPaint(); fx.requestPaint() } }
                 }
             }
         }
@@ -1878,6 +1903,13 @@ Item {
     }
     PC3.Menu {
         id: placesMenu
+        // Each group submenu is wrapped in an item made from this menu's delegate before that item has a parent;
+        // Plasma's default delegate (width: parent.width) then logged "Menu.qml:30:26: TypeError: Cannot read
+        // property 'width' of null" once per submenu at every start. The same delegate, null-safe.
+        delegate: PC3.MenuItem {
+            width: parent ? parent.width : implicitWidth
+            onImplicitWidthChanged: placesMenu.contentItem.contentItem.childrenChanged()
+        }
         PC3.MenuItem { text: "Show all"; onTriggered: map.allCategories(true) }
         PC3.MenuItem { text: "Hide all"; onTriggered: map.allCategories(false) }
         PC3.MenuSeparator {}
@@ -1888,12 +1920,12 @@ Item {
                 id: groupMenu
                 required property string modelData
                 title: modelData === "civic" ? "🚔 Emergency & civic" : modelData === "kids" ? "🛝 Kids & fun" : "⛽ Services"
-                PC3.MenuItem { text: "Show all in this group"; onTriggered: map.groupToggled(modelData, true) }
-                PC3.MenuItem { text: "Hide all in this group"; onTriggered: map.groupToggled(modelData, false) }
+                PC3.MenuItem { text: "Show all in this group"; onTriggered: map.groupToggled(groupMenu.modelData, true) }
+                PC3.MenuItem { text: "Hide all in this group"; onTriggered: map.groupToggled(groupMenu.modelData, false) }
                 PC3.MenuSeparator {}
                 Instantiator {
                     id: groupItems
-                    readonly property string grp: modelData
+                    readonly property string grp: groupMenu.modelData
                     model: (map.src.poiCategories || []).filter(function(c) { return (c.group || "services") === groupItems.grp })
                     delegate: PC3.MenuItem {
                         required property var modelData
@@ -1992,12 +2024,13 @@ Item {
                 spacing: 4
                 PC3.ToolButton {
                     icon.name: "go-next"; text: "Directions"
+                    onPressed: map.userTouched()
                     onClicked: Qt.openUrlExternally(`https://www.openstreetmap.org/directions?engine=fossgis_osrm_car&route=${map.src.lat},${map.src.lon};${card.info.poi.lat},${card.info.poi.lon}`)
                 }
-                PC3.ToolButton { icon.name: "internet-web-browser"; text: "OSM"; onClicked: Qt.openUrlExternally(card.info.poi.osm) }
+                PC3.ToolButton { icon.name: "internet-web-browser"; text: "OSM"; onPressed: map.userTouched(); onClicked: Qt.openUrlExternally(card.info.poi.osm) }
                 PC3.ToolButton {
                     visible: !!(card.info && card.info.poi && card.info.poi.website)
-                    icon.name: "globe"; text: "Website"; onClicked: Qt.openUrlExternally(card.info.poi.website)
+                    icon.name: "globe"; text: "Website"; onPressed: map.userTouched(); onClicked: Qt.openUrlExternally(card.info.poi.website)
                 }
             }
         }
@@ -2020,12 +2053,31 @@ Item {
         var col = sc.rank >= 3 ? sc.color : a.status === "used" ? "#ffd166" : a.status === "active" ? "#6cff8a" : a.status === "travelling" ? "#ff4fd8" : "#8a93a6"
         return {title: (sc.rank >= 3 ? sc.glyph + " " : "📶 ") + (a.ssid || "(hidden network)"), lines: lines, color: col, poi: null}
     }
+    // Desktop 3.8 fields (each optional; an older desktop's detail line already says "emergency dept." / "no ER"):
+    // er "yes" | "no", peds tier 1-4, campusEr, driveS / driveEst.
+    function erStatus(p) {
+        if (!p || (p.er === undefined && p.peds === undefined && p.cat !== "peds_er" && p.cat !== "peds_urgent")) return ""
+        if (p.cat === "peds_urgent" || p.peds === 4) return "Not an ER"
+        if (p.er === "no") return "No ER"
+        if (p.er === "yes") return p.peds === 3 ? "ER · pediatrics dept." : "ER"
+        if (p.cat === "peds_er") return p.campusEr ? `ER on campus: ${p.campusEr} — call ahead` : "ER not confirmed — call ahead"
+        return ""
+    }
+    function driveText(p) {
+        if (!p || !(p.driveS > 0)) return ""
+        var m = Math.max(1, Math.round(p.driveS / 60))
+        return "~" + (m < 60 ? m + " min" : Math.floor(m / 60) + " h" + (m % 60 ? " " + (m % 60) + " min" : "")) + (p.driveEst === false ? " drive" : " drive (est.)")
+    }
     function poiInfo(p, pinned) {
         if (!p) return null
-        var lines = [`${p.label} · ${distText(p.d || 0)} ${compass(p.brg || 0)}` + (src.source === "ip" ? " (from IP estimate)" : "")]
+        var eta = driveText(p)
+        var lines = [`${p.label} · ${distText(p.d || 0)} ${compass(p.brg || 0)}` + (eta ? " · " + eta : "") + (src.source === "ip" ? " (from IP estimate)" : "")]
+        var st = erStatus(p)
+        if (st && (p.detail || "").toLowerCase().indexOf(st.toLowerCase()) < 0) lines.push((/call ahead|not an er|no er/i.test(st) ? "⚠ " : "🏥 ") + st)
         if (p.detail) lines.push(p.detail)
         if (p.hours) lines.push("🕑 " + p.hours)
         if (p.phone) lines.push("☎ " + p.phone)
+        if (p.address) lines.push("📍 " + p.address)
         if (!pinned) lines.push("Click for directions")
         return {title: `${p.icon} ${p.name || p.label}`, lines: lines, color: p.color, poi: p, pinned: pinned}
     }

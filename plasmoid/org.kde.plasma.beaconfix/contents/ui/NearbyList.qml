@@ -18,11 +18,37 @@ ColumnLayout {
     function copyText(t) { clip.text = t; clip.selectAll(); clip.copy() }
     function distText(m) { return m < 950 ? Math.round(m / 10) * 10 + " m" : m < 9950 ? (m / 1000).toFixed(1) + " km" : Math.round(m / 1000) + " km" }
 
+    // ── pediatric help (desktop 3.8+). Every field is optional: an older desktop just shows the rows it has. ──
+    property bool pedsOnly: false               // the Kids ER chip: pediatric ERs and pediatric urgent care only
+    readonly property bool pedsKnown: !!src.pedsSupported || (src.poiCategories || []).some(function(c) { return c.key === "peds_er" })
+    readonly property var helpRows: [["police", "🚔 Police"], ["fire", "🚒 Fire"], ["hospital", "🏥 ER"], ["pediatric", "🧸 Pediatric ER"],
+                                     ["pediatricCloser", "🧸 Closer"], ["urgent", "🩺 Urgent care"], ["pediatricUrgent", "🩹 Pediatric urgent care"]]
+    function durText(s) { var m = Math.max(1, Math.round(s / 60)); return m < 60 ? m + " min" : Math.floor(m / 60) + " h" + (m % 60 ? " " + (m % 60) + " min" : "") }
+    // driveS is the desktop's estimate (straight line x 1.4 at 70 km/h) unless it says driveEst: false (a road route)
+    function etaText(q) { return q && q.driveS > 0 ? "~" + durText(q.driveS) + (q.driveEst === false ? " drive" : " drive (est.)") : "" }
+    function tierText(q) {                      // how sure we are this is a pediatric ER: always shown, never ranked
+        if (!q) return ""
+        switch (q.tier !== undefined ? q.tier : q.peds) {
+        case 1: return "Dedicated pediatric ER"
+        case 2: return "Children's hospital · " + (q.campusEr ? "ER on campus: " + q.campusEr + " — call ahead" : "ER not confirmed — call ahead")
+        case 3: return "ER with a pediatrics department"
+        case 4: return "Not an ER"
+        default: return q.er === "yes" ? "ER" : q.er === "no" ? "No ER" : ""
+        }
+    }
+    function helpDetail(key, q) {
+        if (!q) return ""
+        if (key === "pediatric" || key === "pediatricCloser") return tierText(q)
+        if (key === "pediatricUrgent") return ["Not an ER", q.hours ? "🕑 " + q.hours : ""].filter(function(s) { return !!s }).join(" · ")
+        return ""
+    }
+
     readonly property var rows: {
-        var p = src.pois || [], out = [], q = filter.text.trim().toLowerCase()
+        var p = src.pois || [], out = [], q = filter.text.trim().toLowerCase(), peds = pedsOnly
         for (var i = 0; i < p.length; i++) {
             var x = p[i]
-            if (hiddenCats.indexOf(x.cat) >= 0 && !q) continue
+            if (peds && x.cat !== "peds_er" && x.cat !== "peds_urgent") continue
+            if (hiddenCats.indexOf(x.cat) >= 0 && !q && !peds) continue
             if (q && (x.name + " " + x.label + " " + (x.detail || "") + " " + (x.group || "") + " " + (x.address || "")).toLowerCase().indexOf(q) < 0) continue
             out.push({i: i, p: x})
         }
@@ -30,11 +56,12 @@ ColumnLayout {
         return out
     }
 
-    // ── nearest help: police / fire / ER / urgent care + the local emergency number ──
+    // ── nearest help: police / fire / ER / pediatric ER / urgent care + the local emergency number ──
+    // The nearest general ER always keeps its row: a pediatric ER is listed after it, never instead of it.
     Rectangle {
         id: emergencyCard
         readonly property var e: nearby.src.emergency || null
-        visible: e !== null && (e.police || e.fire || e.hospital || e.urgent || e.number)
+        visible: e !== null && !!(e.police || e.fire || e.hospital || e.urgent || e.number || e.pediatric || e.pediatricUrgent || e.pediatricNote)
         Layout.fillWidth: true
         radius: 6; color: Qt.rgba(1, 0.3, 0.3, 0.10); border.color: Qt.rgba(1, 0.3, 0.3, 0.45); border.width: 1
         implicitHeight: emCol.implicitHeight + 12
@@ -47,23 +74,44 @@ ColumnLayout {
                 color: "#ff6b6b"; font.bold: true; font.pixelSize: Kirigami.Theme.smallFont.pixelSize
             }
             Repeater {
-                model: emergencyCard.e ? [["police", "🚔 Police"], ["fire", "🚒 Fire"], ["hospital", "🏥 ER"], ["urgent", "🩺 Urgent care"]].filter(function(k) { return !!emergencyCard.e[k[0]] }) : []
+                model: emergencyCard.e ? nearby.helpRows.filter(function(k) { return !!emergencyCard.e[k[0]] }) : []
                 delegate: RowLayout {
+                    id: helpRow
                     required property var modelData
                     readonly property var q: emergencyCard.e[modelData[0]]
+                    readonly property string sub: nearby.helpDetail(modelData[0], q)
+                    readonly property string eta: nearby.etaText(q)
                     Layout.fillWidth: true; spacing: 4
-                    PC3.Label {
-                        Layout.fillWidth: true
-                        text: `${modelData[1]}: ${q.name}` + (q.d !== undefined ? ` · ${nearby.distText(q.d)} ${nearby.compass(q.brg || 0)}` : "") + (q.address ? ` · ${q.address}` : "")
-                        color: "#e6edf7"; font.pixelSize: Kirigami.Theme.smallFont.pixelSize; elide: Text.ElideRight
+                    ColumnLayout {
+                        Layout.fillWidth: true; spacing: 0
+                        PC3.Label {
+                            Layout.fillWidth: true
+                            text: `${helpRow.modelData[1]}: ${helpRow.q.name}`
+                                  + (helpRow.q.d !== undefined ? ` · ${nearby.distText(helpRow.q.d)} ${nearby.compass(helpRow.q.brg || 0)}` : "")
+                                  + (helpRow.eta ? ` · ${helpRow.eta}` : "") + (helpRow.q.address ? ` · ${helpRow.q.address}` : "")
+                            color: "#e6edf7"; font.pixelSize: Kirigami.Theme.smallFont.pixelSize; elide: Text.ElideRight
+                        }
+                        PC3.Label {
+                            visible: helpRow.sub !== ""
+                            Layout.fillWidth: true
+                            text: helpRow.sub
+                            color: /call ahead|not an er|no er/i.test(helpRow.sub) ? "#ffd166" : "#9fb0c8"
+                            font.pixelSize: Kirigami.Theme.smallFont.pixelSize; elide: Text.ElideRight
+                        }
                     }
                     PC3.ToolButton {
-                        visible: !!q.phone; icon.name: "call-start"; text: q.phone || ""; display: QQC2.AbstractButton.TextBesideIcon
+                        visible: !!helpRow.q.phone; icon.name: "call-start"; text: helpRow.q.phone || ""; display: QQC2.AbstractButton.TextBesideIcon
                         font.pixelSize: Kirigami.Theme.smallFont.pixelSize
-                        onClicked: Qt.openUrlExternally("tel:" + (q.phone || "").replace(/ /g, ""))
-                        QQC2.ToolTip.text: "Call " + (q.phone || ""); QQC2.ToolTip.visible: hovered
+                        onClicked: Qt.openUrlExternally("tel:" + (helpRow.q.phone || "").replace(/ /g, ""))
+                        QQC2.ToolTip.text: "Call " + (helpRow.q.phone || ""); QQC2.ToolTip.visible: hovered
                     }
                 }
+            }
+            PC3.Label {                          // "No pediatric ER mapped within 150 km — go to the nearest ER", "Saved 4 d ago …"
+                visible: !!(emergencyCard.e && emergencyCard.e.pediatricNote)
+                Layout.fillWidth: true
+                text: emergencyCard.e ? (emergencyCard.e.pediatricNote || "") : ""
+                color: "#ffd166"; font.italic: true; font.pixelSize: Kirigami.Theme.smallFont.pixelSize; wrapMode: Text.Wrap
             }
         }
     }
@@ -82,13 +130,20 @@ ColumnLayout {
                 required property var modelData
                 text: modelData[1]; checkable: true; checked: filter.text.trim().toLowerCase() === modelData[0]
                 QQC2.ToolTip.text: modelData[0] === "civic" ? "Emergency & civic" : modelData[0] === "kids" ? "Kids & fun" : "Services"; QQC2.ToolTip.visible: hovered
-                onClicked: filter.text = checked ? modelData[0] : ""
+                onClicked: { filter.text = checked ? modelData[0] : ""; nearby.pedsOnly = false }
             }
+        }
+        PC3.ToolButton {
+            visible: nearby.pedsKnown
+            text: "🧸 Kids ER"; checkable: true; checked: nearby.pedsOnly
+            QQC2.ToolTip.text: "Pediatric ERs and pediatric urgent care only (urgent care is not an ER)"; QQC2.ToolTip.visible: hovered
+            onClicked: { nearby.pedsOnly = checked; if (checked) filter.text = "" }
         }
     }
     PC3.Label {
         Layout.fillWidth: true
         text: nearby.src.poiNote ? nearby.src.poiNote
+              : nearby.pedsOnly ? `${nearby.rows.length} pediatric ER & urgent care · OpenStreetMap`
               : `${nearby.rows.length} of ${(nearby.src.pois || []).length} places · OpenStreetMap`
         color: nearby.src.poiNote ? "#ffd166" : "#9fb0c8"
         font.pixelSize: Kirigami.Theme.smallFont.pixelSize
@@ -130,7 +185,7 @@ ColumnLayout {
                     }
                     PC3.Label {
                         Layout.fillWidth: true
-                        text: [row.modelData.p.label, row.modelData.p.detail, row.modelData.p.hours].filter(function(s) { return !!s }).join(" · ")
+                        text: [row.modelData.p.label, row.modelData.p.detail, row.modelData.p.hours, nearby.etaText(row.modelData.p)].filter(function(s) { return !!s }).join(" · ")
                         color: "#9fb0c8"; font.pixelSize: Kirigami.Theme.smallFont.pixelSize; elide: Text.ElideRight
                     }
                     PC3.Label {
@@ -169,7 +224,8 @@ ColumnLayout {
         PC3.Label {
             anchors.centerIn: parent
             visible: list.count === 0
-            text: (nearby.src.pois || []).length ? "Nothing matches" : "No places loaded yet"
+            text: !(nearby.src.pois || []).length ? "No places loaded yet"
+                  : nearby.pedsOnly ? "No pediatric ER or pediatric urgent care in the list — the nearest ER is above" : "Nothing matches"
             color: "#9fb0c8"
         }
     }
