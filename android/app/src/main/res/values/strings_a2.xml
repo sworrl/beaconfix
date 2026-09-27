@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- A2: the Help screen ("Nearest help") and the Home / Places help cards. -->
+<resources>
+    <string name="help_title">Nearest help</string>
+    <string name="help_back">‹ Back</string>
+    <string name="help_call_number">Call %1$s</string>
+    <string name="help_call_sub">Life-threatening? Call first. Any ER must stabilize a child — this list helps you choose where to drive.</string>
+
+    <string name="help_dispatcher_title">For the dispatcher</string>
+    <string name="help_dispatcher_acc_age">±%1$s · fix %2$s</string>
+    <string name="help_dispatcher_age">fix %1$s</string>
+    <string name="help_dispatcher_rv">This is the RV\'s position — the phone has no recent fix of its own.</string>
+    <string name="help_dispatcher_none">No position yet. Turn on location, or open BeaconFix near the RV.</string>
+    <string name="help_dispatcher_no_address">Street address not known yet</string>
+    <string name="help_saved">(saved)</string>
+    <string name="help_copy">Copy</string>
+    <string name="help_copied">Copied</string>
+    <string name="help_share">Share</string>
+    <string name="help_share_subject">My location</string>
+
+    <string name="help_peds_title">Children\'s ER</string>
+    <string name="help_peds_none">No pediatric ER mapped nearby — go to the nearest ER</string>
+    <string name="help_closer">Closer:</string>
+    <string name="help_er_title">Nearest ER (any)</string>
+    <string name="help_er_none">No ER in the saved places yet</string>
+    <string name="help_urgent_title">Urgent care</string>
+    <string name="help_safety_title">Police &amp; fire</string>
+    <string name="help_poison_title">Poison Control</string>
+    <string name="help_poison_body">Swallowed something? Poison Control answers 24/7 and it is free.</string>
+    <string name="help_more">More: pharmacy, vet</string>
+    <string name="help_less">Less</string>
+
+    <string name="help_badge_childrens_er">Children\'s ER</string>
+    <string name="help_badge_campus">Children\'s hospital — ER on campus: %1$s — call ahead</string>
+    <string name="help_badge_unconfirmed">Children\'s hospital — ER not confirmed, call ahead</string>
+    <string name="help_badge_peds_dept">ER · pediatrics dept.</string>
+    <string name="help_badge_not_er">Not an ER</string>
+    <string name="help_badge_er">ER</string>
+    <string name="help_badge_er_unconfirmed">ER not confirmed — call ahead</string>
+    <string name="help_badge_guessed">Found by name only — call ahead</string>
+
+    <string name="help_open">Open</string>
+    <string name="help_closed">Closed</string>
+    <string name="help_closes">closes %1$s</string>
+    <string name="help_from_you">from you</string>
+    <string name="help_from_rv">from the RV</string>
+
+    <string name="help_call">Call</string>
+    <string name="help_no_phone">No phone listed</string>
+    <string name="help_search">Search</string>
+    <string name="help_directions">Directions</string>
+    <string name="help_on_map">Map</string>
+    <string name="help_cd_call">Call %1$s</string>
+    <string name="help_cd_directions">Directions to %1$s</string>
+    <string name="help_cd_share">Share %1$s</string>
+    <string name="help_cd_map">Show %1$s on the map</string>
+    <string name="help_cd_search">Search the web for %1$s</string>
+    <string name="help_search_query">%1$s phone number</string>
+
+    <string name="help_source_desktop">From the RV desktop · %1$s</string>
+    <string name="help_source_desktop_far">From the RV desktop · %1$s · %2$s from here</string>
+    <string name="help_source_phone">Found by this phone · %1$s</string>
+    <string name="help_source_none">No saved places yet. Pull down to refresh.</string>
+    <string name="help_stale">These places may be out of date for where you are.</string>
+    <string name="help_osm_note">OpenStreetMap data can be incomplete.</string>
+    <string name="help_refresh">Refresh</string>
+    <string name="help_refreshing">Looking for help nearby…</string>
+    <string name="help_error">Last try: %1$s</string>
+
+    <string name="help_card_title">Nearest help</string>
+    <string name="help_card_empty">Tap to find the nearest ER</string>
+    <string name="help_card_er">ER: %1$s</string>
+    <string name="help_card_saved">saved %1$s</string>
+</resources>
