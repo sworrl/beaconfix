@@ -170,7 +170,7 @@ class MirrorMappingTest {
 
     @Test fun prefillBuildsAStaleViewFromTheCache() {
         val snaps = mapOf(
-            Mirror.LOCATION to snap(Mirror.LOCATION, enc(LocationDto(valid = true, lat = 40.0, lon = -75.0, place = "Testville")), 100),
+            Mirror.LOCATION to snap(Mirror.LOCATION, enc(LocationDto(valid = true, lat = 40.0, lon = -75.0, place = "Testville", ageS = 5.0)), 100),
             Mirror.TRIP to snap(Mirror.TRIP, enc(TripDto(Trip(rank = "Scout", stopsToday = 2))), 300),
             Mirror.EMERGENCY to snap(Mirror.EMERGENCY, enc(EmergencyDto(number = "911", hospital = HelpPlaceDto(name = "Test General"))), 200),
             Mirror.DEVICES to snap(Mirror.DEVICES, enc(DevicesPositions(listOf(LinkedDevice(device = "pi", kind = "pi")))), 150),
@@ -178,9 +178,10 @@ class MirrorMappingTest {
         val near = DesktopCache.toEntity(src, PoiDto(name = "Near", cat = "fuel", lat = 40.001, lon = -75.0), 40.0, -75.0, 250)
         val far = DesktopCache.toEntity(src, PoiDto(name = "Far", cat = "peds_er", lat = 40.5, lon = -75.0, scope = "far"), 40.0, -75.0, 250)
         val other = DesktopCache.toEntity("desktop:other", PoiDto(name = "Other", cat = "fuel", lat = 40.0, lon = -75.0), 40.0, -75.0, 999)
-        val v = Mirror.prefill(desk, snaps, listOf(far, other, near))
+        val v = Mirror.prefill(desk, snaps, listOf(far, other, near), now = 3_600_100L)
         assertTrue(v.stale); assertEquals(300L, v.cachedAt)
         assertEquals(setOf("location", "trip", "pois", "emergency", "devices"), v.cached)
+        assertEquals(3605.0, v.location?.ageS ?: 0.0, 1e-9)       // 5 s old when saved, saved an hour ago
         assertEquals("Testville", v.location?.place); assertEquals("Scout", v.trip?.rank); assertEquals(2, v.trip?.stopsToday)
         assertEquals("Test General", v.emergency?.hospital?.name); assertEquals("pi", v.devices.single().device)
         assertEquals(listOf("Near", "Far"), v.pois.map { it.name })       // this desktop's rows only, nearest first

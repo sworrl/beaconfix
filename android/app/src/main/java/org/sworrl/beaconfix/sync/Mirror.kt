@@ -176,10 +176,14 @@ object Mirror {
      * places, emergency and devices from its snapshots and cached rows. [DesktopView.cached] lists what came from the
      * cache, [DesktopView.cachedAt] is when the newest of it was saved, and [DesktopView.stale] is set when anything was.
      */
-    fun prefill(d: DesktopEntity, snaps: Map<String, SnapshotEntity>, rows: List<PoiEntity>): DesktopView {
+    fun prefill(d: DesktopEntity, snaps: Map<String, SnapshotEntity>, rows: List<PoiEntity>, now: Long = System.currentTimeMillis()): DesktopView {
         val src = DesktopCache.desktopSource(d.id)
         val mine = rows.filter { it.source == src }
-        val loc = decode<LocationDto>(snaps[LOCATION])
+        // the fix's age as the desktop reported it, plus how long ago that answer was saved
+        val loc = decode<LocationDto>(snaps[LOCATION])?.let { l ->
+            val saved = snaps[LOCATION]?.fetchedAt ?: now
+            l.copy(ageS = l.ageS?.let { it + (now - saved).coerceAtLeast(0) / 1000.0 })
+        }
         val trip = decode<TripDto>(snaps[TRIP])?.trip
         val em = decode<EmergencyDto>(snaps[EMERGENCY])
         val dev = decode<DevicesPositions>(snaps[DEVICES])?.devices
