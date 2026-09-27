@@ -17,7 +17,8 @@ import java.time.LocalDateTime
  * desktop's). When the shared fixture file is present, every scenario's help picks are checked against it too.
  */
 class NearestHelpTest {
-    private val oLat = 39.6350; private val oLon = -79.9550
+    /** A round synthetic origin beside the campus (the picks and the drive time match the C5 scenarios). */
+    private val oLat = 39.65; private val oLon = -79.95
 
     private val wvuCampus = NearestHelp.Candidate(key = "way/1135527599", cat = "peds_er", name = "WVU Medicine Children's", lat = 39.654058, lon = -79.955153,
         phone = "+13045981111", peds = 2, campus = "Ruby Memorial Hospital")
