@@ -7,6 +7,7 @@
 #include "notify.h"
 #include "mapdb.h"
 #include "importers.h"
+#include "poiclassify.h"
 #include <QClipboard>
 #include <QCoreApplication>
 #include <QDBusConnection>
@@ -122,6 +123,11 @@ Locator::Locator(bool standalone, QObject *parent) : QObject(parent), m_standalo
     rebuildPatternCaches();
     m_wigleToken     = s.value("wigleToken").toString();
     m_poiRadiusKm    = qBound(1, s.value("poiRadiusKm", 6).toInt(), 30);
+    m_pedsRadiusKm   = qBound(50, s.value("pedsRadiusKm", 150).toInt(), 300);
+    m_overpassTimer.setSingleShot(true);
+    connect(&m_overpassTimer, &QTimer::timeout, this, &Locator::pumpOverpass);
+    m_pedsRetryTimer.setSingleShot(true);
+    connect(&m_pedsRetryTimer, &QTimer::timeout, this, [this] { refreshPediatric(false); });
     m_notifyStops    = s.value("notifyStops", true).toBool();
     m_notifyRegions  = s.value("notifyRegions", true).toBool();
     m_notifyAchievements = s.value("notifyAchievements", true).toBool();
@@ -182,9 +188,10 @@ Locator::Locator(bool standalone, QObject *parent) : QObject(parent), m_standalo
     if (m_dbUsable && m_db->isEmpty() && anyJson) migrateJsonToDb();
     else if (m_db->isOpen()) loadFromDb();
     loadAnchors();
+    rebuildMergedPois();
     if (m_db->isOpen()) m_countryCode = m_db->kv(QStringLiteral("countryCode"));
     for (const Fix &f : m_history) noteVisited(f, false);
-    connect(this, &Locator::FixChanged, this, [this] { refreshPois(); fetchElevation(); checkAchievements(); });
+    connect(this, &Locator::FixChanged, this, [this] { rebuildMergedPois(); refreshPois(); refreshPediatric(false); fetchElevation(); checkAchievements(); });
     connect(this, &Locator::scanUpdated, this, [this] { checkAchievements(); });
     // Position refinement: beacons with new samples are refit in a batch, not on every scan
     m_refitTimer.setSingleShot(true); m_refitTimer.setInterval(10000);
@@ -1108,7 +1115,7 @@ QString Locator::StateJson() const
     o["lastEventId"] = m_eventId;
     o["liveScanSeconds"] = m_liveScanSecs;
     QJsonArray pois;
-    for (const Poi &pt : m_pois) {
+    for (const Poi &pt : m_allPois) {
         const PoiCategory *c = poiCategory(pt.cat);
         QJsonObject a;
         a["cat"] = pt.cat; a["name"] = pt.name; a["lat"] = pt.lat; a["lon"] = pt.lon;
@@ -1123,6 +1130,13 @@ QString Locator::StateJson() const
         if (pt.emergency) a["emergency"] = true;
         a["group"] = c ? c->group : QStringLiteral("services");
         a["osm"] = QStringLiteral("https://www.openstreetmap.org/%1/%2").arg(pt.osmType).arg(pt.osmId);
+        if (!pt.osmType.isEmpty()) a["osmType"] = pt.osmType;
+        if (pt.osmId) a["osmId"] = double(pt.osmId);
+        if (pt.peds) a["peds"] = pt.peds;
+        if (!pt.er.isEmpty()) a["er"] = pt.er;
+        if (!pt.campus.isEmpty()) a["campusEr"] = pt.campus;
+        if (pt.scope != QLatin1String("near")) a["scope"] = pt.scope;
+        if (pt.driveS > 0) { a["driveS"] = pt.driveS; a["driveM"] = pt.driveM; a["driveEst"] = pt.driveEst; }
         if (m_fix.valid) {
             a["d"] = qRound(distanceM(m_fix.lat, m_fix.lon, pt.lat, pt.lon));
             a["brg"] = qRound(bearingDeg(m_fix.lat, m_fix.lon, pt.lat, pt.lon));
@@ -1134,9 +1148,12 @@ QString Locator::StateJson() const
     o["tileBase"] = m_tileBase;
     QJsonArray cats;
     for (const PoiCategory &c : poiCategories())
-        cats.append(QJsonObject{{"key", c.key}, {"label", c.label}, {"icon", c.icon}, {"color", c.color.name()}, {"group", c.group}, {"groupLabel", poiGroupLabel(c.group)}, {"wide", c.wide}});
+        cats.append(QJsonObject{{"key", c.key}, {"label", c.label}, {"icon", c.icon}, {"color", c.color.name()}, {"group", c.group}, {"groupLabel", poiGroupLabel(c.group)}, {"wide", c.wide}, {"reachKm", c.reachKm}});
     o["poiCategories"] = cats;
     o["emergency"] = emergencyJson();
+    o["pedsNote"] = o["emergency"].toObject()["pediatricNote"];
+    o["pedsTime"] = m_pedsTime.isValid() ? m_pedsTime.toString(Qt::ISODate) : QString();
+    o["pedsRadiusKm"] = m_pedsRadiusKm;
     QJsonArray track;
     for (const Stop &s : stops()) {
         const Fix &f = s.fix;
@@ -1833,7 +1850,7 @@ void Locator::reverseGeocode(double lat, double lon)
 // Picked for life on the road: fuel, food, water, dump stations, camping, laundry…
 const QList<PoiCategory> &Locator::poiCategories()
 {
-    // key, label, icon, colour, group, wide-radius
+    // key, label, icon, colour, group, wide-radius[, reachKm]
     static const QList<PoiCategory> cats = {
         // Services (life on the road)
         {QStringLiteral("fuel"),     QStringLiteral("Fuel"),              QStringLiteral("⛽"), QColor(0xff, 0x9f, 0x43), QStringLiteral("services"), false},
@@ -1859,6 +1876,9 @@ const QList<PoiCategory> &Locator::poiCategories()
         {QStringLiteral("fire"),     QStringLiteral("Fire station"),      QStringLiteral("🚒"), QColor(0xff, 0x4d, 0x4d), QStringLiteral("civic"), true},
         {QStringLiteral("health"),   QStringLiteral("Hospital / ER"),     QStringLiteral("🏥"), QColor(0xff, 0x4f, 0x4f), QStringLiteral("civic"), true},
         {QStringLiteral("urgent"),   QStringLiteral("Urgent care / clinic"), QStringLiteral("🩺"), QColor(0xff, 0x8a, 0x8a), QStringLiteral("civic"), true},
+        // Pediatric ERs come from their own search (reachKm), see refreshPediatric()
+        {QStringLiteral("peds_er"),  QStringLiteral("Pediatric ER"),      QStringLiteral("🧸"), QColor(0xff, 0x5f, 0xa2), QStringLiteral("civic"), true, 150},
+        {QStringLiteral("peds_urgent"), QStringLiteral("Pediatric urgent care"), QStringLiteral("🩹"), QColor(0xff, 0xa3, 0xcf), QStringLiteral("civic"), true, 50},
         {QStringLiteral("pharmacy"), QStringLiteral("Pharmacy"),          QStringLiteral("💊"), QColor(0xff, 0x7a, 0xa8), QStringLiteral("civic"), false},
         {QStringLiteral("dentist"),  QStringLiteral("Dentist"),           QStringLiteral("🦷"), QColor(0xe6, 0xed, 0xf7), QStringLiteral("civic"), false},
         {QStringLiteral("vet"),      QStringLiteral("Veterinary"),        QStringLiteral("🐾"), QColor(0xd0, 0xa0, 0x6a), QStringLiteral("civic"), true},
@@ -1903,83 +1923,31 @@ const PoiCategory *Locator::poiCategory(const QString &key)
     return nullptr;
 }
 
-static QString poiCategoryFor(const QJsonObject &t)
+static const char *const kOverpassMirrors[] = {"https://overpass-api.de/api/interpreter",
+                                               "https://overpass.kumi.systems/api/interpreter"};
+static const int kOverpassLastMirror = int(sizeof(kOverpassMirrors) / sizeof(*kOverpassMirrors)) - 1;
+
+// A bbox query is ~20× faster than around: on ways; the radius is applied to the answer.
+static QString bboxFor(double lat, double lon, int rM)
 {
-    const QString am = t["amenity"].toString(), shop = t["shop"].toString(), tour = t["tourism"].toString(), hw = t["highway"].toString();
-    const QString le = t["leisure"].toString(), hc = t["healthcare"].toString(), off = t["office"].toString(), gov = t["government"].toString();
-    const QString name = t["name"].toString().toLower();
-    // Emergency & civic
-    if (am == "police") return "police";
-    if (am == "fire_station") return "fire";
-    if (am == "hospital") return "health";
-    if (am == "clinic" || am == "doctors" || am == "urgent_care" || hc == "urgent_care" || hc == "clinic" || hc == "doctor") return "urgent";
-    if (am == "pharmacy" || shop == "chemist" || hc == "pharmacy") return "pharmacy";
-    if (am == "dentist" || hc == "dentist") return "dentist";
-    if (am == "veterinary") return "vet";
-    if (am == "library") return "library";
-    if (am == "townhall") return "townhall";
-    if (am == "courthouse") return "court";
-    if (off == "government" && (gov == "transportation" || gov == "vehicle_registration" || gov == "driving_license" || name.contains("dmv") || name.contains("motor vehicle") || name.contains("driver")))
-        return "dmv";
-    if (am == "school" || am == "kindergarten") return "school";
-    if (am == "community_centre") return "community";
-    // Kids & fun
-    if (le == "playground") return "playground";
-    if (le == "dog_park") return "dogpark";
-    if (le == "park" || le == "garden") return "park";
-    if (le == "swimming_pool" || le == "swimming_area" || (le == "sports_centre" && t["sport"].toString().contains("swimming"))) return t["access"].toString() == "private" ? QString() : QStringLiteral("pool");
-    if (le == "water_park" || t["playground"].toString() == "splash_pad" || t["playground:splash_pad"].toString() == "yes") return "splash";
-    if (tour == "zoo" || tour == "aquarium") return "zoo";
-    if (tour == "museum" || tour == "gallery") return "museum";
-    if (tour == "theme_park") return "themepark";
-    if (am == "ice_cream" || shop == "ice_cream") return "icecream";
-    if (am == "cinema") return "cinema";
-    if (le == "bowling_alley") return "bowling";
-    if (le == "amusement_arcade") return "arcade";
-    if (le == "trampoline_park" || (le == "sports_centre" && t["sport"].toString().contains("trampoline"))) return "trampoline";
-    if (le == "skatepark" || (le == "pitch" && t["sport"].toString().contains("skateboard"))) return "skate";
-    if (t["natural"].toString() == "beach" || le == "beach_resort") return "beach";
-    if (tour == "picnic_site" || le == "picnic_table") return "picnic";
-    if (hw == "trailhead" || le == "nature_reserve" || t["boundary"].toString() == "national_park") return "trail";
-    // Services
-    if (am == "fuel") return t["fuel:lpg"].toString() == "yes" && t["fuel:diesel"].toString() != "yes" && t["fuel:octane_87"].toString() != "yes" ? "propane" : "fuel";
-    if (shop == "gas" || (shop == "bottled_gas")) return "propane";
-    if (am == "charging_station") return "charging";
-    if (shop == "supermarket" || shop == "convenience" || shop == "greengrocer" || shop == "wholesale") return "grocery";
-    if (am == "restaurant" || am == "fast_food" || am == "food_court" || am == "pub") return "food";
-    if (am == "cafe") return "cafe";
-    if (tour == "camp_site" || tour == "caravan_site") return "camp";
-    if (am == "sanitary_dump_station") return "dump";
-    if (am == "drinking_water" || am == "water_point") return "water";
-    if (am == "shower") return "shower";
-    if (am == "toilets") return t["shower"].toString() == "yes" ? "shower" : "toilets";
-    if (shop == "laundry" || am == "laundry") return "laundry";
-    if (shop == "car_repair" || shop == "tyres" || shop == "car_parts" || am == "vehicle_inspection") return "repair";
-    if (am == "car_wash") return "carwash";
-    if (shop == "hardware" || shop == "doityourself" || shop == "outdoor" || shop == "trade") return "hardware";
-    if (am == "post_office" || am == "parcel_locker") return "post";
-    if (hw == "rest_area" || hw == "services") return "rest";
-    const QString ia = t["internet_access"].toString();
-    if (ia == "wlan" || ia == "yes") return "wifi";
-    return {};
+    const double dLat = rM / 111320.0, dLon = rM / (111320.0 * std::cos(qDegreesToRadians(lat)));
+    return QStringLiteral("%1,%2,%3,%4").arg(lat - dLat, 0, 'f', 5).arg(lon - dLon, 0, 'f', 5).arg(lat + dLat, 0, 'f', 5).arg(lon + dLon, 0, 'f', 5);
 }
 
-// "123 Main St, Town, ST 12345" from OSM addr:* tags (whatever is present, in that order)
-static QString poiAddress(const QJsonObject &t)
+// The help categories get a drive time (docs/API.md "Pediatric ER")
+static bool driveCat(const QString &cat)
 {
-    QString street = t["addr:street"].toString(), hn = t["addr:housenumber"].toString(), unit = t["addr:unit"].toString();
-    QString line1 = hn.isEmpty() ? street : (street.isEmpty() ? hn : hn + QLatin1Char(' ') + street);
-    if (!unit.isEmpty() && !line1.isEmpty()) line1 += QStringLiteral(" #") + unit;
-    QString city = t["addr:city"].toString(); if (city.isEmpty()) city = t["addr:town"].toString(); if (city.isEmpty()) city = t["addr:village"].toString();
-    QString state = t["addr:state"].toString(); if (state.isEmpty()) state = t["addr:province"].toString();
-    const QString post = t["addr:postcode"].toString();
-    QStringList parts;
-    if (!line1.isEmpty()) parts << line1;
-    if (!city.isEmpty()) parts << city;
-    QString tail = state; if (!post.isEmpty()) tail += (tail.isEmpty() ? QString() : QStringLiteral(" ")) + post;
-    if (!tail.isEmpty()) parts << tail;
-    if (parts.isEmpty() && !t["addr:full"].toString().isEmpty()) parts << t["addr:full"].toString();
-    return parts.join(QStringLiteral(", "));
+    return cat == QLatin1String("peds_er") || cat == QLatin1String("peds_urgent") || cat == QLatin1String("health") || cat == QLatin1String("urgent")
+        || cat == QLatin1String("police") || cat == QLatin1String("fire");
+}
+
+static QString poiKey(const Poi &p) { return p.osmType + QLatin1Char('/') + QString::number(p.osmId); }
+
+static QString ageText(qint64 secs)
+{
+    if (secs < 3600) return QStringLiteral("%1 min").arg(qMax<qint64>(1, secs / 60));
+    if (secs < 48 * 3600) return QStringLiteral("%1 h").arg(secs / 3600);
+    return QStringLiteral("%1 d").arg(secs / 86400);
 }
 
 void Locator::refreshPois(bool force)
@@ -1995,8 +1963,45 @@ void Locator::refreshPois(bool force)
     }
     // Don't hammer Overpass after a failure
     if (!force && m_poiTried.isValid() && m_poiTried.secsTo(QDateTime::currentDateTime()) < 120) return;
+    if (!overpassSlot(false, force)) return;
     m_poiTried = QDateTime::currentDateTime();
     queryOverpass(m_fix.lat, m_fix.lon, radius, 0);
+}
+
+// Overpass allows two query slots per IP. We use one: a single query in flight, 5 s between
+// queries, and a minute's pause after 429 / 504. A request that has to wait is queued (the
+// newest one per kind) and re-checked by pumpOverpass().
+bool Locator::overpassSlot(bool peds, bool force)
+{
+    const QDateTime now = QDateTime::currentDateTime();
+    qint64 wait = 0;
+    if (m_overpassIdle.isValid()) wait = qMax<qint64>(wait, 5000 - m_overpassIdle.msecsTo(now));
+    if (m_overpassCoolUntil.isValid()) wait = qMax<qint64>(wait, now.msecsTo(m_overpassCoolUntil));
+    if (!m_poiBusy && !m_pedsBusy && wait <= 0) return true;
+    if (peds) { m_pedsPending = true; m_pedsPendingForce = m_pedsPendingForce || force; }
+    else      { m_poiPending = true;  m_poiPendingForce = m_poiPendingForce || force; }
+    if (!m_poiBusy && !m_pedsBusy) m_overpassTimer.start(int(qBound(qint64(0), wait, qint64(3600000))) + 50);
+    return false;
+}
+
+void Locator::overpassDone()
+{
+    m_overpassIdle = QDateTime::currentDateTime();
+    if (m_poiPending || m_pedsPending) m_overpassTimer.start(5050);
+}
+
+void Locator::pumpOverpass()
+{
+    if (m_poiBusy || m_pedsBusy) return;
+    if (m_poiPending) {                                   // the places around us first
+        const bool f = m_poiPendingForce; m_poiPending = m_poiPendingForce = false;
+        refreshPois(f);
+        if (m_poiBusy) return;                            // the pediatric search waits for it (overpassDone re-arms the timer)
+    }
+    if (m_pedsPending) {
+        const bool f = m_pedsPendingForce; m_pedsPending = m_pedsPendingForce = false;
+        refreshPediatric(f);
+    }
 }
 
 static QString hcLabel(const QJsonObject &t)
@@ -2008,22 +2013,79 @@ static QString hcLabel(const QJsonObject &t)
     return {};
 }
 
+// One classified Overpass element → a place with its one-line detail; false = not worth showing
+static bool makePoi(const PoiClassify::Element &e, const PoiClassify::Result &r, Poi *out)
+{
+    const QJsonObject &t = e.tags;
+    const QString &cat = r.cat;
+    Poi pt;
+    pt.cat = cat;
+    pt.lat = e.lat; pt.lon = e.lon;
+    pt.osmType = e.type; pt.osmId = e.id;
+    pt.name = t["name"].toString();
+    if (pt.name.isEmpty()) pt.name = t["brand"].toString();
+    if (pt.name.isEmpty()) pt.name = t["operator"].toString();
+    const QString ia = t["internet_access"].toString();
+    pt.wifi = ia == "wlan" || ia == "yes";
+    pt.hours = t["opening_hours"].toString();
+    pt.phone = r.phone;
+    pt.website = t["website"].toString(); if (pt.website.isEmpty()) pt.website = t["contact:website"].toString();
+    pt.address = r.address;
+    pt.wheelchair = t["wheelchair"].toString();
+    pt.emergency = r.emergency;
+    pt.peds = r.peds; pt.er = r.er; pt.campus = r.campus;
+    QStringList d;
+    if (!r.detail.isEmpty()) d << r.detail;                // the ER confidence first: "ER not confirmed — call ahead", "not an ER", …
+    if (!t["brand"].toString().isEmpty() && t["brand"].toString() != pt.name) d << t["brand"].toString();
+    if (cat == "fuel") {
+        QStringList f;
+        if (t["fuel:diesel"].toString() == "yes") f << "diesel";
+        if (t["fuel:lpg"].toString() == "yes") f << "propane";
+        if (t["fuel:HGV_diesel"].toString() == "yes" || t["hgv"].toString() == "yes") f << "truck lanes";
+        if (!f.isEmpty()) d << f.join(" · ");
+    }
+    if (cat == "camp") {
+        if (t["fee"].toString() == "no") d << "free";
+        if (t["power_supply"].toString() == "yes") d << "hookups";
+        if (t["sanitary_dump_station"].toString() == "yes") d << "dump station";
+        if (t["shower"].toString() == "yes" || t["showers"].toString() == "yes") d << "showers";
+        if (!t["capacity"].toString().isEmpty()) d << t["capacity"].toString() + " sites";
+    }
+    if (cat == "dump" || cat == "water" || cat == "toilets" || cat == "shower") {
+        if (t["fee"].toString() == "no") d << "free";
+        else if (t["fee"].toString() == "yes") d << "fee";
+        if (t["access"].toString() == "customers") d << "customers only";
+    }
+    if (cat == "food" || cat == "cafe") {
+        const QString c = t["cuisine"].toString();
+        if (!c.isEmpty()) d << QString(c).replace('_', ' ').replace(';', ", ");
+    }
+    if (cat == "charging") {
+        QStringList s;
+        for (const char *k : {"socket:tesla_supercharger", "socket:type2_combo", "socket:chademo", "socket:nacs"})
+            if (!t[k].toString().isEmpty() && t[k].toString() != "no") s << QString::fromLatin1(k).section(':', 1);
+        if (!s.isEmpty()) d << s.join(", ");
+    }
+    if ((cat == "urgent" || cat == "peds_urgent") && !hcLabel(t).isEmpty()) d << hcLabel(t);
+    if (cat == "park" || cat == "playground" || cat == "dogpark") { if (t["dog"].toString() == "yes" || t["dog"].toString() == "leashed") d << "dogs ok"; if (t["fee"].toString() == "yes") d << "fee"; }
+    if (cat == "pool" && t["indoor"].toString() == "yes") d << "indoor";
+    if (cat == "trail" && !t["sac_scale"].toString().isEmpty()) d << t["sac_scale"].toString().replace('_', ' ');
+    if (!pt.wheelchair.isEmpty() && pt.wheelchair != "no") d << (pt.wheelchair == "yes" ? QStringLiteral("♿") : QStringLiteral("♿ limited"));
+    if (pt.wifi && cat != "wifi") d << "Wi-Fi";
+    pt.detail = d.join(" · ");
+    if (pt.name.isEmpty() && (cat == "food" || cat == "cafe" || cat == "grocery" || cat == "wifi" || cat == "hardware" || cat == "museum" || cat == "cinema" || cat == "icecream" || cat == "school" || cat == "community")) return false;
+    *out = pt;
+    return true;
+}
+
 void Locator::queryOverpass(double lat, double lon, int radiusM, int mirror)
 {
-    static const char *mirrors[] = {"https://overpass-api.de/api/interpreter",
-                                    "https://overpass.kumi.systems/api/interpreter"};
-    const int lastMirror = int(sizeof(mirrors) / sizeof(*mirrors)) - 1;
     m_poiBusy = true;
     m_poiNote = QStringLiteral("Loading places within %1 km…").arg(radiusM / 1000);
     emit poisUpdated();
-    // A bbox query is ~20× faster than around: on ways; the radius is applied below.
     // Two boxes: everything within the radius, and the sparse civic / attraction categories out to the wide radius.
-    auto bboxFor = [lat, lon](int rM) {
-        const double dLat = rM / 111320.0, dLon = rM / (111320.0 * std::cos(qDegreesToRadians(lat)));
-        return QStringLiteral("%1,%2,%3,%4").arg(lat - dLat, 0, 'f', 5).arg(lon - dLon, 0, 'f', 5).arg(lat + dLat, 0, 'f', 5).arg(lon + dLon, 0, 'f', 5);
-    };
     const int wideM = qMax(radiusM, qMin(25000, radiusM * 4));
-    const QString bbox = bboxFor(radiusM), wide = bboxFor(wideM);
+    const QString bbox = bboxFor(lat, lon, radiusM), wide = bboxFor(lat, lon, wideM);
     const QString q = QStringLiteral(
         "[out:json][timeout:25];("
         "nwr[amenity~\"^(fuel|charging_station|restaurant|fast_food|food_court|pub|cafe|sanitary_dump_station|drinking_water|water_point|"
@@ -2042,90 +2104,39 @@ void Locator::queryOverpass(double lat, double lon, int radiusM, int mirror)
         "nwr[natural=beach](%2);"
         "nwr[highway=trailhead](%2);"
         ");out center tags qt 2500;").arg(bbox, wide);
-    QNetworkRequest req{QUrl(QString::fromLatin1(mirrors[mirror]))};
+    QNetworkRequest req{QUrl(QString::fromLatin1(kOverpassMirrors[mirror]))};
     req.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/x-www-form-urlencoded"));
     req.setHeader(QNetworkRequest::UserAgentHeader, QString::fromLatin1(USER_AGENT));
     req.setTransferTimeout(30000);
     QUrlQuery body; body.addQueryItem(QStringLiteral("data"), q);
     QNetworkReply *rep = m_nam.post(req, body.toString(QUrl::FullyEncoded).toUtf8());
-    connect(rep, &QNetworkReply::finished, this, [this, rep, lat, lon, radiusM, mirror, lastMirror] {
+    connect(rep, &QNetworkReply::finished, this, [this, rep, lat, lon, radiusM, wideM, mirror] {
         rep->deleteLater();
         const int http = rep->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
         const QJsonDocument doc = QJsonDocument::fromJson(rep->readAll());
         // Overpass reports timeouts / overload as HTTP 200 with a "remark" and no elements
         const QString remark = doc.object()["remark"].toString();
         if (rep->error() != QNetworkReply::NoError || !doc.isObject() || remark.contains(QLatin1String("error"), Qt::CaseInsensitive)) {
-            if (mirror < lastMirror) { queryOverpass(lat, lon, radiusM, mirror + 1); return; }
+            if (mirror < kOverpassLastMirror) { queryOverpass(lat, lon, radiusM, mirror + 1); return; }
             m_poiBusy = false;
+            if (http == 429 || http == 504) m_overpassCoolUntil = QDateTime::currentDateTime().addSecs(60);
             m_poiNote = QStringLiteral("Couldn't load places (%1)").arg(!remark.isEmpty() ? remark.left(80) : http ? QStringLiteral("HTTP %1").arg(http) : rep->errorString());
             emit poisUpdated();
+            overpassDone();
             return;
         }
+        QList<PoiClassify::Element> els;
+        for (const QJsonValue &v : doc.object()["elements"].toArray()) els << PoiClassify::Element::fromOverpass(v.toObject());
+        const QList<PoiClassify::Result> res = PoiClassify::classifyAll(els);   // category + pediatric tier, campus ERs, duplicates
         QHash<QString, QList<Poi>> byCat;
-        for (const QJsonValue &v : doc.object()["elements"].toArray()) {
-            const QJsonObject el = v.toObject(), t = el["tags"].toObject();
-            const QString cat = poiCategoryFor(t);
-            if (cat.isEmpty()) continue;
+        for (int i = 0; i < els.size(); ++i) {
+            const PoiClassify::Result &r = res[i];
+            const PoiClassify::Element &e = els[i];
+            if (r.dropped || r.cat.isEmpty() || (e.lat == 0 && e.lon == 0)) continue;
+            const PoiCategory *pc = poiCategory(r.cat);
+            if (distanceM(lat, lon, e.lat, e.lon) > (pc && pc->wide ? wideM : radiusM)) continue;
             Poi pt;
-            pt.cat = cat;
-            pt.lat = el.contains("lat") ? el["lat"].toDouble() : el["center"].toObject()["lat"].toDouble();
-            pt.lon = el.contains("lon") ? el["lon"].toDouble() : el["center"].toObject()["lon"].toDouble();
-            const PoiCategory *pc = poiCategory(cat);
-            const double dist = distanceM(lat, lon, pt.lat, pt.lon);
-            if ((pt.lat == 0 && pt.lon == 0) || dist > (pc && pc->wide ? qMax(radiusM, qMin(25000, radiusM * 4)) : radiusM)) continue;
-            pt.osmType = el["type"].toString(); pt.osmId = qint64(el["id"].toDouble());
-            pt.name = t["name"].toString();
-            if (pt.name.isEmpty()) pt.name = t["brand"].toString();
-            if (pt.name.isEmpty()) pt.name = t["operator"].toString();
-            const QString ia = t["internet_access"].toString();
-            pt.wifi = ia == "wlan" || ia == "yes";
-            pt.hours = t["opening_hours"].toString();
-            pt.phone = t["phone"].toString(); if (pt.phone.isEmpty()) pt.phone = t["contact:phone"].toString();
-            pt.website = t["website"].toString(); if (pt.website.isEmpty()) pt.website = t["contact:website"].toString();
-            pt.address = poiAddress(t);
-            pt.wheelchair = t["wheelchair"].toString();
-            pt.emergency = cat == "health" && (t["emergency"].toString() == "yes" || t["opening_hours"].toString() == "24/7");
-            QStringList d;
-            if (!t["brand"].toString().isEmpty() && t["brand"].toString() != pt.name) d << t["brand"].toString();
-            if (cat == "fuel") {
-                QStringList f;
-                if (t["fuel:diesel"].toString() == "yes") f << "diesel";
-                if (t["fuel:lpg"].toString() == "yes") f << "propane";
-                if (t["fuel:HGV_diesel"].toString() == "yes" || t["hgv"].toString() == "yes") f << "truck lanes";
-                if (!f.isEmpty()) d << f.join(" · ");
-            }
-            if (cat == "camp") {
-                if (t["fee"].toString() == "no") d << "free";
-                if (t["power_supply"].toString() == "yes") d << "hookups";
-                if (t["sanitary_dump_station"].toString() == "yes") d << "dump station";
-                if (t["shower"].toString() == "yes" || t["showers"].toString() == "yes") d << "showers";
-                if (!t["capacity"].toString().isEmpty()) d << t["capacity"].toString() + " sites";
-            }
-            if (cat == "dump" || cat == "water" || cat == "toilets" || cat == "shower") {
-                if (t["fee"].toString() == "no") d << "free";
-                else if (t["fee"].toString() == "yes") d << "fee";
-                if (t["access"].toString() == "customers") d << "customers only";
-            }
-            if (cat == "food" || cat == "cafe") {
-                const QString c = t["cuisine"].toString();
-                if (!c.isEmpty()) d << QString(c).replace('_', ' ').replace(';', ", ");
-            }
-            if (cat == "charging") {
-                QStringList s;
-                for (const char *k : {"socket:tesla_supercharger", "socket:type2_combo", "socket:chademo", "socket:nacs"})
-                    if (!t[k].toString().isEmpty() && t[k].toString() != "no") s << QString::fromLatin1(k).section(':', 1);
-                if (!s.isEmpty()) d << s.join(", ");
-            }
-            if (cat == "health") { if (pt.emergency) d << "emergency dept."; if (!t["emergency"].toString().isEmpty() && t["emergency"].toString() != "yes") d << "no ER"; }
-            if (cat == "urgent" && !hcLabel(t).isEmpty()) d << hcLabel(t);
-            if (cat == "park" || cat == "playground" || cat == "dogpark") { if (t["dog"].toString() == "yes" || t["dog"].toString() == "leashed") d << "dogs ok"; if (t["fee"].toString() == "yes") d << "fee"; }
-            if (cat == "pool" && t["indoor"].toString() == "yes") d << "indoor";
-            if (cat == "trail" && !t["sac_scale"].toString().isEmpty()) d << t["sac_scale"].toString().replace('_', ' ');
-            if (!pt.wheelchair.isEmpty() && pt.wheelchair != "no") d << (pt.wheelchair == "yes" ? QStringLiteral("♿") : QStringLiteral("♿ limited"));
-            if (pt.wifi && cat != "wifi") d << "Wi-Fi";
-            pt.detail = d.join(" · ");
-            if (pt.name.isEmpty() && (cat == "food" || cat == "cafe" || cat == "grocery" || cat == "wifi" || cat == "hardware" || cat == "museum" || cat == "cinema" || cat == "icecream" || cat == "school" || cat == "community")) continue;
-            byCat[cat] << pt;
+            if (makePoi(e, r, &pt)) byCat[r.cat] << pt;
         }
         // Keep the nearest few dozen per category so a city doesn't bury the map
         QList<Poi> out;
@@ -2143,8 +2154,233 @@ void Locator::queryOverpass(double lat, double lon, int radiusM, int mirror)
         m_poiNote = m_fix.source == QLatin1String("ip") ? QStringLiteral("around the approximate (IP) position — may be far off") : QString();
         if (m_pois.isEmpty()) m_poiNote = QStringLiteral("No mapped places within %1 km").arg(radiusM / 1000);
         savePois();
+        rebuildMergedPois();
         emit poisUpdated();
+        overpassDone();
     });
+}
+
+// ── Pediatric ERs ─────────────────────────────────────────────────────────────
+// Children's hospitals are sparse (one per region), so they get their own query out to
+// pedsRadiusKm instead of a bigger main query. It re-runs only when we moved a quarter of the
+// radius, the answer is 30 days old, the radius changed, or the user asked; a failure backs off
+// 10 minutes and never throws away what we had.
+void Locator::setPedsRadiusKm(int km)
+{
+    km = qBound(50, km, 300);
+    if (km == m_pedsRadiusKm) return;
+    m_pedsRadiusKm = km;
+    QSettings().setValue("pedsRadiusKm", km);
+    emit poisUpdated();
+    refreshPediatric(false);                              // a different radius re-queries (when the fix allows it)
+}
+
+void Locator::refreshPediatric(bool force)
+{
+    if (!m_fix.valid || m_pedsBusy) return;
+    if (m_fix.source == QLatin1String("ip") || m_fix.accuracy > 5000) {   // the ground station's city is no place to search from
+        if (m_pedsSkipLogged != m_fix.time) {
+            m_pedsSkipLogged = m_fix.time;
+            if (m_fix.source == QLatin1String("ip")) qInfo("beaconfix: pediatric search skipped (IP fix)");
+            else qInfo("beaconfix: pediatric search skipped (fix ±%d km)", qRound(m_fix.accuracy / 1000));
+        }
+        return;
+    }
+    const int radiusM = m_pedsRadiusKm * 1000;
+    const QDateTime now = QDateTime::currentDateTime();
+    const bool have = m_pedsTime.isValid();
+    const double moved = have ? distanceM(m_pedsLat, m_pedsLon, m_fix.lat, m_fix.lon) : 1e12;
+    const bool stale = !have || m_pedsTime.secsTo(now) > 30LL * 86400;
+    if (!force && !stale && moved <= radiusM / 4.0 && m_pedsRadiusM == radiusM) return;
+    if (!force && m_pedsBusyUntil.isValid() && now < m_pedsBusyUntil) return;
+    if (!overpassSlot(true, force)) return;
+    queryPediatric(m_fix.lat, m_fix.lon, radiusM, 0);
+}
+
+void Locator::queryPediatric(double lat, double lon, int radiusM, int mirror)
+{
+    m_pedsBusy = true;
+    if (mirror == 0) { qInfo("beaconfix: pediatric ER search within %d km", radiusM / 1000); emit poisUpdated(); }
+    // Only exact-tag lookups (key=value index + bbox): value regexes and around: over a 300 km box ran into the
+    // timeout on the live server. Every hospital in the box comes back and is classified here, which also gives the
+    // general ERs (kept within 80 km) and the ER on a children's hospital's campus without an around: pass.
+    const QString far = bboxFor(lat, lon, radiusM), urg = bboxFor(lat, lon, 50000);
+    const QString kid = QStringLiteral("[name~\"pa?ediatric|kids|child\",i]"), spec = QStringLiteral("[\"healthcare:speciality\"~\"pa?ediatric\",i]");
+    const QString q = QStringLiteral(
+        "[out:json][timeout:60];("
+        "nwr[amenity=hospital](%1);nwr[healthcare=hospital](%1);"
+        "nwr[building=hospital][name~\"child|pa?ediatric\",i](%1);nwr[\"emergency:paediatric\"=yes](%1);"
+        "nwr[amenity=clinic]%3(%2);nwr[amenity=doctors]%3(%2);nwr[amenity=urgent_care]%3(%2);"
+        "nwr[healthcare=clinic]%3(%2);nwr[healthcare=urgent_care]%3(%2);"
+        "nwr[healthcare=clinic]%4(%2);nwr[healthcare=urgent_care]%4(%2);nwr[healthcare=doctor]%4(%2);"
+        ");out center tags qt;").arg(far, urg, kid, spec);
+    QNetworkRequest req{QUrl(QString::fromLatin1(kOverpassMirrors[mirror]))};
+    req.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/x-www-form-urlencoded"));
+    req.setHeader(QNetworkRequest::UserAgentHeader, QString::fromLatin1(USER_AGENT));
+    req.setTransferTimeout(75000);
+    QUrlQuery body; body.addQueryItem(QStringLiteral("data"), q);
+    QNetworkReply *rep = m_nam.post(req, body.toString(QUrl::FullyEncoded).toUtf8());
+    connect(rep, &QNetworkReply::finished, this, [this, rep, lat, lon, radiusM, mirror] {
+        rep->deleteLater();
+        const int http = rep->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        const QJsonDocument doc = QJsonDocument::fromJson(rep->readAll());
+        const QString remark = doc.object()["remark"].toString();
+        if (rep->error() != QNetworkReply::NoError || !doc.isObject() || remark.contains(QLatin1String("error"), Qt::CaseInsensitive)) {
+            const QString why = !remark.isEmpty() ? remark.left(80) : http ? QStringLiteral("HTTP %1").arg(http) : rep->errorString();
+            qWarning("beaconfix: pediatric ER search failed (%s): %s", kOverpassMirrors[mirror], qPrintable(why));
+            if (mirror < kOverpassLastMirror) {              // the next mirror, after a breath
+                QTimer::singleShot(5000, this, [this, lat, lon, radiusM, mirror] { queryPediatric(lat, lon, radiusM, mirror + 1); });
+                return;
+            }
+            const QDateTime now = QDateTime::currentDateTime();
+            m_pedsBusy = false; m_pedsFailed = true;
+            m_pedsBusyUntil = now.addSecs(600);
+            if (http == 429 || http == 504) m_overpassCoolUntil = now.addSecs(60);
+            m_pedsNote = QStringLiteral("Overpass busy — will retry");
+            m_pedsRetryTimer.start(600 * 1000 + 5000);       // what we had stays: m_pedsPois and the database rows are untouched
+            emit poisUpdated();
+            overpassDone();
+            return;
+        }
+        QList<PoiClassify::Element> els;
+        for (const QJsonValue &v : doc.object()["elements"].toArray()) els << PoiClassify::Element::fromOverpass(v.toObject());
+        const QList<PoiClassify::Result> res = PoiClassify::classifyAll(els);
+        QList<QPair<double, Poi>> peds, urgent, ers;
+        for (int i = 0; i < els.size(); ++i) {
+            const PoiClassify::Result &r = res[i];
+            const PoiClassify::Element &e = els[i];
+            if (r.dropped || r.cat.isEmpty() || (e.lat == 0 && e.lon == 0)) continue;
+            const double d = distanceM(lat, lon, e.lat, e.lon);
+            QList<QPair<double, Poi>> *to = nullptr;
+            if (r.cat == QLatin1String("peds_er") && d <= radiusM) to = &peds;
+            else if (r.cat == QLatin1String("peds_urgent") && d <= 50000) to = &urgent;
+            else if (r.cat == QLatin1String("health") && r.emergency && d <= 80000) to = &ers;
+            if (!to) continue;
+            Poi pt;
+            if (!makePoi(e, r, &pt)) continue;
+            pt.scope = QStringLiteral("far");
+            to->append(qMakePair(d, pt));
+        }
+        auto nearest = [](QList<QPair<double, Poi>> &l, int n) {
+            std::sort(l.begin(), l.end(), [](const QPair<double, Poi> &a, const QPair<double, Poi> &b) { return a.first < b.first; });
+            QList<Poi> out; for (int i = 0; i < l.size() && i < n; ++i) out << l[i].second;
+            return out;
+        };
+        m_pedsPois = nearest(peds, 5) + nearest(urgent, 5) + nearest(ers, 8);
+        m_pedsLat = lat; m_pedsLon = lon; m_pedsRadiusM = radiusM;
+        m_pedsTime = QDateTime::currentDateTime();
+        m_pedsBusy = false; m_pedsFailed = false; m_pedsBusyUntil = QDateTime();
+        m_pedsNote.clear();
+        m_pedsRetryTimer.stop();
+        qInfo("beaconfix: pediatric ER search: %d pediatric ER, %d pediatric urgent care, %d ER within reach (%d elements)",
+              int(qMin<qsizetype>(5, peds.size())), int(qMin<qsizetype>(5, urgent.size())), int(qMin<qsizetype>(8, ers.size())), int(els.size()));
+        savePedsPois();
+        rebuildMergedPois();
+        emit poisUpdated();
+        overpassDone();
+    });
+}
+
+void Locator::rebuildMergedPois()
+{
+    QList<Poi> all = m_pois;
+    QSet<QString> seen;
+    for (const Poi &p : m_pois) seen.insert(poiKey(p));
+    for (const Poi &p : m_pedsPois) if (!seen.contains(poiKey(p))) all << p;
+    for (Poi &p : all) {
+        p.driveS = p.driveM = 0; p.driveEst = true;
+        if (m_fix.valid && driveCat(p.cat)) PoiClassify::driveEstimate(distanceM(m_fix.lat, m_fix.lon, p.lat, p.lon), &p.driveS, &p.driveM);
+    }
+    m_allPois = all;
+}
+
+bool Locator::helpOrigin(double *lat, double *lon) const
+{
+    if (m_fix.valid) { *lat = m_fix.lat; *lon = m_fix.lon; return true; }
+    if (m_poiTime.isValid()) { *lat = m_poiLat; *lon = m_poiLon; return true; }
+    if (m_pedsTime.isValid()) { *lat = m_pedsLat; *lon = m_pedsLon; return true; }
+    return false;
+}
+
+Locator::HelpPicks Locator::helpPicks() const
+{
+    double lat = 0, lon = 0;
+    const bool have = helpOrigin(&lat, &lon);
+    QList<PoiClassify::HelpCandidate> c;
+    QList<const Poi *> ref;
+    for (const Poi &p : m_allPois) {
+        if (p.cat != QLatin1String("peds_er") && p.cat != QLatin1String("peds_urgent") && p.cat != QLatin1String("health")) continue;
+        PoiClassify::HelpCandidate h;
+        h.cat = p.cat; h.peds = p.peds; h.campus = p.campus; h.emergency = p.emergency;
+        h.distM = have ? distanceM(lat, lon, p.lat, p.lon) : 0;
+        if (p.driveS > 0) h.driveS = p.driveS; else PoiClassify::driveEstimate(h.distM, &h.driveS, nullptr);
+        c << h; ref << &p;
+    }
+    const PoiClassify::HelpPicks k = PoiClassify::pickHelp(c);
+    auto at = [&](int i) -> const Poi * { return i >= 0 ? ref[i] : nullptr; };
+    HelpPicks out;
+    out.pediatric = at(k.pediatric); out.closer = at(k.pediatricCloser); out.urgent = at(k.pediatricUrgent); out.hospital = at(k.hospital);
+    return out;
+}
+
+// What to tell the family next to the pediatric pick (docs/API.md "pediatricNote"), first match wins
+QString Locator::pedsNoteFor(const Poi *pick) const
+{
+    const bool cached = m_pedsTime.isValid();
+    if (!cached && m_pedsFailed) return QStringLiteral("Overpass busy — will retry");
+    if (!cached && m_pedsBusy) return QStringLiteral("Looking for pediatric ERs within %1 km…").arg(m_pedsRadiusKm);
+    if (!pick) {
+        if (cached) return QStringLiteral("No pediatric ER mapped within %1 km — go to the nearest ER").arg(m_pedsRadiusM > 0 ? m_pedsRadiusM / 1000 : m_pedsRadiusKm);
+        if (m_fix.valid && (m_fix.source == QLatin1String("ip") || m_fix.accuracy > 5000))
+            return QStringLiteral("The pediatric ER search needs a precise fix — go to the nearest ER");
+        return {};
+    }
+    if (cached) {
+        double lat = 0, lon = 0;
+        const double away = helpOrigin(&lat, &lon) ? distanceM(m_pedsLat, m_pedsLon, lat, lon) : 0;
+        const qint64 age = m_pedsTime.secsTo(QDateTime::currentDateTime());
+        if (m_pedsFailed || age > 30LL * 86400 || away > m_pedsRadiusM / 2.0)
+            return QStringLiteral("Saved %1 ago, %2 km from here — may be incomplete").arg(ageText(age)).arg(qRound(away / 1000.0));
+    }
+    if (pick->peds == 2) return QStringLiteral("ER not confirmed — call ahead");
+    return {};
+}
+
+QString Locator::pedsNote() const { return pedsNoteFor(helpPicks().pediatric); }
+
+QJsonObject Locator::poiOriginJson() const
+{
+    return QJsonObject{{"lat", m_poiLat}, {"lon", m_poiLon}, {"time", m_poiTime.isValid() ? m_poiTime.toString(Qt::ISODate) : QString()}, {"radiusKm", m_poiRadiusM / 1000.0}};
+}
+
+QJsonValue Locator::pedsOriginJson() const
+{
+    if (!m_pedsTime.isValid()) return QJsonValue();
+    return QJsonObject{{"lat", m_pedsLat}, {"lon", m_pedsLon}, {"time", m_pedsTime.toString(Qt::ISODate)}, {"radiusKm", m_pedsRadiusM / 1000.0}};
+}
+
+// JSON fallback (no map database): pois.json holds the near list and, under "peds", the far one
+static QJsonObject poiToJson(const Poi &pt)
+{
+    QJsonObject o{{"cat", pt.cat}, {"name", pt.name}, {"detail", pt.detail}, {"lat", pt.lat}, {"lon", pt.lon},
+                  {"type", pt.osmType}, {"id", double(pt.osmId)}, {"wifi", pt.wifi}, {"hours", pt.hours},
+                  {"phone", pt.phone}, {"website", pt.website}, {"address", pt.address}, {"wheelchair", pt.wheelchair}, {"emergency", pt.emergency}};
+    if (pt.peds) o["peds"] = pt.peds;
+    if (!pt.er.isEmpty()) o["er"] = pt.er;
+    if (!pt.campus.isEmpty()) o["campus"] = pt.campus;
+    return o;
+}
+
+static Poi poiFromJson(const QJsonObject &a)
+{
+    Poi pt;
+    pt.cat = a["cat"].toString(); pt.name = a["name"].toString(); pt.detail = a["detail"].toString();
+    pt.lat = a["lat"].toDouble(); pt.lon = a["lon"].toDouble();
+    pt.osmType = a["type"].toString(); pt.osmId = qint64(a["id"].toDouble());
+    pt.wifi = a["wifi"].toBool(); pt.hours = a["hours"].toString(); pt.phone = a["phone"].toString(); pt.website = a["website"].toString();
+    pt.address = a["address"].toString(); pt.wheelchair = a["wheelchair"].toString(); pt.emergency = a["emergency"].toBool();
+    pt.peds = a["peds"].toInt(); pt.er = a["er"].toString(); pt.campus = a["campus"].toString();
+    return pt;
 }
 
 void Locator::loadPois()
@@ -2155,29 +2391,44 @@ void Locator::loadPois()
     m_poiLat = o["lat"].toDouble(); m_poiLon = o["lon"].toDouble(); m_poiRadiusM = o["radius"].toInt();
     m_poiTime = QDateTime::fromString(o["time"].toString(), Qt::ISODate);
     for (const QJsonValue &v : o["pois"].toArray()) {
-        const QJsonObject a = v.toObject();
-        Poi pt;
-        pt.cat = a["cat"].toString(); pt.name = a["name"].toString(); pt.detail = a["detail"].toString();
-        pt.lat = a["lat"].toDouble(); pt.lon = a["lon"].toDouble();
-        pt.osmType = a["type"].toString(); pt.osmId = qint64(a["id"].toDouble());
-        pt.wifi = a["wifi"].toBool(); pt.hours = a["hours"].toString(); pt.phone = a["phone"].toString(); pt.website = a["website"].toString();
+        const Poi pt = poiFromJson(v.toObject());
         if (poiCategory(pt.cat)) m_pois << pt;
+    }
+    const QJsonObject far = o["peds"].toObject();
+    if (!far.isEmpty()) {
+        m_pedsLat = far["lat"].toDouble(); m_pedsLon = far["lon"].toDouble(); m_pedsRadiusM = far["radius"].toInt();
+        m_pedsTime = QDateTime::fromString(far["time"].toString(), Qt::ISODate);
+        for (const QJsonValue &v : far["pois"].toArray()) {
+            Poi pt = poiFromJson(v.toObject()); pt.scope = QStringLiteral("far");
+            if (poiCategory(pt.cat)) m_pedsPois << pt;
+        }
     }
     if (m_fix.valid && m_fix.source == QLatin1String("ip")) m_poiNote = QStringLiteral("around the approximate (IP) position — may be far off");
 }
 
 void Locator::savePois() const
 {
-    if (m_dbUsable) { m_db->savePois(m_pois, m_poiLat, m_poiLon, m_poiRadiusM, m_poiTime); return; }
-    QJsonArray arr;
-    for (const Poi &pt : m_pois)
-        arr.append(QJsonObject{{"cat", pt.cat}, {"name", pt.name}, {"detail", pt.detail}, {"lat", pt.lat}, {"lon", pt.lon},
-                               {"type", pt.osmType}, {"id", double(pt.osmId)}, {"wifi", pt.wifi}, {"hours", pt.hours},
-                               {"phone", pt.phone}, {"website", pt.website}});
+    if (m_dbUsable) {
+        m_db->savePois(m_pois, m_poiLat, m_poiLon, m_poiRadiusM, m_poiTime);
+        savePedsPois();                                   // far rows a replaced near row was shadowing come back
+        return;
+    }
+    QJsonArray arr, far;
+    for (const Poi &pt : m_pois) arr.append(poiToJson(pt));
+    for (const Poi &pt : m_pedsPois) far.append(poiToJson(pt));
     QJsonObject o{{"lat", m_poiLat}, {"lon", m_poiLon}, {"radius", m_poiRadiusM}, {"time", m_poiTime.toString(Qt::ISODate)}, {"pois", arr}};
+    if (m_pedsTime.isValid())
+        o["peds"] = QJsonObject{{"lat", m_pedsLat}, {"lon", m_pedsLon}, {"radius", m_pedsRadiusM}, {"time", m_pedsTime.toString(Qt::ISODate)}, {"pois", far}};
     QFile f(stateDir() + "/pois.json");
     if (f.open(QIODevice::WriteOnly | QIODevice::Truncate))
         f.write(QJsonDocument(o).toJson(QJsonDocument::Compact));
+}
+
+void Locator::savePedsPois() const
+{
+    if (!m_pedsTime.isValid()) return;
+    if (m_dbUsable) { m_db->savePois(m_pedsPois, m_pedsLat, m_pedsLon, m_pedsRadiusM, m_pedsTime, QStringLiteral("far")); return; }
+    savePois();
 }
 
 // ── Persistence ───────────────────────────────────────────────────────────────
@@ -2571,6 +2822,11 @@ void Locator::loadFromDb()
         m_pois.clear(); for (const Poi &p : pois) if (poiCategory(p.cat)) m_pois << p;
         m_poiLat = plat; m_poiLon = plon; m_poiRadiusM = prad; m_poiTime = ptime;
     }
+    QList<Poi> far; double flat = 0, flon = 0; int frad = 0; QDateTime ftime;
+    if (m_db->loadPois(&far, &flat, &flon, &frad, &ftime, QStringLiteral("far"))) {       // the pediatric ER search
+        m_pedsPois.clear(); for (const Poi &p : far) if (poiCategory(p.cat)) m_pedsPois << p;
+        m_pedsLat = flat; m_pedsLon = flon; m_pedsRadiusM = frad; m_pedsTime = ftime;
+    }
     const QHash<QString, double> elev = m_db->loadElevation();
     for (auto it = elev.constBegin(); it != elev.constEnd(); ++it) m_elevCache.insert(it.key(), it.value());
     const QHash<QString, QDateTime> ach = m_db->loadAchievements();
@@ -2591,6 +2847,7 @@ void Locator::migrateJsonToDb()
     m_db->saveApRecords(m_apRecords, m_travelling, m_notTravelling, apFlags());
     m_db->saveFixes(m_history);
     if (!m_pois.isEmpty() || m_poiTime.isValid()) m_db->savePois(m_pois, m_poiLat, m_poiLon, m_poiRadiusM, m_poiTime);
+    if (m_pedsTime.isValid()) m_db->savePois(m_pedsPois, m_pedsLat, m_pedsLon, m_pedsRadiusM, m_pedsTime, QStringLiteral("far"));
     if (!m_elevCache.isEmpty()) m_db->saveElevation(m_elevCache);
     m_db->saveAchievements(m_achievements);
     int moved = 0;
@@ -2618,6 +2875,7 @@ int Locator::rebuildDbFromJson()
     m_db->saveApRecords(m_apRecords, m_travelling, m_notTravelling, apFlags());
     m_db->saveFixes(m_history);
     m_db->savePois(m_pois, m_poiLat, m_poiLon, m_poiRadiusM, m_poiTime);
+    if (m_pedsTime.isValid()) m_db->savePois(m_pedsPois, m_pedsLat, m_pedsLon, m_pedsRadiusM, m_pedsTime, QStringLiteral("far"));
     m_db->saveElevation(m_elevCache);
     m_db->saveAchievements(m_achievements);
     for (const char *f : {"aps.json", "history.jsonl", "pois.json", "elev.json", "achievements.json"}) QFile::remove(stateDir() + QLatin1Char('/') + QLatin1String(f));
@@ -3054,7 +3312,7 @@ QString Locator::TimeZoneForFix() const
 QList<Poi> Locator::poisMatching(const QStringList &catsOrGroups, double radiusKm) const
 {
     QList<Poi> out;
-    for (const Poi &p : m_pois) {
+    for (const Poi &p : m_allPois) {
         const PoiCategory *c = poiCategory(p.cat);
         bool match = catsOrGroups.isEmpty();
         for (const QString &k : catsOrGroups) if (k.compare(p.cat, Qt::CaseInsensitive) == 0 || (c && k.compare(c->group, Qt::CaseInsensitive) == 0) || k == QLatin1String("all")) match = true;
@@ -3067,35 +3325,62 @@ QList<Poi> Locator::poisMatching(const QStringList &catsOrGroups, double radiusK
     return out;
 }
 
+QJsonObject Locator::helpPlaceJson(const Poi &p) const
+{
+    const PoiCategory *c = poiCategory(p.cat);
+    QJsonObject a{{"name", p.name.isEmpty() ? (c ? c->label : p.cat) : p.name}, {"lat", p.lat}, {"lon", p.lon}};
+    if (m_fix.valid) { a["d"] = qRound(distanceM(m_fix.lat, m_fix.lon, p.lat, p.lon)); a["brg"] = qRound(bearingDeg(m_fix.lat, m_fix.lon, p.lat, p.lon)); }
+    if (!p.phone.isEmpty()) a["phone"] = p.phone;
+    if (!p.address.isEmpty()) a["address"] = p.address;
+    if (!p.hours.isEmpty()) a["hours"] = p.hours;
+    if (!p.website.isEmpty()) a["website"] = p.website;
+    if (!p.osmType.isEmpty() && p.osmId) a["osm"] = QStringLiteral("https://www.openstreetmap.org/%1/%2").arg(p.osmType).arg(p.osmId);
+    int s = p.driveS, m = p.driveM;
+    double lat = 0, lon = 0;
+    if (s <= 0 && helpOrigin(&lat, &lon)) PoiClassify::driveEstimate(distanceM(lat, lon, p.lat, p.lon), &s, &m);
+    if (s > 0) { a["driveS"] = s; a["driveM"] = m; a["driveEst"] = p.driveS > 0 ? p.driveEst : true; }
+    return a;
+}
+
 QJsonObject Locator::emergencyJson() const
 {
     QJsonObject o;
     const QString cc = !m_countryCode.isEmpty() ? m_countryCode : (m_os ? m_os->locale().countryCode : QString());   // name-based guess until the geocode lands
     o["number"] = OsIntegration::emergencyFor(cc);
     o["countryCode"] = cc;
-    auto nearest = [this](const QString &cat, bool erOnly) -> QJsonValue {
-        const Poi *best = nullptr; double bd = 1e12;
-        for (const Poi &p : m_pois) {
-            if (p.cat != cat || (erOnly && !p.emergency)) continue;
-            if (!m_fix.valid) { best = &p; break; }
-            const double d = distanceM(m_fix.lat, m_fix.lon, p.lat, p.lon);
-            if (d < bd) { bd = d; best = &p; }
+    double lat = 0, lon = 0;
+    const bool have = helpOrigin(&lat, &lon);
+    auto nearest = [&](const QString &cat) -> QJsonValue {
+        const Poi *best = nullptr; double bd = 1e18;
+        for (const Poi &p : m_allPois) {
+            if (p.cat != cat) continue;
+            const double d = have ? distanceM(lat, lon, p.lat, p.lon) : 0;
+            if (!best || d < bd) { bd = d; best = &p; }
         }
-        if (!best) return QJsonValue();
-        QJsonObject a{{"name", best->name.isEmpty() ? poiCategory(cat)->label : best->name}, {"lat", best->lat}, {"lon", best->lon}};
-        if (m_fix.valid) { a["d"] = qRound(bd); a["brg"] = qRound(bearingDeg(m_fix.lat, m_fix.lon, best->lat, best->lon)); }
-        if (!best->phone.isEmpty()) a["phone"] = best->phone;
-        if (!best->address.isEmpty()) a["address"] = best->address;
-        if (!best->hours.isEmpty()) a["hours"] = best->hours;
+        return best ? QJsonValue(helpPlaceJson(*best)) : QJsonValue();
+    };
+    auto pedsPlace = [&](const Poi *p, bool notEr) -> QJsonValue {
+        if (!p) return QJsonValue();
+        QJsonObject a = helpPlaceJson(*p);
+        a["tier"] = p->peds; a["er"] = p->er; a["campusEr"] = p->campus;
+        if (notEr) a["notEr"] = true;
         return a;
     };
-    o["police"] = nearest(QStringLiteral("police"), false);
-    o["fire"] = nearest(QStringLiteral("fire"), false);
-    QJsonValue er = nearest(QStringLiteral("health"), true); if (er.isNull()) er = nearest(QStringLiteral("health"), false);
-    o["hospital"] = er;
-    o["urgent"] = nearest(QStringLiteral("urgent"), false);
-    o["pharmacy"] = nearest(QStringLiteral("pharmacy"), false);
-    o["vet"] = nearest(QStringLiteral("vet"), false);
+    const HelpPicks hp = helpPicks();
+    o["police"] = nearest(QStringLiteral("police"));
+    o["fire"] = nearest(QStringLiteral("fire"));
+    o["hospital"] = hp.hospital ? QJsonValue(helpPlaceJson(*hp.hospital)) : QJsonValue();   // the nearest general ER (children's hospitals are "pediatric")
+    o["urgent"] = nearest(QStringLiteral("urgent"));
+    o["pharmacy"] = nearest(QStringLiteral("pharmacy"));
+    o["vet"] = nearest(QStringLiteral("vet"));
+    o["pediatric"] = pedsPlace(hp.pediatric, false);
+    o["pediatricCloser"] = pedsPlace(hp.closer, false);
+    o["pediatricUrgent"] = pedsPlace(hp.urgent, true);
+    o["pediatricNote"] = pedsNoteFor(hp.pediatric);
+    o["pediatricSearchKm"] = m_pedsRadiusKm;
+    o["pediatricTime"] = m_pedsTime.isValid() ? m_pedsTime.toString(Qt::ISODate) : QString();
+    o["origin"] = m_fix.valid ? QJsonValue(QJsonObject{{"lat", m_fix.lat}, {"lon", m_fix.lon}, {"acc", m_fix.accuracy}, {"source", m_fix.source}, {"time", m_fix.time.toString(Qt::ISODate)}})
+                              : QJsonValue();
     return o;
 }
 
@@ -3360,7 +3645,8 @@ QString Locator::kindForDevice(const QString &device, const QString &hint) const
 QStringList Locator::features()
 {
     return {QStringLiteral("sync"), QStringLiteral("locate"), QStringLiteral("home"), QStringLiteral("events"), QStringLiteral("stream"), QStringLiteral("estimates"),
-            QStringLiteral("identity"), QStringLiteral("peers"), QStringLiteral("anchors"), QStringLiteral("ranging"), QStringLiteral("aps-paging"), QStringLiteral("grant-control")};
+            QStringLiteral("identity"), QStringLiteral("peers"), QStringLiteral("anchors"), QStringLiteral("ranging"), QStringLiteral("aps-paging"), QStringLiteral("grant-control"),
+            QStringLiteral("pediatric")};
 }
 
 // ── D-Bus ────────────────────────────────────────────────────────────────────

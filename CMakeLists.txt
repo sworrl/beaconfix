@@ -12,6 +12,7 @@ add_executable(beaconfix
     src/main.cpp
     src/wifiscanner.cpp
     src/locator.cpp
+    src/poiclassify.cpp
     src/beaconview.cpp
     src/tilesource.cpp
     src/apiserver.cpp

@@ -310,6 +310,9 @@ bool MapDb::schema()
     addCol("observations", "seq", "INTEGER DEFAULT 0"); addCol("observations", "device", "TEXT DEFAULT ''");
     addCol("fixes", "seq", "INTEGER DEFAULT 0"); addCol("fixes", "device", "TEXT DEFAULT ''");
     addCol("pois", "address", "TEXT DEFAULT ''"); addCol("pois", "wheelchair", "TEXT DEFAULT ''"); addCol("pois", "emergency", "INTEGER DEFAULT 0");
+    // Pediatric ERs (3.8): which search a place came from, its tier / ER status / campus ER, a stored drive time (0 = estimate)
+    addCol("pois", "scope", "TEXT DEFAULT 'near'"); addCol("pois", "peds", "INTEGER DEFAULT 0"); addCol("pois", "er", "TEXT DEFAULT ''");
+    addCol("pois", "campus", "TEXT DEFAULT ''"); addCol("pois", "drive_s", "INTEGER DEFAULT 0"); addCol("pois", "drive_m", "INTEGER DEFAULT 0");
     q.exec(QStringLiteral("CREATE INDEX IF NOT EXISTS obs_seq ON observations(seq)"));
     q.exec(QStringLiteral("CREATE INDEX IF NOT EXISTS aps_seq ON aps(seq)"));
     q.exec(QStringLiteral("CREATE INDEX IF NOT EXISTS fix_seq ON fixes(seq)"));
@@ -738,42 +741,57 @@ QList<Fix> MapDb::peerFixes(const QString &device) const
 }
 
 // ── Places, elevation, milestones ─────────────────────────────────────────────
-bool MapDb::loadPois(QList<Poi> *pois, double *lat, double *lon, int *radiusM, QDateTime *time) const
+bool MapDb::loadPois(QList<Poi> *pois, double *lat, double *lon, int *radiusM, QDateTime *time, const QString &scope) const
 {
     if (!m_db.isOpen()) return false;
+    const bool far = scope == QLatin1String("far");
+    const QString pre = far ? QStringLiteral("peds_") : QStringLiteral("poi_");
     QSqlQuery q(m_db);
-    q.exec(QStringLiteral("SELECT key, value FROM kv WHERE key IN ('poi_lat','poi_lon','poi_radius','poi_time')"));
+    q.prepare(QStringLiteral("SELECT key, value FROM kv WHERE key IN (?,?,?,?)"));
+    for (const char *k : {"lat", "lon", "radius", "time"}) q.addBindValue(pre + QLatin1String(k));
+    q.exec();
     bool any = false;
     while (q.next()) {
-        const QString k = q.value(0).toString(); any = true;
-        if (k == QLatin1String("poi_lat")) *lat = q.value(1).toDouble(); else if (k == QLatin1String("poi_lon")) *lon = q.value(1).toDouble();
-        else if (k == QLatin1String("poi_radius")) *radiusM = q.value(1).toInt(); else *time = QDateTime::fromString(q.value(1).toString(), Qt::ISODate);
+        const QString k = q.value(0).toString().mid(pre.size()); any = true;
+        if (k == QLatin1String("lat")) *lat = q.value(1).toDouble(); else if (k == QLatin1String("lon")) *lon = q.value(1).toDouble();
+        else if (k == QLatin1String("radius")) *radiusM = q.value(1).toInt(); else *time = QDateTime::fromString(q.value(1).toString(), Qt::ISODate);
     }
     if (!any) return false;
-    q.exec(QStringLiteral("SELECT osm_type, osm_id, cat, name, detail, lat, lon, wifi, hours, phone, website, address, wheelchair, emergency FROM pois"));
+    q.prepare(QStringLiteral("SELECT osm_type, osm_id, cat, name, detail, lat, lon, wifi, hours, phone, website, address, wheelchair, emergency, peds, er, campus, drive_s, drive_m"
+                             " FROM pois WHERE scope=?"));
+    q.addBindValue(far ? QStringLiteral("far") : QStringLiteral("near"));
+    q.exec();
     while (q.next()) {
         Poi p; p.osmType = q.value(0).toString(); p.osmId = q.value(1).toLongLong(); p.cat = q.value(2).toString(); p.name = q.value(3).toString(); p.detail = q.value(4).toString();
         p.lat = q.value(5).toDouble(); p.lon = q.value(6).toDouble(); p.wifi = q.value(7).toInt() != 0; p.hours = q.value(8).toString(); p.phone = q.value(9).toString(); p.website = q.value(10).toString();
         p.address = q.value(11).toString(); p.wheelchair = q.value(12).toString(); p.emergency = q.value(13).toInt() != 0;
+        p.peds = q.value(14).toInt(); p.er = q.value(15).toString(); p.campus = q.value(16).toString(); p.driveS = q.value(17).toInt(); p.driveM = q.value(18).toInt();
+        p.driveEst = p.driveS <= 0;
+        p.scope = far ? QStringLiteral("far") : QStringLiteral("near");
         pois->append(p);
     }
     return true;
 }
 
-void MapDb::savePois(const QList<Poi> &pois, double lat, double lon, int radiusM, const QDateTime &time)
+void MapDb::savePois(const QList<Poi> &pois, double lat, double lon, int radiusM, const QDateTime &time, const QString &scope)
 {
     if (!m_db.isOpen() || m_readOnly) return;
+    const bool far = scope == QLatin1String("far");
+    const QString sc = far ? QStringLiteral("far") : QStringLiteral("near"), pre = far ? QStringLiteral("peds_") : QStringLiteral("poi_");
     m_db.transaction();
     QSqlQuery q(m_db);
-    q.exec(QStringLiteral("DELETE FROM pois"));
-    q.prepare(QStringLiteral("INSERT OR REPLACE INTO pois(osm_type, osm_id, cat, name, detail, lat, lon, wifi, hours, phone, website, address, wheelchair, emergency) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)"));
+    q.prepare(QStringLiteral("DELETE FROM pois WHERE scope=?")); q.addBindValue(sc); q.exec();
+    // A place both searches found is stored once: near replaces a far row, far never replaces a near one
+    q.prepare(QStringLiteral("INSERT OR %1 INTO pois(osm_type, osm_id, cat, name, detail, lat, lon, wifi, hours, phone, website, address, wheelchair, emergency,"
+                             " scope, peds, er, campus, drive_s, drive_m) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").arg(far ? QStringLiteral("IGNORE") : QStringLiteral("REPLACE")));
     for (const Poi &p : pois) {
         q.addBindValue(p.osmType); q.addBindValue(p.osmId); q.addBindValue(p.cat); q.addBindValue(p.name); q.addBindValue(p.detail); q.addBindValue(p.lat); q.addBindValue(p.lon);
-        q.addBindValue(p.wifi ? 1 : 0); q.addBindValue(p.hours); q.addBindValue(p.phone); q.addBindValue(p.website); q.addBindValue(p.address); q.addBindValue(p.wheelchair); q.addBindValue(p.emergency ? 1 : 0); q.exec();
+        q.addBindValue(p.wifi ? 1 : 0); q.addBindValue(p.hours); q.addBindValue(p.phone); q.addBindValue(p.website); q.addBindValue(p.address); q.addBindValue(p.wheelchair); q.addBindValue(p.emergency ? 1 : 0);
+        q.addBindValue(sc); q.addBindValue(p.peds); q.addBindValue(p.er); q.addBindValue(p.campus); q.addBindValue(p.driveEst ? 0 : p.driveS); q.addBindValue(p.driveEst ? 0 : p.driveM); q.exec();
     }
     q.prepare(QStringLiteral("INSERT OR REPLACE INTO kv(key, value) VALUES(?,?)"));
-    const QList<QPair<QString, QString>> kv{{QStringLiteral("poi_lat"), QString::number(lat, 'f', 7)}, {QStringLiteral("poi_lon"), QString::number(lon, 'f', 7)},
-                                            {QStringLiteral("poi_radius"), QString::number(radiusM)}, {QStringLiteral("poi_time"), time.toString(Qt::ISODate)}};
+    const QList<QPair<QString, QString>> kv{{pre + QStringLiteral("lat"), QString::number(lat, 'f', 7)}, {pre + QStringLiteral("lon"), QString::number(lon, 'f', 7)},
+                                            {pre + QStringLiteral("radius"), QString::number(radiusM)}, {pre + QStringLiteral("time"), time.toString(Qt::ISODate)}};
     for (const auto &p : kv) { q.addBindValue(p.first); q.addBindValue(p.second); q.exec(); }
     m_db.commit();
     markDirty();

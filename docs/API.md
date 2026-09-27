@@ -101,7 +101,7 @@ Identity endpoints (challenge sign-in, linking, bundle hand-off) are specified i
 
 | method | path | scope | response |
 |---|---|---|---|
-| GET | `/api/v1/hello` | none | `{"name","version","hostname","pairing","tls","ts","api":2,"kind":"desktop","mdns":<bool>,"identity":{"id","name"}|null,"features":["sync","locate","home","events","stream","estimates","identity","peers","anchors","ranging","aps-paging","grant-control"]}` |
+| GET | `/api/v1/hello` | none | `{"name","version","hostname","pairing","tls","ts","api":2,"kind":"desktop","mdns":<bool>,"identity":{"id","name"}|null,"features":["sync","locate","home","events","stream","estimates","identity","peers","anchors","ranging","aps-paging","grant-control","pediatric"]}` (`pediatric`: 3.8, the pediatric ER fields below) |
 | POST | `/api/v1/pair` body `{"name","kind","scopes":["read"],"identity":{id,pub,name}?,"sas":{"pub"},"proximity":{beacons[],lat,lon,acc,source,ts}}` | none | `202 {"id","code","expires","poll","proximity":{…},"sas":{"pub"},"autoApproved"?}`; `403` when pairing is closed; `429` when five are pending |
 | GET | `/api/v1/pair/<id>` | none | `{"status":"pending","proximity":{…},"sas":{"picked":<bool>}}` · `{"status":"denied","reason":"wrong pictures"?}` · `{"status":"cancelled"}` · `{"status":"approved","scopes":[…],"token":"…"}` (token once); `404` unknown/expired |
 | POST | `/api/v1/pair/<id>/cancel` | none | the device withdraws its request → `{"status":"cancelled"}` |
@@ -122,9 +122,9 @@ Identity endpoints (challenge sign-in, linking, bundle hand-off) are specified i
 | POST | `/api/v1/ranging` body `{"device","time","rtt":[{"bssid","distMm","stdMm","rssi","burst","n","time"}],"ble":[{"rssi","channel"?,"txPower","time"}],"wifi":[{"bssid","rssi","freq"}],"baro"?,"moving","fix"?:{"lat","lon","acc","time","source"},"rttState"?}` | read | the peer's measurements (times in epoch ms; `ble` = what it heard of **our** advert) → that device's estimate (below). The authenticated device is who it is about. `rttState` = why `rtt` is (not) empty: `ok`, `doze` (Android has RTT off in deep Doze until the phone is unlocked, charged or moved), `wifi-off`, `location-off`, `unavailable`, `unsupported`, `no-permission`, `no-response`, `not-80211mc`, `timeout`, `bad-config`, `no-responder`, `idle`, `away`, `backoff`, `failed:<code>` (RANGING.md §7). `rtt`, `ble`, `wifi`, `moving`, `ble[].txPower` and `fix.source` are always present from Android 1.3.2 on (older apps omit empty/default values) |
 | GET | `/api/v1/ranging` | read | `{"updated","anchor","devices":[{"device","kind","distanceM","sigmaM","lowM","highM","method":["rtt","ble","wifi-diff","wifi-geo","fix"],"bearingDeg","bearingSigmaDeg","dz","class","updated","samples":{"rtt","ble","bleDown","bleUp","wifiDiff","since","total":{"rtt","bleDown","bleUp"}},"lastRtt","rttState","rttStateAt","calib":{"rttOffsetM","rttOffsetSigmaM","bleP0","bleN","bleP0Up","bleNUp","calibrated","calibratedAt","distanceM"},"calibrating","lat"?,"lon"?}]}` — `distanceM` is the posterior median, `lowM`/`highM` the 16th/84th percentiles; `lat`/`lon` only when the bearing is observable; `samples` count since the tray started (`since`), `total` includes earlier runs; `rttState` is the peer's last word on its RTT |
 | POST | `/api/v1/ranging/calibrate` body `{"device"?,"distanceM","durationS"?}` | control | "these two are `distanceM` apart": collects `durationS` (default 20, 5–120) of RTT + BLE, then fixes the RTT pair offset and both BLE `P0`s ([RANGING.md](RANGING.md) §8) → `202 {"device","calibrating":true,"distanceM","until","hint"}`; `device` defaults to the caller |
-| GET | `/api/v1/pois` | read | `{"pois":[…]}` places (each with `cat`, `group`, `address`, `phone`, `hours`, `website`, `wheelchair`, `emergency`, `d`, `brg`) |
-| GET | `/api/v1/pois?cat=police,fire&group=kids&radius=<km>` | read | filtered places: categories and/or groups (`civic`, `kids`, `services`), within `radius` km |
-| GET | `/api/v1/emergency` | read | nearest `police`, `fire`, `hospital` (ER preferred), `urgent`, `pharmacy`, `vet` with distance / bearing / phone / address, and `number` — the local emergency number |
+| GET | `/api/v1/pois` | read | `{"pois":[…],"count","categories":[…],"note","origin":{"lat","lon","time","radiusKm"},"pedsOrigin":{…}|null,"ts"}` places (each with `cat`, `group`, `address`, `phone`, `hours`, `website`, `wheelchair`, `emergency`, `osm`, `osmType`, `osmId`, `d`, `brg`; 3.8 adds `peds`, `er`, `campusEr`, `scope` and, for the help categories, `driveS`/`driveM`/`driveEst` — see "Pediatric ER" below). `categories` is the `poiCategories` table of the state (`key`, `label`, `icon`, `color`, `group`, `groupLabel`, `wide`, `reachKm`); `origin` is where the places were fetched, `pedsOrigin` where the pediatric ER search ran |
+| GET | `/api/v1/pois?cat=police,fire&group=kids&radius=<km>` | read | filtered places: categories and/or groups (`civic`, `kids`, `services`), within `radius` km; the same top-level `categories`, `note`, `origin`, `pedsOrigin` |
+| GET | `/api/v1/emergency` | read | nearest `police`, `fire`, `hospital` (the nearest **general** ER, else the nearest hospital), `urgent`, `pharmacy`, `vet` with `d` / `brg` / `phone` / `address` / `hours` / `website` / `osm` / `driveS` / `driveM` / `driveEst`, and `number` — the local emergency number; 3.8 adds `pediatric`, `pediatricCloser`, `pediatricUrgent`, `pediatricNote`, `pediatricSearchKm`, `pediatricTime`, `origin` (below) |
 | GET | `/api/v1/track` | read | `{"track":[…]}` the trip log |
 | GET | `/api/v1/trip` | read | `{"stats":{…}}` |
 | GET | `/api/v1/home` | read | `{"patterns":[…],"atHome","awayKm","awayText","homeLat","homeLon","homeTime"}` |
@@ -167,6 +167,65 @@ each id), `--anchor-remove <id>`, `--ranging` (info + every ranged device), `--r
 path-loss fit learned from anchors: `{"2.4"|"5"|"6": {"p0","n","sigmaP0","sigmaN","samples"}}`).
 | POST | `/api/v1/refresh` | control | re-check the position now (`202`) |
 | POST | `/api/v1/prefetch` | control | save map tiles around the fix (`202`) |
+
+### Pediatric ER (3.8, feature `pediatric`)
+
+Two categories join the civic group right after `urgent`: `peds_er` (🧸 "Pediatric ER", `reachKm`
+150) and `peds_urgent` (🩹 "Pediatric urgent care", `reachKm` 50). Children's hospitals are no
+longer `health`, so `hospital` in `/emergency` is the nearest general ER. Each place carries a
+tier in `peds`:
+
+| `peds` | meaning | `cat` | shown as |
+|---|---|---|---|
+| 1 | dedicated pediatric ER, confirmed (`emergency=yes`) | `peds_er` | "pediatric ER" |
+| 2 | children's hospital, ER not confirmed | `peds_er` | "ER not confirmed — call ahead", or "ER on campus: <name> — call ahead" when a hospital with an ER is within 600 m (`campusEr`) |
+| 3 | general ER with a pediatrics department | `health` | "ER · pediatrics dept." |
+| 4 | pediatric urgent care | `peds_urgent` | "not an ER" |
+
+Place fields added in 3.8 (left out at their default): `osmType`, `osmId`, `peds`, `er`
+(`"yes"` / `"no"`), `campusEr`, `scope` (`"far"` for places from the pediatric search), and for
+`peds_er`, `peds_urgent`, `health`, `urgent`, `police`, `fire`: `driveS`, `driveM`, `driveEst` —
+the straight-line distance × 1.4 at 70 km/h, rounded to 5 minutes (at least 5), `driveEst: true`.
+The classifier rules are in `src/poiclassify.cpp`, with the shared test fixture
+`tests/fixtures/pediatric_tags.json`.
+
+`/emergency` additions:
+
+```json
+{
+  "pediatric": {"name", "lat", "lon", "d", "brg", "phone", "address", "hours", "website", "osm",
+                "tier", "er", "campusEr", "driveS", "driveM", "driveEst"} | null,
+  "pediatricCloser": { same } | null,
+  "pediatricUrgent": { same, "notEr": true } | null,
+  "pediatricNote": "No pediatric ER mapped within 150 km — go to the nearest ER",
+  "pediatricSearchKm": 150,
+  "pediatricTime": "2026-09-27T10:00:00" | "",
+  "origin": {"lat", "lon", "acc", "source", "time"} | null
+}
+```
+
+- **`pediatric`**: rank 0 is tier 1, or tier 2 with an ER on the same campus; rank 1 is tier 2
+  without one, or tier 3. The pick is the lowest `driveS` among rank 0, else among rank 1.
+- **`pediatricCloser`**: a rank-1 site with a lower `driveS` than a rank-0 `pediatric`.
+- **`pediatricUrgent`**: the nearest pediatric urgent care; never an ER.
+- **`pediatricNote`** (first match): no search yet and the last one failed → "Overpass busy — will
+  retry"; searched and nothing found → "No pediatric ER mapped within N km — go to the nearest
+  ER"; the saved answer is older than 30 days, more than half the radius from here, or the last
+  refresh failed → "Saved N d ago, X km from here — may be incomplete"; `pediatric` is tier 2 →
+  "ER not confirmed — call ahead"; otherwise "". An IP-only fix never starts a search.
+- **The search** is its own Overpass query, out to `pedsRadiusKm` (settings key, 50–300 km,
+  default 150; the map's context menu sets it): every hospital in that box, children's hospitals
+  mapped only as a building, and pediatric urgent care within 50 km. It keeps the nearest 5
+  pediatric ERs, 5 pediatric urgent cares and 8 general ERs (within 80 km), merged with the
+  places list (the places query wins for an object both found). It runs again only when the fix
+  moved a quarter of the radius, the answer is 30 days old, the radius changed, or when asked
+  (D-Bus `RefreshPlaces()`, the window's and the map's "reload places"). It never runs at the
+  same time as the places query (one Overpass query at a time, 5 s apart); a failure backs off
+  10 minutes and keeps the saved answer.
+
+`StateJson()` / `/state` add `pedsNote`, `pedsTime` and `pedsRadiusKm`, and each
+`poiCategories[]` entry has `reachKm`. `beaconfix --nearby emergency` prints the pediatric
+lines; `beaconfix --nearby pediatric` lists pediatric ERs and urgent care with their tier.
 
 ### `GET /api/v1/location`
 
