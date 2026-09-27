@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- A9: trip journal, the phone's own day, GPX export -->
+<resources>
+    <string name="a9_export_gpx">Export GPX</string>
+    <string name="a9_export_done">Saved %1$d positions and %2$d stops</string>
+    <string name="a9_export_failed">Export failed: %1$s</string>
+    <string name="a9_as_of">as of %1$s</string>
+    <string name="a9_saved_trip">Trip (saved)</string>
+    <string name="a9_journal_title">Journal</string>
+    <string name="a9_journal_from_track">Stops from the RV\'s trip log</string>
+    <string name="a9_journal_from_desktop">Stops from the RV\'s positions synced to this phone</string>
+    <string name="a9_journal_from_phone">Stops from this phone\'s positions</string>
+    <string name="a9_journal_empty">No stops yet. A stop is staying within 150 m for 10 minutes or more.</string>
+    <string name="a9_journal_more">Show all %1$d days</string>
+    <string name="a9_journal_less">Show fewer days</string>
+    <string name="a9_today">Today</string>
+    <string name="a9_yesterday">Yesterday</string>
+    <string name="a9_day_summary">%1$d stops · %2$s</string>
+    <string name="a9_stop_unnamed">Stop</string>
+    <string name="a9_stayed">stayed %1$s</string>
+    <string name="a9_still_here">here since %1$s</string>
+    <string name="a9_leg">+%1$s</string>
+    <string name="a9_elevation">%1$s elevation</string>
+    <string name="a9_show_on_map">Show %1$s on the map</string>
+    <string name="a9_phone_title">This phone</string>
+    <string name="a9_phone_today">Today</string>
+    <string name="a9_phone_today_value">%1$s · %2$d stops</string>
+    <string name="a9_phone_fixes">Positions (24 h)</string>
+    <string name="a9_phone_last">Last position</string>
+    <string name="a9_phone_none">No positions logged on this phone yet. Turn on the collector on Home to build a journal without the RV.</string>
+    <string name="a9_no_desktop_title">No desktop connected</string>
+    <string name="a9_no_desktop_body">The trip log lives on the BeaconFix desktop: distances, stops, places, and the rank ladder. Pair one to see it here. The journal below uses this phone\'s own positions meanwhile.</string>
+</resources>
