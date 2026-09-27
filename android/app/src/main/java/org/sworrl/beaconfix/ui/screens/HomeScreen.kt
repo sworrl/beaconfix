@@ -120,6 +120,8 @@ fun HomeScreen(onPair: () -> Unit, onIdentity: () -> Unit = {}, onHelp: () -> Un
                 KeyValue("Range", "${org.sworrl.beaconfix.ranging.RangeSession.fmtM(best.lowM)} – ${org.sworrl.beaconfix.ranging.RangeSession.fmtM(best.highM)} (68 %) · " + best.method.joinToString(" + ") + (best.bearingDeg?.let { " · bearing ${it.toInt()}°" } ?: "") + (if (rs.remote != null && System.currentTimeMillis() - rs.remoteAt < 20_000) " · fused by the desktop" else " · fused here"))
                 rs.remote?.samples?.let { KeyValue("Samples", "RTT ${it.rtt} · BLE ${it.ble} · Wi-Fi diff ${it.wifiDiff}" + (rs.remote.calib?.rttOffsetM?.let { c -> " · RTT offset ${"%.2f".format(c)} m" } ?: "")) }
                 rttLine(rs)?.let { KeyValue("Wi-Fi RTT", it) }
+                if (rs.remote?.calib?.rttStale == true) Text("RTT calibration out of date" + (rs.remote?.calib?.rttStaleByM?.let { " (off by ~${"%.1f".format(it)} m)" } ?: "") +
+                    " — calibrate again at a known distance: beaconfix --ranging-calibrate", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
             } else if (rs != null) {
                 val why = when {
                     !Permissions.hasRanging(ctx) -> "needs the Nearby devices permission"

@@ -199,8 +199,11 @@ class RangingRepository @Inject constructor(
                 val k = (rttFails[d.id] ?: 0) + 1; rttFails[d.id] = k; rttNextAt[d.id] = now + backoffMs(k)
             }
             val offset = s.remote?.calib?.rttOffsetM ?: 0.0
-            for (r in rttSamples) { f.updateRtt(r.distMm / 1000.0, max(RangeMath.RTT_FLOOR, r.stdMm / 1000.0 / sqrt(max(r.n, 1).toDouble())), offset); evidence = true; lastEvidence[d.id] = now }
-            if (rttSamples.isNotEmpty()) methods += "rtt"
+            // The desktop found the calibrated offset out of date (the bursts put the range below zero): like the desktop,
+            // keep RTT out of the local fusion until a recalibration instead of pulling the range towards 0 m.
+            val rttUsable = s.remote?.calib?.rttStale != true
+            if (rttUsable) for (r in rttSamples) { f.updateRtt(r.distMm / 1000.0, max(RangeMath.RTT_FLOOR, r.stdMm / 1000.0 / sqrt(max(r.n, 1).toDouble())), offset); evidence = true; lastEvidence[d.id] = now }
+            if (rttUsable && rttSamples.isNotEmpty()) methods += "rtt"
         } else s = when {
             !rtt.supported -> s.copy(rttError = "no Wi-Fi RTT on this phone", rttState = RttState.UNSUPPORTED)
             rttInfo == null || !rttInfo.enabled || rttInfo.bssid.isEmpty() -> s.copy(rttError = if (s.info != null) "the desktop has no RTT responder up" else "", rttState = RttState.NO_RESPONDER)

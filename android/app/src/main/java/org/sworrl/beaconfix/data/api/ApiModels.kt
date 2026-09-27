@@ -159,7 +159,9 @@ data class ObservationDto(val bssid: String, val ssid: String = "", val dbm: Int
                                      /** why [rtt] is (not) empty: ok | doze | wifi-off | location-off | unavailable | unsupported | no-permission | no-response | not-80211mc | timeout | bad-config | no-responder | idle | away | backoff | failed:<code> (ranging/RttRanging.kt RttState) */
                                      val rttState: String? = null)
 @Serializable data class RangeSamples(val rtt: Int = 0, val ble: Int = 0, val wifiDiff: Int = 0)
-@Serializable data class RangeCalib(val rttOffsetM: Double? = null, val bleP0: Double? = null, val bleN: Double? = null, val bleP0Up: Double? = null)
+@Serializable data class RangeCalib(val rttOffsetM: Double? = null, val bleP0: Double? = null, val bleN: Double? = null, val bleP0Up: Double? = null,
+                                    /** desktop 3.8+: the RTT bursts disagree with the calibrated offset (by [rttStaleByM] m); RTT is left out until a recalibration */
+                                    val rttStale: Boolean = false, val rttStaleByM: Double? = null)
 @Serializable data class DeviceRange(val device: String = "", val distanceM: Double? = null, val sigmaM: Double? = null, val lowM: Double? = null, val highM: Double? = null,
                                      val method: List<String> = emptyList(), val bearingDeg: Double? = null, val bearingSigmaDeg: Double? = null, val dz: Double? = null,
                                      @SerialName("class") val cls: String = "unknown", val updated: String = "", val samples: RangeSamples? = null, val calib: RangeCalib? = null)
