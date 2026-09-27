@@ -40,17 +40,31 @@ drops.
   `beaconfix --nearby emergency` prints the pediatric lines; `--nearby pediatric` lists them with
   their tier.
 
+- `GET /api/v1/devices/me` (feature `whoami`): the calling token's name, kind and current scopes, so a
+  phone paired with `read` sees a later `beaconfix --grant-control`.
+
 #### Fixed
 - A hospital tagged only `healthcare=hospital` (no `amenity=hospital`) was not treated as a
   hospital.
 - Overpass etiquette: the near and the pediatric query run one at a time, 5 s apart, with a minute's
-  pause after HTTP 429/504. A failed pediatric search backs off 10 minutes and keeps the saved
-  answer ("Saved … — may be incomplete"); it is skipped for IP-only fixes.
+  pause after HTTP 429/504, and only in the tray (`--once` from the weather widget every 15 minutes
+  posted the pediatric query and quit, leaving the server busy with it in one of our two slots). Failed
+  pediatric searches back off 10, 20, 40 … minutes (at most 4 h) and keep the saved answer ("Saved … —
+  may be incomplete"); it is skipped for IP-only fixes.
+- **The pediatric search never finished on the live server**: its six `[name~…,i]` filters made
+  Overpass time out after 79 s (the same query without them: 11 s). It now asks only exact key=value
+  sets (every hospital, hospital building and clinic in the boxes) and matches names locally; the client
+  waits 30 s longer than the server's own timeout so a server error is read, not cut off.
+- **The Urgent care pick could be a chiropractor**: `urgent` in `/emergency` (the Nearby tab, the widget,
+  the phone) is now the nearest actual urgent care — tagged `urgent_care` or named like one — with
+  `urgentCare: true`, or none; the `urgent` category still lists every clinic.
 
 #### Changed
-- The map database keeps near and far places in `pois` with a `scope` column plus `peds`, `er`,
-  `campus`, `drive_s` and `drive_m` (added columns, no migration step) and `peds_*` kv keys. The
-  window's Reload and the map's "Reload places" refresh both searches.
+- The map database keeps near places in `pois` with `scope`, `peds`, `er`, `campus`, `drive_s` and
+  `drive_m` columns (added, no migration step), and the pediatric search's far places in their own
+  table `pois_far` with `peds_*` kv keys: sharing `pois`' key, a near save replaced every far row inside
+  the near radius and a restart lost the closest ERs. The window's Reload and the map's "Reload places"
+  refresh both searches.
 
 ### Plasma widget 3.8.0
 
@@ -141,11 +155,41 @@ drops.
 - Desktop refresh: a timeout was reported as success, a second paired desktop discarded the first
   one's answers, one unreadable endpoint failed the whole refresh, and cancellation was swallowed.
 
+- **The Identity screen crashed every time it opened** (since 1.3.2): its first frame, before the
+  record loads, nested the scrolling onboarding screen inside its own scroll. It shows a spinner now.
+- **A launch action replayed on rotation**, the scheduled dark theme or a restore: the tile, widget,
+  notification and shortcut actions (Help, Kids ER, Share my location, Where's the RV) and shared map
+  links ran again each time the activity was recreated. They are handled once.
+- **Help "For the dispatcher" could show the last campground's address** with only "(saved)" after it
+  when the phone moved and had no signal. A saved address now stands in only within 500 m of where it
+  was resolved; otherwise the card says to read the coordinates. Copy / Share mark a saved address, say
+  "RV position (phone has no recent fix)" when the origin is the RV, and add "Fix taken HH:MM (N min
+  ago)" to an old fix; Share my location does the same for its last-fix fallback and never adds a saved
+  address.
+- The Home and Places help cards now always show the confidence text ("call ahead", "Not an ER").
+- "No pediatric ER mapped within 150 km" was shown when the search had not finished (Overpass busy); it
+  is shown only after a completed search, else "Children's ER search didn't finish — go to the nearest
+  ER".
+- The Help widget's largest layout lost its last lines ("saved … ago"): Glance drops everything after
+  10 children of one container, so the rows are grouped now.
+- Urgent care on Help, the widget and the tile is an actual urgent care, not the nearest clinic.
+- A token upgraded with `beaconfix --grant-control` after pairing stayed `read` on the phone (no push,
+  no "Send to the RV"); sync re-reads the scopes from desktops with `whoami`, and the incremental-sync
+  cursor is kept (every sync overwrote it with the old one).
+
 #### Security
 - `MainActivity` is exported, so any app could send `--es action forget_identity` (wiping the
   identity) or the `import_host` / `import_code` extras. Those, and the new `sim_offline` /
   `sim_no_desktop` test switches, now work only on a debug build or with Settings → Developer
-  automation on. `show_when_locked` is unchanged.
+  automation on.
+- **`show_when_locked` is one-shot**: it used to keep the activity over the keyguard until it was
+  destroyed, so a locked phone left on BeaconFix by an adb capture opened Help, Settings and identity
+  export to anyone. It now holds for that launch only; the activity finishes when it stops.
+- **A link offer or statement from outside the app** (a tapped `beaconfix://link/…`, another app's
+  `link_payload` extra) no longer links on its own — linking lets that device sign in as you and
+  receive your history. It waits on the Identity screen for Link / Cancel; only the in-app QR scanner
+  acts at once. A place's "Website" opens http(s) addresses only (an OSM `website` tag could hold
+  `beaconfix://…`).
 
 #### Changed
 - No new permissions; background location is asked for only from the System health card. Predictive
@@ -181,6 +225,21 @@ drops.
   tag, kind pi) is resolved like an unknown advert and bound to the Pi that is posting `/ranging`.
 - **Down-link TX reference without `CanSetTxPower`**: while the desktop's byte 8 says 127, its down-link
   prior uses the TX power the peer reports for our advert (its TX-power AD fallback) instead of −59 dBm.
+- **A drifted RTT offset rewrote a manual calibration.** Three hours after a 0.6 m calibration the
+  Pixel's bursts read 1–6.5 m below the calibrated offset; the range slid to 2 cm [1, 5 cm] and the
+  automatic BLE learning, which only asked "was RTT ever calibrated?", rewrote both BLE models. The
+  desktop now marks the offset stale when the median of 10+ recent bursts puts the range below
+  `−max(1 m, 3σ)` (`calib.rttStale`, an event, a line on the phone's range card): RTT stays out of the
+  fusion until the next calibration, the range's interval widens, and learning also needs the range to
+  have held within ±12 % for 30 s with no RTT outlier. Recalibrate a pair that shows it.
+- **The desktop's BLE advert never recovered from a failed registration**: a `RegisterAdvertisement`
+  that bluetoothd answered late (NoReply, then AlreadyExists) was read as "TX power not supported" and
+  given up for good, leaving a stale advert on the air with `txPower` 127. Only shape errors drop the
+  TX-power AD or TxPower now; other errors unregister and retry (2 s doubling to 60 s), and a bluetoothd
+  restart is noticed and both advertising and scanning start again. The Pi agent does the same.
+- **A wedged scanner looked healthy**: `/ranging/info` said `scanning: true` for ~50 minutes of silence.
+  A minute of scanning without any LE advert now reports `scanState: "stalled"` (and `scanning: false`),
+  logs an event and restarts discovery once a minute until adverts arrive again.
 - **BLE on the desktop**: `UnregisterAdvertisement` (every tag rotation, interval or flag change) was a
   3 s blocking D-Bus call on the tray's GUI thread; it is asynchronous now. The once-a-second repeat of a
   held RSSI (BlueZ reports only changes) no longer counts as a new sample: it weights the level by time
@@ -193,7 +252,8 @@ drops.
   least every 10 s (BLE samples in between are kept for the next post). Back to a burst every tick when the
   phone or the desktop moves, the desktop's BLE level moves by more than 6 dB, the distance leaves its band,
   or the user opens the app or a ranging view. Unit-tested (`RttPacerTest`).
-- `GET /api/v1/ranging` `calib` gains `rttCalibrated` and `last` (additive).
+- `GET /api/v1/ranging` `calib` gains `rttCalibrated`, `last`, `rttStale`, `rttStaleByM` and `rttStaleAt`;
+  `/ranging/info` `ble` gains `scanState` (additive).
 
 ## [Android 1.3.2] — 2026-09-27
 
