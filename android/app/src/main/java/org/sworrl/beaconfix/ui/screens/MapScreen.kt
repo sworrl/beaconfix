@@ -19,6 +19,8 @@ import androidx.compose.material3.SmallFloatingActionButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -28,6 +30,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.hilt.navigation.compose.hiltViewModel
@@ -48,10 +51,21 @@ import org.sworrl.beaconfix.ui.SecurityText
 import org.sworrl.beaconfix.ui.gradeGlyph
 import org.sworrl.beaconfix.ui.secName
 import org.sworrl.beaconfix.ui.vm.LiveViewModel
+import org.sworrl.beaconfix.R
+import org.sworrl.beaconfix.ui.ago
+import org.sworrl.beaconfix.ui.map.MapFilterRow
+import org.sworrl.beaconfix.ui.map.MapFilter
+import org.sworrl.beaconfix.ui.map.MapFocus
+import org.sworrl.beaconfix.ui.map.MapPlacesViewModel
+import org.sworrl.beaconfix.ui.map.MapStyleChip
+import org.sworrl.beaconfix.ui.map.PlaceSheet
+import org.sworrl.beaconfix.ui.map.PlaceSheetModel
+import org.sworrl.beaconfix.ui.map.PlacesOverlay
+import org.sworrl.beaconfix.ui.map.TileStyler
 
-/** Beacons with SSID labels and security colours, uncertainty circles, both tracks, the desktop's places, and a follow toggle. */
+/** Beacons with SSID labels and security colours, uncertainty circles, both tracks, the cached places (every desktop and this phone), the RV, and a follow toggle. */
 @Composable
-fun MapScreen(live: LiveViewModel = hiltViewModel(), anchorsVm: AnchorsViewModel = hiltViewModel()) {
+fun MapScreen(live: LiveViewModel = hiltViewModel(), anchorsVm: AnchorsViewModel = hiltViewModel(), placesVm: MapPlacesViewModel = hiltViewModel()) {
     val aps by live.positioned.collectAsState(); val phone by live.phoneTrack.collectAsState(); val desk by live.desktopTrack.collectAsState()
     val views by live.views.collectAsState(); val me by live.phone.collectAsState()
     val anchorsList by anchorsVm.anchors.collectAsState(); val editing by anchorsVm.editing.collectAsState()
@@ -61,17 +75,41 @@ fun MapScreen(live: LiveViewModel = hiltViewModel(), anchorsVm: AnchorsViewModel
     val dragging = remember { HashSet<String>() }
     var eventsOverlay by remember { mutableStateOf<MapEventsOverlay?>(null) }
     var zoomTick by remember { mutableStateOf(0) }
-    var follow by remember { mutableStateOf(true) }; var labels by remember { mutableStateOf(true) }; var places by remember { mutableStateOf(true) }; var layer by remember { mutableStateOf("map") }
+    var follow by remember { mutableStateOf(true) }; var labels by remember { mutableStateOf(true) }
     val ranged = ranges.values.mapNotNull { it.rangedFix }.filter { System.currentTimeMillis() - it.time < 30_000 }.minByOrNull { it.acc }
     val latest = ranged?.let { org.sworrl.beaconfix.data.db.FixEntity(time = it.time, lat = it.lat, lon = it.lon, acc = it.acc, source = "phone-range", provider = if (it.bearingDeg != null) "ranged" else "ring") }
         ?: me.fix ?: views.firstOrNull()?.location?.takeIf { it.valid }?.let { org.sworrl.beaconfix.data.db.FixEntity(time = 0, lat = it.lat, lon = it.lon, acc = it.accuracy, source = "desktop") }
-    val pois = if (places) views.flatMap { it.pois } else emptyList()
+    // places: the offline cache, through the saved filter; the place whose sheet is open always draws
+    val cached by placesVm.places.collectAsState(); val style by placesVm.style.collectAsState(); val filter by placesVm.filter.collectAsState()
+    val prefetchTo by placesVm.prefetchTarget.collectAsState()
+    var sheet by remember { mutableStateOf<org.sworrl.beaconfix.data.db.PoiEntity?>(null) }
+    var sharedPin by remember { mutableStateOf<PlacesOverlay.Pin?>(null) }
+    val pois = MapFilter.apply(filter, cached).let { l -> sheet?.takeIf { s -> s.source.isNotEmpty() && l.none { it.key == s.key } }?.let { l + it } ?: l }
+    val placesOverlay = remember { PlacesOverlay() }
+    val styler = remember { TileStyler() }
+    DisposableEffect(styler) { onDispose { styler.detach() } }
     var devicesLayer by remember { mutableStateOf(true) }
     val devices = if (devicesLayer) views.flatMap { v -> v.devices + (v.location?.takeIf { it.valid }?.let { l -> listOf(org.sworrl.beaconfix.data.api.LinkedDevice(v.desktop.name.ifEmpty { v.desktop.hostname }, "desktop", "", "", l.lat, l.lon, l.accuracy, l.time, l.ageS, l.source, true)) } ?: emptyList()) }.distinctBy { it.device } else emptyList()
+    // the RV = the desktop's last known fix (FixDao.lastDesktop(): the desktop track is newest first), when no live desktop position is drawn
+    val rvLabel = desk.firstOrNull()?.let { stringResource(R.string.map_rv_pin, ago(it.time)) } ?: ""
+    val rvPin = desk.firstOrNull()?.takeIf { devicesLayer && views.none { v -> v.location?.valid == true } }?.let { PlacesOverlay.RvPin(it.lat, it.lon, it.acc, rvLabel) }
     val cache = remember { HashMap<String, BitmapDrawable>() }
     var mapRef by remember { mutableStateOf<MapView?>(null) }
     var ticker by remember { mutableStateOf("") }
     var menu by remember { mutableStateOf(false) }
+    // "Show on map" from Help / Places / the trip journal / a shared link: re-centre, open the sheet (or drop a pin), then clear the target
+    val focus by MapFocus.target.collectAsState()
+    val sharedLabel = stringResource(R.string.map_shared_place); val placeLabel = stringResource(R.string.map_place)
+    LaunchedEffect(focus, mapRef) {
+        val t = focus ?: return@LaunchedEffect
+        val m = mapRef ?: return@LaunchedEffect
+        follow = false
+        PlacesOverlay.centreOn(m, t.lat, t.lon, t.zoom)
+        val key = t.poiKey
+        if (key != null) sheet = placesVm.find(key) ?: PlaceSheetModel.synthetic(t, placeLabel)
+        else sharedPin = PlacesOverlay.Pin(t.lat, t.lon, t.label.ifBlank { sharedLabel })
+        MapFocus.target.value = null
+    }
     Box(Modifier.fillMaxSize()) {
         AndroidView(
             modifier = Modifier.fillMaxSize().semantics { contentDescription = "Map of beacons and positions" },
@@ -85,9 +123,8 @@ fun MapScreen(live: LiveViewModel = hiltViewModel(), anchorsVm: AnchorsViewModel
                 addMapListener(object : org.osmdroid.events.MapListener { override fun onScroll(e: org.osmdroid.events.ScrollEvent?) = false; override fun onZoom(e: org.osmdroid.events.ZoomEvent?): Boolean { val z = e?.zoomLevel?.toInt() ?: -1; if (z != lastZ) { lastZ = z; zoomTick++ }; return false } })
             } },
             update = { map ->
-                val want = if (layer == "sat") ESRI_IMAGERY else TileSourceFactory.MAPNIK
-                if (map.tileProvider.tileSource.name() != want.name()) map.setTileSource(want)
                 map.overlays.clear()
+                style?.let { styler.apply(map, it) }
                 map.overlays.add(org.osmdroid.views.overlay.CopyrightOverlay(map.context))
                 eventsOverlay?.let { map.overlays.add(it) }
                 @Suppress("UNUSED_EXPRESSION") zoomTick
@@ -95,7 +132,7 @@ fun MapScreen(live: LiveViewModel = hiltViewModel(), anchorsVm: AnchorsViewModel
                 if (desk.size > 1) map.overlays.add(Polyline(map).apply { setPoints(desk.map { GeoPoint(it.lat, it.lon) }); outlinePaint.color = AColor.parseColor("#FFD166"); outlinePaint.strokeWidth = 5f })
                 val pt = phone.filter { it.source.startsWith("phone") }
                 if (pt.size > 1) map.overlays.add(Polyline(map).apply { setPoints(pt.map { GeoPoint(it.lat, it.lon) }); outlinePaint.color = AColor.parseColor("#35D6FF"); outlinePaint.strokeWidth = 5f })
-                for (p in pois) map.overlays.add(Marker(map).apply { position = GeoPoint(p.lat, p.lon); setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER); icon = labelIcon(map, cache, p.icon.ifEmpty { "📍" }, if (map.zoomLevelDouble >= 15) p.name.ifEmpty { p.label } else "", AColor.parseColor(p.color.ifEmpty { "#9FB0C8" }), false); title = p.name.ifEmpty { p.label }; snippet = listOf(p.label, p.address, p.detail, p.phone, p.hours).filter { it.isNotEmpty() }.joinToString("\n") })
+                placesOverlay.draw(map, pois, labels, rvPin, sharedPin, onTap = { sheet = it }, onPin = { pin -> sheet = PlaceSheetModel.synthetic(MapFocus.Target(pin.lat, pin.lon, label = pin.label), pin.label) })
                 val zoomed = map.zoomLevelDouble
                 for (a in aps) {
                     val p = GeoPoint(a.lat!!, a.lon!!)
@@ -152,7 +189,8 @@ fun MapScreen(live: LiveViewModel = hiltViewModel(), anchorsVm: AnchorsViewModel
         )
         Column(Modifier.align(Alignment.TopStart).padding(8.dp)) {
             Surface(tonalElevation = 3.dp, shape = MaterialTheme.shapes.small) { Text("  ${aps.size} beacons placed · ${pois.size} places · gold = mapped · cyan = fitted here · red = insecure · magenta = home  ", style = MaterialTheme.typography.labelSmall) }
-            Row { FilterChip(selected = labels, onClick = { labels = !labels }, label = { Text("Aa") }); FilterChip(selected = places, onClick = { places = !places }, label = { Text("Places") }, modifier = Modifier.padding(start = 6.dp)); FilterChip(selected = devicesLayer, onClick = { devicesLayer = !devicesLayer }, label = { Text("Devices") }, modifier = Modifier.padding(start = 6.dp)); FilterChip(selected = layer == "sat", onClick = { layer = if (layer == "sat") "map" else "sat" }, label = { Text("Sat") }, modifier = Modifier.padding(start = 6.dp)); FilterChip(selected = anchorsLayer, onClick = { anchorsLayer = !anchorsLayer }, label = { Text("⌖") }, modifier = Modifier.padding(start = 6.dp)) }
+            Row { FilterChip(selected = labels, onClick = { labels = !labels }, label = { Text("Aa") }); FilterChip(selected = devicesLayer, onClick = { devicesLayer = !devicesLayer }, label = { Text("Devices") }, modifier = Modifier.padding(start = 6.dp)); MapStyleChip(style, { placesVm.setStyle(it) }, Modifier.padding(start = 6.dp)); FilterChip(selected = anchorsLayer, onClick = { anchorsLayer = !anchorsLayer }, label = { Text("⌖") }, modifier = Modifier.padding(start = 6.dp)) }
+            MapFilterRow(filter, { placesVm.setFilter(it) })
         }
         RefitOverlay(mapRef, live.refits.events, onTicker = { ticker = it })
         // below map resolution (the ring would be a few pixels): a proximity inset drawn to scale
@@ -160,6 +198,7 @@ fun MapScreen(live: LiveViewModel = hiltViewModel(), anchorsVm: AnchorsViewModel
         val mpp = mapRef?.let { m -> org.osmdroid.util.TileSystem.GroundResolution(m.mapCenter.latitude, m.zoomLevelDouble) } ?: 1.0
         if (near != null && near.second.distanceM / mpp < 60) ProximityInset(near.first, near.second, Modifier.align(Alignment.TopEnd).padding(top = 64.dp, end = 8.dp))
         editing?.let { AnchorEditorSheet(it, anchorsVm) }
+        sheet?.let { PlaceSheet(it, latest) { sheet = null } }
         if (ticker.isNotEmpty()) Surface(Modifier.align(Alignment.BottomStart).padding(16.dp), tonalElevation = 3.dp, shape = MaterialTheme.shapes.small) { Text("  $ticker  ", style = MaterialTheme.typography.labelSmall) }
         Column(Modifier.align(Alignment.BottomEnd).padding(16.dp)) {
             SmallFloatingActionButton(onClick = { menu = true }, containerColor = MaterialTheme.colorScheme.surfaceVariant) { Text("⋯") }
@@ -169,6 +208,8 @@ fun MapScreen(live: LiveViewModel = hiltViewModel(), anchorsVm: AnchorsViewModel
                 androidx.compose.material3.DropdownMenuItem(text = { Text(if (labels) "Hide names" else "Show names") }, onClick = { menu = false; labels = !labels })
                 androidx.compose.material3.DropdownMenuItem(text = { Text("Place an antenna at the map centre") }, onClick = { menu = false; mapRef?.let { m -> anchorsVm.newAt(m.mapCenter.latitude, m.mapCenter.longitude) } })
                 androidx.compose.material3.DropdownMenuItem(text = { Text("Place an antenna at my position (GNSS average)") }, onClick = { menu = false; anchorsVm.newAt(0.0, 0.0, 1.0, "gps-average"); anchorsVm.startAveraging() })
+                androidx.compose.material3.DropdownMenuItem(text = { Column { Text(stringResource(R.string.map_prefetch)); if (prefetchTo == null) Text(stringResource(R.string.map_prefetch_needs_control), style = MaterialTheme.typography.labelSmall) } },
+                    enabled = prefetchTo != null, onClick = { menu = false; placesVm.prefetch() })
             }
             SmallFloatingActionButton(onClick = { follow = !follow }, modifier = Modifier.padding(top = 8.dp), containerColor = if (follow) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant) { Text("◎") }
         }
@@ -199,12 +240,6 @@ private fun ProximityInset(rs: org.sworrl.beaconfix.ranging.RangeSession, b: org
             Text("— 1 m", style = MaterialTheme.typography.labelSmall, color = androidx.compose.ui.graphics.Color.Gray)
         }
     }
-}
-
-/** Esri World Imagery, as on the desktop and in the Plasma widget (z/y/x order); osmdroid scales the deepest level for zooms past 19. */
-private val ESRI_IMAGERY = object : org.osmdroid.tileprovider.tilesource.OnlineTileSourceBase("EsriWorldImagery", 0, 19, 256, "",
-    arrayOf("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/"), "Imagery © Esri, Maxar, Earthstar Geographics") {
-    override fun getTileURLString(pMapTileIndex: Long): String = baseUrl + org.osmdroid.util.MapTileIndex.getZoom(pMapTileIndex) + "/" + org.osmdroid.util.MapTileIndex.getY(pMapTileIndex) + "/" + org.osmdroid.util.MapTileIndex.getX(pMapTileIndex)
 }
 
 /** A dot (or glyph) with an optional text label to its right, rendered once per (text, colour) and cached. */
