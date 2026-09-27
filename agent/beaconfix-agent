@@ -29,10 +29,11 @@ import time
 import uuid
 from collections import deque
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 BLE_UUID = "28c9f0bf-a089-4a95-b632-5e8ede1b03b6"      # docs/RANGING.md §9.1
 M_PER_DEG = 111320.0                                     # docs/RANGING.md §9.2 (same constant as src/estimator.h)
 KIND_BITS = {0: "desktop", 1: "android", 2: "laptop", 3: "pi", 4: "gnss", 5: "reserved", 6: "reserved", 7: "other"}   # §9.1: 3 bits
+BLE_TX_DBM = 7                                           # the TX power we ask BlueZ for (as the desktop does), clamped to the controller's range
 log = logging.getLogger("beaconfix-agent")
 
 
@@ -545,6 +546,35 @@ def beacon_id(desktop_identity, device):
     return hashlib.sha256(("beaconfix-agent-beacon-v1|%s|%s" % (desktop_identity, device)).encode()).hexdigest()[:26]
 
 
+def agent_kind_code(kind):
+    """The kind bits our advert carries (§9.1): 4 for a node configured as kind gnss, else 3 (pi). Never a desktop/phone
+    kind: phones and the desktop attribute adverts by kind, and an agent must not pass for its desktop."""
+    return 4 if str(kind).lower() == "gnss" else 3
+
+
+def adv_tx_request(want, settable, lo=None, hi=None):
+    """(settable, level) for our advert (RANGING.md §9.1). With BlueZ's CanSetTxPower the request is `want` clamped to
+    the controller's [MinTxPower, MaxTxPower]; it goes into byte 8 and LEAdvertisement1.TxPower (BlueZ then writes back
+    the level the controller selected, which replaces it). Without it the controller picks its own level: byte 8 says
+    127 and the TX-power AD (Includes tx-power, filled in by the kernel) carries the level instead."""
+    if not settable or want == 127:
+        return False, 127
+    lo = -127 if lo is None else int(lo)
+    hi = 20 if hi is None else int(hi)
+    if lo > hi:
+        return False, 127
+    return True, max(lo, min(hi, int(want)))
+
+
+def adv_properties(sd, tx, settable, with_tx_ad):
+    """The LEAdvertisement1 properties (plain Python values; run_scan_loop wraps them in D-Bus types). 28 bytes of
+    service data + the 3-byte TX-power AD fill a legacy advert's 31 bytes exactly ("broadcast" adds no Flags)."""
+    p = {"Type": "broadcast", "ServiceData": {BLE_UUID: bytes(sd)}, "Includes": ["tx-power"] if with_tx_ad else []}
+    if settable:
+        p["TxPower"] = int(tx)
+    return p
+
+
 def max_adv_instances():
     """Controllers differ (a Pi 4 reports 5); ask btmgmt instead of assuming."""
     rc, out, err = run(["btmgmt", "--index", "0", "advinfo"], timeout=8)
@@ -585,6 +615,8 @@ class Ble:
         self.cache = {}                                    # device path -> parsed service data
         self.txcache = {}                                  # device path -> BlueZ Device1.TxPower (the TX-power AD)
         self.adv_ident = None                              # the identity the advert on air was made from
+        self.kind_code = 3                                 # §9.1 kind bits of our advert (agent_kind_code)
+        self.tx_settable, self.tx, self.tx_confirmed = False, 127, False   # our TX power: byte 8 (adv_tx_request)
 
     def set_identities(self, desktop_identity, device):
         self.watch = desktop_identity
@@ -612,9 +644,13 @@ class Ble:
             return
         self._do_advertise()
 
+    def service_data(self, t=None):
+        """Our 10 bytes: the tag of our beacon id, our TX power when BlueZ lets us set it (else 127), our kind."""
+        return ble_service_data(self.identity, time.time() if t is None else t, tx_power=self.tx if self.tx_settable else 127, kind=self.kind_code)
+
     def _do_advertise(self):
         w = int(time.time() // 900)
-        data = ble_adv_data(self.identity, time.time()).hex()
+        data = ble_adv_data(self.identity, time.time(), kind=self.kind_code).hex()
         if self.adv_instance:
             run(["btmgmt", "--index", "0", "remove-adv", str(self.adv_instance)], timeout=8)
         for inst in ([self.adv_instance] if self.adv_instance else list(range(max_adv_instances(), 0, -1))):
@@ -668,6 +704,15 @@ class Ble:
             log.warning("ble: scanning unavailable: %s", self.error)
             return False
         self.scan_ok = True
+        try:                                                       # can we choose our TX power (and so put it in byte 8)?
+            mp = dbus.Interface(bus.get_object("org.bluez", ad_path), "org.freedesktop.DBus.Properties").GetAll("org.bluez.LEAdvertisingManager1")
+            caps = mp.get("SupportedCapabilities", {})
+            self.tx_settable, self.tx = adv_tx_request(BLE_TX_DBM, "CanSetTxPower" in [str(f) for f in mp.get("SupportedFeatures", [])],
+                                                       caps.get("MinTxPower"), caps.get("MaxTxPower"))
+        except Exception as ex:                                    # noqa: BLE001 — an older BlueZ: no TX power request
+            self.tx_settable, self.tx = False, 127
+            log.debug("ble: advertising capabilities: %s", ex)
+        log.info("ble: TX power %s", ("%d dBm requested" % self.tx) if self.tx_settable else "chosen by the controller (TX-power AD)")
         uuid_key = BLE_UUID.lower()
 
         def remember(path, props):
@@ -709,31 +754,60 @@ class Ble:
         adv_path = "/org/sworrl/beaconfix/adv0"
         owner = self
 
+        adv_state = {"registered": False, "busy": False, "tx_ad": True, "stale": False, "adoptions": 0}
+
         class Advertisement(dbus.service.Object):
             def __init__(self_, conn):
                 self_.sd = b""
                 dbus.service.Object.__init__(self_, conn, adv_path)
 
+            def props(self_):
+                p = adv_properties(self_.sd, owner.tx, owner.tx_settable, adv_state["tx_ad"])
+                out = {"Type": dbus.String(p["Type"]),
+                       "ServiceData": dbus.Dictionary({BLE_UUID: dbus.Array(list(self_.sd), signature="y")}, signature="sv"),
+                       "Includes": dbus.Array(p["Includes"], signature="s")}
+                if "TxPower" in p:
+                    out["TxPower"] = dbus.Int16(p["TxPower"])
+                return out
+
             @dbus.service.method("org.freedesktop.DBus.Properties", in_signature="s", out_signature="a{sv}")
             def GetAll(self_, iface):
-                return {"Type": dbus.String("broadcast"),
-                        "ServiceData": dbus.Dictionary({BLE_UUID: dbus.Array(list(self_.sd), signature="y")}, signature="sv"),
-                        "IncludeTxPower": dbus.Boolean(False)}
+                return self_.props() if iface == "org.bluez.LEAdvertisement1" else {}
+
+            @dbus.service.method("org.freedesktop.DBus.Properties", in_signature="ss", out_signature="v")
+            def Get(self_, iface, name):
+                return self_.props()[name]
+
+            # BlueZ writes the level the controller SELECTED into TxPower once it has accepted the parameters
+            # (src/advertising.c add_adv_params_callback): that, not the request, is what byte 8 must carry.
+            @dbus.service.method("org.freedesktop.DBus.Properties", in_signature="ssv", out_signature="")
+            def Set(self_, iface, name, value):
+                if iface != "org.bluez.LEAdvertisement1" or name != "TxPower":
+                    return
+                dbm = int(value)
+                if not -127 <= dbm <= 20:
+                    return
+                owner.tx_confirmed = True
+                if dbm != owner.tx and adv_state["adoptions"] < 2:     # a controller that never settles must not loop us
+                    adv_state["adoptions"] += 1
+                    owner.tx = dbm
+                    adv_state["stale"] = True
+                    log.info("ble: the controller selected %d dBm: re-advertising with it", dbm)
 
             @dbus.service.method("org.bluez.LEAdvertisement1", in_signature="", out_signature="")
             def Release(self_):
                 owner.adv_ok = False
 
         adv = Advertisement(bus)
-        adv_state = {"registered": False, "busy": False}
 
         def refresh_adv():
             if not self.identity or adv_state["busy"]:
                 return
             w = int(time.time() // 900)
-            if adv_state["registered"] and self.adv_window == w and self.adv_ident == self.identity:
+            if adv_state["registered"] and self.adv_window == w and self.adv_ident == self.identity and not adv_state["stale"]:
                 return
-            adv.sd = ble_service_data(self.identity, time.time())
+            adv_state["stale"] = False
+            adv.sd = self.service_data()
             ident = self.identity
             adv_state["busy"] = True
 
@@ -747,11 +821,24 @@ class Ble:
                 resume()
                 adv_state.update(registered=True, busy=False)
                 self.adv_ok, self.adv_window, self.adv_ident, self.error = True, w, ident, ""
-                log.info("ble: advertising BeaconFix beacon via BlueZ (tag window %d)", w)
+                log.info("ble: advertising BeaconFix beacon via BlueZ (tag window %d, TX %s)", w, self.tx if self.tx_settable else "AD")
+                if adv_state["stale"]:                              # BlueZ reported a different selected level meanwhile
+                    GLib.timeout_add(500, lambda: (refresh_adv(), False)[1])
 
             def fail(e):
                 resume()
                 adv_state["busy"] = False
+                if adv_state["tx_ad"]:                              # the TX-power AD did not fit: go without it (byte 8 still says it)
+                    adv_state["tx_ad"] = False
+                    log.info("ble: advertisement without the TX-power AD (%s)", str(e)[:80])
+                    GLib.timeout_add(200, lambda: (refresh_adv(), False)[1])
+                    return
+                if self.tx_settable:                                # this BlueZ refused the TxPower request: let the controller choose
+                    self.tx_settable, self.tx = False, 127
+                    adv_state["tx_ad"] = True
+                    log.info("ble: TxPower request refused (%s); the controller chooses", str(e)[:80])
+                    GLib.timeout_add(200, lambda: (refresh_adv(), False)[1])
+                    return
                 self.adv_ok, self.error = False, "RegisterAdvertisement: %s" % str(e)[:120]
                 log.warning("ble: %s", self.error)
 
@@ -1262,6 +1349,8 @@ class Agent:
         self.queue = Queue(os.path.join(self.state_dir, "queue.db"))
         self.desk = Desktop(cfg["desktop"].get("url", ""), cfg["desktop"].get("token_file", "/etc/beaconfix-agent/token"), self.links, self.device)
         self.ble = Ble(self.stop) if cfg["ble"].getboolean("enabled", True) and not args.no_ble else None
+        if self.ble:
+            self.ble.kind_code = agent_kind_code(self.kind)
         self.wifi_on = cfg["wifi"].getboolean("enabled", True) and not args.no_wifi
         self.wifi_if = cfg["wifi"].get("interface", "auto")
         self.can_trigger = True
@@ -1462,7 +1551,8 @@ class Agent:
               "average": r and {k: (round(v, 8) if k in ("lat", "lon") else (round(v, 3) if isinstance(v, float) else v)) for k, v in r.items()},
               "fix": fix and {"lat": round(fix["lat"], 8), "lon": round(fix["lon"], 8), "acc": round(fix["acc"], 2), "source": fix["source"]},
               "lastParked": last and {"lat": round(last["lat"], 8), "lon": round(last["lon"], 8), "sigmaH": round(last["sigmaH"], 2), "durationS": int(last["durationS"])},
-              "wifi": self.last_scan, "ble": self.ble and {"advertising": self.ble.adv_ok, "scanning": self.ble.scan_ok, "identity": bool(self.ble.identity), "error": self.ble.error},
+              "wifi": self.last_scan, "ble": self.ble and {"advertising": self.ble.adv_ok, "scanning": self.ble.scan_ok, "identity": bool(self.ble.identity), "error": self.ble.error,
+                                  "txPower": self.ble.tx if self.ble.tx_settable else None, "txPowerConfirmed": self.ble.tx_confirmed},
               "desktop": {"url": self.desk.base, "lastOk": self.desk.last_ok and iso_utc(self.desk.last_ok), "error": self.desk.last_error, "features": sorted(self.desk.features)},
               "queue": {"obs": self.queue.count("obs"), "fixes": self.queue.count("fixes")}, "links": self.links.state, "stats": self.stats}
         try:

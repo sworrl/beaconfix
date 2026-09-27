@@ -243,6 +243,44 @@ class TestBle(unittest.TestCase):
         self.assertTrue(p["rtt"] and p["api"])
         self.assertEqual(p["txPower"], 127)
 
+    def test_agent_kind_is_pi_or_gnss_never_a_desktop(self):
+        self.assertEqual(A.agent_kind_code("pi"), 3)
+        self.assertEqual(A.agent_kind_code("GNSS"), 4)
+        self.assertEqual(A.agent_kind_code("desktop"), 3)       # an agent must never pass for its desktop
+        self.assertEqual(A.agent_kind_code(""), 3)
+
+    def test_tx_power_request(self):
+        self.assertEqual(A.adv_tx_request(7, True, -34, 7), (True, 7))
+        self.assertEqual(A.adv_tx_request(7, True, -20, 4), (True, 4))      # clamped to the controller's maximum
+        self.assertEqual(A.adv_tx_request(7, True, None, None), (True, 7))
+        self.assertEqual(A.adv_tx_request(7, False, -34, 7), (False, 127))  # no CanSetTxPower: the controller picks
+        self.assertEqual(A.adv_tx_request(127, True, -34, 7), (False, 127))
+        self.assertEqual(A.adv_tx_request(7, True, 10, 0), (False, 127))    # nonsense range
+
+    def test_advert_carries_its_tx_power_and_kind(self):
+        b = A.Ble(threading.Event())
+        b.set_identities(self.IDENT, "pi")
+        b.kind_code = A.agent_kind_code("gnss")
+        b.tx_settable, b.tx = A.adv_tx_request(A.BLE_TX_DBM, True, -34, 7)
+        p = A.parse_service_data(b.service_data(1790478720.0))
+        self.assertEqual(p["txPower"], 7)
+        self.assertEqual(p["kind"], "gnss")
+        self.assertEqual(p["tag"], A.ble_tag(A.beacon_id(self.IDENT, "pi"), int(1790478720.0 // 900)))
+        b.tx_settable, b.tx = A.adv_tx_request(A.BLE_TX_DBM, False)
+        self.assertEqual(A.parse_service_data(b.service_data(1790478720.0))["txPower"], 127)
+
+    def test_adv_properties_fit_a_legacy_advert(self):
+        sd = A.ble_service_data(self.IDENT, 0.0, tx_power=7)
+        p = A.adv_properties(sd, 7, True, True)
+        self.assertEqual(p["Type"], "broadcast")
+        self.assertEqual(p["Includes"], ["tx-power"])
+        self.assertEqual(p["TxPower"], 7)
+        self.assertEqual(p["ServiceData"][A.BLE_UUID], sd)
+        self.assertEqual(len(A.ble_adv_data(self.IDENT, 0.0)) + 3, 31)   # service data AD + TX-power AD = a full legacy PDU
+        q = A.adv_properties(sd, 127, False, False)
+        self.assertNotIn("TxPower", q)                          # absent, not 127: BlueZ rejects values outside −127…+20
+        self.assertEqual(q["Includes"], [])
+
 
 class TestQueue(unittest.TestCase):
     def test_put_peek_drop_cap(self):
