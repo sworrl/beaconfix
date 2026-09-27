@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- A7: the map's places layer, place sheet, styles and filters. -->
+<resources>
+    <string name="map_filter_all">All</string>
+    <string name="map_filter_kids_er">Kids ER</string>
+    <string name="map_filter_help">Help &amp; medical</string>
+    <string name="map_filter_kids">Kids &amp; fun</string>
+    <string name="map_filter_off">Off</string>
+    <string name="map_filter_cd">Places on the map: %1$s</string>
+
+    <string name="map_style_streets">Streets</string>
+    <string name="map_style_dark">Dark</string>
+    <string name="map_style_topo">Topo</string>
+    <string name="map_style_satellite">Satellite</string>
+    <string name="map_style_cd">Map style: %1$s</string>
+
+    <string name="map_prefetch">Ask the RV to save map tiles here</string>
+    <string name="map_prefetch_needs_control">needs control access</string>
+    <string name="map_prefetch_ok">The RV is saving map tiles around its position</string>
+    <string name="map_prefetch_failed">The RV did not answer — try again when it is in reach</string>
+    <string name="map_prefetch_forbidden">The RV refused: this phone needs control access (pair again with control)</string>
+
+    <string name="map_rv_pin">RV · %1$s</string>
+    <string name="map_shared_place">Shared place</string>
+    <string name="map_place">Place</string>
+
+    <string name="map_tier_peds_er">Children\'s ER</string>
+    <string name="map_tier_campus">Children\'s hospital — ER on campus: %1$s — call ahead</string>
+    <string name="map_tier_unconfirmed">Children\'s hospital — ER not confirmed, call ahead</string>
+    <string name="map_tier_peds_dept">ER · pediatrics dept.</string>
+    <string name="map_tier_peds_urgent">Pediatric urgent care — Not an ER</string>
+    <string name="map_tier_urgent">Urgent care — Not an ER</string>
+    <string name="map_tier_er">ER</string>
+    <string name="map_tier_no_er">No ER</string>
+    <string name="map_tier_er_unknown">ER not confirmed — call ahead</string>
+
+    <string name="map_eta_min_est">~%1$d min (est.)</string>
+    <string name="map_eta_h_est">~%1$d h (est.)</string>
+    <string name="map_eta_hm_est">~%1$d h %2$d min (est.)</string>
+    <string name="map_eta_min">~%1$d min</string>
+    <string name="map_eta_h">~%1$d h</string>
+    <string name="map_eta_hm">~%1$d h %2$d min</string>
+    <string name="map_sheet_from_you">%1$s from you</string>
+    <string name="map_sheet_from_rv_origin">%1$s from the RV</string>
+
+    <string name="map_sheet_unnamed">Unnamed place</string>
+    <string name="map_sheet_distance">%1$s %2$s from you</string>
+    <string name="map_sheet_hours">Hours: %1$s</string>
+    <string name="map_sheet_no_phone">No phone listed</string>
+    <string name="map_sheet_call">Call</string>
+    <string name="map_sheet_search">Search</string>
+    <string name="map_sheet_directions">Directions</string>
+    <string name="map_sheet_share">Share</string>
+    <string name="map_sheet_website">Website</string>
+    <string name="map_sheet_cd_call">Call %1$s</string>
+    <string name="map_sheet_cd_directions">Directions to %1$s</string>
+    <string name="map_sheet_from_rv">From the RV desktop · saved %1$s</string>
+    <string name="map_sheet_from_phone">Found by this phone · %1$s</string>
+    <string name="map_sheet_osm_note">OpenStreetMap data can be incomplete</string>
+</resources>

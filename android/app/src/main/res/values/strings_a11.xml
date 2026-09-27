@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- A11: phone backup to a file / to the RV. -->
+<resources>
+    <string name="backup_title">Backup</string>
+    <string name="backup_body">Your beacons, the Wi-Fi observations and trips this phone recorded, and your antenna anchors, as one BeaconFix export file (JSON) — for a new phone, or for the desktop\'s map database. It is a history of where you have been: keep it private.</string>
+    <string name="backup_last">Last backup: %1$s</string>
+    <string name="backup_never">No backup saved yet</string>
+    <string name="backup_save">Save backup…</string>
+    <string name="backup_send">Send to the RV</string>
+    <string name="backup_send_to">Send to %1$s</string>
+    <string name="backup_restore">Restore…</string>
+    <string name="backup_send_needs_control">Sending needs a paired desktop with control access</string>
+    <string name="backup_identity_note">Your identity is not in the backup (its key never leaves the phone that way); anchors come back via sync.</string>
+    <string name="backup_identity_export">Export the identity…</string>
+    <string name="backup_saved">Saved — beacons: %1$d · observations: %2$d · fixes: %3$d</string>
+    <string name="backup_failed">Backup failed: %1$s</string>
+    <string name="backup_sent">%1$s took the backup — rows it did not have yet: %2$d</string>
+    <string name="backup_send_busy">%1$s is busy with another import — try again in a minute</string>
+    <string name="backup_send_too_big">The backup is larger than the desktop accepts (200 MB)</string>
+    <string name="backup_send_failed">%1$s could not import it: %2$s</string>
+    <string name="backup_send_unreachable">%1$s is not reachable — try again in Wi-Fi reach of the RV</string>
+</resources>

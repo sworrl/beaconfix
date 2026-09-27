@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- A8: Where's the RV, share my location. -->
+<resources>
+    <string name="rv_title">Where\'s the RV</string>
+    <string name="rv_name">RV</string>
+    <string name="rv_line">RV: %1$s %2$s · seen %3$s</string>
+    <string name="rv_line_no_phone">RV: seen %1$s · this phone\'s position is unknown</string>
+    <string name="rv_unknown">RV position unknown</string>
+    <string name="rv_unknown_hint">It shows up once the desktop in the RV has shared its position (a sync, or a visit in Wi-Fi reach).</string>
+    <string name="rv_accuracy">±%1$s</string>
+    <string name="rv_show_on_map">show on the map</string>
+    <string name="rv_navigate">Navigate back</string>
+    <string name="rv_share">Share RV spot</string>
+    <string name="rv_share_label">RV</string>
+    <string name="rv_devices">Our other devices</string>
+    <string name="rv_age_now">just now</string>
+    <string name="rv_age_min">%1$d min ago</string>
+    <string name="rv_age_h">%1$d h ago</string>
+    <string name="rv_age_d">%1$d d ago</string>
+
+    <string name="share_my_location">Share my location</string>
+    <string name="share_subject">My location</string>
+    <string name="share_no_fix">No location yet — turn on location and try again</string>
+</resources>
