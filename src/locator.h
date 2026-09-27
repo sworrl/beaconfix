@@ -1,5 +1,6 @@
 #pragma once
 #include "wifiscanner.h"
+#include "estimator.h"
 #include <QColor>
 #include <QDateTime>
 #include <QHash>
@@ -30,7 +31,12 @@ struct Fix {
     static Fix fromJson(const QJsonObject &o);
 };
 
-struct ApObservation { double lat = 0, lon = 0; double acc = 0; int dbm = -100; QDateTime time; };
+struct ApObservation {
+    double lat = 0, lon = 0; double acc = 0; int dbm = -100; QDateTime time;
+    QString device;                   // who heard it: "" = this host, else the LAN-API device id / peer name
+    qint64  id = 0;                   // database row (0 = not stored yet)
+    bool    dirty = false;            // changed in memory since it was stored
+};
 
 // A place an AP was heard, at whatever precision the fix had (IP fixes included):
 // two sightings further apart than their combined error mean the AP travels with us.
@@ -49,15 +55,24 @@ struct ApRecord {
     QString security;                 // last seen: open owe wep wpa1 wpa2-tkip wpa2 wpa2-eap wpa3 wpa2/3 wpa3-eap192
     int secFlags = 0, wpaFlags = 0, rsnFlags = 0, maxKbps = 0;
     bool adhoc = false;
+    Estimator::Fit fit;               // our own multilateration from obs (valid when the geometry allows it)
+    bool   fitDirty = false;          // new observations since the last full fit
+    double peerLat = 0, peerLon = 0, peerAcc = 0;   // a position another BeaconFix / the phone synced to us
+    QString peerFrom;                 // which device ("" = none)
+    bool   hasPeer() const { return !peerFrom.isEmpty() && peerAcc > 0; }
 };
 
 // Where we think an AP is, for the map
 struct ApEstimate {
-    enum Kind { None, Ring, Centroid, Wigle, Observed } kind = None;   // Observed: one place we heard it (internal map)
-    double lat = 0, lon = 0;          // Centroid / Wigle: the estimate. Ring: our own position.
+    enum Kind { None, Ring, Centroid, Wigle, Observed, Trilat, Peer } kind = None;   // Observed: one place we heard it · Trilat: our fit · Peer: synced from another device
+    double lat = 0, lon = 0;          // Centroid / Wigle / Trilat / Peer: the estimate. Ring: our own position.
     double radiusM = 0;               // Ring: RSSI distance. Others: uncertainty.
     double bearingDeg = 0;            // Ring only: stable pseudo-bearing (bearing is unknown)
-    int    vantage = 0;               // Centroid: distinct places it was heard from
+    int    vantage = 0;               // Centroid / Trilat: distinct places it was heard from
+    Estimator::Fit fit;               // Trilat: the fit statistics
+    // When a placement (WiGLE / Apple) and our own fit disagree by more than 3× their accuracy, both are reported
+    bool   hasAlt = false; Kind altKind = None; double altLat = 0, altLon = 0, altAcc = 0;
+    static const char *kindName(Kind k) { switch (k) { case Ring: return "ring"; case Centroid: return "centroid"; case Wigle: return "wigle"; case Observed: return "observed"; case Trilat: return "trilat"; case Peer: return "peer"; default: return "none"; } }
 };
 
 // Point-of-interest category (OpenStreetMap tags → icon, colour, label)
@@ -297,6 +312,17 @@ public:
     bool    apiListening() const;
     bool    exportGpx(const QString &path, QString *error) const;
     static QString stateDir();
+    // Observations from other devices (the LAN API / sync): stored, merged into the records, refit queued
+    int     ingestObservations(const QJsonArray &observations, const QString &device, QString *error = nullptr);
+    int     mergePeerAps(const QJsonArray &aps, const QString &device);
+    int     appendPeerFixes(const QJsonArray &fixes, const QString &device);
+    void    queueRefit(const QString &bssid);
+    int     refitCount() const;                          // records with a valid fit of our own
+    // Sync with another BeaconFix (a laptop feeding the RV desktop, or the other way round)
+    struct SyncPeer { QString url, token, name; int minutes = 15; QDateTime last; QString lastResult; bool ok = false; };
+    QList<SyncPeer> syncPeers() const { return m_syncPeers; }
+    void    setSyncPeers(const QList<SyncPeer> &peers);
+    bool    syncBusy() const { return m_syncBusy; }
 
 public slots:
     void    Refresh();
@@ -323,6 +349,8 @@ public slots:
     bool    KnownRemove(const QString &mac);
     int     KnownImport(const QString &path);
     void    SetHomeNetworks(const QStringList &patterns) { setHomeNetworks(patterns); }
+    int     Refit();                                     // full refit of every beacon with enough samples; returns valid fits
+    QString Sync(const QString &url, const QString &token);   // one sync round with another BeaconFix; JSON result
 
 signals:
     void FixChanged();
@@ -338,6 +366,8 @@ signals:
     void poisUpdated();
     void statusMessage(const QString &message);
     void eventLogged(const QString &json);          // one BeaconEvent, as JSON
+    void syncFinished(const QString &url, bool ok, const QString &message);
+    void refitDone(int refitted);
     void pairingRequested(const QString &json);     // LAN API: a device asked for access (id, name, ip, code)
     void deviceApproved(const QString &name);
 
@@ -360,7 +390,14 @@ private:
     void saveState() const;
     void appendHistory(const Fix &f);
     void noteObservations(const QList<AccessPoint> &aps, const Fix &at);
-    void saveApRecords() const;
+    void saveApRecords();
+    void saveRecord(const QString &bssid);
+    void refitQueued();
+    bool refitOne(const QString &bssid, qint64 now);
+    QList<Estimator::Obs> obsFor(const ApRecord &r, const QString &bssid) const;
+    void loadSyncPeers();
+    void saveSyncPeers() const;
+    void syncStep(int peerIndex);
     bool matchesIgnore(const AccessPoint &ap) const;
     void queueWigle();
     void pumpWigle();
@@ -439,6 +476,12 @@ private:
     void rebuildPatternCaches();
     QHash<QString, QString> m_homeSsids;     // BSSID → SSID from the UniFi export (home-networks.json bssids[])
     QHash<QString, QDateTime> m_insecureNoted; // ap_insecure once per BSSID per 24 h
+    QSet<QString> m_refitQueue;         // BSSIDs with new samples, refit in a batch
+    QTimer m_refitTimer;
+    QList<SyncPeer> m_syncPeers;
+    QTimer m_syncTimer;
+    bool m_syncBusy = false;
+    int  m_syncCursorPeer = -1;
     Fix m_homeFix;                      // last precise fix taken while a home AP was heard
     bool m_homeInRange = false;         // for the single "home" event on transitions
     QString m_wigleToken;

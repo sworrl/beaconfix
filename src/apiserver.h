@@ -26,6 +26,9 @@ class QTcpSocket;
 //   GET  /api/v1/aps | pois | track | trip     read
 //   GET  /api/v1/stream                read    · Server-Sent Events: fix, beacon, ping (30 s)
 //   POST /api/v1/refresh | prefetch    control
+//   GET  /api/v1/db/changes?since=&limit=   read · sync feed: AP positions (+fit), observations, fixes after a cursor
+//   POST /api/v1/db/sync               control · a peer's {device, observations, aps, fixes} merged; refits queued; returns cursor
+//   POST /api/v1/db/observations       control · samples from one device (256 KB); /db/sync allows 1 MB bodies
 //
 // Security: only private / link-local peers are answered at all; everything
 // but hello and pairing needs "Authorization: Bearer <token>". Tokens are

@@ -43,9 +43,16 @@ public:
     QJsonObject stats() const;
 
     // Access points + everything learned about them
-    QHash<QString, ApRecord> loadApRecords(QSet<QString> *travelling, QSet<QString> *notTravelling) const;
-    void saveApRecords(const QHash<QString, ApRecord> &recs, const QSet<QString> &travelling, const QSet<QString> &notTravelling,
-                       const QHash<QString, int> &flags);      // flags: bit0 home, bit1 travelling, bit2 ignored
+    QHash<QString, ApRecord> loadApRecords(QSet<QString> *travelling, QSet<QString> *notTravelling) const;   // incl. fits + peer positions
+    void saveApRecords(QHash<QString, ApRecord> &recs, const QSet<QString> &travelling, const QSet<QString> &notTravelling,
+                       const QHash<QString, int> &flags);      // flags: bit0 home, bit1 travelling, bit2 ignored; assigns observation ids
+    void saveRecord(const QString &bssid, ApRecord &r, int flags);   // one record (new / changed observations only)
+    void saveEstimate(const QString &bssid, const Estimator::Fit &fit);
+    // Change sequence for sync: every stored/changed AP position, observation and fix gets the next number
+    qint64 currentSeq() const { return m_seq; }
+    QJsonObject changesSince(qint64 since, int limit, bool *more, qint64 *cursor) const;
+    QString kv(const QString &key) const;
+    void    setKv(const QString &key, const QString &value);
     // Trip log
     QList<Fix> loadFixes() const;
     void saveFixes(const QList<Fix> &fixes);                   // rewrite (departures change)
@@ -64,7 +71,11 @@ public:
     QList<ApPos> positions(const QStringList &bssids, double maxAcc = 0) const;   // all when bssids is empty
     bool estimate(const QList<QPair<QString, int>> &heard, double *lat, double *lon, double *acc, int *used, QStringList *usedBssids = nullptr,
                   int minAps = 2, double maxAcc = 150) const;
-    int  addObservations(const QJsonArray &observations, QString *error = nullptr);   // from another BeaconFix / device
+    int  addObservations(const QJsonArray &observations, const QString &device, QString *error = nullptr,
+                         QHash<QString, QList<ApObservation>> *added = nullptr);   // from another BeaconFix / device; dedup (bssid, time, device)
+    int  mergePeerAps(const QJsonArray &aps, const QString &device, QStringList *touched = nullptr);   // positions another device worked out
+    int  appendPeerFixes(const QJsonArray &fixes, const QString &device);
+    QList<Fix> peerFixes(const QString &device = QString()) const;
     QJsonObject exportJson() const;
     int  importJson(const QJsonObject &dump, QString *error = nullptr);
 
@@ -80,6 +91,8 @@ private:
     bool schema();
     void markDirty();
     void updatePosition(const QString &bssid, const ApRecord &r, int flags);
+    qint64 nextSeq();
+    void   loadSeq();
     static QByteArray encrypt(const QByteArray &key, const QByteArray &plain, QString *error);
     static QByteArray decrypt(const QByteArray &key, const QByteArray &blob, QString *error);
     static QByteArray walletKey(bool create, QString *source);
@@ -89,5 +102,6 @@ private:
     QByteArray m_key;
     QSqlDatabase m_db;
     bool m_readOnly = false, m_dirty = false;
+    qint64 m_seq = 0;
     QTimer m_flushTimer;
 };

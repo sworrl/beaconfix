@@ -16,6 +16,10 @@
 #include <QRegularExpression>
 #include <QSettings>
 #include <QSharedPointer>
+#include <QEventLoop>
+#include <QHostInfo>
+#include <QSaveFile>
+#include <QSysInfo>
 #include <QPointF>
 #include <QHash>
 #include <QStandardPaths>
@@ -23,6 +27,7 @@
 #include <QUrlQuery>
 #include <QtMath>
 #include <algorithm>
+#include <functional>
 #include <cmath>
 
 static const char *USER_AGENT = "BeaconFix/" BEACONFIX_VERSION " (KDE desktop locator; +https://github.com/sworrl/beaconfix)";
@@ -138,6 +143,22 @@ Locator::Locator(bool standalone, QObject *parent) : QObject(parent), m_standalo
     for (const Fix &f : m_history) noteVisited(f, false);
     connect(this, &Locator::FixChanged, this, [this] { refreshPois(); fetchElevation(); checkAchievements(); });
     connect(this, &Locator::scanUpdated, this, [this] { checkAchievements(); });
+    // Position refinement: beacons with new samples are refit in a batch, not on every scan
+    m_refitTimer.setSingleShot(true); m_refitTimer.setInterval(10000);
+    connect(&m_refitTimer, &QTimer::timeout, this, &Locator::refitQueued);
+    // Sync with other BeaconFix instances (a laptop, the phone's desktop) on a timer
+    loadSyncPeers();
+    m_syncTimer.setInterval(60000);
+    connect(&m_syncTimer, &QTimer::timeout, this, [this] {
+        if (m_standalone || m_syncBusy) return;
+        const QDateTime now = QDateTime::currentDateTime();
+        for (int i = 0; i < m_syncPeers.size(); ++i) {
+            const SyncPeer &pr = m_syncPeers[i];
+            if (pr.minutes <= 0 || pr.url.isEmpty() || pr.token.isEmpty()) continue;
+            if (!pr.last.isValid() || pr.last.secsTo(now) >= pr.minutes * 60) { syncStep(i); break; }
+        }
+    });
+    if (!standalone) m_syncTimer.start();
 }
 
 void Locator::setNotifyStops(bool b)        { m_notifyStops = b; QSettings().setValue("notifyStops", b); }
@@ -441,6 +462,8 @@ static const QList<Achievement> &achievementDefs()
         {QStringLiteral("sharp_fix"),     QStringLiteral("Pin-sharp"),         QStringLiteral("A fix better than ±30 m"),                     QStringLiteral("🎯"), {}},
         {QStringLiteral("first_wigle"),   QStringLiteral("Ground truth"),      QStringLiteral("First beacon placed by WiGLE"),                QStringLiteral("💎"), {}},
         {QStringLiteral("first_located"), QStringLiteral("Triangulated"),      QStringLiteral("First beacon multilaterated from your own stops"), QStringLiteral("📐"), {}},
+        {QStringLiteral("first_trilat"),  QStringLiteral("Surveyor"),          QStringLiteral("First beacon positioned by a least-squares fit of your samples"), QStringLiteral("📡"), {}},
+        {QStringLiteral("trilat_100"),    QStringLiteral("Cartographer's hundred"), QStringLiteral("100 beacons positioned from your own samples"),  QStringLiteral("🗺️"), {}},
         {QStringLiteral("beacons_100"),   QStringLiteral("Century"),           QStringLiteral("100 beacons logged"),                          QStringLiteral("💯"), {}},
         {QStringLiteral("beacons_1000"),  QStringLiteral("Grand"),             QStringLiteral("1,000 beacons logged"),                        QStringLiteral("🏆"), {}},
         {QStringLiteral("beacons_5000"),  QStringLiteral("Beacon hoard"),      QStringLiteral("5,000 beacons logged"),                        QStringLiteral("👑"), {}},
@@ -526,9 +549,12 @@ void Locator::checkAchievements()
     if (homebody) unlock(QStringLiteral("homebody"));
     bool wigle = false, located = false;
     for (const ApRecord &r : m_apRecords) if (r.wigle) { wigle = true; break; }
-    for (const AccessPoint &ap : m_aps) if (estimateFor(ap).kind == ApEstimate::Centroid) { located = true; break; }
+    for (const AccessPoint &ap : m_aps) { const ApEstimate::Kind k = estimateFor(ap).kind; if (k == ApEstimate::Centroid || k == ApEstimate::Trilat) { located = true; break; } }
     if (wigle) unlock(QStringLiteral("first_wigle"));
     if (located) unlock(QStringLiteral("first_located"));
+    const int fitted = refitCount();
+    if (fitted >= 1) unlock(QStringLiteral("first_trilat"));
+    if (fitted >= 100) unlock(QStringLiteral("trilat_100"));
     if (st.beaconsTotal >= 100) unlock(QStringLiteral("beacons_100"));
     if (st.beaconsTotal >= 1000) unlock(QStringLiteral("beacons_1000"));
     if (st.beaconsTotal >= 5000) unlock(QStringLiteral("beacons_5000"));
@@ -753,13 +779,29 @@ ApEstimate Locator::estimateFor(const AccessPoint &ap) const
     const QString st = apStatus(ap);
     // Our own gear rides along: wherever it was "located" before is meaningless now
     const ApRecord *r = st == QLatin1String("travelling") || st == QLatin1String("active") ? nullptr : record(ap.bssid);
-    if (r && r->wigle) {
-        e.kind = ApEstimate::Wigle; e.lat = r->wLat; e.lon = r->wLon; e.radiusM = 25;
+    const bool fit = r && r->fit.valid && r->fit.quality != QLatin1String("none");
+    // A placement (WiGLE / Apple, ±25 m) and our own multilateration: the tighter one is the answer,
+    // and when they disagree by more than 3× their accuracy the card shows both.
+    if (r && (fit || r->wigle)) {
+        const bool useFit = fit && (!r->wigle || r->fit.acc <= 25.0);
+        if (useFit) { e.kind = ApEstimate::Trilat; e.lat = r->fit.lat; e.lon = r->fit.lon; e.radiusM = r->fit.acc; e.vantage = r->fit.vantage; e.fit = r->fit; }
+        else        { e.kind = ApEstimate::Wigle; e.lat = r->wLat; e.lon = r->wLon; e.radiusM = 25; if (fit) e.fit = r->fit; }
+        if (fit && r->wigle) {
+            const double d = distanceM(r->fit.lat, r->fit.lon, r->wLat, r->wLon);
+            if (d > 3.0 * qMax(25.0, r->fit.acc)) {
+                e.hasAlt = true;
+                if (useFit) { e.altKind = ApEstimate::Wigle; e.altLat = r->wLat; e.altLon = r->wLon; e.altAcc = 25; }
+                else        { e.altKind = ApEstimate::Trilat; e.altLat = r->fit.lat; e.altLon = r->fit.lon; e.altAcc = r->fit.acc; }
+            }
+        }
         return e;
     }
-    // Multilateration from distinct vantage points. Observations whose fixes overlap
-    // (a parked rig, BeaconDB jitter) are merged into one vantage point: the fix was
-    // computed from these very APs, so jitter alone says nothing about where they are.
+    if (r && r->hasPeer()) {                            // another device worked it out and synced it to us
+        e.kind = ApEstimate::Peer; e.lat = r->peerLat; e.lon = r->peerLon; e.radiusM = r->peerAcc;
+        return e;
+    }
+    // Two vantage points only (the engine wants three): the old signal-weighted centroid, honestly wide.
+    // Observations whose fixes overlap (a parked rig, BeaconDB jitter) are merged into one vantage point.
     if (r && r->obs.size() >= 2) {
         struct V { double lat, lon, acc, dbmSum; int n; };
         QList<V> vs;
@@ -774,40 +816,12 @@ ApEstimate Locator::estimateFor(const AccessPoint &ap) const
             if (!merged) vs.append({o.lat, o.lon, o.acc, double(o.dbm), 1});
         }
         if (vs.size() >= 2) {
-            // Local metric frame around the first vantage point
-            const double lat0 = vs[0].lat, lon0 = vs[0].lon;
-            const double my = 111320.0, mx = 111320.0 * std::cos(qDegreesToRadians(lat0));
-            const int freq = ap.frequency ? ap.frequency : r->freq;
-            struct P { double x, y, d, w, acc; };
-            QList<P> ps; double sw = 0, sx = 0, sy = 0, meanAcc = 0;
-            for (const V &v : vs) {
-                const double dbm = v.dbmSum / v.n;
-                const double w = std::pow(qMax(1.0, dbm + 100.0), 2.0) / qMax(10.0, v.acc);
-                P p{(v.lon - lon0) * mx, (v.lat - lat0) * my, rssiDistanceM(qRound(dbm), freq), w, v.acc};
-                ps << p; sw += w; sx += w * p.x; sy += w * p.y; meanAcc += v.acc / vs.size();
-            }
-            double x = sx / sw, y = sy / sw;                 // weighted centroid as the seed
-            if (vs.size() >= 3) {                            // Gauss–Newton on range residuals
-                for (int it = 0; it < 25; ++it) {
-                    double a11 = 0, a12 = 0, a22 = 0, b1 = 0, b2 = 0;
-                    for (const P &p : ps) {
-                        const double dx = x - p.x, dy = y - p.y, rr = qMax(1.0, std::hypot(dx, dy));
-                        const double res = rr - p.d, jx = dx / rr, jy = dy / rr;
-                        a11 += p.w * jx * jx; a12 += p.w * jx * jy; a22 += p.w * jy * jy;
-                        b1 -= p.w * jx * res; b2 -= p.w * jy * res;
-                    }
-                    const double det = a11 * a22 - a12 * a12;
-                    if (std::abs(det) < 1e-9) break;
-                    const double ux = (a22 * b1 - a12 * b2) / det, uy = (a11 * b2 - a12 * b1) / det;
-                    x += ux; y += uy;
-                    if (std::hypot(ux, uy) < 0.5) break;
-                }
-            }
-            double rms = 0;
-            for (const P &p : ps) { const double res = std::hypot(x - p.x, y - p.y) - p.d; rms += res * res / ps.size(); }
-            e.kind = ApEstimate::Centroid; e.vantage = vs.size();
-            e.lat = lat0 + y / my; e.lon = lon0 + x / mx;
-            e.radiusM = qBound(15.0, std::sqrt(rms) + meanAcc * (vs.size() >= 3 ? 0.7 : 1.2), 600.0);
+            double sw = 0, sl = 0, so = 0, meanAcc = 0;
+            for (const V &v : vs) { const double w = std::pow(qMax(1.0, v.dbmSum / v.n + 100.0), 2.0) / qMax(10.0, v.acc); sw += w; sl += w * v.lat; so += w * v.lon; meanAcc += v.acc / vs.size(); }
+            e.kind = ApEstimate::Centroid; e.vantage = vs.size(); e.lat = sl / sw; e.lon = so / sw;
+            double spread = 0;
+            for (const V &v : vs) { const double w = std::pow(qMax(1.0, v.dbmSum / v.n + 100.0), 2.0) / qMax(10.0, v.acc), d = distanceM(e.lat, e.lon, v.lat, v.lon); spread += w * d * d; }
+            e.radiusM = qBound(30.0, std::sqrt(spread / sw) + meanAcc, 600.0);
             return e;
         }
     }
@@ -837,7 +851,7 @@ Stats Locator::stats() const
         if (s == QLatin1String("used")) ++st.usedNow;
         if (s == QLatin1String("travelling") || s == QLatin1String("active")) ++st.travellingNow;
         const ApEstimate::Kind k = estimateFor(ap).kind;
-        if (k == ApEstimate::Centroid || k == ApEstimate::Wigle || k == ApEstimate::Observed) ++st.locatedNow;
+        if (k == ApEstimate::Centroid || k == ApEstimate::Wigle || k == ApEstimate::Observed || k == ApEstimate::Trilat || k == ApEstimate::Peer) ++st.locatedNow;
     }
     for (const Fix &f : m_history)
         if (f.accuracy >= 0 && (st.bestAccuracy < 0 || f.accuracy < st.bestAccuracy)) st.bestAccuracy = f.accuracy;
@@ -976,9 +990,14 @@ QString Locator::StateJson() const
         QJsonObject a;
         a["bssid"] = ap.bssid; a["ssid"] = ap.ssid; a["dbm"] = ap.dbm; a["freq"] = ap.frequency;
         a["status"] = apStatus(ap);
-        a["kind"] = e.kind == ApEstimate::Wigle ? "wigle" : e.kind == ApEstimate::Centroid ? "centroid" : e.kind == ApEstimate::Observed ? "observed" : e.kind == ApEstimate::Ring ? "ring" : "none";
+        a["kind"] = QLatin1String(ApEstimate::kindName(e.kind));
         a["lat"] = e.lat; a["lon"] = e.lon; a["r"] = e.radiusM; a["bearing"] = e.bearingDeg;
         if (e.vantage) a["vantage"] = e.vantage;
+        if (e.fit.valid) a["fit"] = QJsonObject{{"n", e.fit.n}, {"vantage", e.fit.vantage}, {"rms", e.fit.rms}, {"acc", e.fit.acc}, {"p0", e.fit.p0}, {"pathloss", e.fit.pathloss},
+                                                {"quality", e.fit.quality}, {"rejected", e.fit.rejected}, {"semiMajor", e.fit.semiMajor}, {"semiMinor", e.fit.semiMinor}, {"orient", e.fit.orientDeg},
+                                                {"updated", e.fit.updated > 0 ? QJsonValue(QDateTime::fromSecsSinceEpoch(e.fit.updated).toString(Qt::ISODate)) : QJsonValue()}};
+        if (e.hasAlt) a["alt"] = QJsonObject{{"kind", QLatin1String(ApEstimate::kindName(e.altKind))}, {"lat", e.altLat}, {"lon", e.altLon}, {"acc", e.altAcc}};
+        if (const ApRecord *rr = record(ap.bssid)) { a["samples"] = rr->obs.size(); if (rr->hasPeer()) a["peer"] = QJsonObject{{"from", rr->peerFrom}, {"lat", rr->peerLat}, {"lon", rr->peerLon}, {"acc", rr->peerAcc}}; }
         const int f = ap.frequency;
         a["band"] = f >= 5925 ? QStringLiteral("6") : f >= 4900 ? QStringLiteral("5") : QStringLiteral("2.4");
         a["ch"] = f >= 5925 ? (f - 5950) / 5 : f >= 4900 ? (f - 5000) / 5 : f == 2484 ? 14 : f > 2400 ? (f - 2407) / 5 : 0;
@@ -1068,6 +1087,7 @@ QString Locator::StateJson() const
     sj["stops"] = st.stops; sj["distanceKm"] = st.distanceKm; sj["beaconsTotal"] = st.beaconsTotal;
     sj["beaconsNow"] = st.beaconsNow; sj["usedNow"] = st.usedNow; sj["travellingNow"] = st.travellingNow;
     sj["locatedNow"] = st.locatedNow; sj["bestAccuracy"] = st.bestAccuracy;
+    sj["fitted"] = refitCount();
     sj["rank"] = st.rank; sj["rankLevel"] = st.rankLevel; sj["nextRankAt"] = st.nextRankAt; sj["rankAt"] = st.rankAt; sj["rankCount"] = st.rankCount;
     QJsonArray ladder;
     for (const RankTier &r : rankLadder()) ladder.append(QJsonObject{{"at", r.at}, {"name", QString::fromLatin1(r.name)}});
@@ -1161,6 +1181,13 @@ void Locator::onScanFinished(const QList<AccessPoint> &aps)
         for (const AccessPoint &ap : aps)   if (apStatus(ap) == QLatin1String("used")) after.insert(ap.bssid);
         m_aps = aps;
         if (m_fix.valid) noteSightings(m_aps, m_fix);
+        // A fresh, tight fix (GPS, or a Wi-Fi fix from the last two minutes) makes every live scan a sample:
+        // this is how a laptop carried around collects vantage points without re-geolocating each time
+        if (m_fix.precise() && m_fix.accuracy > 0 && m_fix.accuracy <= 60 && m_fix.time.isValid() && m_fix.time.secsTo(QDateTime::currentDateTime()) <= 120) {
+            QList<AccessPoint> fixed;
+            for (const AccessPoint &ap : m_aps) if (!isHome(ap)) fixed << ap;
+            noteObservations(fixed, m_fix);
+        }
         emit scanUpdated();
         queueWigle();
         // …unless the neighbourhood changed by more than half: then we've arrived somewhere
@@ -2034,17 +2061,143 @@ void Locator::noteObservations(const QList<AccessPoint> &aps, const Fix &at)
             if (!add && qAbs(last.dbm - ap.dbm) >= 6 && at.accuracy < last.acc) {
                 // same spot, better fix: replace the last observation
                 r.obs.last().lat = at.lat; r.obs.last().lon = at.lon; r.obs.last().acc = at.accuracy;
-                r.obs.last().dbm = ap.dbm; r.obs.last().time = at.time;
+                r.obs.last().dbm = ap.dbm; r.obs.last().time = at.time; r.obs.last().dirty = true;
+                r.fitDirty = true; queueRefit(ap.bssid);
             }
         }
         if (add) {
-            ApObservation ob; ob.lat = at.lat; ob.lon = at.lon; ob.acc = at.accuracy; ob.dbm = ap.dbm; ob.time = at.time;
+            ApObservation ob; ob.lat = at.lat; ob.lon = at.lon; ob.acc = at.accuracy; ob.dbm = ap.dbm; ob.time = at.time; ob.dirty = true;
             r.obs.append(ob);
-            while (r.obs.size() > 60) r.obs.removeFirst();
+            while (r.obs.size() > 500) r.obs.removeFirst();
+            // Nudge the existing fit right away; the full refit follows in the 10 s batch
+            if (r.fit.valid) { Estimator::Obs eo; eo.lat = at.lat; eo.lon = at.lon; eo.acc = at.accuracy; eo.dbm = ap.dbm; eo.t = at.time.toSecsSinceEpoch(); r.fit = Estimator::update(r.fit, eo); }
+            r.fitDirty = true; queueRefit(ap.bssid);
         }
     }
     saveApRecords();
     queueWigle();
+}
+
+// ── position refinement ──────────────────────────────────────────────────────
+QList<Estimator::Obs> Locator::obsFor(const ApRecord &r, const QString &bssid) const
+{
+    QList<Estimator::Obs> out; out.reserve(r.obs.size());
+    AccessPoint probe; probe.bssid = bssid; probe.ssid = r.ssid;
+    const bool rides = isTravelling(bssid) || isHome(probe);           // moves with us: no fit at all
+    if (rides) return out;
+    for (const ApObservation &o : r.obs) {
+        if (o.acc <= 0 || o.acc > 300) continue;                         // a coarse fix says nothing about the beacon
+        Estimator::Obs e; e.lat = o.lat; e.lon = o.lon; e.acc = o.acc; e.dbm = o.dbm; e.t = o.time.isValid() ? o.time.toSecsSinceEpoch() : 0; e.device = o.device;
+        out << e;
+    }
+    return out;
+}
+
+void Locator::queueRefit(const QString &bssid)
+{
+    if (m_standalone || bssid.isEmpty()) return;
+    m_refitQueue.insert(bssid);
+    if (!m_refitTimer.isActive()) m_refitTimer.start();
+}
+
+bool Locator::refitOne(const QString &bssid, qint64 now)
+{
+    auto it = m_apRecords.find(bssid);
+    if (it == m_apRecords.end()) return false;
+    ApRecord &r = it.value();
+    const QList<Estimator::Obs> obs = obsFor(r, bssid);
+    const Estimator::Fit before = r.fit;
+    if (obs.size() < 3) { r.fit = Estimator::Fit(); r.fit.n = obs.size(); r.fit.quality = QStringLiteral("none"); }
+    else r.fit = Estimator::fitAp(obs, now);
+    r.fitDirty = false;
+    if (m_dbUsable) { m_db->saveEstimate(bssid, r.fit); saveRecord(bssid); }
+    if (r.fit.valid && !before.valid) {
+        BeaconEvent ev; ev.type = QStringLiteral("ap_placed"); ev.bssid = bssid; ev.ssid = r.ssid; ev.kind = QStringLiteral("trilat");
+        ev.hasPos = true; ev.lat = r.fit.lat; ev.lon = r.fit.lon;
+        ev.text = QStringLiteral("%1 positioned from %2 of your samples (±%3 m)").arg(r.ssid.isEmpty() ? QStringLiteral("(hidden)") : r.ssid).arg(r.fit.n).arg(qRound(r.fit.acc));
+        logEvent(ev);
+    }
+    return r.fit.valid;
+}
+
+void Locator::refitQueued()
+{
+    if (m_refitQueue.isEmpty()) return;
+    const QSet<QString> batch = m_refitQueue; m_refitQueue.clear();
+    const qint64 now = QDateTime::currentSecsSinceEpoch();
+    int fitted = 0;
+    for (const QString &b : batch) if (refitOne(b, now)) ++fitted;
+    if (m_dbUsable) m_db->flush();
+    emit refitDone(batch.size());
+    emit scanUpdated();
+    checkAchievements();
+}
+
+int Locator::Refit()
+{
+    const qint64 now = QDateTime::currentSecsSinceEpoch();
+    int fitted = 0, tried = 0;
+    m_refitQueue.clear(); m_refitTimer.stop();
+    for (auto it = m_apRecords.begin(); it != m_apRecords.end(); ++it) {
+        if (it->obs.size() < 3) continue;
+        ++tried;
+        if (refitOne(it.key(), now)) ++fitted;
+    }
+    if (m_dbUsable) m_db->flush();
+    emit statusMessage(QStringLiteral("Refit %1 beacons: %2 positioned").arg(tried).arg(fitted));
+    emit refitDone(tried);
+    emit scanUpdated();
+    checkAchievements();
+    return fitted;
+}
+
+int Locator::refitCount() const
+{
+    int n = 0;
+    for (const ApRecord &r : m_apRecords) if (r.fit.valid && r.fit.quality != QLatin1String("none")) ++n;
+    return n;
+}
+
+// ── data from other devices (LAN API, sync) ──────────────────────────────────
+int Locator::ingestObservations(const QJsonArray &observations, const QString &device, QString *error)
+{
+    if (!m_dbUsable) { if (error) *error = QStringLiteral("map database not writable"); return -1; }
+    QHash<QString, QList<ApObservation>> added;
+    const int n = m_db->addObservations(observations, device, error, &added);
+    if (n <= 0) return n;
+    for (auto it = added.constBegin(); it != added.constEnd(); ++it) {
+        ApRecord &r = m_apRecords[it.key()];
+        for (const ApObservation &o : it.value()) { r.obs.append(o); if (r.fit.valid) { Estimator::Obs eo; eo.lat = o.lat; eo.lon = o.lon; eo.acc = o.acc; eo.dbm = o.dbm; eo.t = o.time.toSecsSinceEpoch(); r.fit = Estimator::update(r.fit, eo); } }
+        while (r.obs.size() > 500) r.obs.removeFirst();
+        r.fitDirty = true; queueRefit(it.key());
+    }
+    emit scanUpdated();
+    return n;
+}
+
+int Locator::mergePeerAps(const QJsonArray &aps, const QString &device)
+{
+    if (!m_dbUsable) return -1;
+    QStringList touched;
+    const int n = m_db->mergePeerAps(aps, device, &touched);
+    for (const QJsonValue &v : aps) {
+        const QJsonObject o = v.toObject();
+        const QString b = o["bssid"].toString().toUpper().trimmed();
+        if (!touched.contains(b)) continue;
+        ApRecord &r = m_apRecords[b];
+        if (r.ssid.isEmpty()) r.ssid = o["ssid"].toString();
+        if (!r.freq && o["freq"].toInt() > 0) r.freq = o["freq"].toInt();
+        const double acc = o["acc"].toDouble(100);
+        if (!r.hasPeer() || r.peerFrom == device || r.peerAcc > acc) { r.peerLat = o["lat"].toDouble(); r.peerLon = o["lon"].toDouble(); r.peerAcc = acc; r.peerFrom = device; }
+    }
+    if (n > 0) emit scanUpdated();
+    return n;
+}
+
+int Locator::appendPeerFixes(const QJsonArray &fixes, const QString &device)
+{
+    if (!m_dbUsable) return -1;
+    return m_db->appendPeerFixes(fixes, device);
 }
 
 void Locator::noteSightings(const QList<AccessPoint> &aps, const Fix &at)
@@ -2186,7 +2339,15 @@ bool Locator::tryInternal(const QList<AccessPoint> &usable)
     return true;
 }
 
-void Locator::saveApRecords() const
+void Locator::saveRecord(const QString &bssid)
+{
+    auto it = m_apRecords.find(bssid);
+    if (it == m_apRecords.end()) return;
+    if (m_dbUsable) { m_db->saveRecord(bssid, it.value(), apFlags().value(bssid, 0)); return; }
+    saveApRecords();
+}
+
+void Locator::saveApRecords()
 {
     if (m_dbUsable) { m_db->saveApRecords(m_apRecords, m_travelling, m_notTravelling, apFlags()); return; }
     QJsonObject recs;
@@ -2261,4 +2422,149 @@ double Locator::distanceM(double lat1, double lon1, double lat2, double lon2)
     const double a = std::sin(dLat / 2) * std::sin(dLat / 2)
                    + std::cos(lat1 * d2r) * std::cos(lat2 * d2r) * std::sin(dLon / 2) * std::sin(dLon / 2);
     return 2 * R * std::asin(std::sqrt(a));
+}
+
+
+// ── Sync with another BeaconFix ──────────────────────────────────────────────
+// A laptop carried around feeds the desktop in the RV (and gets its map back), the phone's
+// desktop feeds the laptop, and so on. Each side keeps two cursors per peer in the database:
+// "pushed" (the last change sequence of ours the peer has) and "pulled" (theirs we have).
+static QString syncFile() { return QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation) + QStringLiteral("/sworrl/beaconfix-sync.json"); }
+static QString peerKey(const QString &url) { const QUrl u(url); return QStringLiteral("%1:%2").arg(u.host()).arg(u.port(47822)); }
+static QString ourDeviceName() { QString h = QSysInfo::machineHostName(); if (h.isEmpty()) h = QHostInfo::localHostName(); return h.isEmpty() ? QStringLiteral("beaconfix") : h; }
+
+void Locator::loadSyncPeers()
+{
+    m_syncPeers.clear();
+    QFile f(syncFile());
+    if (!f.open(QIODevice::ReadOnly)) return;
+    for (const QJsonValue &v : QJsonDocument::fromJson(f.readAll()).object()["peers"].toArray()) {
+        const QJsonObject o = v.toObject();
+        SyncPeer p; p.url = o["url"].toString().trimmed(); p.token = o["token"].toString(); p.name = o["name"].toString(); p.minutes = o["minutes"].toInt(15);
+        p.last = QDateTime::fromString(o["last"].toString(), Qt::ISODate); p.lastResult = o["lastResult"].toString(); p.ok = o["ok"].toBool();
+        if (!p.url.isEmpty()) m_syncPeers << p;
+    }
+}
+
+void Locator::saveSyncPeers() const
+{
+    QJsonArray arr;
+    for (const SyncPeer &p : m_syncPeers)
+        arr.append(QJsonObject{{"url", p.url}, {"token", p.token}, {"name", p.name}, {"minutes", p.minutes}, {"last", p.last.isValid() ? p.last.toString(Qt::ISODate) : QString()}, {"lastResult", p.lastResult}, {"ok", p.ok}});
+    QDir().mkpath(QFileInfo(syncFile()).path());
+    QSaveFile f(syncFile());
+    if (!f.open(QIODevice::WriteOnly)) return;
+    f.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner);
+    f.write(QJsonDocument(QJsonObject{{"peers", arr}}).toJson(QJsonDocument::Indented));
+    f.commit();
+}
+
+void Locator::setSyncPeers(const QList<SyncPeer> &peers)
+{
+    QList<SyncPeer> keep;
+    for (const SyncPeer &p : peers) {
+        if (p.url.trimmed().isEmpty()) continue;
+        SyncPeer q = p; q.url = p.url.trimmed(); if (q.url.endsWith(QLatin1Char('/'))) q.url.chop(1);
+        for (const SyncPeer &old : m_syncPeers) if (peerKey(old.url) == peerKey(q.url)) { q.last = old.last; q.lastResult = old.lastResult; q.ok = old.ok; }
+        keep << q;
+    }
+    m_syncPeers = keep;
+    saveSyncPeers();
+}
+
+// One round with peer i: hello → push our changes → pull theirs. Runs asynchronously; the
+// result lands in m_syncPeers[i] and syncFinished().
+void Locator::syncStep(int i)
+{
+    if (m_syncBusy || i < 0 || i >= m_syncPeers.size() || !m_dbUsable) return;
+    m_syncBusy = true;
+    const SyncPeer peer = m_syncPeers[i];
+    const QString base = peer.url + QStringLiteral("/api/v1/"), key = peerKey(peer.url);
+    const QByteArray auth = "Bearer " + peer.token.toUtf8();
+    struct Ctx { int pushedObs = 0, pushedFixes = 0, pulledObs = 0, pulledAps = 0, pulledFixes = 0, rounds = 0; QString peerName; };
+    auto ctx = QSharedPointer<Ctx>::create();
+    auto done = [this, i, key](bool ok, const QString &msg) {
+        m_syncBusy = false;
+        if (i < m_syncPeers.size()) { m_syncPeers[i].last = QDateTime::currentDateTime(); m_syncPeers[i].lastResult = msg; m_syncPeers[i].ok = ok; saveSyncPeers(); }
+        if (m_dbUsable) m_db->flush();
+        emit syncFinished(key, ok, msg);
+        emit statusMessage((ok ? QStringLiteral("Sync with %1: ") : QStringLiteral("Sync with %1 failed: ")).arg(key) + msg);
+        if (ok) { emit scanUpdated(); emit FixChanged(); }
+    };
+    auto request = [base, auth](const QString &ep) { QNetworkRequest r(QUrl(base + ep)); r.setRawHeader("Authorization", auth); r.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json")); r.setHeader(QNetworkRequest::UserAgentHeader, QString::fromLatin1(USER_AGENT)); r.setTransferTimeout(30000); return r; };
+
+    // Pull loop (after the push): GET db/changes?since=<pulled>
+    auto pull = QSharedPointer<std::function<void()>>::create();
+    *pull = [this, ctx, key, request, done, pull] {
+        const qint64 since = m_db->kv(QStringLiteral("sync:%1:pulled").arg(key)).toLongLong();
+        QNetworkReply *rep = m_nam.get(request(QStringLiteral("db/changes?since=%1&limit=2000").arg(since)));
+        connect(rep, &QNetworkReply::finished, this, [this, rep, ctx, key, done, pull] {
+            rep->deleteLater();
+            const QJsonObject o = QJsonDocument::fromJson(rep->readAll()).object();
+            if (rep->error() != QNetworkReply::NoError) { done(false, QStringLiteral("pull: %1").arg(o["error"].toString().isEmpty() ? rep->errorString() : o["error"].toString())); return; }
+            const QString me = ourDeviceName();
+            QJsonArray obs; for (const QJsonValue &v : o["observations"].toArray()) if (v.toObject()["device"].toString() != me) obs.append(v);   // our own samples coming back
+            QJsonArray fixes; for (const QJsonValue &v : o["fixes"].toArray()) if (v.toObject()["device"].toString() != me) fixes.append(v);
+            QJsonArray aps; for (const QJsonValue &v : o["aps"].toArray()) if (v.toObject()["lat"].isDouble() && v.toObject()["source"].toString() != QLatin1String("peer")) aps.append(v);
+            const QString from = ctx->peerName.isEmpty() ? key : ctx->peerName;
+            ctx->pulledObs += qMax(0, ingestObservations(obs, from));
+            ctx->pulledAps += qMax(0, mergePeerAps(aps, from));
+            ctx->pulledFixes += qMax(0, appendPeerFixes(fixes, from));
+            m_db->setKv(QStringLiteral("sync:%1:pulled").arg(key), QString::number(qint64(o["cursor"].toDouble())));
+            if (o["more"].toBool() && ++ctx->rounds < 50) { (*pull)(); return; }
+            done(true, QStringLiteral("pushed %1 samples + %2 stops, pulled %3 samples, %4 positions, %5 stops").arg(ctx->pushedObs).arg(ctx->pushedFixes).arg(ctx->pulledObs).arg(ctx->pulledAps).arg(ctx->pulledFixes));
+        });
+    };
+    // Push loop: POST db/sync with our changes since <pushed>
+    auto push = QSharedPointer<std::function<void()>>::create();
+    *push = [this, ctx, key, request, done, pull, push] {
+        const qint64 since = m_db->kv(QStringLiteral("sync:%1:pushed").arg(key)).toLongLong();
+        bool more = false; qint64 cursor = 0;
+        QJsonObject ch = m_db->changesSince(since, 2000, &more, &cursor);
+        QJsonArray obs; for (const QJsonValue &v : ch["observations"].toArray()) if (v.toObject()["device"].toString().isEmpty()) obs.append(v);   // ours only, not what peers gave us
+        QJsonArray fixes; for (const QJsonValue &v : ch["fixes"].toArray()) if (v.toObject()["device"].toString().isEmpty()) fixes.append(v);
+        QJsonArray aps; for (const QJsonValue &v : ch["aps"].toArray()) { const QJsonObject a = v.toObject(); if (a["source"].toString() == QLatin1String("trilat") || a["source"].toString() == QLatin1String("placed")) aps.append(a); }
+        if (obs.isEmpty() && fixes.isEmpty() && aps.isEmpty()) { m_db->setKv(QStringLiteral("sync:%1:pushed").arg(key), QString::number(cursor)); (*pull)(); return; }
+        QJsonObject body{{"device", ourDeviceName()}, {"observations", obs}, {"aps", aps}, {"fixes", fixes}, {"sinceCursor", double(m_db->kv(QStringLiteral("sync:%1:pulled").arg(key)).toLongLong())}};
+        QNetworkReply *rep = m_nam.post(request(QStringLiteral("db/sync")), QJsonDocument(body).toJson(QJsonDocument::Compact));
+        connect(rep, &QNetworkReply::finished, this, [this, rep, ctx, key, cursor, more, done, pull, push] {
+            rep->deleteLater();
+            const QJsonObject o = QJsonDocument::fromJson(rep->readAll()).object();
+            if (rep->error() != QNetworkReply::NoError) { done(false, QStringLiteral("push: %1").arg(o["error"].toString().isEmpty() ? rep->errorString() : o["error"].toString())); return; }
+            ctx->pushedObs += o["accepted"].toObject()["observations"].toInt(); ctx->pushedFixes += o["accepted"].toObject()["fixes"].toInt();
+            m_db->setKv(QStringLiteral("sync:%1:pushed").arg(key), QString::number(cursor));
+            if (more && ++ctx->rounds < 50) { (*push)(); return; }
+            ctx->rounds = 0; (*pull)();
+        });
+    };
+    QNetworkReply *hello = m_nam.get(request(QStringLiteral("hello")));
+    connect(hello, &QNetworkReply::finished, this, [this, hello, ctx, done, push] {
+        hello->deleteLater();
+        const QJsonObject o = QJsonDocument::fromJson(hello->readAll()).object();
+        if (hello->error() != QNetworkReply::NoError) { done(false, QStringLiteral("hello: %1").arg(hello->errorString())); return; }
+        bool sync = false; for (const QJsonValue &v : o["features"].toArray()) if (v.toString() == QLatin1String("sync")) sync = true;
+        if (!sync) { done(false, QStringLiteral("%1 runs BeaconFix %2 without the sync API (needs 3.4+)").arg(o["hostname"].toString(), o["version"].toString())); return; }
+        ctx->peerName = o["hostname"].toString();
+        (*push)();
+    });
+}
+
+QString Locator::Sync(const QString &url, const QString &token)
+{
+    if (m_standalone || !m_dbUsable) return QStringLiteral("{\"ok\":false,\"error\":\"needs the running instance with a writable database\"}");
+    if (m_syncBusy) return QStringLiteral("{\"ok\":false,\"error\":\"a sync is already running\"}");
+    QString u = url.trimmed(); if (u.endsWith(QLatin1Char('/'))) u.chop(1);
+    int idx = -1;
+    for (int i = 0; i < m_syncPeers.size(); ++i) if (peerKey(m_syncPeers[i].url) == peerKey(u)) idx = i;
+    if (idx < 0) { SyncPeer p; p.url = u; p.token = token; p.minutes = 0; m_syncPeers << p; idx = m_syncPeers.size() - 1; saveSyncPeers(); }
+    else if (!token.isEmpty()) m_syncPeers[idx].token = token;
+    QEventLoop loop; QJsonObject result;
+    QMetaObject::Connection c = connect(this, &Locator::syncFinished, &loop, [&](const QString &, bool ok, const QString &msg) { result = QJsonObject{{"ok", ok}, {"message", msg}}; loop.quit(); });
+    QTimer::singleShot(180000, &loop, &QEventLoop::quit);
+    syncStep(idx);
+    loop.exec();
+    disconnect(c);
+    if (result.isEmpty()) result = QJsonObject{{"ok", false}, {"error", "timed out"}};
+    result["peer"] = peerKey(u);
+    return QString::fromUtf8(QJsonDocument(result).toJson(QJsonDocument::Compact));
 }

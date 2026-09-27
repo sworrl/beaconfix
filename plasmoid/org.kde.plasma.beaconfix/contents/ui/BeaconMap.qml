@@ -49,6 +49,8 @@ Item {
     property int  tourMinutes: 2
     property bool flying: false
     property bool holding: false
+    readonly property bool zooming: Math.abs(zoomTarget - zoom) > 0.002
+    onZoomingChanged: if (!zooming) overlay.requestPaint()
     property real lastUserInput: 0
     property string caption: ""
     property var  _fly: null
@@ -306,7 +308,7 @@ Item {
         running: !map.flying && Math.abs(map.zoomTarget - map.zoom) > 0.002
         onTriggered: {
             var d = map.zoomTarget - map.zoom
-            map.applyZoom(Math.abs(d) < 0.01 ? map.zoomTarget : map.zoom + d * 0.3, map.zoomAnchor.x, map.zoomAnchor.y)
+            map.applyZoom(Math.abs(d) < 0.006 ? map.zoomTarget : map.zoom + d * 0.22, map.zoomAnchor.x, map.zoomAnchor.y)
         }
     }
 
@@ -341,24 +343,44 @@ Item {
             for (var x = x0; x <= x1; x++)
                 for (var y = y0; y <= y1; y++) need[z + "/" + x + "/" + y] = [x, y]
             var lk = map.layerIndex + "," + map.tileBase
+            // Tiles of another zoom level stay (marked stale, underneath) until every tile of
+            // the new level has loaded, so a zoom step no longer flashes to the coarse layer.
             for (var i = tiles.count - 1; i >= 0; i--) {
                 var t = tiles.get(i)
-                if (t.lk === lk && need[t.k] !== undefined) delete need[t.k]
-                else tiles.remove(i)
+                if (t.lk !== lk) { tiles.remove(i); continue }
+                if (t.tz === z) { if (need[t.k] !== undefined) delete need[t.k]; else tiles.remove(i) }
+                else {                          // other level: keep only while it still covers the view
+                    var on = Math.pow(2, t.tz), ax = map.toMerc(0, 0), bx = map.toMerc(map.width, map.height)
+                    var vis = (t.tx + 1) / on > ax.x && t.tx / on < bx.x && (t.ty + 1) / on > ax.y && t.ty / on < bx.y
+                    if (!vis) tiles.remove(i); else tiles.setProperty(i, "stale", true)
+                }
             }
             for (var k in need) {
                 var tx = need[k][0], ty = need[k][1]
-                tiles.append({k: k, lk: lk, tz: z, tx: tx, ty: ty, url: map.tileUrl(z, ((tx % n) + n) % n, ty, labels)})
+                tiles.append({k: k, lk: lk, tz: z, tx: tx, ty: ty, stale: false, ready: false, url: map.tileUrl(z, ((tx % n) + n) % n, ty, labels)})
             }
+            tl.currentZ = z
+            prune()
+        }
+        property int currentZ: 0
+        function prune() {                      // drop stale tiles once the current level is fully loaded
+            var allReady = true
+            for (var i = 0; i < tiles.count; i++) { var t = tiles.get(i); if (t.tz === tl.currentZ && !t.ready) { allReady = false; break } }
+            if (!allReady) return
+            for (var j = tiles.count - 1; j >= 0; j--) if (tiles.get(j).stale) tiles.remove(j)
         }
         ListModel { id: tiles }
         Repeater {
             model: tiles
             delegate: Image {
+                required property int index
                 required property int tz
                 required property int tx
                 required property int ty
+                required property bool stale
                 required property string url
+                z: stale ? 0 : 1
+                onStatusChanged: if (status === Image.Ready || status === Image.Error) { tiles.setProperty(index, "ready", true); tl.prune() }
                 readonly property real n: Math.pow(2, tz)
                 readonly property real ox: map.width / 2 + (tx / n - map.cx) * map.ws
                 readonly property real oy: map.height / 2 + (ty / n - map.cy) * map.ws
@@ -504,7 +526,7 @@ Item {
             // ── Wi-Fi names: pills beside the beacons, strongest first, no overlaps ──
             // (skipped while a cinematic flight is running: text layout is the expensive part)
             var hits = []
-            if (!map.flying && map.showSsids && map.zoom >= 13) {
+            if (!map.flying && !map.zooming && map.showSsids && map.zoom >= 13) {
                 var lbl = pts.slice().sort(function(a, b) { return b.dbm - a.dbm })
                 var limit = map.zoom >= 15 ? lbl.length : 12, taken = [], made = 0, h = 16
                 ctx.textBaseline = "middle"; ctx.textAlign = "left"
@@ -774,7 +796,7 @@ Item {
         }
         onDoubleClicked: mouse => { if (mouse.button === Qt.LeftButton) map.zoomAt(1, mouse.x, mouse.y) }
         onExited: if (map.hover && map.hover.kind === "beacon") map.hover = null
-        onWheel: wheel => { map.zoomAt(wheel.angleDelta.y / 120 * 0.5, wheel.x, wheel.y); wheel.accepted = true }
+        onWheel: wheel => { map.zoomAt(wheel.angleDelta.y / 120 * 0.35, wheel.x, wheel.y); wheel.accepted = true }
 
         // Touch / touchpad: pinch zooms about the pinch centre; press-and-hold opens the context menu.
         // Handlers sit on the MouseArea so they see the points first; the tap handler is passive

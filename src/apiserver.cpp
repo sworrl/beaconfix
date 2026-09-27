@@ -29,6 +29,14 @@ static const int   MAX_PENDING    = 5;
 static const int   MAX_STREAMS    = 8;
 static const int   MAX_OPEN       = 32;
 static const int   MAX_BODY       = 4096;
+static const int   MAX_BODY_SYNC  = 1024 * 1024;         // /db/sync: a phone reconnecting after a day pushes thousands of samples
+static const int   MAX_BODY_OBS   = 256 * 1024;          // /db/observations
+static int bodyLimitFor(const QString &path)
+{
+    if (path == QLatin1String("/api/v1/db/sync")) return MAX_BODY_SYNC;
+    if (path == QLatin1String("/api/v1/db/observations")) return MAX_BODY_OBS;
+    return MAX_BODY;
+}
 static const int   RATE_PER_MIN   = 60;
 static const int   LOG_KEEP       = 100;
 
@@ -556,7 +564,7 @@ void ApiServer::onReadyRead(QTcpSocket *s)
         if (c > 0) r.headers.insert(lines[i].left(c).trimmed().toLower(), lines[i].mid(c + 1).trimmed());
     }
     const int len = r.headers.value("content-length", "0").toInt();
-    if (len < 0 || len > MAX_BODY) { s->setProperty("handled", true); replyRaw(s, 413, "application/json", "{\"error\":\"body too large\"}"); return; }
+    if (len < 0 || len > bodyLimitFor(r.path)) { s->setProperty("handled", true); replyRaw(s, 413, "application/json", "{\"error\":\"body too large\"}"); return; }
     if (buf.size() < hdrEnd + 4 + len) { s->setProperty("buf", buf); return; }
     r.body = buf.mid(hdrEnd + 4, len);
     s->setProperty("handled", true);
@@ -673,7 +681,8 @@ void ApiServer::handle(QTcpSocket *s, const Request &r)
     if (ep == QLatin1String("hello")) {
         if (r.method != QLatin1String("GET")) { finish(405, QJsonObject{{"error", "method not allowed"}}, {"Allow: GET"}); return; }
         finish(200, QJsonObject{{"name", "BeaconFix"}, {"version", QStringLiteral(BEACONFIX_VERSION)}, {"hostname", QHostInfo::localHostName()},
-                                {"pairing", pairingOpen()}, {"tls", m_tls}, {"ts", QDateTime::currentDateTime().toString(Qt::ISODate)}});
+                                {"pairing", pairingOpen()}, {"tls", m_tls}, {"ts", QDateTime::currentDateTime().toString(Qt::ISODate)},
+                                {"features", QJsonArray{"sync", "locate", "home", "events", "stream", "estimates"}}, {"api", 2}});
         return;
     }
     if (ep == QLatin1String("pair")) {
@@ -801,9 +810,45 @@ void ApiServer::handle(QTcpSocket *s, const Request &r)
         MapDb *db = m_loc->mapDb();
         if (!db || !db->isOpen() || db->readOnly()) { finish(503, QJsonObject{{"error", "map database not writable"}}); return; }
         QString err;
-        const int n = db->addObservations(QJsonDocument::fromJson(r.body).object()["observations"].toArray(), &err);
+        const QJsonObject b = QJsonDocument::fromJson(r.body).object();
+        const QString from = b["device"].toString().isEmpty() ? dev->name : b["device"].toString().left(64);
+        const int n = m_loc->ingestObservations(b["observations"].toArray(), from, &err);
         if (n < 0) { finish(500, QJsonObject{{"error", err}}); return; }
-        finish(200, QJsonObject{{"added", n}});
+        finish(200, QJsonObject{{"added", n}, {"device", from}, {"cursor", double(db->currentSeq())}, {"refitQueued", n > 0}});
+        return;
+    }
+    if (ep == QLatin1String("db/changes")) {                  // the sync feed: everything after a cursor, oldest first
+        if (!get) { finish(405, QJsonObject{{"error", "method not allowed"}}, {"Allow: GET"}); return; }
+        MapDb *db = m_loc->mapDb();
+        if (!db || !db->isOpen()) { finish(503, QJsonObject{{"error", "map database unavailable"}}); return; }
+        const QUrlQuery qq(r.query);
+        const qint64 since = qq.queryItemValue(QStringLiteral("since")).toLongLong();
+        const int limit = qq.hasQueryItem(QStringLiteral("limit")) ? qq.queryItemValue(QStringLiteral("limit")).toInt() : 500;
+        bool more = false; qint64 cursor = 0;
+        QJsonObject o = db->changesSince(since, limit, &more, &cursor);
+        o["device"] = QHostInfo::localHostName();
+        finish(200, o);
+        return;
+    }
+    if (ep == QLatin1String("db/sync")) {                     // a peer's changes, merged; then it pulls ours from /db/changes
+        if (!post) { finish(405, QJsonObject{{"error", "method not allowed"}}, {"Allow: POST"}); return; }
+        if (!control) { finish(403, QJsonObject{{"error", "control scope required"}}); return; }
+        MapDb *db = m_loc->mapDb();
+        if (!db || !db->isOpen() || db->readOnly()) { finish(503, QJsonObject{{"error", "map database not writable"}}); return; }
+        const QJsonObject b = QJsonDocument::fromJson(r.body).object();
+        if (b.isEmpty()) { finish(400, QJsonObject{{"error", "JSON body required"}}); return; }
+        const QString from = b["device"].toString().isEmpty() ? dev->name : b["device"].toString().left(64);
+        QString err;
+        const int obs = m_loc->ingestObservations(b["observations"].toArray(), from, &err);
+        const int aps = m_loc->mergePeerAps(b["aps"].toArray(), from);
+        const int fixes = m_loc->appendPeerFixes(b["fixes"].toArray(), from);
+        if (obs < 0 || aps < 0 || fixes < 0) { finish(500, QJsonObject{{"error", err.isEmpty() ? QStringLiteral("merge failed") : err}}); return; }
+        QJsonObject o{{"accepted", QJsonObject{{"observations", obs}, {"aps", aps}, {"fixes", fixes}}}, {"cursor", double(db->currentSeq())}, {"refitQueued", obs > 0 || aps > 0}, {"device", from}};
+        if (b.contains("sinceCursor")) {                        // convenience: the peer's pull in the same round trip
+            bool more = false; qint64 cursor = 0;
+            o["changes"] = db->changesSince(qint64(b["sinceCursor"].toDouble()), 500, &more, &cursor);
+        }
+        finish(200, o);
         return;
     }
     if (ep == QLatin1String("db/export")) {

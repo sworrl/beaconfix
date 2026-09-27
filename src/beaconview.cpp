@@ -982,6 +982,10 @@ QString BeaconView::beaconCard(int i) const
     const QString band = ap.frequency >= 5925 ? QStringLiteral("6 GHz") : ap.frequency >= 4900 ? QStringLiteral("5 GHz") : QStringLiteral("2.4 GHz");
     const QString how = e.kind == ApEstimate::Wigle ? QStringLiteral("WiGLE position · %1 %2 from you")
                                                           .arg(distText(Locator::distanceM(fix.lat, fix.lon, e.lat, e.lon)), compass(Locator::bearingDeg(fix.lat, fix.lon, e.lat, e.lon)))
+                      : e.kind == ApEstimate::Trilat ? QStringLiteral("Fitted from %1 of your samples at %2 places, ±%3 (%4) · %5 %6 from you").arg(e.fit.n).arg(e.fit.vantage).arg(distText(e.radiusM), e.fit.quality)
+                                                          .arg(distText(Locator::distanceM(fix.lat, fix.lon, e.lat, e.lon)), compass(Locator::bearingDeg(fix.lat, fix.lon, e.lat, e.lon)))
+                      : e.kind == ApEstimate::Peer ? QStringLiteral("Positioned by a synced device, ±%1 · %2 %3 from you").arg(distText(e.radiusM))
+                                                          .arg(distText(Locator::distanceM(fix.lat, fix.lon, e.lat, e.lon)), compass(Locator::bearingDeg(fix.lat, fix.lon, e.lat, e.lon)))
                       : e.kind == ApEstimate::Centroid ? QStringLiteral("Multilaterated from %1 places, ±%2 · %3 %4 from you").arg(e.vantage).arg(distText(e.radiusM))
                                                           .arg(distText(Locator::distanceM(fix.lat, fix.lon, e.lat, e.lon)), compass(Locator::bearingDeg(fix.lat, fix.lon, e.lat, e.lon)))
                       : e.kind == ApEstimate::Observed ? QStringLiteral("Heard here before (internal map), ±%1 · %2 %3 from you").arg(distText(e.radiusM))

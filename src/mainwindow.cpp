@@ -13,6 +13,7 @@
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QLabel>
+#include <QGridLayout>
 #include <QLineEdit>
 #include <QListWidget>
 #include <QMenu>
@@ -405,6 +406,72 @@ QWidget *MainWindow::buildSettings()
         form->addRow(QStringLiteral("Map database:"), dbBox);
     }
 
+    // ── Positioning: our own fits ──
+    {
+        auto *box = new QWidget; auto *v = new QVBoxLayout(box); v->setContentsMargins(0, 0, 0, 0);
+        auto *info = new QLabel; info->setWordWrap(true);
+        auto *row = new QHBoxLayout;
+        auto *refit = new QPushButton(QIcon::fromTheme(QStringLiteral("view-refresh")), QStringLiteral("Refit all beacons"));
+        refit->setToolTip(QStringLiteral("Re-estimate every beacon's position from all its samples with the least-squares fit (a log-distance path-loss model, robust weights). Beacons with new samples are refit automatically ten seconds after a scan."));
+        row->addWidget(refit); row->addStretch();
+        v->addWidget(info); v->addLayout(row);
+        auto refreshInfo = [this, info] {
+            int fitted = m_loc->refitCount(), withSamples = 0, samples = 0;
+            for (const AccessPoint &ap : m_loc->accessPoints()) if (const ApRecord *r = m_loc->record(ap.bssid)) { if (r->obs.size() >= 3) ++withSamples; samples += r->obs.size(); }
+            info->setText(QStringLiteral("%1 beacons positioned from your own samples · %2 in range with enough samples to fit · %3 samples on the beacons in range\nEvery scan taken while the fix is fresh and tight (GPS, or Wi-Fi within two minutes) adds a sample; walk or drive around and the positions tighten. Samples from paired devices and synced peers count too.")
+                          .arg(fitted).arg(withSamples).arg(samples));
+        };
+        connect(refit, &QPushButton::clicked, this, [this, refit] { refit->setEnabled(false); const int n = m_loc->Refit(); statusBar()->showMessage(QStringLiteral("Refit done: %1 beacons positioned").arg(n), 5000); refit->setEnabled(true); });
+        connect(m_loc, &Locator::refitDone, this, refreshInfo);
+        connect(m_loc, &Locator::scanUpdated, this, refreshInfo);
+        refreshInfo();
+        form->addRow(QStringLiteral("Positioning:"), box);
+    }
+    // ── Sync with another BeaconFix ──
+    {
+        auto *box = new QWidget; auto *v = new QVBoxLayout(box); v->setContentsMargins(0, 0, 0, 0);
+        auto *hint = new QLabel(QStringLiteral("A laptop carried around feeds this BeaconFix its samples and gets the map back (and the other way round). Pair this machine with the other one's LAN API first (its Devices tab → token or pairing), then enter its address and token here."));
+        hint->setWordWrap(true); hint->setStyleSheet(QStringLiteral("color: palette(mid)"));
+        auto *grid = new QGridLayout;
+        auto *url = new QLineEdit; url->setPlaceholderText(QStringLiteral("http://<beaconfix-host>:47822"));
+        auto *tok = new QLineEdit; tok->setPlaceholderText(QStringLiteral("token from the other BeaconFix")); tok->setEchoMode(QLineEdit::Password);
+        auto *mins = new QSpinBox; mins->setRange(0, 1440); mins->setSuffix(QStringLiteral(" min")); mins->setSpecialValueText(QStringLiteral("manual only")); mins->setValue(15);
+        auto *now = new QPushButton(QIcon::fromTheme(QStringLiteral("view-refresh")), QStringLiteral("Sync now"));
+        auto *status = new QLabel; status->setWordWrap(true);
+        const QList<Locator::SyncPeer> peers = m_loc->syncPeers();
+        if (!peers.isEmpty()) { url->setText(peers.first().url); tok->setText(peers.first().token); mins->setValue(peers.first().minutes); }
+        grid->addWidget(new QLabel(QStringLiteral("Other BeaconFix:")), 0, 0); grid->addWidget(url, 0, 1);
+        grid->addWidget(new QLabel(QStringLiteral("Token:")), 1, 0); grid->addWidget(tok, 1, 1);
+        grid->addWidget(new QLabel(QStringLiteral("Every:")), 2, 0); grid->addWidget(mins, 2, 1);
+        auto *row = new QHBoxLayout; row->addWidget(now); row->addStretch();
+        v->addWidget(hint); v->addLayout(grid); v->addLayout(row); v->addWidget(status);
+        auto apply = [this, url, tok, mins] {
+            QList<Locator::SyncPeer> l;
+            if (!url->text().trimmed().isEmpty()) { Locator::SyncPeer p; p.url = url->text().trimmed(); p.token = tok->text().trimmed(); p.minutes = mins->value(); l << p; }
+            m_loc->setSyncPeers(l);
+        };
+        auto refreshStatus = [this, status] {
+            const QList<Locator::SyncPeer> l = m_loc->syncPeers();
+            if (l.isEmpty()) { status->setText(QStringLiteral("No peer configured.")); return; }
+            const Locator::SyncPeer &p = l.first();
+            status->setText(p.last.isValid() ? QStringLiteral("%1 · last sync %2: %3").arg(p.ok ? QStringLiteral("✓") : QStringLiteral("✗"), p.last.toString(QStringLiteral("ddd HH:mm")), p.lastResult) : QStringLiteral("Never synced yet."));
+        };
+        connect(url, &QLineEdit::editingFinished, this, apply);
+        connect(tok, &QLineEdit::editingFinished, this, apply);
+        connect(mins, &QSpinBox::valueChanged, this, [apply](int) { apply(); });
+        connect(now, &QPushButton::clicked, this, [this, apply, url, tok, now, status] {
+            apply();
+            if (url->text().trimmed().isEmpty() || tok->text().trimmed().isEmpty()) { status->setText(QStringLiteral("Enter the other BeaconFix's address and token first.")); return; }
+            now->setEnabled(false); status->setText(QStringLiteral("Syncing…"));
+            const QJsonObject r = QJsonDocument::fromJson(m_loc->Sync(url->text().trimmed(), tok->text().trimmed()).toUtf8()).object();
+            now->setEnabled(true);
+            statusBar()->showMessage(r["ok"].toBool() ? QStringLiteral("Synced: %1").arg(r["message"].toString()) : QStringLiteral("Sync failed: %1").arg(r["message"].toString().isEmpty() ? r["error"].toString() : r["message"].toString()), 6000);
+        });
+        connect(m_loc, &Locator::syncFinished, this, refreshStatus);
+        refreshStatus();
+        form->addRow(QStringLiteral("Sync:"), box);
+    }
+
     m_prefetch = new QCheckBox(QStringLiteral("Save map tiles around each new stop for offline use (~10 km, zoom 10–15, ≤400 tiles)"));
     m_prefetch->setChecked(m_loc->prefetchTiles()); connect(m_prefetch, &QCheckBox::toggled, m_loc, &Locator::setPrefetchTiles);
     form->addRow(QStringLiteral("Offline:"), m_prefetch);
@@ -556,6 +623,8 @@ void MainWindow::refreshAps()
         const ApEstimate e = m_loc->estimateFor(ap);
         const ApRecord *r = m_loc->record(ap.bssid);
         const QString where = e.kind == ApEstimate::Wigle ? QStringLiteral("WiGLE %1, %2").arg(e.lat, 0, 'f', 5).arg(e.lon, 0, 'f', 5)
+                            : e.kind == ApEstimate::Trilat ? QStringLiteral("fit %1, %2 ±%3 m (%4 samples from %5 places, %6)").arg(e.lat, 0, 'f', 5).arg(e.lon, 0, 'f', 5).arg(qRound(e.radiusM)).arg(e.fit.n).arg(e.fit.vantage).arg(e.fit.quality)
+                            : e.kind == ApEstimate::Peer ? QStringLiteral("from %1: %2, %3 ±%4 m").arg(r ? r->peerFrom : QString()).arg(e.lat, 0, 'f', 5).arg(e.lon, 0, 'f', 5).arg(qRound(e.radiusM))
                             : e.kind == ApEstimate::Centroid ? QStringLiteral("est. %1, %2 ±%3 m (%4 obs)").arg(e.lat, 0, 'f', 5).arg(e.lon, 0, 'f', 5).arg(qRound(e.radiusM)).arg(r ? r->obs.size() : 0)
                             : e.kind == ApEstimate::Observed ? QStringLiteral("heard here before %1, %2 ±%3 m").arg(e.lat, 0, 'f', 5).arg(e.lon, 0, 'f', 5).arg(qRound(e.radiusM))
                             : e.kind == ApEstimate::Ring ? QStringLiteral("~%1 m away, bearing unknown").arg(qRound(e.radiusM)) : QString();

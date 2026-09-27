@@ -14,6 +14,7 @@
 #include <QSqlError>
 #include <QSqlQuery>
 #include <QSqlRecord>
+#include <QSqlDriver>
 #include <QStandardPaths>
 #include <QtMath>
 #include <openssl/evp.h>
@@ -201,8 +202,56 @@ bool MapDb::open(bool readOnly)
     q.exec(QStringLiteral("PRAGMA journal_mode=TRUNCATE"));
     q.exec(QStringLiteral("PRAGMA synchronous=NORMAL"));
     if (!readOnly && !schema()) return false;
+    loadSeq();
     if (!readOnly && !blobExists) markDirty();                 // write the (empty) encrypted file right away
     return true;
+}
+
+// ── change sequence (for sync) ────────────────────────────────────────────────
+void MapDb::loadSeq()
+{
+    QSqlQuery q(m_db);
+    q.exec(QStringLiteral("SELECT value FROM kv WHERE key='seq'"));
+    m_seq = q.next() ? q.value(0).toLongLong() : 0;
+    for (const char *t : {"aps", "observations", "fixes", "estimates"}) {
+        QSqlQuery m(m_db); m.exec(QStringLiteral("SELECT COALESCE(MAX(seq),0) FROM %1").arg(QLatin1String(t)));
+        if (m.next()) m_seq = qMax(m_seq, m.value(0).toLongLong());
+    }
+    if (m_readOnly) return;
+    // Rows from before the sequence column existed (schema ≤ 2) have seq 0 and would never reach a
+    // peer: number them once, in storage order, so the first sync carries the whole history.
+    for (const char *t : {"aps", "observations", "fixes"}) {
+        QSqlQuery c(m_db); c.exec(QStringLiteral("SELECT COUNT(*) FROM %1 WHERE seq IS NULL OR seq=0").arg(QLatin1String(t)));
+        if (!c.next() || c.value(0).toInt() == 0) continue;
+        const QString order = QLatin1String(t) == QLatin1String("aps") ? QStringLiteral("rowid") : QStringLiteral("id");
+        QSqlQuery sel(m_db); sel.exec(QStringLiteral("SELECT rowid FROM %1 WHERE seq IS NULL OR seq=0 ORDER BY %2").arg(QLatin1String(t), order));
+        QList<qint64> rows; while (sel.next()) rows << sel.value(0).toLongLong();
+        m_db.transaction();
+        QSqlQuery up(m_db); up.prepare(QStringLiteral("UPDATE %1 SET seq=? WHERE rowid=?").arg(QLatin1String(t)));
+        for (qint64 r : rows) { up.addBindValue(double(++m_seq)); up.addBindValue(double(r)); up.exec(); }
+        QSqlQuery kv(m_db); kv.prepare(QStringLiteral("INSERT OR REPLACE INTO kv(key, value) VALUES('seq', ?)")); kv.addBindValue(QString::number(m_seq)); kv.exec();
+        m_db.commit();
+        markDirty();
+    }
+}
+qint64 MapDb::nextSeq()
+{
+    ++m_seq;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("INSERT OR REPLACE INTO kv(key, value) VALUES('seq', ?)")); q.addBindValue(QString::number(m_seq)); q.exec();
+    return m_seq;
+}
+QString MapDb::kv(const QString &key) const
+{
+    if (!m_db.isOpen()) return {};
+    QSqlQuery q(m_db); q.prepare(QStringLiteral("SELECT value FROM kv WHERE key=?")); q.addBindValue(key); q.exec();
+    return q.next() ? q.value(0).toString() : QString();
+}
+void MapDb::setKv(const QString &key, const QString &value)
+{
+    if (!m_db.isOpen() || m_readOnly) return;
+    QSqlQuery q(m_db); q.prepare(QStringLiteral("INSERT OR REPLACE INTO kv(key, value) VALUES(?,?)")); q.addBindValue(key); q.addBindValue(value); q.exec();
+    markDirty();
 }
 
 bool MapDb::schema()
@@ -224,6 +273,9 @@ bool MapDb::schema()
         "CREATE TABLE IF NOT EXISTS elevation (cell TEXT PRIMARY KEY, elev REAL, time TEXT)",
         "CREATE TABLE IF NOT EXISTS achievements (key TEXT PRIMARY KEY, unlocked TEXT)",
         "CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT)",
+        // Our own fit per beacon (see estimator.h): position, error ellipse, model, statistics
+        "CREATE TABLE IF NOT EXISTS estimates (bssid TEXT PRIMARY KEY, lat REAL, lon REAL, acc REAL, semi_major REAL, semi_minor REAL, orient REAL, rms REAL,"
+        " p0 REAL, pathloss REAL, fitted_n INTEGER, n INTEGER, vantage INTEGER, rejected INTEGER, quality TEXT, updated TEXT, seq INTEGER DEFAULT 0)",
     };
     QSqlQuery q(m_db);
     for (const char *s : ddl) if (!q.exec(QString::fromLatin1(s))) { m_error = q.lastError().text(); return false; }
@@ -234,8 +286,23 @@ bool MapDb::schema()
                                                {QStringLiteral("wpa_flags"), QStringLiteral("INTEGER DEFAULT 0")}, {QStringLiteral("rsn_flags"), QStringLiteral("INTEGER DEFAULT 0")},
                                                {QStringLiteral("max_kbps"), QStringLiteral("INTEGER DEFAULT 0")}, {QStringLiteral("adhoc"), QStringLiteral("INTEGER DEFAULT 0")}};
     for (const auto &c : extra) if (!have.contains(c.first)) q.exec(QStringLiteral("ALTER TABLE aps ADD COLUMN %1 %2").arg(c.first, c.second));
-    q.exec(QStringLiteral("INSERT OR IGNORE INTO kv(key, value) VALUES ('schema', '2')"));
-    q.exec(QStringLiteral("UPDATE kv SET value='2' WHERE key='schema'"));
+    // Schema 3: change sequence numbers, per-device observations, positions synced from peers
+    const QList<QPair<QString, QString>> extra3{{QStringLiteral("seq"), QStringLiteral("INTEGER DEFAULT 0")}, {QStringLiteral("peer_lat"), QStringLiteral("REAL")},
+                                                {QStringLiteral("peer_lon"), QStringLiteral("REAL")}, {QStringLiteral("peer_acc"), QStringLiteral("REAL")}, {QStringLiteral("peer_from"), QStringLiteral("TEXT")}};
+    for (const auto &c : extra3) if (!have.contains(c.first)) q.exec(QStringLiteral("ALTER TABLE aps ADD COLUMN %1 %2").arg(c.first, c.second));
+    auto addCol = [&](const char *table, const char *col, const char *type) {
+        QSqlQuery ti(m_db); ti.exec(QStringLiteral("PRAGMA table_info(%1)").arg(QLatin1String(table)));
+        bool has = false; while (ti.next()) if (ti.value(1).toString() == QLatin1String(col)) has = true;
+        if (!has) q.exec(QStringLiteral("ALTER TABLE %1 ADD COLUMN %2 %3").arg(QLatin1String(table), QLatin1String(col), QLatin1String(type)));
+    };
+    addCol("observations", "seq", "INTEGER DEFAULT 0"); addCol("observations", "device", "TEXT DEFAULT ''");
+    addCol("fixes", "seq", "INTEGER DEFAULT 0"); addCol("fixes", "device", "TEXT DEFAULT ''");
+    q.exec(QStringLiteral("CREATE INDEX IF NOT EXISTS obs_seq ON observations(seq)"));
+    q.exec(QStringLiteral("CREATE INDEX IF NOT EXISTS aps_seq ON aps(seq)"));
+    q.exec(QStringLiteral("CREATE INDEX IF NOT EXISTS fix_seq ON fixes(seq)"));
+    q.exec(QStringLiteral("CREATE UNIQUE INDEX IF NOT EXISTS obs_dedup ON observations(bssid, time, device)"));
+    q.exec(QStringLiteral("INSERT OR IGNORE INTO kv(key, value) VALUES ('schema', '3')"));
+    q.exec(QStringLiteral("UPDATE kv SET value='3' WHERE key='schema'"));
     q.exec(QStringLiteral("INSERT OR IGNORE INTO kv(key, value) VALUES ('created', '%1')").arg(QDateTime::currentDateTime().toString(Qt::ISODate)));
     return true;
 }
@@ -284,6 +351,12 @@ QJsonObject MapDb::stats() const
     }
     q.exec(QStringLiteral("SELECT COUNT(*) FROM aps WHERE lat IS NOT NULL")); o["apsPositioned"] = q.next() ? q.value(0).toInt() : 0;
     q.exec(QStringLiteral("SELECT COUNT(*) FROM aps WHERE home=1")); o["apsHome"] = q.next() ? q.value(0).toInt() : 0;
+    q.exec(QStringLiteral("SELECT COUNT(*) FROM estimates WHERE quality<>'none'")); o["estimates"] = q.next() ? q.value(0).toInt() : 0;
+    q.exec(QStringLiteral("SELECT COUNT(*) FROM estimates WHERE quality='good'")); o["estimatesGood"] = q.next() ? q.value(0).toInt() : 0;
+    q.exec(QStringLiteral("SELECT COUNT(*) FROM aps WHERE source='trilat'")); o["apsTrilat"] = q.next() ? q.value(0).toInt() : 0;
+    q.exec(QStringLiteral("SELECT COUNT(*) FROM aps WHERE peer_from IS NOT NULL AND peer_from<>''")); o["apsFromPeers"] = q.next() ? q.value(0).toInt() : 0;
+    q.exec(QStringLiteral("SELECT COUNT(DISTINCT device) FROM observations WHERE device<>''")); o["observingDevices"] = q.next() ? q.value(0).toInt() : 0;
+    o["seq"] = double(m_seq);
     q.exec(QStringLiteral("SELECT value FROM kv WHERE key='created'")); if (q.next()) o["created"] = q.value(0).toString();
     q.exec(QStringLiteral("SELECT value FROM kv WHERE key='migrated'")); if (q.next()) o["migrated"] = q.value(0).toString();
     return o;
@@ -295,7 +368,12 @@ QJsonObject MapDb::stats() const
 // heard it, widened by the RSSI distance ("observed").
 static bool positionFrom(const ApRecord &r, double *lat, double *lon, double *acc, QString *source)
 {
+    // Our own fit beats a placement when it is at least as tight; a placement (WiGLE / Apple, ±25 m)
+    // beats a loose fit; a peer's position fills in when we have neither.
+    const bool fit = r.fit.valid && r.fit.quality != QLatin1String("none");
+    if (fit && (!r.wigle || r.fit.acc <= 25.0)) { *lat = r.fit.lat; *lon = r.fit.lon; *acc = r.fit.acc; *source = QStringLiteral("trilat"); return true; }
     if (r.wigle) { *lat = r.wLat; *lon = r.wLon; *acc = 25; *source = QStringLiteral("placed"); return true; }
+    if (r.hasPeer()) { *lat = r.peerLat; *lon = r.peerLon; *acc = r.peerAcc; *source = QStringLiteral("peer"); return true; }
     if (r.obs.isEmpty()) return false;
     struct V { double lat, lon, acc, dbm; int n; };
     QList<V> vs;
@@ -326,14 +404,26 @@ static bool positionFrom(const ApRecord &r, double *lat, double *lon, double *ac
 void MapDb::updatePosition(const QString &bssid, const ApRecord &r, int flags)
 {
     double lat = 0, lon = 0, acc = 0; QString source;
+    const bool have = positionFrom(r, &lat, &lon, &acc, &source);
+    // Only a real change gets a new sequence number, so peers do not re-download every AP on every save
+    QSqlQuery cur(m_db);
+    cur.prepare(QStringLiteral("SELECT lat, lon, acc, source, home, travelling, ignored FROM aps WHERE bssid=?")); cur.addBindValue(bssid); cur.exec();
+    bool changed = true;
+    if (cur.next()) {
+        const bool had = !cur.value(0).isNull();
+        changed = had != have || (have && (std::fabs(cur.value(0).toDouble() - lat) > 1e-7 || std::fabs(cur.value(1).toDouble() - lon) > 1e-7
+                                           || std::fabs(cur.value(2).toDouble() - acc) > 0.5 || cur.value(3).toString() != source))
+               || cur.value(4).toInt() != ((flags & 1) ? 1 : 0) || cur.value(5).toInt() != ((flags & 2) ? 1 : 0) || cur.value(6).toInt() != ((flags & 4) ? 1 : 0);
+    }
+    if (!changed) return;
     QSqlQuery q(m_db);
-    if (positionFrom(r, &lat, &lon, &acc, &source)) {
-        q.prepare(QStringLiteral("UPDATE aps SET lat=?, lon=?, acc=?, source=?, home=?, travelling=?, ignored=? WHERE bssid=?"));
+    if (have) {
+        q.prepare(QStringLiteral("UPDATE aps SET lat=?, lon=?, acc=?, source=?, home=?, travelling=?, ignored=?, seq=? WHERE bssid=?"));
         q.addBindValue(lat); q.addBindValue(lon); q.addBindValue(acc); q.addBindValue(source);
     } else {
-        q.prepare(QStringLiteral("UPDATE aps SET lat=NULL, lon=NULL, acc=NULL, source=NULL, home=?, travelling=?, ignored=? WHERE bssid=?"));
+        q.prepare(QStringLiteral("UPDATE aps SET lat=NULL, lon=NULL, acc=NULL, source=NULL, home=?, travelling=?, ignored=?, seq=? WHERE bssid=?"));
     }
-    q.addBindValue(flags & 1 ? 1 : 0); q.addBindValue(flags & 2 ? 1 : 0); q.addBindValue(flags & 4 ? 1 : 0); q.addBindValue(bssid);
+    q.addBindValue(flags & 1 ? 1 : 0); q.addBindValue(flags & 2 ? 1 : 0); q.addBindValue(flags & 4 ? 1 : 0); q.addBindValue(double(nextSeq())); q.addBindValue(bssid);
     q.exec();
 }
 
@@ -343,20 +433,32 @@ QHash<QString, ApRecord> MapDb::loadApRecords(QSet<QString> *travelling, QSet<QS
     QHash<QString, ApRecord> out;
     if (!m_db.isOpen()) return out;
     QSqlQuery q(m_db);
-    q.exec(QStringLiteral("SELECT bssid, ssid, freq, wigle, wlat, wlon, wigle_checked, security, sec_flags, wpa_flags, rsn_flags, max_kbps, adhoc FROM aps"));
+    q.exec(QStringLiteral("SELECT bssid, ssid, freq, wigle, wlat, wlon, wigle_checked, security, sec_flags, wpa_flags, rsn_flags, max_kbps, adhoc, peer_lat, peer_lon, peer_acc, peer_from FROM aps"));
     while (q.next()) {
         ApRecord &r = out[q.value(0).toString()];
         r.ssid = q.value(1).toString(); r.freq = q.value(2).toInt();
         r.wigle = q.value(3).toInt() != 0; r.wLat = q.value(4).toDouble(); r.wLon = q.value(5).toDouble();
         r.wigleChecked = QDateTime::fromString(q.value(6).toString(), Qt::ISODate);
         r.security = q.value(7).toString(); r.secFlags = q.value(8).toInt(); r.wpaFlags = q.value(9).toInt(); r.rsnFlags = q.value(10).toInt(); r.maxKbps = q.value(11).toInt(); r.adhoc = q.value(12).toInt() != 0;
+        if (!q.value(13).isNull() && !q.value(16).toString().isEmpty()) { r.peerLat = q.value(13).toDouble(); r.peerLon = q.value(14).toDouble(); r.peerAcc = q.value(15).toDouble(); r.peerFrom = q.value(16).toString(); }
     }
-    q.exec(QStringLiteral("SELECT bssid, time, lat, lon, acc, dbm FROM observations ORDER BY id"));
+    q.exec(QStringLiteral("SELECT bssid, time, lat, lon, acc, dbm, id, device FROM observations ORDER BY id"));
     while (q.next()) {
         auto it = out.find(q.value(0).toString()); if (it == out.end()) continue;
         ApObservation o; o.time = QDateTime::fromString(q.value(1).toString(), Qt::ISODate);
         o.lat = q.value(2).toDouble(); o.lon = q.value(3).toDouble(); o.acc = q.value(4).toDouble(); o.dbm = q.value(5).toInt();
+        o.id = q.value(6).toLongLong(); o.device = q.value(7).toString();
         it->obs.append(o);
+    }
+    q.exec(QStringLiteral("SELECT bssid, lat, lon, acc, semi_major, semi_minor, orient, rms, p0, pathloss, fitted_n, n, vantage, rejected, quality, updated FROM estimates"));
+    while (q.next()) {
+        auto it = out.find(q.value(0).toString()); if (it == out.end()) continue;
+        Estimator::Fit &f = it->fit;
+        f.lat = q.value(1).toDouble(); f.lon = q.value(2).toDouble(); f.acc = q.value(3).toDouble(); f.semiMajor = q.value(4).toDouble(); f.semiMinor = q.value(5).toDouble();
+        f.orientDeg = q.value(6).toDouble(); f.rms = q.value(7).toDouble(); f.p0 = q.value(8).toDouble(); f.pathloss = q.value(9).toDouble(); f.fittedN = q.value(10).toInt() != 0;
+        f.n = q.value(11).toInt(); f.vantage = q.value(12).toInt(); f.rejected = q.value(13).toInt(); f.quality = q.value(14).toString();
+        f.updated = QDateTime::fromString(q.value(15).toString(), Qt::ISODate).toSecsSinceEpoch();
+        f.valid = f.quality != QLatin1String("none") && !f.quality.isEmpty();
     }
     q.exec(QStringLiteral("SELECT bssid, lat, lon, acc, time FROM sightings ORDER BY id"));
     while (q.next()) {
@@ -373,51 +475,100 @@ QHash<QString, ApRecord> MapDb::loadApRecords(QSet<QString> *travelling, QSet<QS
     return out;
 }
 
-void MapDb::saveApRecords(const QHash<QString, ApRecord> &recs, const QSet<QString> &travelling, const QSet<QString> &notTravelling, const QHash<QString, int> &flags)
+void MapDb::saveApRecords(QHash<QString, ApRecord> &recs, const QSet<QString> &travelling, const QSet<QString> &notTravelling, const QHash<QString, int> &flags)
 {
     if (!m_db.isOpen() || m_readOnly) return;
-    const QString now = QDateTime::currentDateTime().toString(Qt::ISODate);
     m_db.transaction();
-    QSqlQuery q(m_db), del(m_db), ins(m_db);
-    q.prepare(QStringLiteral("INSERT INTO aps(bssid, ssid, band, ch, freq, first_seen, last_seen, times_seen, wigle, wlat, wlon, wigle_checked) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)"
-                             " ON CONFLICT(bssid) DO UPDATE SET ssid=CASE WHEN excluded.ssid<>'' THEN excluded.ssid ELSE aps.ssid END, band=excluded.band, ch=excluded.ch,"
-                             " freq=CASE WHEN excluded.freq>0 THEN excluded.freq ELSE aps.freq END, last_seen=excluded.last_seen, times_seen=excluded.times_seen,"
-                             " wigle=excluded.wigle, wlat=excluded.wlat, wlon=excluded.wlon, wigle_checked=excluded.wigle_checked"));
-    for (auto it = recs.constBegin(); it != recs.constEnd(); ++it) {
-        const ApRecord &r = it.value();
-        const int f = r.freq;
-        QString last = now;
-        for (const ApObservation &o : r.obs) if (o.time.isValid() && o.time.toString(Qt::ISODate) > last) last = o.time.toString(Qt::ISODate);
-        q.addBindValue(it.key()); q.addBindValue(r.ssid);
-        q.addBindValue(f >= 5925 ? QStringLiteral("6") : f >= 4900 ? QStringLiteral("5") : f > 0 ? QStringLiteral("2.4") : QString());
-        q.addBindValue(f >= 5925 ? (f - 5950) / 5 : f >= 4900 ? (f - 5000) / 5 : f == 2484 ? 14 : f > 2400 ? (f - 2407) / 5 : 0);
-        q.addBindValue(f); q.addBindValue(now); q.addBindValue(now); q.addBindValue(r.obs.size() + r.seen.size());
-        q.addBindValue(r.wigle ? 1 : 0); q.addBindValue(r.wigle ? QVariant(r.wLat) : QVariant()); q.addBindValue(r.wigle ? QVariant(r.wLon) : QVariant());
-        q.addBindValue(r.wigleChecked.isValid() ? QVariant(r.wigleChecked.toString(Qt::ISODate)) : QVariant());
-        q.exec();
-        for (const char *t : {"observations", "sightings", "cells"}) { del.prepare(QStringLiteral("DELETE FROM %1 WHERE bssid=?").arg(QLatin1String(t))); del.addBindValue(it.key()); del.exec(); }
-        ins.prepare(QStringLiteral("INSERT INTO observations(bssid, time, lat, lon, acc, dbm, fix_source) VALUES(?,?,?,?,?,?,?)"));
-        for (const ApObservation &o : r.obs) {
-            ins.addBindValue(it.key()); ins.addBindValue(o.time.toString(Qt::ISODate)); ins.addBindValue(o.lat); ins.addBindValue(o.lon); ins.addBindValue(o.acc); ins.addBindValue(o.dbm); ins.addBindValue(QStringLiteral("wifi"));
-            ins.exec();
-        }
-        ins.prepare(QStringLiteral("INSERT INTO sightings(bssid, lat, lon, acc, time) VALUES(?,?,?,?,?)"));
-        for (const ApSighting &s : r.seen) { ins.addBindValue(it.key()); ins.addBindValue(s.lat); ins.addBindValue(s.lon); ins.addBindValue(s.acc); ins.addBindValue(s.time.toString(Qt::ISODate)); ins.exec(); }
-        ins.prepare(QStringLiteral("INSERT OR IGNORE INTO cells(bssid, cell) VALUES(?,?)"));
-        for (const QString &c : r.cells) { ins.addBindValue(it.key()); ins.addBindValue(c); ins.exec(); }
-        updatePosition(it.key(), r, flags.value(it.key(), 0));
-        if (!r.security.isEmpty()) {
-            QSqlQuery sec(m_db);
-            sec.prepare(QStringLiteral("UPDATE aps SET security=?, sec_flags=?, wpa_flags=?, rsn_flags=?, max_kbps=?, adhoc=? WHERE bssid=?"));
-            sec.addBindValue(r.security); sec.addBindValue(r.secFlags); sec.addBindValue(r.wpaFlags); sec.addBindValue(r.rsnFlags); sec.addBindValue(r.maxKbps); sec.addBindValue(r.adhoc ? 1 : 0); sec.addBindValue(it.key());
-            sec.exec();
-        }
-    }
+    for (auto it = recs.begin(); it != recs.end(); ++it) saveRecord(it.key(), it.value(), flags.value(it.key(), 0));
+    QSqlQuery q(m_db), ins(m_db);
     q.exec(QStringLiteral("DELETE FROM flags"));
     ins.prepare(QStringLiteral("INSERT OR IGNORE INTO flags(kind, bssid) VALUES(?,?)"));
     for (const QString &b : travelling) { ins.addBindValue(QStringLiteral("travelling")); ins.addBindValue(b); ins.exec(); }
     for (const QString &b : notTravelling) { ins.addBindValue(QStringLiteral("notTravelling")); ins.addBindValue(b); ins.exec(); }
     m_db.commit();
+    markDirty();
+}
+
+// One record. Observations are written incrementally (INSERT new ones and remember their row id,
+// UPDATE the ones changed in memory) so their sequence numbers stay stable for sync; sightings
+// and cells are small and rewritten.
+void MapDb::saveRecord(const QString &bssid, ApRecord &r, int flags)
+{
+    if (!m_db.isOpen() || m_readOnly) return;
+    const bool ownTx = !m_db.driver()->hasFeature(QSqlDriver::Transactions) ? false : m_db.transaction();
+    const QString now = QDateTime::currentDateTime().toString(Qt::ISODate);
+    const int f = r.freq;
+    QString last = now;
+    for (const ApObservation &o : r.obs) if (o.time.isValid() && o.time.toString(Qt::ISODate) > last) last = o.time.toString(Qt::ISODate);
+    QSqlQuery q(m_db);
+    QSqlQuery cur(m_db); cur.prepare(QStringLiteral("SELECT ssid FROM aps WHERE bssid=?")); cur.addBindValue(bssid); cur.exec();
+    const bool isNew = !cur.next();
+    const bool ssidChanged = !isNew && !r.ssid.isEmpty() && cur.value(0).toString() != r.ssid;
+    q.prepare(QStringLiteral("INSERT INTO aps(bssid, ssid, band, ch, freq, first_seen, last_seen, times_seen, wigle, wlat, wlon, wigle_checked, seq) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                             " ON CONFLICT(bssid) DO UPDATE SET ssid=CASE WHEN excluded.ssid<>'' THEN excluded.ssid ELSE aps.ssid END, band=excluded.band, ch=excluded.ch,"
+                             " freq=CASE WHEN excluded.freq>0 THEN excluded.freq ELSE aps.freq END, last_seen=excluded.last_seen, times_seen=excluded.times_seen,"
+                             " wigle=excluded.wigle, wlat=excluded.wlat, wlon=excluded.wlon, wigle_checked=excluded.wigle_checked, seq=CASE WHEN excluded.seq>0 THEN excluded.seq ELSE aps.seq END"));
+    q.addBindValue(bssid); q.addBindValue(r.ssid);
+    q.addBindValue(f >= 5925 ? QStringLiteral("6") : f >= 4900 ? QStringLiteral("5") : f > 0 ? QStringLiteral("2.4") : QString());
+    q.addBindValue(f >= 5925 ? (f - 5950) / 5 : f >= 4900 ? (f - 5000) / 5 : f == 2484 ? 14 : f > 2400 ? (f - 2407) / 5 : 0);
+    q.addBindValue(f); q.addBindValue(now); q.addBindValue(now); q.addBindValue(r.obs.size() + r.seen.size());
+    q.addBindValue(r.wigle ? 1 : 0); q.addBindValue(r.wigle ? QVariant(r.wLat) : QVariant()); q.addBindValue(r.wigle ? QVariant(r.wLon) : QVariant());
+    q.addBindValue(r.wigleChecked.isValid() ? QVariant(r.wigleChecked.toString(Qt::ISODate)) : QVariant());
+    q.addBindValue(isNew || ssidChanged ? double(nextSeq()) : 0.0);
+    q.exec();
+    // Observations: new rows get an id + seq; rows changed in memory get a fresh seq
+    QSqlQuery ins(m_db), upd(m_db);
+    ins.prepare(QStringLiteral("INSERT OR IGNORE INTO observations(bssid, time, lat, lon, acc, dbm, fix_source, device, seq) VALUES(?,?,?,?,?,?,?,?,?)"));
+    upd.prepare(QStringLiteral("UPDATE observations SET time=?, lat=?, lon=?, acc=?, dbm=?, seq=? WHERE id=?"));
+    for (ApObservation &o : r.obs) {
+        if (o.id > 0 && !o.dirty) continue;
+        if (o.id > 0) {
+            upd.addBindValue(o.time.toString(Qt::ISODate)); upd.addBindValue(o.lat); upd.addBindValue(o.lon); upd.addBindValue(o.acc); upd.addBindValue(o.dbm); upd.addBindValue(double(nextSeq())); upd.addBindValue(double(o.id));
+            upd.exec(); o.dirty = false; continue;
+        }
+        ins.addBindValue(bssid); ins.addBindValue(o.time.toString(Qt::ISODate)); ins.addBindValue(o.lat); ins.addBindValue(o.lon); ins.addBindValue(o.acc); ins.addBindValue(o.dbm);
+        ins.addBindValue(o.device.isEmpty() ? QStringLiteral("wifi") : QStringLiteral("remote")); ins.addBindValue(o.device); ins.addBindValue(double(nextSeq()));
+        if (ins.exec() && ins.numRowsAffected() > 0) o.id = ins.lastInsertId().toLongLong();
+        else {                                                     // duplicate (bssid, time, device): adopt the existing row
+            QSqlQuery d(m_db); d.prepare(QStringLiteral("SELECT id FROM observations WHERE bssid=? AND time=? AND device=?"));
+            d.addBindValue(bssid); d.addBindValue(o.time.toString(Qt::ISODate)); d.addBindValue(o.device); d.exec();
+            if (d.next()) o.id = d.value(0).toLongLong();
+        }
+        o.dirty = false;
+    }
+    QSqlQuery del(m_db);
+    for (const char *t : {"sightings", "cells"}) { del.prepare(QStringLiteral("DELETE FROM %1 WHERE bssid=?").arg(QLatin1String(t))); del.addBindValue(bssid); del.exec(); }
+    ins.prepare(QStringLiteral("INSERT INTO sightings(bssid, lat, lon, acc, time) VALUES(?,?,?,?,?)"));
+    for (const ApSighting &sg : r.seen) { ins.addBindValue(bssid); ins.addBindValue(sg.lat); ins.addBindValue(sg.lon); ins.addBindValue(sg.acc); ins.addBindValue(sg.time.toString(Qt::ISODate)); ins.exec(); }
+    ins.prepare(QStringLiteral("INSERT OR IGNORE INTO cells(bssid, cell) VALUES(?,?)"));
+    for (const QString &c : r.cells) { ins.addBindValue(bssid); ins.addBindValue(c); ins.exec(); }
+    if (r.hasPeer()) {
+        QSqlQuery pq(m_db); pq.prepare(QStringLiteral("UPDATE aps SET peer_lat=?, peer_lon=?, peer_acc=?, peer_from=? WHERE bssid=?"));
+        pq.addBindValue(r.peerLat); pq.addBindValue(r.peerLon); pq.addBindValue(r.peerAcc); pq.addBindValue(r.peerFrom); pq.addBindValue(bssid); pq.exec();
+    }
+    updatePosition(bssid, r, flags);
+    if (!r.security.isEmpty()) {
+        QSqlQuery sec(m_db);
+        sec.prepare(QStringLiteral("UPDATE aps SET security=?, sec_flags=?, wpa_flags=?, rsn_flags=?, max_kbps=?, adhoc=? WHERE bssid=?"));
+        sec.addBindValue(r.security); sec.addBindValue(r.secFlags); sec.addBindValue(r.wpaFlags); sec.addBindValue(r.rsnFlags); sec.addBindValue(r.maxKbps); sec.addBindValue(r.adhoc ? 1 : 0); sec.addBindValue(bssid);
+        sec.exec();
+    }
+    if (ownTx) m_db.commit();
+    markDirty();
+}
+
+void MapDb::saveEstimate(const QString &bssid, const Estimator::Fit &fit)
+{
+    if (!m_db.isOpen() || m_readOnly) return;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("INSERT OR REPLACE INTO estimates(bssid, lat, lon, acc, semi_major, semi_minor, orient, rms, p0, pathloss, fitted_n, n, vantage, rejected, quality, updated, seq)"
+                             " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"));
+    q.addBindValue(bssid); q.addBindValue(fit.lat); q.addBindValue(fit.lon); q.addBindValue(fit.acc); q.addBindValue(fit.semiMajor); q.addBindValue(fit.semiMinor); q.addBindValue(fit.orientDeg);
+    q.addBindValue(fit.rms); q.addBindValue(fit.p0); q.addBindValue(fit.pathloss); q.addBindValue(fit.fittedN ? 1 : 0); q.addBindValue(fit.n); q.addBindValue(fit.vantage); q.addBindValue(fit.rejected);
+    q.addBindValue(fit.valid ? fit.quality : QStringLiteral("none"));
+    q.addBindValue(QDateTime::fromSecsSinceEpoch(fit.updated > 0 ? fit.updated : QDateTime::currentSecsSinceEpoch()).toString(Qt::ISODate));
+    q.addBindValue(double(nextSeq()));
+    q.exec();
     markDirty();
 }
 
@@ -429,14 +580,14 @@ static void bindFix(QSqlQuery &q, const Fix &f)
     q.addBindValue(f.hasElevation() ? QVariant(f.elevation) : QVariant()); q.addBindValue(f.apCount); q.addBindValue(f.apUsed);
     q.addBindValue(f.departed.isValid() ? QVariant(f.departed.toString(Qt::ISODate)) : QVariant());
 }
-static const char *FIX_INSERT = "INSERT INTO fixes(time, lat, lon, acc, source, provider, place, city, region, country, elev, ap_count, ap_used, departed) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
+static const char *FIX_INSERT = "INSERT INTO fixes(time, lat, lon, acc, source, provider, place, city, region, country, elev, ap_count, ap_used, departed, seq, device) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
 
 QList<Fix> MapDb::loadFixes() const
 {
     QList<Fix> out;
     if (!m_db.isOpen()) return out;
     QSqlQuery q(m_db);
-    q.exec(QStringLiteral("SELECT time, lat, lon, acc, source, provider, place, city, region, country, elev, ap_count, ap_used, departed FROM fixes ORDER BY id"));
+    q.exec(QStringLiteral("SELECT time, lat, lon, acc, source, provider, place, city, region, country, elev, ap_count, ap_used, departed FROM fixes WHERE device='' OR device IS NULL ORDER BY id"));
     while (q.next()) {
         Fix f; f.valid = true;
         f.time = QDateTime::fromString(q.value(0).toString(), Qt::ISODate); f.lat = q.value(1).toDouble(); f.lon = q.value(2).toDouble(); f.accuracy = q.value(3).toDouble();
@@ -453,9 +604,9 @@ void MapDb::saveFixes(const QList<Fix> &fixes)
     if (!m_db.isOpen() || m_readOnly) return;
     m_db.transaction();
     QSqlQuery q(m_db);
-    q.exec(QStringLiteral("DELETE FROM fixes"));
+    q.exec(QStringLiteral("DELETE FROM fixes WHERE device='' OR device IS NULL"));   // peers' fixes are kept
     q.prepare(QString::fromLatin1(FIX_INSERT));
-    for (const Fix &f : fixes) { bindFix(q, f); q.exec(); }
+    for (const Fix &f : fixes) { bindFix(q, f); q.addBindValue(double(nextSeq())); q.addBindValue(QString()); q.exec(); }
     m_db.commit();
     markDirty();
 }
@@ -465,8 +616,49 @@ void MapDb::appendFix(const Fix &f)
     if (!m_db.isOpen() || m_readOnly) return;
     QSqlQuery q(m_db);
     q.prepare(QString::fromLatin1(FIX_INSERT));
-    bindFix(q, f); q.exec();
+    bindFix(q, f); q.addBindValue(double(nextSeq())); q.addBindValue(QString()); q.exec();
     markDirty();
+}
+
+int MapDb::appendPeerFixes(const QJsonArray &fixes, const QString &device)
+{
+    if (!m_db.isOpen() || m_readOnly || device.isEmpty()) return 0;
+    int n = 0;
+    m_db.transaction();
+    QSqlQuery q(m_db), dup(m_db);
+    dup.prepare(QStringLiteral("SELECT 1 FROM fixes WHERE device=? AND time=?"));
+    q.prepare(QString::fromLatin1(FIX_INSERT));
+    for (const QJsonValue &v : fixes) {
+        const QJsonObject o = v.toObject();
+        if (!o["lat"].isDouble() || !o["lon"].isDouble() || o["time"].toString().isEmpty()) continue;
+        dup.addBindValue(device); dup.addBindValue(o["time"].toString()); dup.exec();
+        if (dup.next()) continue;
+        Fix f = Fix::fromJson(o); f.valid = true;
+        if (f.accuracy < 0) f.accuracy = o["acc"].toDouble(-1);
+        bindFix(q, f); q.addBindValue(double(nextSeq())); q.addBindValue(device);
+        if (q.exec()) ++n;
+    }
+    m_db.commit();
+    if (n) markDirty();
+    return n;
+}
+
+QList<Fix> MapDb::peerFixes(const QString &device) const
+{
+    QList<Fix> out;
+    if (!m_db.isOpen()) return out;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("SELECT time, lat, lon, acc, source, provider, place, city, region, country, elev, ap_count, ap_used, departed, device FROM fixes WHERE device<>'' %1 ORDER BY id").arg(device.isEmpty() ? QString() : QStringLiteral("AND device=?")));
+    if (!device.isEmpty()) q.addBindValue(device);
+    q.exec();
+    while (q.next()) {
+        Fix f; f.valid = true;
+        f.time = QDateTime::fromString(q.value(0).toString(), Qt::ISODate); f.lat = q.value(1).toDouble(); f.lon = q.value(2).toDouble(); f.accuracy = q.value(3).toDouble();
+        f.source = q.value(4).toString(); f.provider = q.value(5).toString(); f.place = q.value(6).toString(); f.city = q.value(7).toString(); f.region = q.value(8).toString(); f.country = q.value(9).toString();
+        f.elevation = q.value(10).isNull() ? -9999 : q.value(10).toDouble(); f.apCount = q.value(11).toInt(); f.apUsed = q.value(12).toInt();
+        out << f;
+    }
+    return out;
 }
 
 // ── Places, elevation, milestones ─────────────────────────────────────────────
@@ -577,65 +769,141 @@ QList<MapDb::ApPos> MapDb::positions(const QStringList &bssids, double maxAcc) c
 
 bool MapDb::estimate(const QList<QPair<QString, int>> &heard, double *lat, double *lon, double *acc, int *used, QStringList *usedBssids, int minAps, double maxAcc) const
 {
+    // Weighted least squares on ranges (see estimator.h): each known beacon says "you are d metres
+    // from me" with d from ITS fitted P0/n when we have a fit, the default model otherwise.
     QStringList ids; QHash<QString, int> dbm;
     for (const auto &h : heard) { ids << h.first.toUpper(); dbm.insert(h.first.toUpper(), h.second); }
     QList<ApPos> ps = positions(ids, maxAcc);
-    double sw = 0, sl = 0, so = 0; QList<double> accs; int n = 0;
-    QList<ApPos> usable;
+    QList<Estimator::Known> known;
+    QSqlQuery q(m_db);
     for (const ApPos &p : ps) {
         if (p.home || p.travelling || p.ignored) continue;
-        usable << p;
+        Estimator::Known k; k.bssid = p.bssid; k.lat = p.lat; k.lon = p.lon; k.acc = p.acc; k.dbm = dbm.value(p.bssid.toUpper(), -80);
+        q.prepare(QStringLiteral("SELECT p0, pathloss, quality FROM estimates WHERE bssid=?")); q.addBindValue(p.bssid); q.exec();
+        if (q.next() && q.value(2).toString() != QLatin1String("none")) { k.p0 = q.value(0).toDouble(); k.pathloss = q.value(1).toDouble(); k.haveModel = true; }
+        known << k;
     }
-    if (usable.size() < minAps) { *used = usable.size(); return false; }
-    for (const ApPos &p : usable) {
-        const double w = std::pow(10.0, dbm.value(p.bssid.toUpper(), -80) / 20.0) / qMax(10.0, p.acc);
-        sw += w; sl += w * p.lat; so += w * p.lon; accs << p.acc; ++n;
-        if (usedBssids) usedBssids->append(p.bssid);
-    }
-    *lat = sl / sw; *lon = so / sw;
-    double spread = 0;
-    for (const ApPos &p : usable) { const double w = std::pow(10.0, dbm.value(p.bssid.toUpper(), -80) / 20.0) / qMax(10.0, p.acc), d = Locator::distanceM(*lat, *lon, p.lat, p.lon); spread += w * d * d; }
-    std::sort(accs.begin(), accs.end());
-    *acc = qMax(40.0, qMax(std::sqrt(spread / sw), accs[accs.size() / 2]));
-    *used = n;
+    *used = known.size();
+    if (known.size() < minAps) return false;
+    const Estimator::SelfFix sf = Estimator::selfLocate(known);
+    if (!sf.valid) return false;
+    *lat = sf.lat; *lon = sf.lon; *acc = sf.acc; *used = sf.used;
+    if (usedBssids) for (const Estimator::Known &k : known) usedBssids->append(k.bssid);
     return true;
 }
 
-int MapDb::addObservations(const QJsonArray &observations, QString *error)
+int MapDb::addObservations(const QJsonArray &observations, const QString &device, QString *error, QHash<QString, QList<ApObservation>> *added)
 {
     if (!m_db.isOpen() || m_readOnly) { if (error) *error = QStringLiteral("database not writable"); return -1; }
-    int added = 0;
+    int n = 0;
     m_db.transaction();
     QSqlQuery q(m_db);
-    QSet<QString> touched;
     for (const QJsonValue &v : observations) {
         const QJsonObject o = v.toObject();
         const QString bssid = o["bssid"].toString().toUpper().trimmed();
         if (bssid.size() != 17 || !o["lat"].isDouble() || !o["lon"].isDouble()) continue;
         const double acc = o["acc"].toDouble(100);
         if (acc <= 0 || acc > 2000) continue;
-        q.prepare(QStringLiteral("INSERT INTO aps(bssid, ssid, first_seen, last_seen, times_seen) VALUES(?,?,?,?,1) ON CONFLICT(bssid) DO UPDATE SET last_seen=excluded.last_seen, times_seen=aps.times_seen+1,"
-                                 " ssid=CASE WHEN excluded.ssid<>'' THEN excluded.ssid ELSE aps.ssid END"));
+        const QString dev = o["device"].toString().isEmpty() ? device : o["device"].toString();
         const QString t = o["time"].toString().isEmpty() ? QDateTime::currentDateTime().toString(Qt::ISODate) : o["time"].toString();
-        q.addBindValue(bssid); q.addBindValue(o["ssid"].toString()); q.addBindValue(t); q.addBindValue(t); q.exec();
-        q.prepare(QStringLiteral("INSERT INTO observations(bssid, time, lat, lon, acc, dbm, fix_source) VALUES(?,?,?,?,?,?,?)"));
+        q.prepare(QStringLiteral("INSERT INTO aps(bssid, ssid, freq, first_seen, last_seen, times_seen, seq) VALUES(?,?,?,?,?,1,?) ON CONFLICT(bssid) DO UPDATE SET last_seen=excluded.last_seen, times_seen=aps.times_seen+1,"
+                                 " ssid=CASE WHEN excluded.ssid<>'' THEN excluded.ssid ELSE aps.ssid END, freq=CASE WHEN excluded.freq>0 THEN excluded.freq ELSE aps.freq END"));
+        q.addBindValue(bssid); q.addBindValue(o["ssid"].toString()); q.addBindValue(o["freq"].toInt(0)); q.addBindValue(t); q.addBindValue(t); q.addBindValue(double(nextSeq())); q.exec();
+        q.prepare(QStringLiteral("INSERT OR IGNORE INTO observations(bssid, time, lat, lon, acc, dbm, fix_source, device, seq) VALUES(?,?,?,?,?,?,?,?,?)"));
         q.addBindValue(bssid); q.addBindValue(t); q.addBindValue(o["lat"].toDouble()); q.addBindValue(o["lon"].toDouble()); q.addBindValue(acc);
-        q.addBindValue(o["dbm"].toInt(-80)); q.addBindValue(o["source"].toString().isEmpty() ? QStringLiteral("remote") : o["source"].toString()); q.exec();
-        touched.insert(bssid); ++added;
-    }
-    // Recompute the position of every AP that received data, from all its observations
-    for (const QString &b : touched) {
-        ApRecord r;
-        q.prepare(QStringLiteral("SELECT freq, wigle, wlat, wlon, home, travelling, ignored FROM aps WHERE bssid=?")); q.addBindValue(b); q.exec();
-        int flags = 0;
-        if (q.next()) { r.freq = q.value(0).toInt(); r.wigle = q.value(1).toInt() != 0; r.wLat = q.value(2).toDouble(); r.wLon = q.value(3).toDouble(); flags = (q.value(4).toInt() ? 1 : 0) | (q.value(5).toInt() ? 2 : 0) | (q.value(6).toInt() ? 4 : 0); }
-        q.prepare(QStringLiteral("SELECT time, lat, lon, acc, dbm FROM observations WHERE bssid=? ORDER BY id")); q.addBindValue(b); q.exec();
-        while (q.next()) { ApObservation ob; ob.time = QDateTime::fromString(q.value(0).toString(), Qt::ISODate); ob.lat = q.value(1).toDouble(); ob.lon = q.value(2).toDouble(); ob.acc = q.value(3).toDouble(); ob.dbm = q.value(4).toInt(); r.obs << ob; }
-        updatePosition(b, r, flags);
+        q.addBindValue(o["dbm"].toInt(-80)); q.addBindValue(o["source"].toString().isEmpty() ? QStringLiteral("remote") : o["source"].toString()); q.addBindValue(dev); q.addBindValue(double(nextSeq()));
+        if (!q.exec() || q.numRowsAffected() <= 0) continue;   // duplicate (bssid, time, device)
+        ApObservation ob; ob.id = q.lastInsertId().toLongLong(); ob.time = QDateTime::fromString(t, Qt::ISODate); ob.lat = o["lat"].toDouble(); ob.lon = o["lon"].toDouble(); ob.acc = acc; ob.dbm = o["dbm"].toInt(-80); ob.device = dev;
+        if (added) (*added)[bssid].append(ob);
+        ++n;
     }
     m_db.commit();
-    if (added) markDirty();
-    return added;
+    if (n) markDirty();
+    return n;
+}
+
+// Positions another device worked out (its own fits). They fill the "peer" slot; our own fit,
+// once we have one, takes precedence in positionFrom(). A better (tighter) peer estimate replaces an older one.
+int MapDb::mergePeerAps(const QJsonArray &aps, const QString &device, QStringList *touched)
+{
+    if (!m_db.isOpen() || m_readOnly || device.isEmpty()) return 0;
+    int n = 0;
+    m_db.transaction();
+    QSqlQuery q(m_db), cur(m_db);
+    for (const QJsonValue &v : aps) {
+        const QJsonObject o = v.toObject();
+        const QString bssid = o["bssid"].toString().toUpper().trimmed();
+        if (bssid.size() != 17 || !o["lat"].isDouble() || !o["lon"].isDouble()) continue;
+        const double acc = o["acc"].toDouble(100);
+        if (acc <= 0 || acc > 2000) continue;
+        const QString t = QDateTime::currentDateTime().toString(Qt::ISODate);
+        q.prepare(QStringLiteral("INSERT INTO aps(bssid, ssid, freq, first_seen, last_seen, times_seen, seq) VALUES(?,?,?,?,?,0,?) ON CONFLICT(bssid) DO UPDATE SET"
+                                 " ssid=CASE WHEN excluded.ssid<>'' AND (aps.ssid IS NULL OR aps.ssid='') THEN excluded.ssid ELSE aps.ssid END, freq=CASE WHEN excluded.freq>0 AND (aps.freq IS NULL OR aps.freq=0) THEN excluded.freq ELSE aps.freq END"));
+        q.addBindValue(bssid); q.addBindValue(o["ssid"].toString()); q.addBindValue(o["freq"].toInt(0)); q.addBindValue(t); q.addBindValue(t); q.addBindValue(double(nextSeq())); q.exec();
+        cur.prepare(QStringLiteral("SELECT peer_acc, peer_from, lat, acc FROM aps WHERE bssid=?")); cur.addBindValue(bssid); cur.exec();
+        if (!cur.next()) continue;
+        const bool hadPeer = !cur.value(1).toString().isEmpty() && cur.value(0).toDouble() > 0;
+        if (hadPeer && cur.value(1).toString() != device && cur.value(0).toDouble() <= acc) continue;   // someone else's tighter estimate stays
+        q.prepare(QStringLiteral("UPDATE aps SET peer_lat=?, peer_lon=?, peer_acc=?, peer_from=? WHERE bssid=?"));
+        q.addBindValue(o["lat"].toDouble()); q.addBindValue(o["lon"].toDouble()); q.addBindValue(acc); q.addBindValue(device); q.addBindValue(bssid); q.exec();
+        if (cur.value(2).isNull() || cur.value(3).toDouble() > acc) {                 // no position of our own (or a worse one): use it
+            q.prepare(QStringLiteral("UPDATE aps SET lat=?, lon=?, acc=?, source='peer', seq=? WHERE bssid=? AND (lat IS NULL OR source='peer' OR source='observed' OR acc>?)"));
+            q.addBindValue(o["lat"].toDouble()); q.addBindValue(o["lon"].toDouble()); q.addBindValue(acc); q.addBindValue(double(nextSeq())); q.addBindValue(bssid); q.addBindValue(acc); q.exec();
+        }
+        if (touched) touched->append(bssid);
+        ++n;
+    }
+    m_db.commit();
+    if (n) markDirty();
+    return n;
+}
+
+// Everything with a change sequence after `since`, oldest first, capped — the sync feed
+QJsonObject MapDb::changesSince(qint64 since, int limit, bool *more, qint64 *cursor) const
+{
+    QJsonObject out; QJsonArray aps, obs, fixes;
+    if (more) *more = false;
+    if (cursor) *cursor = m_seq;
+    if (!m_db.isOpen()) return out;
+    limit = qBound(1, limit, 5000);
+    qint64 maxSeq = since; int total = 0;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("SELECT bssid, ssid, freq, lat, lon, acc, source, home, travelling, ignored, security, seq FROM aps WHERE seq>? ORDER BY seq LIMIT ?")); q.addBindValue(double(since)); q.addBindValue(limit + 1); q.exec();
+    while (q.next()) {
+        if (aps.size() >= limit) { if (more) *more = true; break; }
+        QJsonObject a{{"bssid", q.value(0).toString()}, {"ssid", q.value(1).toString()}, {"freq", q.value(2).toInt()}, {"source", q.value(6).toString()},
+                      {"home", q.value(7).toInt() != 0}, {"travelling", q.value(8).toInt() != 0}, {"ignored", q.value(9).toInt() != 0}, {"security", q.value(10).toString()}, {"seq", q.value(11).toDouble()}};
+        if (!q.value(3).isNull()) { a["lat"] = q.value(3).toDouble(); a["lon"] = q.value(4).toDouble(); a["acc"] = q.value(5).toDouble(); }
+        QSqlQuery e(m_db); e.prepare(QStringLiteral("SELECT n, vantage, rms, acc, p0, pathloss, quality, updated FROM estimates WHERE bssid=? AND quality<>'none'")); e.addBindValue(q.value(0).toString()); e.exec();
+        if (e.next()) a["fit"] = QJsonObject{{"n", e.value(0).toInt()}, {"vantage", e.value(1).toInt()}, {"rms", e.value(2).toDouble()}, {"acc", e.value(3).toDouble()}, {"p0", e.value(4).toDouble()}, {"pathloss", e.value(5).toDouble()}, {"quality", e.value(6).toString()}, {"updated", e.value(7).toString()}};
+        aps.append(a); maxSeq = qMax(maxSeq, q.value(11).toLongLong()); ++total;
+    }
+    q.prepare(QStringLiteral("SELECT bssid, time, lat, lon, acc, dbm, device, seq FROM observations WHERE seq>? ORDER BY seq LIMIT ?")); q.addBindValue(double(since)); q.addBindValue(limit + 1); q.exec();
+    while (q.next()) {
+        if (obs.size() >= limit) { if (more) *more = true; break; }
+        obs.append(QJsonObject{{"bssid", q.value(0).toString()}, {"time", q.value(1).toString()}, {"lat", q.value(2).toDouble()}, {"lon", q.value(3).toDouble()}, {"acc", q.value(4).toDouble()},
+                               {"dbm", q.value(5).toInt()}, {"device", q.value(6).toString()}, {"seq", q.value(7).toDouble()}});
+        maxSeq = qMax(maxSeq, q.value(7).toLongLong()); ++total;
+    }
+    q.prepare(QStringLiteral("SELECT time, lat, lon, acc, source, provider, place, city, region, country, elev, device, seq FROM fixes WHERE seq>? ORDER BY seq LIMIT ?")); q.addBindValue(double(since)); q.addBindValue(limit + 1); q.exec();
+    while (q.next()) {
+        if (fixes.size() >= limit) { if (more) *more = true; break; }
+        QJsonObject f{{"time", q.value(0).toString()}, {"lat", q.value(1).toDouble()}, {"lon", q.value(2).toDouble()}, {"acc", q.value(3).toDouble()}, {"source", q.value(4).toString()}, {"provider", q.value(5).toString()},
+                      {"place", q.value(6).toString()}, {"city", q.value(7).toString()}, {"region", q.value(8).toString()}, {"country", q.value(9).toString()}, {"device", q.value(11).toString()}, {"seq", q.value(12).toDouble()}};
+        if (!q.value(10).isNull()) f["elev"] = q.value(10).toDouble();
+        fixes.append(f); maxSeq = qMax(maxSeq, q.value(12).toLongLong()); ++total;
+    }
+    // The cursor a client should store: when a table hit the cap, the smallest "next" seq across tables keeps ordering safe
+    qint64 next = maxSeq;
+    if (more && *more) {
+        next = m_seq;
+        for (const QJsonArray *arr : {&aps, &obs, &fixes}) if (arr->size() >= limit) next = qMin(next, qint64(arr->last().toObject()["seq"].toDouble()));
+        // every table is complete up to `next` only if the others have no rows in (since, next] beyond what we returned — they were read fully or capped at ≥ next
+    }
+    if (cursor) *cursor = (more && *more) ? next : m_seq;
+    out["since"] = double(since); out["aps"] = aps; out["observations"] = obs; out["fixes"] = fixes; out["count"] = total;
+    out["cursor"] = double(cursor ? *cursor : m_seq); out["more"] = more ? *more : false;
+    return out;
 }
 
 // ── Export / import ───────────────────────────────────────────────────────────
@@ -660,11 +928,12 @@ QJsonObject MapDb::exportJson() const
     if (!m_db.isOpen()) return {};
     QJsonObject o{{"beaconfix", "mapdb"}, {"version", 1}, {"exported", QDateTime::currentDateTime().toString(Qt::ISODate)}};
     o["aps"] = dumpTable(m_db, QStringLiteral("SELECT * FROM aps"));
-    o["observations"] = dumpTable(m_db, QStringLiteral("SELECT bssid, time, lat, lon, acc, dbm, fix_source FROM observations ORDER BY id"));
+    o["observations"] = dumpTable(m_db, QStringLiteral("SELECT bssid, time, lat, lon, acc, dbm, fix_source, device FROM observations ORDER BY id"));
+    o["estimates"] = dumpTable(m_db, QStringLiteral("SELECT * FROM estimates"));
     o["sightings"] = dumpTable(m_db, QStringLiteral("SELECT bssid, lat, lon, acc, time FROM sightings ORDER BY id"));
     o["cells"] = dumpTable(m_db, QStringLiteral("SELECT bssid, cell FROM cells"));
     o["flags"] = dumpTable(m_db, QStringLiteral("SELECT kind, bssid FROM flags"));
-    o["fixes"] = dumpTable(m_db, QStringLiteral("SELECT time, lat, lon, acc, source, provider, place, city, region, country, elev, ap_count, ap_used, departed FROM fixes ORDER BY id"));
+    o["fixes"] = dumpTable(m_db, QStringLiteral("SELECT time, lat, lon, acc, source, provider, place, city, region, country, elev, ap_count, ap_used, departed, device FROM fixes ORDER BY id"));
     o["pois"] = dumpTable(m_db, QStringLiteral("SELECT * FROM pois"));
     o["elevation"] = dumpTable(m_db, QStringLiteral("SELECT * FROM elevation"));
     o["achievements"] = dumpTable(m_db, QStringLiteral("SELECT * FROM achievements"));
@@ -699,6 +968,7 @@ int MapDb::importJson(const QJsonObject &dump, QString *error)
     insertRows(QStringLiteral("pois"), dump["pois"].toArray(), true);
     insertRows(QStringLiteral("elevation"), dump["elevation"].toArray(), true);
     insertRows(QStringLiteral("achievements"), dump["achievements"].toArray(), true);
+    insertRows(QStringLiteral("estimates"), dump["estimates"].toArray(), true);
     m_db.commit();
     if (n) markDirty();
     return n;

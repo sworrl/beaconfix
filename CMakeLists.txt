@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(beaconfix VERSION 3.3.0 LANGUAGES CXX)
+project(beaconfix VERSION 3.4.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -16,6 +16,7 @@ add_executable(beaconfix
     src/tilesource.cpp
     src/apiserver.cpp
     src/mapdb.cpp
+    src/estimator.cpp
     src/tray.cpp
     src/mainwindow.cpp
 )

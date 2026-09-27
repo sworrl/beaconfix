@@ -70,8 +70,11 @@ int main(int argc, char **argv)
     QCommandLineOption dbStats(QStringLiteral("db-stats"), QStringLiteral("Print the internal map database's statistics as JSON, exit."));
     QCommandLineOption dbExport(QStringLiteral("db-export"), QStringLiteral("Export the internal map database (JSON dump) to <file>, exit."), QStringLiteral("file"));
     QCommandLineOption dbImport(QStringLiteral("db-import"), QStringLiteral("Merge a JSON dump (from --db-export) into the internal map database, exit."), QStringLiteral("file"));
+    QCommandLineOption refit(QStringLiteral("refit"), QStringLiteral("Re-estimate every beacon's position from all its samples (least squares), print the count, exit."));
+    QCommandLineOption sync(QStringLiteral("sync"), QStringLiteral("Sync samples, positions and stops with another BeaconFix: --sync <http://host:47822> --sync-token <token>; exit."), QStringLiteral("url"));
+    QCommandLineOption syncToken(QStringLiteral("sync-token"), QStringLiteral("Bearer token for --sync (remembered for that peer once given)."), QStringLiteral("token"));
     p.addOptions({tray, once, json, refresh, snapshot, gpx, copy, newTrip, prefetch, apiStatus, devices, approve, deny, revoke, token, control, pairing,
-                  homeAdd, homeRemove, homeList, homeSync, homeToken, homeImport, knownImport, knownList, knownAdd, knownName, knownRemove, dbStats, dbExport, dbImport});
+                  homeAdd, homeRemove, homeList, homeSync, homeToken, homeImport, knownImport, knownList, knownAdd, knownName, knownRemove, dbStats, dbExport, dbImport, refit, sync, syncToken});
     p.process(app);
 
     QTextStream out(stdout);
@@ -181,6 +184,21 @@ int main(int argc, char **argv)
         return 0;
     }
 
+    if (p.isSet(refit) || p.isSet(sync)) {
+        QDBusInterface iface(SVC, PATH, SVC, bus);
+        if (!iface.isValid()) { fprintf(stderr, "beaconfix: %s needs the running instance\n", p.isSet(refit) ? "--refit" : "--sync"); return 1; }
+        int rc = 0;
+        if (p.isSet(refit)) { QDBusReply<int> r = iface.call(QStringLiteral("Refit")); if (!r.isValid()) { fprintf(stderr, "beaconfix: refit failed\n"); rc = 1; } else out << "Positioned " << r.value() << " beacon(s) from their samples\n"; }
+        if (p.isSet(sync)) {
+            iface.setTimeout(200000);
+            QDBusReply<QString> r = iface.call(QStringLiteral("Sync"), p.value(sync).trimmed(), p.value(syncToken).trimmed());
+            const QJsonObject o = QJsonDocument::fromJson(r.value().toUtf8()).object();
+            if (!r.isValid() || !o["ok"].toBool()) { fprintf(stderr, "beaconfix: sync failed: %s\n", qPrintable(o["message"].toString().isEmpty() ? o["error"].toString() : o["message"].toString())); rc = 1; }
+            else out << "Synced with " << o["peer"].toString() << ": " << o["message"].toString() << "\n";
+        }
+        out.flush();
+        return rc;
+    }
     if (p.isSet(dbStats) || p.isSet(dbExport) || p.isSet(dbImport)) {
         QDBusInterface iface(SVC, PATH, SVC, bus);
         if (iface.isValid()) {

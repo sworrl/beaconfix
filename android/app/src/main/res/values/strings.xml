@@ -1,0 +1,14 @@
+<resources>
+    <string name="app_name">BeaconFix</string>
+    <string name="notif_channel_collector">Beacon collector</string>
+    <string name="notif_channel_collector_desc">Shown while BeaconFix records Wi-Fi beacons and your position</string>
+    <string name="notif_collecting">Collecting beacons</string>
+    <string name="notif_stop">Stop</string>
+    <string name="nav_home">Home</string>
+    <string name="nav_map">Map</string>
+    <string name="nav_beacons">Beacons</string>
+    <string name="nav_survey">Survey</string>
+    <string name="nav_sync">Sync</string>
+    <string name="nav_settings">Settings</string>
+    <string name="cd_map">Map of beacons and positions</string>
+</resources>

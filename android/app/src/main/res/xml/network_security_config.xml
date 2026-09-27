@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The BeaconFix LAN API is plain HTTP on private addresses unless the desktop has a certificate.
+     Map tiles are HTTPS. Cleartext is permitted so a paired desktop on the LAN can be reached. -->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+            <certificates src="user" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>
