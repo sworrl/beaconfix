@@ -86,6 +86,7 @@ struct PoiCategory {
     QColor  color;
     QString group;                    // services | civic | kids  (menus group by this)
     bool    wide = false;             // civic: fetched out to the wide radius (police/fire are sparse in the country)
+    int     reachKm = 0;              // searched out to this far by a separate query (pediatric ERs); 0 = the wide rule above
 };
 
 struct Poi {
@@ -97,6 +98,14 @@ struct Poi {
     QString address;                  // "123 Main St, Town, ST 12345" from addr:* tags
     QString wheelchair;               // yes | limited | no | ""
     bool    emergency = false;        // hospital with an emergency department / 24 h service
+    // Pediatric ERs (src/poiclassify.h): tier 0 none · 1 pediatric ER · 2 children's hospital, ER not confirmed ·
+    // 3 general ER with a pediatrics dept. · 4 pediatric urgent care (not an ER)
+    int     peds = 0;
+    QString er;                       // "yes" | "no" | "" (unknown)
+    QString campus;                   // tier 2: the ER hospital on the same campus
+    int     driveS = 0, driveM = 0;   // drive time / road distance from the fix (pois() only; 0 = not computed)
+    bool    driveEst = true;          // an estimate (straight line × 1.4 at 70 km/h), not a routed time
+    QString scope = QStringLiteral("near");   // near: the main places query · far: the pediatric ER search
 };
 
 // Local solar times for the fix (computed, no network)
@@ -278,15 +287,24 @@ public:
     static const QList<PoiCategory> &poiCategories();
     static const PoiCategory *poiCategory(const QString &key);
     static QString poiGroupLabel(const QString &group);           // "Emergency & civic" …
-    QJsonObject emergencyJson() const;                            // nearest police / fire / ER / urgent care + the local number
+    QJsonObject emergencyJson() const;                            // nearest police / fire / ER / pediatric ER / urgent care + the local number (docs/API.md)
     QList<Poi> poisMatching(const QStringList &catsOrGroups, double radiusKm) const;   // nearest first
-    const QList<Poi> &pois() const { return m_pois; }
+    const QList<Poi> &pois() const { return m_allPois; }         // near + far merged (deduped by OSM object, near wins); drive times from the fix
     QString poiNote() const { return m_poiNote; }
     bool    poisLoading() const { return m_poiBusy; }
     int     poiRadiusKm() const { return m_poiRadiusKm; }
     void    setPoiRadiusKm(int km);
     void    setTileBase(const QString &url) { m_tileBase = url; }
     void    refreshPois(bool force = false);
+    // Pediatric ERs: a separate, rarer query out to pedsRadiusKm (QSettings "pedsRadiusKm", 50–300, default 150)
+    int     pedsRadiusKm() const { return m_pedsRadiusKm; }
+    void    setPedsRadiusKm(int km);
+    void    refreshPediatric(bool force = false);
+    bool    pedsLoading() const { return m_pedsBusy; }
+    QString pedsNote() const;                                     // the pediatricNote of emergencyJson()
+    QDateTime pedsTime() const { return m_pedsTime; }
+    QJsonObject poiOriginJson() const;                            // {lat, lon, time, radiusKm} of the places query
+    QJsonValue  pedsOriginJson() const;                           // the same for the pediatric search, or null
     static double distanceM(double lat1, double lon1, double lat2, double lon2);
 
     // Settings
@@ -391,7 +409,7 @@ public slots:
     bool    CopyToClipboard(const QString &what);       // coords | geo | osm | google | apple | text
     void    StartTrip();
     void    PrefetchTiles();
-    void    RefreshPlaces() { refreshPois(true); }        // re-query OpenStreetMap for places around the fix
+    void    RefreshPlaces() { refreshPois(true); refreshPediatric(true); }   // re-query OpenStreetMap for places around the fix (and the pediatric ERs)
     // LAN API management (see apiserver.h)
     QString ApiStatus() const;
     bool    ApproveDevice(const QString &id);
@@ -491,8 +509,19 @@ private:
     void pumpWigle();
     void noteSightings(const QList<AccessPoint> &aps, const Fix &at);
     void queryOverpass(double lat, double lon, int radiusM, int mirror);
+    void queryPediatric(double lat, double lon, int radiusM, int mirror);
+    bool overpassSlot(bool peds, bool force);     // one Overpass query at a time, 5 s apart: false = queued
+    void overpassDone();
+    void pumpOverpass();
+    void rebuildMergedPois();
+    struct HelpPicks { const Poi *pediatric = nullptr, *closer = nullptr, *urgent = nullptr, *hospital = nullptr; };
+    HelpPicks helpPicks() const;                  // PoiClassify::pickHelp over pois(), from the fix
+    bool helpOrigin(double *lat, double *lon) const;   // the fix, else where the places were fetched
+    QString pedsNoteFor(const Poi *pick) const;
+    QJsonObject helpPlaceJson(const Poi &p) const;
     void loadPois();
     void savePois() const;
+    void savePedsPois() const;
     void rewriteHistory() const;
     void fetchElevation();
     void loadElevationCache();
@@ -558,12 +587,27 @@ private:
     QSet<QString> m_travelling, m_notTravelling;
     QStringList m_wigleQueue;
     bool m_wigleBusy = false;
-    QList<Poi> m_pois;
+    QList<Poi> m_pois;                              // near: the main places query
+    QList<Poi> m_allPois;                           // near + far, what pois() returns
     double m_poiLat = 0, m_poiLon = 0; int m_poiRadiusM = 0;
     QDateTime m_poiTime, m_poiTried;
     QString m_poiNote;
     bool m_poiBusy = false;
     int  m_poiRadiusKm = 6;
+    // Pediatric ERs (far scope)
+    QList<Poi> m_pedsPois;
+    double m_pedsLat = 0, m_pedsLon = 0; int m_pedsRadiusM = 0;
+    QDateTime m_pedsTime;                           // when the cached far list was fetched (invalid = never)
+    QDateTime m_pedsBusyUntil;                      // back-off after a failed search
+    QDateTime m_pedsSkipLogged;                     // the fix we last logged "skipped (IP fix)" for
+    int  m_pedsRadiusKm = 150;
+    bool m_pedsBusy = false, m_pedsFailed = false;
+    QString m_pedsNote;                             // the last search's own message ("Overpass busy — will retry" …)
+    QTimer m_pedsRetryTimer;
+    // Overpass etiquette: one query in flight, 5 s between queries, a minute's pause after 429 / 504
+    QTimer m_overpassTimer;
+    QDateTime m_overpassIdle, m_overpassCoolUntil;
+    bool m_poiPending = false, m_poiPendingForce = false, m_pedsPending = false, m_pedsPendingForce = false;
     QString m_tileBase;
     QHash<QString, double> m_elevCache;   // "lat,lon" rounded to ~100 m
     QString m_elevNote; bool m_elevBusy = false; QDateTime m_elevTried;

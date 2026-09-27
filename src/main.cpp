@@ -11,6 +11,7 @@
 #include "tray.h"
 #include "apiserver.h"
 #include "mapdb.h"
+#include "poiclassify.h"
 #include "ranging/rangingservice.h"
 #include <QApplication>
 #include <QCommandLineParser>
@@ -123,7 +124,7 @@ int main(int argc, char **argv)
     QCommandLineOption identityImport(QStringLiteral("identity-import"), QStringLiteral("Import an identity from <file> or a BFID1: text (asks for the passphrase / word code), exit."), QStringLiteral("file-or-text"));
     QCommandLineOption identityLinkQr(QStringLiteral("identity-link-qr"), QStringLiteral("Print our link payload (beaconfix://link/… text + QR, from the running tray) for another identity to scan and co-sign, exit."));
     QCommandLineOption identitySelftest(QStringLiteral("identity-selftest"), QStringLiteral("Print the fixed-seed test vectors (seed = 32×0x01), exit."));
-    QCommandLineOption nearby(QStringLiteral("nearby"), QStringLiteral("List places near the fix: <what> is a category (police, fire, health, urgent, pharmacy, library, playground, park, dogpark, pool, …), a group (civic, kids, services), 'emergency' for the nearest help, or 'all'; exit."), QStringLiteral("what"));
+    QCommandLineOption nearby(QStringLiteral("nearby"), QStringLiteral("List places near the fix: <what> is a category (police, fire, health, urgent, peds_er, peds_urgent, pharmacy, library, playground, park, dogpark, pool, …), a group (civic, kids, services), 'pediatric' for pediatric ERs and urgent care, 'emergency' for the nearest help, or 'all'; exit."), QStringLiteral("what"));
     QCommandLineOption radius(QStringLiteral("radius"), QStringLiteral("With --nearby: only places within <km>."), QStringLiteral("km"));
     QCommandLineOption tz(QStringLiteral("tz"), QStringLiteral("Print the IANA time zone for the current fix, exit."));
     QCommandLineOption applyOs(QStringLiteral("apply-os"), QStringLiteral("Apply the OS integration now (time zone, GeoClue, Night Light) and print the report, exit."));
@@ -234,7 +235,15 @@ int main(int argc, char **argv)
         const double km = p.isSet(radius) ? p.value(radius).toDouble() : 0;
         auto fmt = [](const QJsonObject &q) {
             QString line = QStringLiteral("%1 %2").arg(q["icon"].toString(), q["name"].toString().isEmpty() ? q["label"].toString() : q["name"].toString());
+            const int tier = q.contains("tier") ? q["tier"].toInt() : q["peds"].toInt();
+            if (tier > 0) line += QStringLiteral("  [tier %1: %2]").arg(tier).arg(PoiClassify::tierLabel(tier));
+            if (!q["campusEr"].toString().isEmpty()) line += QStringLiteral("  ·  ER on campus: ") + q["campusEr"].toString();
             if (q.contains("d")) line += QStringLiteral("  ·  %1 km %2").arg(q["d"].toDouble() / 1000.0, 0, 'f', 1).arg(Locator::compass(q["brg"].toDouble()));
+            if (q["driveS"].toInt() > 0) {
+                const int min = q["driveS"].toInt() / 60;
+                line += QStringLiteral("  ·  ~%1%2").arg(min < 60 ? QStringLiteral("%1 min").arg(min) : min % 60 ? QStringLiteral("%1 h %2 min").arg(min / 60).arg(min % 60) : QStringLiteral("%1 h").arg(min / 60),
+                                                   q["driveEst"].toBool(true) ? QStringLiteral(" (est.)") : QString());
+            }
             if (!q["phone"].toString().isEmpty()) line += QStringLiteral("  ·  ☎ ") + q["phone"].toString();
             if (!q["address"].toString().isEmpty()) line += QStringLiteral("  ·  ") + q["address"].toString();
             if (!q["hours"].toString().isEmpty()) line += QStringLiteral("  ·  🕑 ") + q["hours"].toString();
@@ -249,19 +258,39 @@ int main(int argc, char **argv)
                 QJsonObject q = v.toObject(); q["label"] = QString::fromLatin1(k); q["icon"] = QString();
                 out << "  " << QString::fromLatin1(k).leftJustified(9) << fmt(q).trimmed() << "\n";
             }
+            if (e.contains("pediatric")) {                                // a 3.8+ tray (or this binary standalone)
+                const QList<QPair<const char *, QString>> peds{{"pediatric", QStringLiteral("Pediatric ER")}, {"pediatricCloser", QStringLiteral("Closer")},
+                                                               {"pediatricUrgent", QStringLiteral("Pediatric urgent care (not an ER)")}};
+                for (const auto &k : peds) {
+                    const QJsonValue v = e[QLatin1String(k.first)];
+                    if (v.isNull() || v.isUndefined()) {
+                        if (qstrcmp(k.first, "pediatric") == 0) {
+                            if (e["pediatricTime"].toString().isEmpty()) out << "  " << k.second << ": not searched yet\n";
+                            else out << "  " << k.second << ": none mapped within " << e["pediatricSearchKm"].toInt() << " km\n";
+                        }
+                        continue;
+                    }
+                    QJsonObject q = v.toObject(); q["icon"] = QString();
+                    out << "  " << k.second << ":  " << fmt(q).trimmed() << "\n";
+                }
+                if (!e["pediatricNote"].toString().isEmpty()) out << "  " << e["pediatricNote"].toString() << "\n";
+            }
             out.flush(); return 0;
         }
         int n = 0;
         QList<QJsonObject> rows;
+        const bool pediatric = what == QLatin1String("pediatric") || what == QLatin1String("peds");
         for (const QJsonValue &v : st["pois"].toArray()) {
             const QJsonObject q = v.toObject();
-            if (!(what == QLatin1String("all") || what == q["cat"].toString().toLower() || what == q["group"].toString().toLower())) continue;
+            const QString cat = q["cat"].toString().toLower();
+            if (pediatric ? !(cat == QLatin1String("peds_er") || cat == QLatin1String("peds_urgent"))
+                          : !(what == QLatin1String("all") || what == cat || what == q["group"].toString().toLower())) continue;
             if (km > 0 && q.contains("d") && q["d"].toDouble() > km * 1000) continue;
             rows << q;
         }
         std::sort(rows.begin(), rows.end(), [](const QJsonObject &a, const QJsonObject &b) { return a["d"].toDouble() < b["d"].toDouble(); });
         for (const QJsonObject &q : rows) { out << fmt(q) << "\n"; ++n; }
-        if (n == 0) out << "No places matching '" << what << "'" << (km > 0 ? QStringLiteral(" within %1 km").arg(km) : QString()) << ". Categories: police fire health urgent pharmacy dentist vet library townhall court dmv school community playground park dogpark pool splash zoo museum themepark icecream cinema bowling arcade trampoline skate beach picnic trail fuel propane charging grocery food cafe camp water dump shower toilets laundry repair hardware wifi post rest carwash; groups: civic kids services; or emergency / all.\n";
+        if (n == 0) out << "No places matching '" << what << "'" << (km > 0 ? QStringLiteral(" within %1 km").arg(km) : QString()) << ". Categories: police fire health urgent peds_er peds_urgent pharmacy dentist vet library townhall court dmv school community playground park dogpark pool splash zoo museum themepark icecream cinema bowling arcade trampoline skate beach picnic trail fuel propane charging grocery food cafe camp water dump shower toilets laundry repair hardware wifi post rest carwash; groups: civic kids services; or pediatric / emergency / all.\n";
         out.flush(); return n ? 0 : 1;
     }
 

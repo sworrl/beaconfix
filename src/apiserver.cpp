@@ -1167,7 +1167,8 @@ void ApiServer::handle(QTcpSocket *s, const Request &r)
         const QUrlQuery qq(r.query);
         QStringList keys = (qq.queryItemValue(QStringLiteral("cat")) + QLatin1Char(',') + qq.queryItemValue(QStringLiteral("group"))).split(QLatin1Char(','), Qt::SkipEmptyParts);
         const double radius = qq.queryItemValue(QStringLiteral("radius")).toDouble();
-        const QJsonArray all = stateObject()["pois"].toArray();
+        const QJsonObject st = stateObject();
+        const QJsonArray all = st["pois"].toArray();
         QJsonArray out2;
         for (const QJsonValue &v : all) {
             const QJsonObject p = v.toObject();
@@ -1177,7 +1178,8 @@ void ApiServer::handle(QTcpSocket *s, const Request &r)
             if (radius > 0 && p.contains("d") && p["d"].toDouble() > radius * 1000) continue;
             out2.append(p);
         }
-        finish(200, QJsonObject{{"pois", out2}, {"count", out2.size()}, {"filter", QJsonArray::fromStringList(keys)}, {"radiusKm", radius}, {"ts", QDateTime::currentDateTime().toString(Qt::ISODate)}});
+        finish(200, QJsonObject{{"pois", out2}, {"count", out2.size()}, {"filter", QJsonArray::fromStringList(keys)}, {"radiusKm", radius}, {"ts", QDateTime::currentDateTime().toString(Qt::ISODate)},
+                                {"categories", st["poiCategories"]}, {"note", st["poiNote"]}, {"origin", m_loc->poiOriginJson()}, {"pedsOrigin", m_loc->pedsOriginJson()}});
         return;
     }
     if (ep == QLatin1String("aps")) {                          // paged: ?offset=&limit= (heard now), ?all=1&after=<bssid> (the whole map database)
@@ -1261,6 +1263,10 @@ void ApiServer::handle(QTcpSocket *s, const Request &r)
         const QString key = ep == QLatin1String("trip") ? QStringLiteral("stats") : ep;
         QJsonObject o{{ep, st[key]}};
         if (ep != QLatin1String("trip")) o["count"] = st[key].toArray().size();
+        if (ep == QLatin1String("pois")) {                     // what the phone needs to show them offline: the category table, where they were fetched
+            o["categories"] = st["poiCategories"]; o["note"] = st["poiNote"];
+            o["origin"] = m_loc->poiOriginJson(); o["pedsOrigin"] = m_loc->pedsOriginJson();
+        }
         o["ts"] = QDateTime::currentDateTime().toString(Qt::ISODate);
         finish(200, o);
         return;

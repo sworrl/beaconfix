@@ -76,7 +76,7 @@ Tray::Tray(Locator *loc, QObject *parent) : QObject(parent), m_loc(loc)
     connect(open, &QAction::triggered, this, &Tray::openWindowRequested);
     QAction *offline = m_menu.addAction(QIcon::fromTheme(QStringLiteral("document-save")), QStringLiteral("Save map around here for offline"));
     connect(offline, &QAction::triggered, m_loc, &Locator::PrefetchTiles);
-    QAction *emerg = m_menu.addAction(QIcon::fromTheme(QStringLiteral("dialog-warning")), QStringLiteral("Nearest help (police, fire, ER)…"));
+    QAction *emerg = m_menu.addAction(QIcon::fromTheme(QStringLiteral("dialog-warning")), QStringLiteral("Nearest help (police, fire, ER, pediatric ER)…"));
     connect(emerg, &QAction::triggered, this, &Tray::openEmergencyRequested);
     m_identityAct = m_menu.addAction(QIcon::fromTheme(QStringLiteral("user-identity")), QStringLiteral("Identity…"));
     connect(m_identityAct, &QAction::triggered, this, &Tray::openIdentityRequested);

@@ -13,10 +13,10 @@ SECURITY.md): `~/.local/state/beaconfix/beaconfix.db`.
 | `cells` | `bssid`, `cell` | ~5 km cells it was seen in (travelling detection) |
 | `flags` | `kind`, `bssid` | manual `travelling` / `notTravelling` marks |
 | `fixes` | `id`, `time`, `lat`, `lon`, `acc`, `source`, `provider`, `place`, `city`, `region`, `country`, `elev`, `ap_count`, `ap_used`, `departed` | the trip log |
-| `pois` | `osm_type`, `osm_id`, `cat`, `name`, `detail`, `lat`, `lon`, `wifi`, `hours`, `phone`, `website` | places of interest cache |
+| `pois` | `osm_type`, `osm_id`, `cat`, `name`, `detail`, `lat`, `lon`, `wifi`, `hours`, `phone`, `website`, `address`, `wheelchair`, `emergency`, `scope`, `peds`, `er`, `campus`, `drive_s`, `drive_m` | places of interest cache. `scope` = `near` (the places query around the fix) or `far` (the pediatric ER search, 3.8); an object both found is stored once, as `near`. `peds` = pediatric tier (API.md "Pediatric ER"), `drive_s`/`drive_m` a routed drive time (0 = use the estimate) |
 | `elevation` | `cell`, `elev`, `time` | elevation cache per ~100 m cell |
 | `achievements` | `key`, `unlocked` | milestones |
-| `kv` | `key`, `value` | misc |
+| `kv` | `key`, `value` | misc: `poi_lat`/`poi_lon`/`poi_radius`/`poi_time` (where and when the places were fetched), `peds_lat`/`peds_lon`/`peds_radius`/`peds_time` (the same for the pediatric ER search), `countryCode`, `environment`, `sync:<peer>:pulled`/`pushed`, `seq`, `schema`, `created` |
 
 ## Migration
 

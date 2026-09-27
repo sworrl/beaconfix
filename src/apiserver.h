@@ -29,6 +29,8 @@ class QTemporaryFile;
 //   GET  /api/v1/state                 read    · everything (Locator::StateJson)
 //   GET  /api/v1/events?since=<id>     read    · beacon/fix/stop events newer than <id>
 //   GET  /api/v1/aps | pois | track | trip     read
+//   GET  /api/v1/pois[?cat=&group=&radius=]    read    · places (+ categories, note, origin, pedsOrigin; pediatric ERs merged in)
+//   GET  /api/v1/emergency             read    · nearest police / fire / ER / pediatric ER (+ closer, urgent care, note) and the local number
 //   GET  /api/v1/stream                read    · Server-Sent Events: fix, beacon, ping (30 s)
 //   POST /api/v1/refresh | prefetch    control
 //   GET  /api/v1/db/changes?since=&limit=   read · sync feed: AP positions (+fit), observations, fixes after a cursor

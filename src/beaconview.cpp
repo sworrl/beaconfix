@@ -432,14 +432,17 @@ void BeaconView::drawPois(QPainter &p)
     const double cell = m_zoom < 13 ? 56 : m_zoom < 15.5 ? 40 : 0;
     QHash<qint64, QList<int>> grid;
     QList<int> order;
+    QList<int> pedsLast;                                     // pediatric ERs are drawn on top
     for (int i = 0; i < pois.size(); ++i) {
         if (m_hiddenCats.contains(pois[i].cat)) continue;
         const QPointF s = toScreen(pois[i].lat, pois[i].lon);
         if (!view.contains(s)) continue;
         m_poiPos[i] = s;
         if (cell > 0) grid[(qint64(std::floor(s.x() / cell)) << 32) ^ qint64(std::floor(s.y() / cell) + 100000)].append(i);
+        else if (pois[i].cat == QLatin1String("peds_er")) pedsLast << i;
         else order << i;
     }
+    order += pedsLast;
     QFont emoji = font(); emoji.setPointSizeF(font().pointSizeF() * 1.05);
     auto pin = [&](const QPointF &s, const PoiCategory *c, bool hot, bool wifi) {
         const double r = hot ? 14 : 11.5;
@@ -451,13 +454,32 @@ void BeaconView::drawPois(QPainter &p)
         if (wifi) { p.setPen(Qt::NoPen); p.setBrush(C_ME); p.drawEllipse(s + QPointF(r * 0.72, -r * 0.72), 3.2, 3.2); }
     };
     if (cell > 0) {
+        // A cluster shows its most important member: a pediatric ER, then an ER, then police / fire, else the most common kind.
+        // Clusters holding a pediatric ER are drawn last, on top.
+        QList<QList<int>> clusters, pedsClusters;
         for (auto it = grid.begin(); it != grid.end(); ++it) {
-            const QList<int> &ids = it.value();
+            bool peds = false; for (int i : it.value()) if (pois[i].cat == QLatin1String("peds_er")) peds = true;
+            (peds ? pedsClusters : clusters) << it.value();
+        }
+        clusters += pedsClusters;
+        for (const QList<int> &ids : clusters) {
             QPointF c; QHash<QString, int> counts;
-            for (int i : ids) { c += m_poiPos[i]; counts[pois[i].cat]++; }
+            bool peds = false, er = false, police = false, fire = false;
+            for (int i : ids) {
+                c += m_poiPos[i]; counts[pois[i].cat]++;
+                const QString &cat = pois[i].cat;
+                if (cat == QLatin1String("peds_er")) peds = true;
+                else if (cat == QLatin1String("health") && pois[i].emergency) er = true;
+                else if (cat == QLatin1String("police")) police = true;
+                else if (cat == QLatin1String("fire")) fire = true;
+            }
             c /= ids.size();
             QString top; int best = 0;
-            for (auto ci = counts.begin(); ci != counts.end(); ++ci) if (ci.value() > best) { best = ci.value(); top = ci.key(); }
+            if (peds) top = QStringLiteral("peds_er");
+            else if (er) top = QStringLiteral("health");
+            else if (police) top = QStringLiteral("police");
+            else if (fire) top = QStringLiteral("fire");
+            else for (auto ci = counts.begin(); ci != counts.end(); ++ci) if (ci.value() > best) { best = ci.value(); top = ci.key(); }
             const int hitIdx = m_hits.size();
             const bool hot = m_hover == hitIdx;
             pin(c, Locator::poiCategory(top), hot, false);
@@ -1069,6 +1091,12 @@ QString BeaconView::poiCard(int i) const
                                                         compass(Locator::bearingDeg(fix.lat, fix.lon, pt.lat, pt.lon)));
     if (fix.source == QLatin1String("ip")) s += QStringLiteral(" (from IP estimate)");
     if (!pt.detail.isEmpty()) s += QStringLiteral("\n") + pt.detail;
+    if (pt.driveS > 0) {
+        const int min = pt.driveS / 60;
+        s += QStringLiteral("\n🚗 ~%1 drive%2").arg(min < 60 ? QStringLiteral("%1 min").arg(min) : min % 60 ? QStringLiteral("%1 h %2 min").arg(min / 60).arg(min % 60) : QStringLiteral("%1 h").arg(min / 60),
+                                                    pt.driveEst ? QStringLiteral(" (est.)") : QString());
+    }
+    if (!pt.address.isEmpty()) s += QStringLiteral("\n") + pt.address;
     if (!pt.hours.isEmpty()) s += QStringLiteral("\n🕑 ") + pt.hours;
     if (!pt.phone.isEmpty()) s += QStringLiteral("\n☎ ") + pt.phone;
     s += QStringLiteral("\nRight-click for directions & more");
@@ -1469,6 +1497,16 @@ void BeaconView::buttonClicked(int b, const QPoint &globalPos)
             a->setCheckable(true); a->setChecked(km == m_loc->poiRadiusKm());
             connect(a, &QAction::triggered, this, [this, km] { m_loc->setPoiRadiusKm(km); });
         }
+        QMenu *peds = menu.addMenu(QStringLiteral("Pediatric ER search: %1 km").arg(m_loc->pedsRadiusKm()));
+        peds->setToolTipsVisible(true);
+        auto *pedsGrp = new QActionGroup(peds);
+        pedsGrp->setExclusive(true);
+        for (int km : {50, 100, 150, 200, 300}) {
+            QAction *a = peds->addAction(QStringLiteral("%1 km").arg(km));
+            a->setCheckable(true); a->setChecked(km == m_loc->pedsRadiusKm()); pedsGrp->addAction(a);
+            a->setToolTip(QStringLiteral("How far to look for children's hospitals (a separate, rarer search)"));
+            connect(a, &QAction::triggered, this, [this, km] { m_loc->setPedsRadiusKm(km); });
+        }
         QAction *reload = menu.addAction(QIcon::fromTheme(QStringLiteral("view-refresh")), QStringLiteral("Reload places"));
         QAction *chosen = menu.exec(globalPos);
         if (chosen == all || chosen == none) {
@@ -1476,7 +1514,7 @@ void BeaconView::buttonClicked(int b, const QPoint &globalPos)
             if (chosen == none) for (const PoiCategory &c : Locator::poiCategories()) m_hiddenCats.insert(c.key);
             QSettings().setValue("map/hiddenCategories", QStringList(m_hiddenCats.begin(), m_hiddenCats.end()));
             update();
-        } else if (chosen == reload) m_loc->refreshPois(true);
+        } else if (chosen == reload) m_loc->RefreshPlaces();
         break;
     }
     }

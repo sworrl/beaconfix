@@ -60,9 +60,10 @@ public:
     QList<Fix> loadFixes() const;
     void saveFixes(const QList<Fix> &fixes);                   // rewrite (departures change)
     void appendFix(const Fix &f);
-    // Places
-    bool loadPois(QList<Poi> *pois, double *lat, double *lon, int *radiusM, QDateTime *time) const;
-    void savePois(const QList<Poi> &pois, double lat, double lon, int radiusM, const QDateTime &time);
+    // Places. scope "near": the main query around the fix (kv poi_*); "far": the pediatric ER search (kv peds_*).
+    // Both share the table: a place in both lists is stored once, as near (the merged view prefers near anyway).
+    bool loadPois(QList<Poi> *pois, double *lat, double *lon, int *radiusM, QDateTime *time, const QString &scope = QStringLiteral("near")) const;
+    void savePois(const QList<Poi> &pois, double lat, double lon, int radiusM, const QDateTime &time, const QString &scope = QStringLiteral("near"));
     // Elevation cells
     QHash<QString, double> loadElevation() const;
     void saveElevation(const QHash<QString, double> &cells);
