@@ -6,7 +6,7 @@ import androidx.room.RoomDatabase
 @Database(
     entities = [ApEntity::class, ObservationEntity::class, FixEntity::class, PoiEntity::class, DesktopEntity::class, IdentityEntity::class, PendingLinkEntity::class, AnchorEntity::class],
     version = 3,
-    exportSchema = false,
+    exportSchema = true,
 )
 abstract class AppDatabase : RoomDatabase() {
     abstract fun aps(): ApDao

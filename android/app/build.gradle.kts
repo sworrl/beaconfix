@@ -90,7 +90,11 @@ android {
         disable += listOf("MissingTranslation")
     }
     testOptions { unitTests.isReturnDefaultValues = true }
+    // Room schema history (app/schemas) doubles as the MigrationTest's assets.
+    sourceSets["androidTest"].assets.srcDir("$projectDir/schemas")
 }
+
+ksp { arg("room.schemaLocation", "$projectDir/schemas") }
 
 dependencies {
     implementation(libs.androidx.core.ktx)
@@ -148,4 +152,5 @@ dependencies {
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
+    androidTestImplementation(libs.androidx.room.testing)
 }
