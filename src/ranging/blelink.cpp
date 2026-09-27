@@ -225,13 +225,17 @@ void BleLink::registerAdvert()
     attempt(true, attempt);
 }
 
+// Asynchronous, like probeTxPower(): this runs on the tray's GUI thread (every tag rotation, interval or flag change),
+// and a busy bluetoothd must not freeze it. Messages on one connection are delivered in order and bluetoothd drops the
+// advertisement before it answers, so a RegisterAdvertisement sent right after finds the path free.
 void BleLink::unregisterAdvert()
 {
     if (!m_advertising) return;
     QDBusMessage call = QDBusMessage::createMethodCall(kBluez, m_adapter, QStringLiteral("org.bluez.LEAdvertisingManager1"),
                                                        QStringLiteral("UnregisterAdvertisement"));
     call << QVariant::fromValue(QDBusObjectPath(kAdvPath));
-    QDBusConnection::systemBus().call(call, QDBus::BlockWithGui, 3000);
+    auto *w = new QDBusPendingCallWatcher(QDBusConnection::systemBus().asyncCall(call, 3000), this);
+    connect(w, &QDBusPendingCallWatcher::finished, w, &QObject::deleteLater);
     m_advertising = false;
     emit advertisingChanged(false);
 }
@@ -275,7 +279,9 @@ void BleLink::dutyTick()
 }
 
 // BlueZ only emits RSSI when it changes; a still link repeats values that never arrive as events.
-// Re-emit the held value once a second while the device keeps advertising (last event < 10 s).
+// Re-emit the held value once a second while the device keeps advertising (last event < 10 s), marked `held`:
+// it keeps a still link's level weighted by time, but it is not a new measurement, and the ranging service does
+// not count it as one (feeding it as fresh samples made the BLE filter overconfident).
 void BleLink::holdTick()
 {
     const qint64 now = nowMs();
@@ -285,7 +291,7 @@ void BleLink::holdTick()
         const RangeMath::BleAdvert a = RangeMath::parseServiceData(d.serviceData);
         if (!a.valid) continue;
         emit sample(a.tag, d.rssi, d.txPower != 127 ? d.txPower : a.txPower, a.kind, int(quint8(d.serviceData.at(9))), now,
-                    it.key().section(QLatin1Char('/'), -1).mid(4).replace(QLatin1Char('_'), QLatin1Char(':')));
+                    it.key().section(QLatin1Char('/'), -1).mid(4).replace(QLatin1Char('_'), QLatin1Char(':')), true);
     }
 }
 

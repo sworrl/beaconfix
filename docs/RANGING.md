@@ -7,7 +7,8 @@ surveyed **anchors** (an antenna you place on a map) turn those metres into abso
 Everything here is implemented twice, in C++ (`src/ranging/rangemath.*`, `src/ranging/anchors.*`)
 and in Kotlin (`android/…/ranging/RangeMath.kt`), and both must reproduce the test vectors in §11.
 
-Status: spec v1 (2026-09-27). Protocol names in §4 (anchors) and §7 (endpoints) are frozen.
+Status: spec v1 (2026-09-27), polished for 3.8 / Android 1.4 (link-offset drift, calibration acceptance, TX-power
+references, RTT pacing). Protocol names in §4 (anchors) and §7 (endpoints) are frozen; 3.8 only adds fields.
 
 ---
 
@@ -66,6 +67,10 @@ Priors for `P0` when nothing is calibrated yet:
 |---|---|---|
 | BLE beacon with advertised TX power `t` | `t − 41` | 6 dB |
 | BLE beacon, TX power unknown (`127`) | −59 | 8 dB |
+
+`t` is byte 8 of the advert (§9.1), or, when that says 127, the TX-power AD (BlueZ `Device1.TxPower`, Android
+`ScanResult.getTxPower()`). The desktop's own down links (a peer hearing us) use the level it advertises; while its byte 8
+says 127 (a BlueZ without `CanSetTxPower`), the level the peer reports for our advert (`ble[].txPower`) stands in (3.8).
 | Wi-Fi AP, 2.4 GHz | −40 | 8 dB |
 | Wi-Fi AP, 5 GHz / 6 GHz | −46.5 / −48.2 (Friis ratio to 2.437 GHz) | 8 dB |
 
@@ -268,11 +273,15 @@ advert), `b_2` = `ble-up` (the desktop hears the phone's). Prior `u₀ = log10(1
 (±1 decade); `b_k ~ N(0, 82.34 dB²)` = `σ_P0² + σ_s² + σ_ff²` = `36 + 36 + 5.57²/3` — the last term
 is the **frozen multipath fade**: a still device sees one Rayleigh draw per advertising channel,
 averaged over BLE's three channels that is a constant error of variance `5.57²/3`, which belongs in
-the link offset, not in the per-sample noise. `e_c ~ N(0, 0.5²)` before calibration.
+the link offset, not in the per-sample noise. `e_c ~ N(0, 0.5²)` is the filter's default (the test vectors and the
+phone's local filter use it); the desktop starts an uncalibrated pair at `N(0, 2²)` (§8).
 
 * **Predict** over `Δt` seconds: `P_uu += q·Δt`, `q = 0.002²/s` still, `0.05²/s` moving.
-  Still: offsets drift by `P_bb += 10⁻⁴·Δt`. **Moving**: moving more than λ/2 draws a new fade, so
-  each offset's variance is re-inflated by `σ_ff²` (capped at the prior). `P_cc += 10⁻⁶·Δt`.
+  Still: offsets drift by `P_bb += 2.5·10⁻³·Δt` dB² (σ 3 dB per √hour: people moving about, doors, temperature and
+  the phone's orientation change a static link by several dB over an hour). Until 3.8 it was `10⁻⁴` (0.6 dB per √hour):
+  a filter that had run for hours trusted its offsets so much that it read 1.0 m [0.87, 1.15] for a true 0.6 m; in the
+  2-hour simulation of §10 its interval held the truth in 38 % of runs, 82 % now. **Moving**: moving more than λ/2
+  draws a new fade, so each offset's variance is re-inflated by `σ_ff²` (capped at the prior). `P_cc += 10⁻⁶·Δt`.
 * **RSSI update** (link `k`, level `L`, `σ_L`, model `P0_k`, `n_k`):
   `h = P0_k − 10·n_k·u + b_k`, `H = [−10·n_k, …, 1 (at b_k), …]`, `R = σ_L²`, Huber `k = 2.5`
   (`R ← R·|z|/k` when `|z| > k`).
@@ -468,7 +477,17 @@ a reason: `ok`, `doze`, `wifi-off`, `location-off`, `unavailable`, `unsupported`
 the collector is off and the app is in the background), `away` (1.3.2: the desktop has not answered
 for 5 min, or neither the responder's beacon nor the desktop's BLE advert was heard in the last few
 minutes, in which case one probe burst a minute), `backoff` (1.3.2: the last bursts got no answer; two quick
-retries, then 5 s doubling to 2 min), or `failed:<code>`.
+retries, then 5 s doubling to 2 min), `slow` (1.4.0: bursts are paced, see below), or `failed:<code>`.
+
+**Pacing (Android 1.4.0).** While a session runs (app open or collector on) the loop ticks every 2.5 s, and 1.3.x fired
+an 8-exchange burst on every tick for as long as the session lasted. Now (`RttPacer`): a burst every tick while anything
+changes; once the fused distance has held for **2 min** (within max(0.5 m, 20 %) of where the quiet period began) with
+**neither side moving** (the phone's accelerometer, the desktop's `trip.moving`), **one burst every 30 s** (`rttState`
+`slow` on the ticks between). Back to a burst every tick at once when either side moves, when the level of the desktop's
+advert (linear mean over 10 s) moves by more than **6 dB**, when the distance leaves its band, or when the user opens the
+app or a ranging view (the Home desktop card, the map; `RangingRepository.boost`). While slow the phone posts with each
+burst and at least every 10 s (the desktop's BLE window), carrying the advert samples of the ticks in between;
+`ok` ↔ `slow` alone does not count as an `rttState` change.
 In deep Doze the app waits a minute between ticks (or until `rttState` changes) instead of 2.5 s,
 advertises at 1 s and scans at the low-power rate; unanswered POSTs back off from 5 s to 5 min. The
 minute is a coroutine timer on the monotonic clock, which stops while the CPU sleeps and the app holds
@@ -497,10 +516,14 @@ answered bursts, one every ~2.65 s).
    "samples": {"rtt": 30, "ble": 412, "bleDown": 200, "bleUp": 212, "wifiDiff": 11,
                "since": "2026-09-27T07:39:43.159", "total": {"rtt": 139, "bleDown": 200, "bleUp": 7354}},
    "lastRtt": "…", "rttState": "doze", "rttStateAt": "…",
-   "calib": {"rttOffsetM": 0.57, "bleP0": -47.2, "bleN": 2.0, "bleP0Up": -49.8}}]}
+   "calib": {"rttOffsetM": 0.57, "rttOffsetSigmaM": 0.13, "bleP0": -47.2, "bleN": 2.0, "bleP0Up": -49.8, "bleNUp": 2.0,
+             "calibrated": true, "calibratedAt": "…", "distanceM": 0.61, "rttCalibrated": true,
+             "last": {"at": "…", "ok": true, "distanceM": 0.61, "rttBursts": 11, "rttAgreed": 9, "text": "Ranging calibrated with …"}}}]}
 ```
 `samples` counts since the tray started (`since`); `total` adds earlier runs (kept in
-`ranging.json`, written at most once a minute). `rttState` is the peer's last `rttState`.
+`ranging.json`, written at most once a minute). `rttState` is the peer's last `rttState`. `calib.rttCalibrated`
+(3.8): a calibration measured the RTT pair offset (it gates the automatic BLE learning of §8); `calib.last` (3.8): the
+outcome of the last calibration, failed ones included.
 
 `POST /ranging/calibrate` (control): `{"device": "…", "distanceM": 0.61, "durationS": 20}` — §8.
 
@@ -511,12 +534,19 @@ answered bursts, one every ~2.65 s).
   20 s, 5–120) of RTT and BLE in both directions without feeding the filter, then:
   * RTT: `c = m − D`, where `m` is the median of the **densest 2 m cluster** of the window's bursts
     (the nearest one on a tie: time-of-flight errors are late). It needs `N ≥ 3` bursts in that
-    cluster and at least 30 % of all bursts; otherwise `c` is left as it was. A plain median was not
+    cluster and at least 30 % of all bursts. A plain median was not
     robust enough: in the 0.6 m calibration of 2026-09-27 the Pixel reported 8 bursts at 14.4–14.7 m
     and 7 at 196–408 m, the median landed on the cluster's edge (c 14.11 m instead of 13.95 m), and one
     more bad burst would have made it ~200 m. The median of the `N` cluster bursts has
-    `σ ≈ 1.2533·σ_burst/√N`, plus 5 cm for the tape measure: `e_c` is reset to
-    `N(0, (1.2533·σ_b/√N)² + 0.05²)`. The event log says how many bursts agreed.
+    `σ ≈ 1.2533·σ_b/√N`, plus 5 cm for the tape measure: `e_c` is reset to
+    `N(0, (1.2533·σ_b/√N)² + 0.05²)`. `σ_b` comes from the cluster's bursts only (3.8; it was the
+    largest σ of *all* bursts, outliers included): the larger of their RMS reported σ and their scatter
+    (sample SD, with 3 or more), floored at 0.3 m. The event log says how many bursts agreed.
+  * **When RTT disagrees, nothing changes (3.8).** Three or more bursts of which fewer than 3, or fewer
+    than 30 %, fall into one 2 m cluster make the whole window suspect (the phone moved, heavy multipath):
+    the calibration fails — no RTT offset, no BLE model, no log-range update, and the peer keeps its
+    previous `calibrated` state. The event log and `calib.last` say why. With fewer than 3 bursts (a phone
+    in Doze) the BLE links calibrate alone and `c` stays; with no usable RTT and no BLE it fails too.
   * BLE, each link: an RLS update at `x = log10 D` with the window's level (`R = σ_L²`), which
     moves `P0` and leaves `n` at its prior; the link offset `b_k` is reset to 0 with variance
     `max(σ_L², σ_ff²) + σ_ff²`. The calibration pins `P0` and the shadowing, **not** the fade at
@@ -527,7 +557,8 @@ answered bursts, one every ~2.65 s).
   Calibrations persist per device in `~/.local/state/beaconfix/ranging.json`; the filter state does not.
 * **Automatic.** Whenever the range filter's `√P_uu < 0.05` with RTT in the last 30 s, each BLE
   level is also an RLS sample at `x = u` (RTT-supervised) — **only once the pair's RTT offset has
-  been calibrated** (a calibration window that had RTT bursts). An uncalibrated pair is not a known
+  been calibrated** (a calibration whose bursts agreed: `calib.rttCalibrated`, kept in `ranging.json`; a file
+  from before 3.8 counts when its stored offset variance is below the 0.25 m² prior of the time). An uncalibrated pair is not a known
   distance: the Pixel 10 Pro XL ↔ AX210 pair read ~11 m at 0.6 m on 2026-09-27 and the automatic
   step had taught both BLE links that bias. Until then `e_c` starts at `N(0, 2²)` (σ 2 m, was 0.5 m),
   which also keeps `√P_uu` above the gate. A calibration restarts each link that has samples in the
@@ -577,7 +608,24 @@ differs from the request) and reports `ble.txPowerConfirmed: true`. The capabili
 asynchronous (the advert is registered when BlueZ has answered or after 2 s). Before 3.7.0's
 fix it said 127 while the controller picked 10 dBm on its own, and every down link used the −59 dBm
 "unknown" prior instead of `tx − 41` — a 25–28 dB wrong reference. Without `CanSetTxPower` byte 8
-stays 127. Scanners that see 127 fall back to the TX-power AD (BlueZ `Device1.TxPower`).
+stays 127. Scanners that see 127 fall back to the TX-power AD (BlueZ `Device1.TxPower`), and the desktop's
+down-link prior then uses the level the peer reports for our advert (`ble[].txPower`, §3.1).
+The desktop registers and unregisters its advert asynchronously (3.8: `UnregisterAdvertisement`, sent on every
+tag rotation and interval change, was a 3 s blocking call on the tray's GUI thread).
+
+**The Pi agent's TX power (3.8).** The agent did not say its own: byte 8 was 127 and its advert had no TX-power AD,
+so the desktop's up link from it used the −59 dBm "unknown" reference. It now asks BlueZ the same way (7 dBm through
+`LEAdvertisement1.TxPower` when `CanSetTxPower` is offered, clamped to Min/MaxTxPower), puts the level into byte 8,
+adopts the level BlueZ writes back as selected (re-registering once), and asks for the TX-power AD (`Includes:
+["tx-power"]`; 28 + 3 = 31 bytes, a full legacy advert; without it if BlueZ refuses) so that a controller that cannot
+set its level still tells scanners what it uses. A node configured as kind `gnss` advertises kind 4, otherwise 3 (pi);
+never a desktop or phone kind.
+
+**Held RSSI (3.8).** BlueZ reports a device's RSSI only when it changes, so a still link goes quiet. The desktop's
+`BleLink` therefore repeats the held value once a second while the device keeps advertising (its last report < 10 s
+old), flagged `held`: it keeps a still link's level weighted by time, but it is not a measurement. `N_eff` (§3.2)
+counts reported samples only, and a window of repeats alone is no update (until 3.8 every repeat counted as a new
+sample, which made the BLE filter overconfident).
 
 **Who is who.** The desktop resolves a tag by computing the tags of every identity it knows —
 paired devices that signed in with an identity, linked identities, and **pending link requests**
@@ -586,8 +634,12 @@ The **Pi agent** has no identity; its advert's tag is made from
 `beacon_id = hex(SHA-256("beaconfix-agent-beacon-v1|" + desktopIdentityId + "|" + deviceName))[:26]`,
 which the desktop derives for every paired device without an identity. (It used to advertise the
 desktop's own identity with kind `pi`: phones counted it as the desktop, and the desktop dropped it
-as its own advert.) A phone attributes a desktop's tag only to an advert of kind `desktop` or
-`laptop`.
+as its own advert.) A desktop's tag belongs only to an advert of kind `desktop` or `laptop`, everywhere:
+a phone attributes a desktop's tag only to such an advert, the agent reports only adverts of kind
+`desktop` as the desktop's down link (`ble[]`), and the desktop (3.8) drops an advert with its own tag as its own, or
+counts one with a paired desktop's or laptop's tag as that device, only when its kind bits say desktop
+or laptop. An agent from before 3.7 (the desktop's tag, kind `pi`) is therefore no longer dropped: it
+is resolved like an unknown advert and bound to the Pi that is posting `/ranging`.
 An unknown tag of the same kind as the one device that is posting `/ranging` right now is bound to
 that device for the window (session binding). The kind bits also tell the desktop what a device is
 (`linkedDevices[].kind`).
@@ -654,23 +706,25 @@ every one containing 0.6 m. Before this calibration the same links read 10.7–1
 
 **Accuracy in simulation** (`tests/ranging_math_test.cpp`, deterministic SplitMix64; realistic
 Rayleigh fades, shadowing, device gain, NLOS bursts; the fade is redrawn when the phone is put
-down after calibrating):
+down after calibrating; in the 2-hour run both links' offsets random-walk at σ 3 dB per √hour):
 
 | Scenario | Estimate | 16–84 % interval | Error |
 |---|---|---|---|
-| 0.6 m, BLE only, uncalibrated | 0.85 m | [0.42, 1.72] | +41 % |
+| 0.6 m, BLE only, uncalibrated | 0.85 m | [0.42, 1.72] | +42 % |
 | 0.6 m, BLE only, calibrated at 0.61 m | 0.67 m | [0.47, 0.97] | +12 % |
 | 0.6 m, RTT 80 MHz (+0.55 m pair offset) + BLE, calibrated | 0.63 m | [0.54, 0.74] | +5 % |
 | 3 m, RTT 20 MHz + BLE, calibrated at 0.61 m | 3.30 m | [3.04, 3.59] | +10 % |
 | 12 m, RTT 20 MHz, 30 % NLOS bursts + BLE | 12.19 m | [11.85, 12.54] | +2 % |
 | 4 m, BLE link offset learned away by RTT | 4.01 m | [3.51, 4.58] | 0 % |
+| 0.6 m for 2 h: RTT 10 min, then BLE only, drifting links | 0.59 m | [0.43, 0.81] | −1 % |
 
 | Monte Carlo (200 runs) | RMS error | Interval covers the truth |
 |---|---|---|
 | BLE calibrated, 0.6 m | 0.216 m | 76 % |
-| RTT + BLE, 0.6 m | 0.066 m | 86 % |
+| RTT + BLE, 0.6 m | 0.067 m | 86 % |
 | 3 m | 0.244 m | 72 % |
 | 12 m, NLOS | 0.362 m | 67 % |
+| 0.6 m for 2 h, RTT 10 min then BLE only, drifting links | 0.137 m | 82 % (38 % and 0.238 m with the drift of 3.7) |
 
 (The ideal coverage of a 16–84 % interval is 68 %.) Trilateration from RTT rings to three
 anchors: RMS 0.63 m against a reported 0.63 m. Rayleigh: the mean of dB is biased −2.49 dB, the
@@ -717,22 +771,32 @@ to 1e-9 relative.
   1.2000000000000028
  ],
  "filter": [
-  0.07689184589073313,
-  -2.346394966745461,
-  -3.216254519170332,
-  0.03199376149468647,
-  0.6099619659885955,
-  15.451403824803288,
-  11.340684557362152,
-  16.862234789129364,
-  1.193690797804488,
-  0.49163204865477367,
-  0.7907220427756135,
-  1.802020993067806,
+  0.07689093392987602,
+  -2.346415535374766,
+  -3.216278090901163,
+  0.031994050882637924,
+  0.6099683097169435,
+  15.463545696660228,
+  11.340825811962223,
+  16.87439220342253,
+  1.1936882912146383,
+  0.49163323972359524,
+  0.7907189095276757,
+  1.8020205656066342,
   -0.051605713228050784,
-  -0.1224998190898708,
-  -0.19449382951591473,
-  -0.8251881985773648
+  -0.12249847699217876,
+  -0.1944921230282392,
+  -0.8251850909005902
+ ],
+ "filter_drift": [
+  0.6298835297924379,
+  2.2340875206714412,
+  0.18792407716665965,
+  3.578842109814038,
+  82.34179352734864,
+  91.34179352734864,
+  0.253602,
+  0.4333269413222595
  ],
  "filter_rtt_robust": [
   1.3733860610084303,

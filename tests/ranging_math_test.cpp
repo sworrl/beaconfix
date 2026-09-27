@@ -45,6 +45,7 @@ struct Scenario {
     double p0DownPrior, p0UpPrior;           // what the filter starts from (from TX power)
     bool calibrate; double calDist, calSeconds;
     uint64_t seed;
+    double driftDb2PerS = 0;                 // the links' true offsets random-walk at this rate (dB²/s) after calibrating
 };
 struct Result { double est, low, high; QString cls; double rttOffset; };
 
@@ -68,6 +69,10 @@ static Result runScenario(const Scenario &sc, bool print)
         const bool calPhase = t <= calEnd;
         const double dNow = calPhase ? sc.calDist : sc.d;       // the devices sit at calDist while calibrating
         f.predict(1.0, false);
+        if (!calPhase && sc.driftDb2PerS > 0) {                 // a still link is not frozen for hours: people, doors, temperature
+            down.shadow += std::sqrt(sc.driftDb2PerS) * rng.normal();
+            up.shadow += std::sqrt(sc.driftDb2PerS) * rng.normal();
+        }
         if (sc.rtt && (t <= sc.rttUntilS + calEnd)) {
             double m = dNow + sc.rttOffsetTrue + sc.rttSingle / std::sqrt(8.0) * rng.normal();
             if (rng.uniform() < sc.nlosP) m += rng.expo(2.0);
@@ -134,14 +139,16 @@ static void scenarios()
         {"3 m, RTT 20 MHz + BLE, calibrated at 0.61 m",                   3.0,  120, true,  2.5, 0.55, 0,   1e9, true, -59, -48, true, 0.61, 20, 14},
         {"12 m, RTT 20 MHz, 30% NLOS bursts + BLE, calibrated",           12.0, 120, true,  2.5, 0.55, 0.3, 1e9, true, -59, -48, true, 0.61, 20, 15},
         {"4 m, BLE prior 8 dB off, RTT for 60 s then gone",               4.0,  180, true,  0.7, 0.0,  0,   60, true, -51, -40, false, 0,   0,  16},
+        {"0.6 m for 2 h: RTT 10 min, then BLE only, links drift",         0.6, 7200, true,  0.7, 0.55, 0,  600, true, -59, -48, true, 0.61, 20, 17, 2.5e-3},
     };
-    Result R[6];
-    for (int i = 0; i < 6; ++i) R[i] = runScenario(S[i], true);
+    Result R[7];
+    for (int i = 0; i < 7; ++i) R[i] = runScenario(S[i], true);
     check(R[1].high < 2.0, "calibrated BLE at 0.6 m should classify adjacent");
     check(std::fabs(R[2].est - 0.6) < 0.25, "RTT+BLE at 0.6 m within 25 cm");
     check(std::fabs(R[3].est - 3.0) < 1.0, "3 m within 1 m");
     check(std::fabs(R[4].est - 12.0) < 3.0, "12 m with NLOS within 3 m");
     check(std::fabs(R[5].est - 4.0) / 4.0 < 0.3, "offset learned away: 4 m within 30 % after RTT is gone");
+    check(R[6].low <= 0.6 && 0.6 <= R[6].high, "2 h with drifting links: the interval still holds the truth");
 
     // Honest error bars: how often does the [low, high] (16–84 %) interval contain the truth?
     {
@@ -149,7 +156,9 @@ static void scenarios()
             {"cov: 0.6 m BLE calibrated", 0.6, 120, false, 0, 0, 0, 0, true, -59, -48, true, 0.61, 20, 0},
             {"cov: 0.6 m RTT 80 MHz + BLE", 0.6, 120, true, 0.7, 0.55, 0, 1e9, true, -59, -48, true, 0.61, 20, 0},
             {"cov: 3 m RTT 20 MHz + BLE", 3.0, 120, true, 2.5, 0.55, 0, 1e9, true, -59, -48, true, 0.61, 20, 0},
-            {"cov: 12 m RTT 20 MHz NLOS + BLE", 12.0, 120, true, 2.5, 0.55, 0.3, 1e9, true, -59, -48, true, 0.61, 20, 0}};
+            {"cov: 12 m RTT 20 MHz NLOS + BLE", 12.0, 120, true, 2.5, 0.55, 0.3, 1e9, true, -59, -48, true, 0.61, 20, 0},
+            // A long run: the filter must not trust its link offsets more than the drifting world allows
+            {"cov: 0.6 m 2 h, RTT 10 min then BLE, drift", 0.6, 7200, true, 0.7, 0.55, 0, 600, true, -59, -48, true, 0.61, 20, 0, 2.5e-3}};
         for (const Scenario &b : base) {
             int inside = 0; double se = 0; const int T = 200;
             for (int k = 0; k < T; ++k) {
@@ -272,6 +281,12 @@ static QJsonObject vectors()
     f2.updateRtt(25.0, 0.4, 0.0);                               // far outlier vs the 10 m prior, NLOS side
     f2.updateRtt(4.0, 0.4, 0.0);
     v["filter_rtt_robust"] = QJsonArray{f2.x[0], f2.P[0][0], f2.distanceM()};
+    RangeFilter f3(2);                                          // the process model over an hour still, then moving
+    f3.updateRssi(0, -60, 2.0, -48, 2.0);
+    f3.predict(3600, false);
+    const double z5 = f3.updateRssi(0, -58, 2.0, -48, 2.0);
+    f3.predict(2, true);
+    v["filter_drift"] = QJsonArray{f3.x[0], f3.x[1], f3.P[0][0], f3.P[0][1], f3.P[1][1], f3.P[2][2], f3.P[3][3], z5};
 
     Rls2 r(-59, 2.0);
     r.update(std::log10(0.61), -44.3, 16);
@@ -358,7 +373,8 @@ static const char *kExpectedVectors = R"JSON({
 "chi2_6_-":2.7560888499578042,
 "classify":["unknown","adjacent","room","far","near","unknown"],
 "enu":[1.7054479876969342,2.0037599996868494,1.2000000000000028],
-"filter":[0.07689184589073313,-2.346394966745461,-3.216254519170332,0.03199376149468647,0.6099619659885955,15.451403824803288,11.340684557362152,16.862234789129364,1.193690797804488,0.49163204865477367,0.7907220427756135,1.802020993067806,-0.051605713228050784,-0.1224998190898708,-0.19449382951591473,-0.8251881985773648],
+"filter":[0.07689093392987602,-2.346415535374766,-3.216278090901163,0.031994050882637924,0.6099683097169435,15.463545696660228,11.340825811962223,16.87439220342253,1.1936882912146383,0.49163323972359524,0.7907189095276757,1.8020205656066342,-0.051605713228050784,-0.12249847699217876,-0.1944921230282392,-0.8251850909005902],
+"filter_drift":[0.6298835297924379,2.2340875206714412,0.18792407716665965,3.578842109814038,82.34179352734864,91.34179352734864,0.253602,0.4333269413222595],
 "filter_rtt_robust":[1.3733860610084303,0.00012094918043716869,23.62577485657404],
 "fingerprint":[-3.450000000000003,2.6597122993644633,13.321666666666667,0,0,0,0,6,-10.255926479189677,-13.444994423861454],
 "fingerprint_far":[4,54.952733457943324,44.702733457943324,4.666438293955714,1.9159647199595962,17.307883242697173],

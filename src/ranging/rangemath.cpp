@@ -72,7 +72,7 @@ void RangeFilter::predict(double dtS, bool moving)
     P[0][0] += (moving ? 0.0025 : 4e-6) * dtS;
     // Moving more than λ/2 draws a new multipath fade: the link offsets lose that part of their knowledge.
     for (int k = 1; k < nx - 1; ++k) P[k][k] = moving ? std::min(P[k][k] + kFrozenFadeVar, std::max(P[k][k], offsetVarCap))
-                                                    : P[k][k] + 1e-4 * dtS;
+                                                    : P[k][k] + kOffsetDrift * dtS;
     P[nx - 1][nx - 1] += 1e-6 * dtS;
 }
 

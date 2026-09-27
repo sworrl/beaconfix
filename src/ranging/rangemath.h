@@ -24,6 +24,10 @@ constexpr double kZ84 = 0.9944578832097535;          // Φ⁻¹(0.84)
 // it is a constant error of variance 5.57²/3 dB² that belongs in the link offset, not in the noise.
 constexpr double kFrozenFadeVar = kRayleighDbStd * kRayleighDbStd / 3.0;
 constexpr double kOffsetVar0 = 36.0 + kShadowBle * kShadowBle + kFrozenFadeVar;   // σ_P0² + σ_s² + frozen fade
+// Drift of a still link's offset (dB²/s): σ 3 dB per √hour. People moving about the RV, doors, temperature and the
+// phone's orientation change a static link by several dB over an hour. The first value (10⁻⁴, 0.6 dB per √hour) let a
+// filter that had run for hours trust its offsets so much that it read 1.0 m [0.87, 1.15] for a true 0.6 m.
+constexpr double kOffsetDrift = 2.5e-3;
 
 double fsplDb(double dM, double fMHz);               // 20·log10(d) + 20·log10(f) − 27.55
 double priorP0Ble(int txPower);                      // t − 41, or −59 when t == 127 (unknown)

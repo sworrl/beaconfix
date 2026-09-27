@@ -152,6 +152,7 @@ object RttState {
     const val NO_RESPONDER = "no-responder"     // the desktop serves no responder (ranging/info rtt disabled)
     const val IDLE = "idle"                     // not in a session (collector off, app in the background): RTT is not attempted
     const val AWAY = "away"                     // the desktop is not around (responder not in the Wi-Fi scan, its BLE not heard, or its API not answering): no burst
-    const val BACKOFF = "backoff"               // the last bursts got no answer: waiting (2.5 s doubling to 2 min) before the next one
+    const val BACKOFF = "backoff"               // the last bursts got no answer: two quick retries, then waiting 5 s doubling to 2 min (RangingRepository.backoffMs)
+    const val SLOW = "slow"                     // 1.4: nothing moved and the distance held for 2 min: one burst every 30 s (RttPacer)
     // plus "failed:<code>" for RangingResultCallback.onRangingFailure codes other than RTT_NOT_AVAILABLE
 }

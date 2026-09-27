@@ -56,6 +56,8 @@ object RangeMath {
     const val Z84 = 0.9944578832097535
     const val FROZEN_FADE_VAR = RAYLEIGH_DB_STD * RAYLEIGH_DB_STD / 3.0
     const val OFFSET_VAR0 = 36.0 + SHADOW_BLE * SHADOW_BLE + FROZEN_FADE_VAR
+    /** Drift of a still link's offset (dB²/s): σ 3 dB per √hour (was 10⁻⁴: long-running filters became overconfident). */
+    const val OFFSET_DRIFT = 2.5e-3
     const val BLE_SERVICE_UUID = "28c9f0bf-a089-4a95-b632-5e8ede1b03b6"
     const val KIND_DESKTOP = 0; const val KIND_ANDROID = 1; const val KIND_LAPTOP = 2; const val KIND_PI = 3; const val KIND_GNSS = 4; const val KIND_OTHER = 7
 
@@ -359,7 +361,7 @@ class RangeFilter(offsets: Int = 2, u0: Double = 1.0, puu0: Double = 1.0, offset
     fun predict(dtS: Double, moving: Boolean) {
         if (!(dtS > 0)) return
         p[0][0] += (if (moving) 0.0025 else 4e-6) * dtS
-        for (k in 1 until nx - 1) p[k][k] = if (moving) min(p[k][k] + RangeMath.FROZEN_FADE_VAR, max(p[k][k], offsetVarCap)) else p[k][k] + 1e-4 * dtS
+        for (k in 1 until nx - 1) p[k][k] = if (moving) min(p[k][k] + RangeMath.FROZEN_FADE_VAR, max(p[k][k], offsetVarCap)) else p[k][k] + RangeMath.OFFSET_DRIFT * dtS
         p[nx - 1][nx - 1] += 1e-6 * dtS
     }
 
