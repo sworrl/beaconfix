@@ -269,6 +269,17 @@ class TestBle(unittest.TestCase):
         b.tx_settable, b.tx = A.adv_tx_request(A.BLE_TX_DBM, False)
         self.assertEqual(A.parse_service_data(b.service_data(1790478720.0))["txPower"], 127)
 
+    def test_adv_errors_only_drop_tx_for_a_wrong_shape(self):
+        self.assertTrue(A.adv_error_is_shape("org.bluez.Error.InvalidLength", "Advertising data too long"))
+        self.assertTrue(A.adv_error_is_shape("org.bluez.Error.Failed", "Failed to parse advertisement."))
+        self.assertTrue(A.adv_error_is_shape("org.bluez.Error.InvalidArguments", ""))
+        # bluetoothd busy / a registration that outlived the timeout / no free instance: retry, keep the TX power
+        self.assertFalse(A.adv_error_is_shape("org.freedesktop.DBus.Error.NoReply", "Did not receive a reply"))
+        self.assertFalse(A.adv_error_is_shape("org.bluez.Error.AlreadyExists", "Already Exists"))
+        self.assertFalse(A.adv_error_is_shape("org.bluez.Error.NotPermitted", "Maximum advertisements reached"))
+        self.assertFalse(A.adv_error_is_shape("", "Failed to register advertisement"))
+        self.assertEqual([A.adv_retry_delay(x) for x in (0, 2, 4, 32, 60)], [2, 4, 8, 60, 60])
+
     def test_adv_properties_fit_a_legacy_advert(self):
         sd = A.ble_service_data(self.IDENT, 0.0, tx_power=7)
         p = A.adv_properties(sd, 7, True, True)

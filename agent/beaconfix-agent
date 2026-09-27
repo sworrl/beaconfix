@@ -575,6 +575,23 @@ def adv_properties(sd, tx, settable, with_tx_ad):
     return p
 
 
+def adv_error_is_shape(name, message):
+    """A RegisterAdvertisement error that says the advertisement's SHAPE is wrong (too long, a property BlueZ cannot
+    parse or refuses). Only these drop the TX-power AD or the TxPower request; NoReply (bluetoothd busy past the
+    timeout), AlreadyExists (a registration that outlived it), Failed and NotPermitted are transient: unregister our
+    path and retry. Same rule as the desktop's BleLink::shapeError."""
+    name = name or ""
+    if name.endswith(".InvalidArguments") or name.endswith(".InvalidLength"):
+        return True
+    m = (message or "").lower()
+    return any(k in m for k in ("parse", "too long", "length", "invalid"))
+
+
+def adv_retry_delay(previous):
+    """The next retry delay after a transient registration failure: 2 s, doubling, at most 60 s."""
+    return 2 if not previous else min(60, previous * 2)
+
+
 def max_adv_instances():
     """Controllers differ (a Pi 4 reports 5); ask btmgmt instead of assuming."""
     rc, out, err = run(["btmgmt", "--index", "0", "advinfo"], timeout=8)
@@ -754,7 +771,7 @@ class Ble:
         adv_path = "/org/sworrl/beaconfix/adv0"
         owner = self
 
-        adv_state = {"registered": False, "busy": False, "tx_ad": True, "stale": False, "adoptions": 0}
+        adv_state = {"registered": False, "busy": False, "tx_ad": True, "stale": False, "adoptions": 0, "retry_s": 0}
 
         class Advertisement(dbus.service.Object):
             def __init__(self_, conn):
@@ -797,6 +814,7 @@ class Ble:
             @dbus.service.method("org.bluez.LEAdvertisement1", in_signature="", out_signature="")
             def Release(self_):
                 owner.adv_ok = False
+                adv_state["registered"] = False                # BlueZ dropped it: the next restart() registers it again
 
         adv = Advertisement(bus)
 
@@ -819,7 +837,7 @@ class Ble:
 
             def ok():
                 resume()
-                adv_state.update(registered=True, busy=False)
+                adv_state.update(registered=True, busy=False, retry_s=0)
                 self.adv_ok, self.adv_window, self.adv_ident, self.error = True, w, ident, ""
                 log.info("ble: advertising BeaconFix beacon via BlueZ (tag window %d, TX %s)", w, self.tx if self.tx_settable else "AD")
                 if adv_state["stale"]:                              # BlueZ reported a different selected level meanwhile
@@ -828,19 +846,33 @@ class Ble:
             def fail(e):
                 resume()
                 adv_state["busy"] = False
-                if adv_state["tx_ad"]:                              # the TX-power AD did not fit: go without it (byte 8 still says it)
-                    adv_state["tx_ad"] = False
-                    log.info("ble: advertisement without the TX-power AD (%s)", str(e)[:80])
-                    GLib.timeout_add(200, lambda: (refresh_adv(), False)[1])
-                    return
-                if self.tx_settable:                                # this BlueZ refused the TxPower request: let the controller choose
-                    self.tx_settable, self.tx = False, 127
-                    adv_state["tx_ad"] = True
-                    log.info("ble: TxPower request refused (%s); the controller chooses", str(e)[:80])
-                    GLib.timeout_add(200, lambda: (refresh_adv(), False)[1])
-                    return
-                self.adv_ok, self.error = False, "RegisterAdvertisement: %s" % str(e)[:120]
-                log.warning("ble: %s", self.error)
+                name = e.get_dbus_name() if hasattr(e, "get_dbus_name") else ""
+                msg = (e.get_dbus_message() if hasattr(e, "get_dbus_message") else "") or str(e)
+                if adv_error_is_shape(name, msg):
+                    if adv_state["tx_ad"]:                          # the TX-power AD did not fit: go without it (byte 8 still says it)
+                        adv_state["tx_ad"] = False
+                        log.info("ble: advertisement without the TX-power AD (%s)", msg[:80])
+                        GLib.timeout_add(200, lambda: (refresh_adv(), False)[1])
+                        return
+                    if self.tx_settable:                            # this BlueZ refused the TxPower request: let the controller choose
+                        self.tx_settable, self.tx = False, 127
+                        adv_state["tx_ad"] = True
+                        log.info("ble: TxPower request refused (%s); the controller chooses", msg[:80])
+                        GLib.timeout_add(200, lambda: (refresh_adv(), False)[1])
+                        return
+                # Transient (bluetoothd busy past the timeout, a registration that outlived it, no free instance): nothing
+                # about the advert is wrong, so nothing is dropped. Clear our path, then register again after a back-off.
+                self.adv_ok, self.error = False, "RegisterAdvertisement: %s" % msg[:120]
+                adv_state["registered"] = False
+                delay = adv_state["retry_s"] = adv_retry_delay(adv_state["retry_s"])
+                log.warning("ble: %s (%s); retrying in %d s", self.error, name or "?", delay)
+
+                def retry():
+                    if self.stop.is_set():
+                        return False
+                    advmgr.UnregisterAdvertisement(adv_path, reply_handler=lambda: refresh_adv(), error_handler=lambda _e: refresh_adv())
+                    return False
+                GLib.timeout_add_seconds(delay, retry)
 
             def register():
                 # The Pi's Broadcom controller rejects a new advertisement (0x03) while an LE scan runs, and
@@ -893,6 +925,22 @@ class Ble:
             except Exception as ex:                                # noqa: BLE001
                 log.debug("ble: restart discovery: %s", ex)
             return True
+
+        # bluetoothd restarted (or went away and came back): the new one knows nothing of our advertisement
+        bluez_seen = {"owner": None}
+
+        def bluez_owner(new_owner):
+            first, bluez_seen["owner"] = bluez_seen["owner"] is None, new_owner
+            if first or not new_owner:                             # (watch_name_owner reports the current owner at once)
+                return
+            log.info("ble: BlueZ (re)started: advertising again")
+            adv_state.update(registered=False, busy=False, retry_s=0)
+            self.adv_ok = False
+            GLib.timeout_add(2000, lambda: (restart(), False)[1])
+        try:
+            bus.watch_name_owner("org.bluez", bluez_owner)
+        except Exception as ex:                                    # noqa: BLE001
+            log.debug("ble: cannot watch org.bluez: %s", ex)
 
         GLib.timeout_add(500, tick)
         GLib.timeout_add_seconds(120, restart)
