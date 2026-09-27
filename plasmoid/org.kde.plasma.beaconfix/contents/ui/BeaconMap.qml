@@ -721,7 +721,9 @@ Item {
             for (var i = tiles.count - 1; i >= 0; i--) {
                 var t = tiles.get(i)
                 if (t.lk !== lk) { tiles.remove(i); continue }
-                if (t.tz === z) { if (need[t.k] !== undefined) have[t.k] = true; else tiles.remove(i) }
+                // a tile of this level marked stale by a zoom step that was undone is current again: prune() would
+                // otherwise drop it, and with the same view refresh() stops early, so the map stayed blank
+                if (t.tz === z) { if (need[t.k] !== undefined) { have[t.k] = true; if (t.stale) tiles.setProperty(i, "stale", false) } else tiles.remove(i) }
                 else {                          // other level: keep only while it still covers the view
                     var on = Math.pow(2, t.tz), ax = map.toMerc(0, 0), bx = map.toMerc(map.width, map.height)
                     var vis = (t.tx + 1) / on > ax.x && t.tx / on < bx.x && (t.ty + 1) / on > ax.y && t.ty / on < bx.y
