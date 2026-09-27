@@ -85,11 +85,12 @@ void RangingService::start()
 }
 
 // The reference of every down link (a peer hearing us) is our TX power: −59 dBm was the "unknown" prior
-// while our advert said 127, ~30 dB below what a 7–10 dBm advert gives at 1 m.
+// while our advert said 127, ~30 dB below what a 7–10 dBm advert gives at 1 m. When BlueZ cannot set it (byte 8
+// stays 127) the level the peer reports for our advert (its TX-power AD fallback) stands in (downTxOf).
 void RangingService::applyOurTx(int tx)
 {
     m_ourTx = tx;
-    for (Peer &p : m_peers) if (!p.calibrated) p.rlsDown = Rls2(priorP0Ble(tx), kNBle);
+    for (Peer &p : m_peers) if (!p.calibrated) p.rlsDown = Rls2(priorP0Ble(downTxOf(p)), kNBle);
 }
 
 // The Pi agent has no identity of its own. It used to advertise OUR tag (kind pi), so phones counted it as this
@@ -189,14 +190,27 @@ void RangingService::flushUp(Peer &p, qint64 nowMs_, bool force)
     if (p.winUp.empty()) return;
     const double span = (nowMs_ - p.winUpStartMs) / 1000.0;
     if (!force && span < (p.firstUp ? kFirstWindowS : kWindowS)) return;
-    const Level L = levelFromSamples(p.winUp, 3, std::max(1.0, span), p.moving);
+    // Only what BlueZ reported is a measurement; BleLink's held repeats of an unchanged RSSI weight the level by time
+    // but add no information (a window of repeats alone is no update at all).
+    const Level L = freshLevel(p.winUp, p.winUpFresh, std::max(1.0, span), p.moving);
     if (L.valid) {
         advance(p, nowMs_);
         if (rttCalibrated(p) && std::sqrt(p.f.puu()) < 0.05 && nowMs_ - p.lastRttMs < 30000) p.rlsUp.update(p.f.u(), L.dbm, L.sigma * L.sigma);
         p.f.updateRssi(1, L.dbm, L.sigma, p.rlsUp.p0, p.rlsUp.n);
-        p.nBleUp += L.n;
+        p.nBleUp += p.winUpFresh;
     }
-    p.winUp.clear(); p.winUpStartMs = 0; p.firstUp = false;
+    p.winUp.clear(); p.winUpFresh = 0; p.winUpStartMs = 0; p.firstUp = false;
+}
+
+RangeMath::Level RangingService::freshLevel(const std::vector<double> &rssi, int fresh, double spanS, bool moving)
+{
+    Level L = levelFromSamples(rssi, 3, spanS, moving);
+    if (!L.valid || fresh >= L.n) return L;
+    if (fresh <= 0) { L.valid = false; return L; }
+    const double tau = moving ? 0.2 : 30.0;                     // the §3.2 coherence model, with N = the fresh samples
+    L.nEff = std::min(double(fresh), 3.0 * (1.0 + std::max(0.0, spanS) / tau));
+    L.sigma = kDbPerNeper / std::sqrt(L.nEff);
+    return L;
 }
 
 void RangingService::wifiDiff(Peer &p, const QJsonArray &theirWifi, qint64 now)
@@ -254,7 +268,7 @@ QJsonObject RangingService::report(const QString &device, const QString &kind, c
         const double dist = s["distMm"].toDouble() / 1000.0;
         const int n = std::max(1, s["n"].toInt(1));
         const double sigma = std::max(kRttFloor, s["stdMm"].toDouble(1000) / 1000.0 / std::sqrt(double(n)));
-        if (calibrating) { p.calRtt.push_back(dist); p.calSigmaB = std::max(p.calSigmaB, sigma); }
+        if (calibrating) { p.calRtt.push_back(dist); p.calRttSigma.push_back(sigma); }
         else { advance(p, std::min(t, now)); p.f.updateRtt(dist, sigma, p.rttOffset); }
         ++p.nRtt; p.lastRttMs = std::max(p.lastRttMs, std::min(t, now));
     }
@@ -263,6 +277,12 @@ QJsonObject RangingService::report(const QString &device, const QString &kind, c
         const QJsonObject s = v.toObject();
         if (!s["rssi"].isDouble()) continue;
         const double r = s["rssi"].toDouble();
+        // The TX power the peer read for our advert: stands in for ours while our byte 8 says 127 (see applyOurTx)
+        const int tx = s["txPower"].isDouble() ? s["txPower"].toInt() : 127;
+        if (tx != 127 && tx >= -127 && tx <= 20 && tx != p.downTx) {
+            p.downTx = tx;
+            if (m_ourTx == 127 && !p.calibrated) p.rlsDown = Rls2(priorP0Ble(tx), kNBle);
+        }
         if (calibrating) { p.calDown.push_back(r); continue; }
         if (p.winDown.empty()) p.winDownStartMs = std::min(now, qint64(s["time"].toDouble(double(now))));
         p.winDown.push_back(r);
@@ -286,53 +306,70 @@ QJsonObject RangingService::report(const QString &device, const QString &kind, c
 }
 
 // ── BLE from the scanner (link 1: we hear the peer) ──────────────────────────
-QString RangingService::resolveTag(const QByteArray &tag, qint64 now)
+QString RangingService::resolveTag(const QByteArray &tag, int kind, qint64 now, bool *own)
 {
     const qint64 w = now / 1000 / 900;
     if (w != m_tagWindow || m_tags.isEmpty()) {
-        m_tags.clear(); m_tagWindow = w;
-        QHash<QString, QString> ids;                            // identity id → device name
-        Identity *own = m_loc->identity();
-        const QString ownId = own && own->exists() ? own->id() : QString();
+        m_tags.clear(); m_bound.clear(); m_tagWindow = w;
+        QHash<QString, TagOwner> ids;                           // identity id → owner
+        Identity *idn = m_loc->identity();
+        const QString ownId = idn && idn->exists() ? idn->id() : QString();
         if (ApiServer *api = m_loc->apiServer())
             for (const ApiServer::Device &d : api->devices()) {
                 if (d.revoked) continue;
-                if (!d.identity.isEmpty()) ids.insert(d.identity, d.name);
-                else if (!ownId.isEmpty()) ids.insert(agentBeaconId(ownId, d.name), d.name);   // a Pi agent's beacon
+                if (!d.identity.isEmpty()) {
+                    const QString k = m_loc->kindForDevice(d.name, d.kind);
+                    ids.insert(d.identity, TagOwner{d.name, false, k == QLatin1String("desktop") || k == QLatin1String("laptop")});
+                } else if (!ownId.isEmpty()) {
+                    ids.insert(agentBeaconId(ownId, d.name), TagOwner{d.name, false, false});   // a Pi agent's beacon
+                }
             }
-        if (Identity *idn = m_loc->identity()) {
-            for (const PendingLink &pl : idn->pending()) if (!ids.contains(pl.id)) ids.insert(pl.id, pl.deviceName.isEmpty() ? pl.name : pl.deviceName);
-            for (const QString &id : idn->linkedIds()) if (!ids.contains(id)) ids.insert(id, QStringLiteral("identity ") + Identity::groupId(id));
-            ids.remove(idn->id());                              // our own adverts (another device sharing our identity is told apart by name elsewhere)
+        if (idn) {
+            for (const PendingLink &pl : idn->pending()) if (!ids.contains(pl.id)) ids.insert(pl.id, TagOwner{pl.deviceName.isEmpty() ? pl.name : pl.deviceName, false, false});
+            for (const QString &id : idn->linkedIds()) if (!ids.contains(id)) ids.insert(id, TagOwner{QStringLiteral("identity ") + Identity::groupId(id), false, false});
         }
+        // Our own adverts (another device sharing our identity is told apart by name elsewhere)
+        if (!ownId.isEmpty()) ids.insert(ownId, TagOwner{QString(), true, true});
         for (auto it = ids.constBegin(); it != ids.constEnd(); ++it)
             for (int dw = -1; dw <= 1; ++dw) m_tags.insert(bleTag(it.key(), (w + dw) * 900), it.value());
     }
-    return m_tags.value(tag);
+    const auto it = m_tags.constFind(tag);
+    if (it != m_tags.constEnd()) {
+        // A desktop's identity tag belongs only to that desktop's own advert. Before 3.8 the Pi agent advertised its
+        // desktop's identity with kind pi: that advert is neither us nor that desktop, so it is resolved like an unknown one.
+        if (!it->desktop || kind == KindDesktop || kind == KindLaptop) {
+            if (it->self) *own = true;
+            return it->device;
+        }
+    }
+    return m_bound.value(tag + char(kind & 7));
 }
 
-void RangingService::onBleSample(const QByteArray &tag, int rssi, int txPower, int kind, int flags, qint64 timeMs, const QString &address)
+void RangingService::onBleSample(const QByteArray &tag, int rssi, int txPower, int kind, int flags, qint64 timeMs, const QString &address, bool held)
 {
     Q_UNUSED(flags); Q_UNUSED(address);
     const qint64 now = nowMs();
-    m_raw.push_back({tag, rssi, timeMs, txPower});
-    QString device = resolveTag(tag, now);
+    if (!held) m_raw.push_back({tag, rssi, timeMs, txPower});  // pairing proximity counts reported adverts only
+    bool own = false;
+    QString device = resolveTag(tag, kind, now, &own);
+    if (own) return;                                            // our own advert
     if (device.isEmpty()) {
         // Session binding: an unknown tag of the same kind as the one peer that is ranging with us right now
         const Peer *only = nullptr; int n = 0;
         for (const Peer &p : m_peers) if (now - p.updatedMs < 30000 && p.kind == QLatin1String(kindName(kind))) { only = &p; ++n; }
         if (n != 1) return;
         device = only->device;
-        m_tags.insert(tag, device);
+        m_bound.insert(tag + char(kind & 7), device);
     }
     Peer &p = peer(device, QString::fromLatin1(kindName(kind)));
     if (!p.calibrated && (!p.haveUpPrior || (txPower != p.upTx && txPower != 127))) { p.rlsUp = Rls2(priorP0Ble(txPower), kNBle); p.haveUpPrior = true; }
     if (txPower != 127) p.upTx = txPower;
     m_dirty = true;
-    if (p.calUntilMs > now) { p.calUp.push_back(rssi); return; }
+    if (p.calUntilMs > now) { p.calUp.push_back(rssi); if (!held) ++p.calUpFresh; return; }
     if (p.winUp.empty()) p.winUpStartMs = now;
     p.winUp.push_back(rssi);
-    p.lastBleUpMs = now;
+    if (!held) ++p.winUpFresh;
+    p.lastBleUpMs = now;                                        // held repeats too: BleLink sends them only while it hears the device
 }
 
 // ── calibration (§8) ─────────────────────────────────────────────────────────
@@ -341,7 +378,7 @@ void RangingService::onBleSample(const QByteArray &tag, int rssi, int txPower, i
 // 14.4–14.7 m and 7 at 196–408 m (bursts whose timestamps the responder got wrong), so the median sat on the
 // cluster's edge, and one more bad burst would have made the offset ~200 m. Time-of-flight errors are late,
 // so among equally dense clusters the nearest wins. Returns the cluster size (0 = no samples).
-int RangingService::rttCluster(std::vector<double> v, double width, double *center)
+int RangingService::rttCluster(std::vector<double> v, double width, double *center, double *lo, double *hi)
 {
     if (v.empty()) return 0;
     std::sort(v.begin(), v.end());
@@ -352,7 +389,32 @@ int RangingService::rttCluster(std::vector<double> v, double width, double *cent
         if (j - i > bj - bi) { bi = i; bj = j; }
     }
     if (center) *center = median(std::vector<double>(v.begin() + qsizetype(bi), v.begin() + qsizetype(bj)));
+    if (lo) *lo = v[bi];                                        // the earliest densest window: every value in [lo, hi] is in it
+    if (hi) *hi = v[bj - 1];
     return int(bj - bi);
+}
+
+double RangingService::rttInlierSigma(const std::vector<double> &dist, const std::vector<double> &sigma, double lo, double hi)
+{
+    double s2 = 0, m = 0, m2 = 0; int n = 0;
+    for (size_t i = 0; i < dist.size() && i < sigma.size(); ++i) {
+        if (dist[i] < lo || dist[i] > hi) continue;             // an outlier's σ says nothing about the cluster
+        s2 += sigma[i] * sigma[i]; m += dist[i]; m2 += dist[i] * dist[i]; ++n;
+    }
+    if (n == 0) return kRttFloor;
+    const double mean = m / n;
+    const double scatter = n >= 3 ? std::sqrt(std::max(0.0, (m2 - n * mean * mean) / (n - 1))) : 0.0;
+    return std::max({kRttFloor, std::sqrt(s2 / n), scatter});
+}
+
+// Three or more bursts that do not agree make the whole window suspect (the phone moved, heavy multipath): then nothing
+// changes — no RTT offset, no BLE model, not "calibrated" — rather than pinning BLE to a distance RTT disputes.
+QString RangingService::calibrationFailure(int bursts, int agreed, bool bleUsable)
+{
+    const bool rttOk = rttClusterOk(bursts, agreed);
+    if (bursts >= 3 && !rttOk) return QStringLiteral("only %1 of %2 RTT bursts agreed within %3 m").arg(agreed).arg(bursts).arg(kCalClusterM, 0, 'f', 0);
+    if (!rttOk && !bleUsable) return QStringLiteral("no usable RTT bursts and too few BLE samples in the window");
+    return QString();
 }
 
 QJsonObject RangingService::calibrate(const QString &device, double distanceM, int durationS)
@@ -363,7 +425,7 @@ QJsonObject RangingService::calibrate(const QString &device, double distanceM, i
     p.calStartMs = now;
     p.calUntilMs = now + qint64(std::clamp(durationS, 5, 120)) * 1000;
     p.calTarget = distanceM;
-    p.calRtt.clear(); p.calDown.clear(); p.calUp.clear(); p.calSigmaB = kRttFloor;
+    p.calRtt.clear(); p.calRttSigma.clear(); p.calDown.clear(); p.calUp.clear(); p.calUpFresh = 0;
     updateAdvertFlags();
     return QJsonObject{{"device", device}, {"calibrating", true}, {"distanceM", distanceM}, {"until", isoMs(p.calUntilMs)},
                        {"hint", "keep both devices at that distance; nudge the phone a few centimetres now and then so the fade averages out"}};
@@ -374,40 +436,44 @@ void RangingService::finishCalibration(Peer &p)
     const double D = p.calTarget;
     const double span = std::max(5.0, (p.calUntilMs - p.calStartMs) / 1000.0);
     p.calUntilMs = 0;
-    bool any = false;
-    double center = 0;
-    const int nRtt = rttCluster(p.calRtt, kCalClusterM, &center);
-    // At least 3 bursts, and at least 30 % of them, must agree within kCalClusterM; otherwise the offset is left as it was.
-    const bool rttOk = nRtt >= 3 && nRtt * 10 >= int(p.calRtt.size()) * 3;
-    if (rttOk) {
-        p.rttOffset = center - D;
-        const double sc = 1.2533 * p.calSigmaB / std::sqrt(double(nRtt));
-        p.rttOffsetVar = sc * sc + 0.05 * 0.05;
-        p.f.resetRttOffset(0, p.rttOffsetVar);
-        any = true;
-    }
-    // A calibration replaces what the links learnt before (automatic learning against an uncalibrated RTT pair
-    // included): start each link that has calibration samples from its TX-power prior.
-    if (p.calDown.size() >= 3) {
-        const Level la = levelFromSamples(p.calDown, 3, span, false);
-        if (la.valid) { p.rlsDown = Rls2(priorP0Ble(m_ourTx), kNBle); p.rlsDown.update(std::log10(D), la.dbm, la.sigma * la.sigma); p.f.resetOffset(0, 0, std::max(la.sigma * la.sigma, kFrozenFadeVar) + kFrozenFadeVar); any = true; }
-    }
-    if (p.calUp.size() >= 3) {
-        const Level lb = levelFromSamples(p.calUp, 3, span, false);
-        if (lb.valid) { p.rlsUp = Rls2(priorP0Ble(p.upTx), kNBle); p.rlsUp.update(std::log10(D), lb.dbm, lb.sigma * lb.sigma); p.f.resetOffset(1, 0, std::max(lb.sigma * lb.sigma, kFrozenFadeVar) + kFrozenFadeVar); any = true; }
-    }
-    if (any) {
+    double center = 0, lo = 0, hi = 0;
+    const int nBursts = int(p.calRtt.size());
+    const int nRtt = rttCluster(p.calRtt, kCalClusterM, &center, &lo, &hi);
+    const bool rttOk = rttClusterOk(nBursts, nRtt);
+    const Level la = p.calDown.size() >= 3 ? levelFromSamples(p.calDown, 3, span, false) : Level();
+    const Level lb = p.calUp.size() >= 3 ? freshLevel(p.calUp, p.calUpFresh, span, false) : Level();
+    const QString at = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
+    const QString fail = calibrationFailure(nBursts, nRtt, la.valid || lb.valid);
+    QString text;
+    if (!fail.isEmpty()) {
+        text = QStringLiteral("Ranging calibration with %1 at %2 m failed: %3; nothing was changed").arg(p.device).arg(D, 0, 'f', 2).arg(fail);
+    } else {
+        if (rttOk) {
+            p.rttOffset = center - D;
+            // The median of the N cluster bursts: σ ≈ 1.2533·σ_b/√N, σ_b from the inliers only, plus 5 cm for the tape measure
+            const double sc = 1.2533 * rttInlierSigma(p.calRtt, p.calRttSigma, lo, hi) / std::sqrt(double(nRtt));
+            p.rttOffsetVar = sc * sc + 0.05 * 0.05;
+            p.f.resetRttOffset(0, p.rttOffsetVar);
+            p.rttCal = true;
+        }
+        // A calibration replaces what the links learnt before: start each link that has calibration samples from its
+        // TX-power prior (a link without samples keeps its previous calibration).
+        if (la.valid) { p.rlsDown = Rls2(priorP0Ble(downTxOf(p)), kNBle); p.rlsDown.update(std::log10(D), la.dbm, la.sigma * la.sigma); p.f.resetOffset(0, 0, std::max(la.sigma * la.sigma, kFrozenFadeVar) + kFrozenFadeVar); }
+        if (lb.valid) { p.rlsUp = Rls2(priorP0Ble(p.upTx), kNBle); p.rlsUp.update(std::log10(D), lb.dbm, lb.sigma * lb.sigma); p.f.resetOffset(1, 0, std::max(lb.sigma * lb.sigma, kFrozenFadeVar) + kFrozenFadeVar); }
         p.f.updateLogRange(std::log10(D), 0.01);               // they were D apart when the window closed
-        p.calibrated = true; p.calibratedAt = QDateTime::currentDateTimeUtc().toString(Qt::ISODate); p.calDistM = D;
-        m_loc->logEvent([&] {
-            BeaconEvent ev; ev.type = QStringLiteral("device"); ev.text = QStringLiteral("Ranging calibrated with %1 at %2 m (%3 of %4 RTT bursts agreed%5, %6 + %7 BLE samples)")
-                .arg(p.device).arg(D, 0, 'f', 2).arg(nRtt).arg(p.calRtt.size()).arg(rttOk ? QString() : QStringLiteral(": RTT offset not changed"))
-                .arg(p.calDown.size()).arg(p.calUp.size());
-            ev.extra = QJsonObject{{"device", p.device}, {"calibrated", true}, {"distanceM", D}, {"rttOffsetM", p.rttOffset},
-                                   {"rttBursts", int(p.calRtt.size())}, {"rttAgreed", nRtt}};
-            return ev; }());
+        p.calibrated = true; p.calibratedAt = at; p.calDistM = D;
+        text = QStringLiteral("Ranging calibrated with %1 at %2 m (%3; %4 + %5 BLE samples)").arg(p.device).arg(D, 0, 'f', 2)
+            .arg(rttOk ? QStringLiteral("%1 of %2 RTT bursts agreed, offset %3 m ± %4").arg(nRtt).arg(nBursts).arg(p.rttOffset, 0, 'f', 2).arg(std::sqrt(p.rttOffsetVar), 0, 'f', 2)
+                       : QStringLiteral("%1 RTT burst%2: offset not changed").arg(nBursts).arg(nBursts == 1 ? "" : "s"))
+            .arg(p.calDown.size()).arg(p.calUpFresh);
     }
-    p.calRtt.clear(); p.calDown.clear(); p.calUp.clear();
+    p.lastCal = QJsonObject{{"at", at}, {"ok", fail.isEmpty()}, {"distanceM", D}, {"rttBursts", nBursts}, {"rttAgreed", nRtt}, {"text", text}};
+    m_loc->logEvent([&] {
+        BeaconEvent ev; ev.type = QStringLiteral("device"); ev.text = text;
+        ev.extra = QJsonObject{{"device", p.device}, {"calibrated", fail.isEmpty()}, {"distanceM", D}, {"rttOffsetM", p.rttOffset},
+                               {"rttBursts", nBursts}, {"rttAgreed", nRtt}};
+        return ev; }());
+    p.calRtt.clear(); p.calRttSigma.clear(); p.calDown.clear(); p.calUp.clear(); p.calUpFresh = 0;
     recompute(p);
     save();
     updateAdvertFlags();
@@ -449,7 +515,8 @@ QJsonObject RangingService::toJson(const Peer &p) const
                   {"rttState", p.rttState.isEmpty() ? QJsonValue() : QJsonValue(p.rttState)}, {"rttStateAt", p.rttStateMs ? QJsonValue(isoMs(p.rttStateMs)) : QJsonValue()},
                   {"calib", QJsonObject{{"rttOffsetM", p.rttOffset}, {"rttOffsetSigmaM", std::sqrt(std::max(0.0, p.rttOffsetVar))}, {"bleP0", p.rlsDown.p0}, {"bleN", p.rlsDown.n},
                                         {"bleP0Up", p.rlsUp.p0}, {"bleNUp", p.rlsUp.n}, {"calibrated", p.calibrated},
-                                        {"calibratedAt", p.calibratedAt.isEmpty() ? QJsonValue() : QJsonValue(p.calibratedAt)}, {"distanceM", p.calibrated ? QJsonValue(p.calDistM) : QJsonValue()}}},
+                                        {"calibratedAt", p.calibratedAt.isEmpty() ? QJsonValue() : QJsonValue(p.calibratedAt)}, {"distanceM", p.calibrated ? QJsonValue(p.calDistM) : QJsonValue()},
+                                        {"rttCalibrated", rttCalibrated(p)}, {"last", p.lastCal.isEmpty() ? QJsonValue() : QJsonValue(p.lastCal)}}},
                   {"calibrating", p.calUntilMs > nowMs()}};
     // Where that puts it on the map: our position ⊕ (bearing, distance), only when the bearing is real
     const Fix &me = m_loc->fix();
@@ -544,6 +611,7 @@ void RangingService::save() const
         if (!p.calibrated && !p.haveUpPrior && !tRtt && !tDown && !tUp) continue;
         auto rls = [](const Rls2 &r) { return QJsonObject{{"p0", r.p0}, {"n", r.n}, {"S", QJsonArray{r.S[0][0], r.S[0][1], r.S[1][1]}}}; };
         peers[p.device] = QJsonObject{{"kind", p.kind}, {"rttOffset", p.rttOffset}, {"rttOffsetVar", p.rttOffsetVar}, {"calibrated", p.calibrated},
+                                      {"rttCalibrated", p.rttCal}, {"lastCal", p.lastCal},
                                       {"calibratedAt", p.calibratedAt}, {"calDistM", p.calDistM}, {"rlsDown", rls(p.rlsDown)}, {"rlsUp", rls(p.rlsUp)},
                                       {"offsetVar", QJsonArray{p.f.offsetVar(0), p.f.offsetVar(1)}},
                                       {"totals", QJsonObject{{"rtt", double(tRtt)}, {"bleDown", double(tDown)}, {"bleUp", double(tUp)},
@@ -574,12 +642,15 @@ void RangingService::load()
         p.prevRtt = qint64(tot["rtt"].toDouble()); p.prevBleDown = qint64(tot["bleDown"].toDouble()); p.prevBleUp = qint64(tot["bleUp"].toDouble());
         p.prevLastRttMs = qint64(tot["lastRttMs"].toDouble());
         p.calibrated = o["calibrated"].toBool(); p.calibratedAt = o["calibratedAt"].toString(); p.calDistM = o["calDistM"].toDouble();
+        p.lastCal = o["lastCal"].toObject();
         // Only a calibration is worth restoring. What an uncalibrated peer's links "learnt" came from the automatic
         // RTT supervision, which trusted an uncalibrated pair (~11 m for 0.6 m): back to the priors.
         if (!p.calibrated) continue;
         rls(o["rlsDown"].toObject(), p.rlsDown); rls(o["rlsUp"].toObject(), p.rlsUp);
         p.haveUpPrior = true;
-        p.rttOffset = o["rttOffset"].toDouble(); p.rttOffsetVar = o["rttOffsetVar"].toDouble(0.25);
+        p.rttOffset = o["rttOffset"].toDouble(); p.rttOffsetVar = o["rttOffsetVar"].toDouble(kUncalRttOffsetVar);
+        // Files before 3.8 have no flag: an RTT-measured offset is the one whose variance is not a prior (0.25, then 4)
+        p.rttCal = o.contains(QStringLiteral("rttCalibrated")) ? o["rttCalibrated"].toBool() : p.rttOffsetVar < 0.2499;
         p.f.resetRttOffset(0, p.rttOffsetVar);
         const QJsonArray ov = o["offsetVar"].toArray();
         for (int k = 0; k < 2 && k < ov.size(); ++k) p.f.resetOffset(k, 0, std::max(ov[k].toDouble(kOffsetVar0), 2.0 * kFrozenFadeVar));
