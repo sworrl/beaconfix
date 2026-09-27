@@ -45,7 +45,7 @@ fun ago(ms: Long): String {
     val s = (System.currentTimeMillis() - ms) / 1000
     return when { s < 5 -> "now"; s < 60 -> "$s s ago"; s < 3600 -> "${s / 60} min ago"; s < 86400 -> "${s / 3600} h ago"; else -> DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT).format(Date(ms)) }
 }
-fun metres(m: Double) = if (m >= 1000) String.format(java.util.Locale.US, "%.1f km", m / 1000) else "${m.toInt()} m"
+fun metres(m: Double) = Units.dist(m)
 
 /** Same grading as the desktop widget's security.js, condensed. */
 data class Grade(val label: String, val color: Color, val why: String)
@@ -88,7 +88,7 @@ fun secName(sec: String) = mapOf("open" to "Open", "owe" to "OWE", "wep" to "WEP
 
 fun hhmm(iso: String): String = iso.takeIf { it.length >= 16 }?.let { it.substring(11, 16) } ?: iso
 fun durText(secs: Long): String = when { secs < 60 -> "$secs s"; secs < 3600 -> "${secs / 60} min"; secs < 86400 -> "${secs / 3600} h ${secs % 3600 / 60} min"; else -> "${secs / 86400} d ${secs % 86400 / 3600} h" }
-fun km(v: Double) = if (v < 10) String.format(java.util.Locale.US, "%.1f km", v) else "${v.toInt()} km"
+fun km(v: Double) = Units.km(v)
 fun compass(deg: Double): String = listOf("N","NNE","NE","ENE","E","ESE","SE","SSE","S","SSW","SW","WSW","W","WNW","NW","NNW")[((((deg % 360) + 360) % 360) / 22.5).toInt() % 16]
 
 /** Sunrise / sunset for a day at a place, NOAA's method; returns local HH:MM or null in polar cases. */
