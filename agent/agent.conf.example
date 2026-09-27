@@ -1,0 +1,45 @@
+# /etc/beaconfix-agent/agent.conf — see docs/AGENT.md
+[agent]
+# device defaults to the hostname
+# device = mypi
+kind = pi
+
+[desktop]
+# Empty = find the desktop over mDNS (_beaconfix._tcp). The wired interface is preferred for this traffic.
+url =
+# url = http://<desktop>:47822
+token_file = /etc/beaconfix-agent/token
+
+[gpsd]
+host = 127.0.0.1
+port = 2947
+
+[wifi]
+enabled = yes
+interface = auto
+
+[ble]
+enabled = yes
+
+[anchor]
+enabled = yes
+# name defaults to "<hostname> GPS antenna"
+
+[power]
+# auto = sysfs power_supply, the PiSugar server, MAX1704x at 0x36, INA219 at 0x40-0x43 (read-only); none = off
+ups = auto
+
+[intervals]
+position = 10
+sync = 60
+fix = 60
+anchor = 600
+wifi = 30
+
+[averaging]
+# prior correlation time of GNSS error (s), floors (m), long-period error prior (m, s)
+tau_prior = 90
+floor = 0.5
+floor_vertical = 1.0
+longperiod_sigma = 1.0
+longperiod_tau = 1200

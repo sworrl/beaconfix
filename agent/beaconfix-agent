@@ -1,0 +1,1626 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+"""beaconfix-agent: a headless BeaconFix node for a Raspberry Pi with a GNSS HAT.
+
+While parked it averages the GNSS fix and reports an honest error (the scatter of correlated
+GNSS errors shrinks with the *effective* number of samples, not the raw count). It tags every
+Wi-Fi scan and BLE sighting with that position and feeds the RV desktop's BeaconFix over its LAN
+API. Everything that cannot be delivered is queued in SQLite and flushed on reconnect.
+See docs/AGENT.md for the maths, the protocol and troubleshooting.
+"""
+import argparse
+import configparser
+import datetime as dt
+import hashlib
+import http.client
+import ipaddress
+import json
+import logging
+import math
+import os
+import re
+import signal
+import socket
+import sqlite3
+import subprocess
+import sys
+import threading
+import time
+import uuid
+from collections import deque
+
+VERSION = "1.0.0"
+BLE_UUID = "28c9f0bf-a089-4a95-b632-5e8ede1b03b6"      # docs/RANGING.md §9.1
+M_PER_DEG = 111320.0                                     # docs/RANGING.md §9.2 (same constant as src/estimator.h)
+KIND_BITS = {0: "desktop", 1: "android", 2: "laptop", 3: "pi", 4: "gnss", 5: "reserved", 6: "reserved", 7: "other"}   # §9.1: 3 bits
+log = logging.getLogger("beaconfix-agent")
+
+
+# ─────────────────────────────── helpers ───────────────────────────────
+def iso_utc(t=None):
+    return dt.datetime.fromtimestamp(time.time() if t is None else t, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_iso(s):
+    if not s:
+        return None
+    try:
+        return dt.datetime.fromisoformat(str(s).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def run(cmd, timeout=10, **kw):
+    """Run a command, never hang, never raise. Returns (rc, stdout, stderr)."""
+    try:
+        p = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout, **kw)
+        return p.returncode, p.stdout, p.stderr
+    except FileNotFoundError:
+        return 127, "", "not found: %s" % cmd[0]
+    except subprocess.TimeoutExpired:
+        return 124, "", "timeout: %s" % " ".join(cmd)
+
+
+def read_text(path, default=None):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return default
+
+
+class Frame:
+    """Local tangent plane, exactly as docs/RANGING.md §9.2."""
+    def __init__(self, lat0, lon0):
+        self.lat0, self.lon0 = lat0, lon0
+        self.k = M_PER_DEG * math.cos(math.radians(lat0))
+
+    def en(self, lat, lon):
+        return (lon - self.lon0) * self.k, (lat - self.lat0) * M_PER_DEG
+
+    def ll(self, e, n):
+        return self.lat0 + n / M_PER_DEG, self.lon0 + e / self.k
+
+
+# ─────────────────────── GNSS averaging (the maths) ───────────────────────
+def integrated_autocorr_time(x, c=5.0):
+    """Sokal's integrated autocorrelation time of a series, in samples, with automatic windowing
+    (stop at the first lag k >= c * tau). Returns (tau, converged). tau >= 1."""
+    n = len(x)
+    if n < 16:
+        return None, False
+    m = sum(x) / n
+    d = [v - m for v in x]
+    var = sum(v * v for v in d) / n
+    if var <= 1e-12:
+        return None, False
+    tau = 1.0
+    for k in range(1, n // 2):
+        s = sum(a * b for a, b in zip(d, d[k:]))
+        tau += 2.0 * (s / n) / var
+        if k >= c * tau:
+            return max(tau, 1.0), True
+    return max(tau, 1.0), False
+
+
+class StaticAverager:
+    """Averages GNSS fixes while stationary and reports an honest 1-sigma error.
+
+    Errors of a static GNSS receiver are strongly autocorrelated (multipath, atmosphere; tau of a
+    minute to tens of minutes), so N fixes carry far fewer than N independent samples. We use:
+
+      * per-epoch variance: shrinkage between the receiver's claim (eph/epx/epy, if any, capped at
+        5 m) and the observed scatter, sigma2 = (k*prior2 + Neff*sample2) / (k + Neff), k = 3;
+      * Neff = duration / tau_int, tau_int = max(2*tau_prior, the integrated autocorrelation time
+        measured on 5-s bin means with Sokal windowing). One session's estimate carries roughly
+        +-50 % error and is biased low for slow error components, so the data may only lengthen
+        tau_int, never shorten it below the prior (2*tau_prior = the OU value for tau_prior);
+      * sigma_mean^2 = sigma2 / Neff
+                     + lp^2 * F(T, tau_lp)       a prior for long-period error that one session cannot
+                                                 observe (atmosphere, geometry): lp = 1 m, tau_lp = 20 min,
+                                                 F = exact variance factor of the mean of an OU process,
+                                                 2*tau/T * (1 - tau/T * (1 - exp(-T/tau)))
+                     + floor^2                   biases that never average out without RTK
+                                                 (0.5 m per horizontal axis, 1.0 m vertical).
+
+    Movement ends the session: speed > 0.6 m/s for 3 epochs when the receiver reports speed (it
+    almost always does), otherwise the last 10 s drifting from the mean by more than
+    max(4.5*sigma_epoch, 12 m) for 8 s. With speed available the drift test is only a gross
+    backstop (6*sigma, 25 m): correlated GNSS error makes 3-sigma excursions of several seconds
+    routine, and a false reset would throw away hours of averaging. Restart after 20 s at rest.
+    """
+    BIN_S = 5.0
+
+    PRIOR_CAP = 5.0          # m: gpsd's HDOP x UERE claim for NMEA-only receivers is typically 2x pessimistic
+
+    def __init__(self, tau_prior_s=90.0, floor_h=0.5, floor_v=1.0, min_tau_s=60.0, k_prior=3.0, lp_sigma=1.0, lp_tau_s=1200.0):
+        self.tau_prior_s, self.floor_h, self.floor_v, self.min_tau_s, self.k_prior = tau_prior_s, floor_h, floor_v, min_tau_s, k_prior
+        self.lp_sigma, self.lp_tau_s = lp_sigma, lp_tau_s
+        self.state = "acquiring"
+        self.last_parked = None
+        self.session = 0
+        self.fast = 0
+        self.slow_since = None
+        self.inst = None
+        self.alt0 = None
+        self.speed_seen = None
+        self.still = deque()
+        self._new_session(None)
+
+    # -- session bookkeeping --
+    def _new_session(self, t):
+        self.frame = None
+        self.n = 0
+        self.mean = [0.0, 0.0, 0.0]
+        self.m2 = [[0.0] * 3 for _ in range(3)]
+        self.t0 = t
+        self.t_last = t
+        self.bins = []                  # [t_start, se, sn, su, count]
+        self.recent = deque()           # (t, e, n)
+        self.eph = deque(maxlen=600)    # receiver's claimed 1-sigma horizontal error per epoch
+        self.drift_since = None
+        self._tau_cache = (None, False, -1.0)
+        self.session += 1
+
+    def _end_session(self, reason, t):
+        r = self.result()
+        if r and r["n"] >= 30:
+            r["ended"] = reason
+            self.last_parked = r
+        self.state = "moving" if reason == "moving" else "acquiring"
+        self.slow_since = None
+        self.still.clear()
+        self._new_session(t)
+
+    # -- input --
+    def add(self, t, lat, lon, alt=None, eph=None, speed=None, epx=None, epy=None):
+        """Feed one fix. t = fix time in epoch seconds (use the receiver's time, not the wall clock,
+        so a replayed log is averaged correctly). Returns the current state name."""
+        sig_claim = None
+        if epx is not None and epy is not None and epx > 0 and epy > 0:
+            sig_claim = math.sqrt((epx * epx + epy * epy) / 2.0) / 2.0    # gpsd epx/epy ~ 95 % → 1-sigma per axis
+        elif eph is not None and eph > 0:
+            sig_claim = eph / 2.0 / math.sqrt(2.0)
+        self.inst = {"t": t, "lat": lat, "lon": lon, "alt": alt, "acc": (sig_claim * math.sqrt(2.0)) if sig_claim else 5.0, "speed": speed}
+
+        if speed is not None and speed > 0.6:
+            self.fast += 1
+        else:
+            self.fast = 0
+        if speed is not None:
+            self.speed_seen = t
+
+        if self.state in ("acquiring", "moving"):
+            self.still.append((t, lat, lon))
+            while self.still and t - self.still[0][0] > 10.0:
+                self.still.popleft()
+            if speed is not None:
+                still = speed <= 0.3
+            else:                                        # no speed: the last 10 s must stay within a few metres
+                fr = Frame(lat, lon)
+                pts = [fr.en(a, b) for _, a, b in self.still]
+                me = sum(p[0] for p in pts) / len(pts)
+                mn = sum(p[1] for p in pts) / len(pts)
+                still = len(pts) >= 5 and max(math.hypot(p[0] - me, p[1] - mn) for p in pts) <= max(3.0 * self._prior_sigma(), 6.0)
+            if not still:
+                self.slow_since = None
+                if self.state == "acquiring" and self.fast >= 3:
+                    self.state = "moving"
+                return self.state
+            if self.slow_since is None:
+                self.slow_since = t
+            if self.state == "acquiring" or t - self.slow_since >= 20.0:
+                self.state = "parked"
+                self._new_session(t)
+            else:
+                return self.state
+
+        # parked: accumulate
+        if self.frame is None:
+            self.frame = Frame(lat, lon)
+            self.alt0 = alt
+            self.t0 = t
+        e, n = self.frame.en(lat, lon)
+        if self.alt0 is None and alt is not None:
+            self.alt0 = alt - self.mean[2]
+        u = (alt - self.alt0) if (alt is not None and self.alt0 is not None) else self.mean[2]
+        x = (e, n, u)
+        self.n += 1
+        delta = [x[i] - self.mean[i] for i in range(3)]
+        for i in range(3):
+            self.mean[i] += delta[i] / self.n
+        for i in range(3):
+            for j in range(3):
+                self.m2[i][j] += delta[i] * (x[j] - self.mean[j])
+        self.t_last = t
+        if sig_claim:
+            self.eph.append(sig_claim)
+        if not self.bins or t - self.bins[-1][0] >= self.BIN_S:
+            self.bins.append([t, 0.0, 0.0, 0.0, 0])
+            if len(self.bins) > 4320:          # 6 h of 5-s bins for the autocorrelation estimate
+                self.bins.pop(0)
+        b = self.bins[-1]
+        b[1] += e; b[2] += n; b[3] += u; b[4] += 1
+
+        # movement test
+        self.recent.append((t, e, n))
+        while self.recent and t - self.recent[0][0] > 10.0:
+            self.recent.popleft()
+        if self.fast >= 3:
+            self._end_session("moving", t)
+            return self.state
+        if self.n >= 20 and len(self.recent) >= 5:
+            re_ = sum(p[1] for p in self.recent) / len(self.recent)
+            rn_ = sum(p[2] for p in self.recent) / len(self.recent)
+            disp = math.hypot(re_ - self.mean[0], rn_ - self.mean[1])
+            has_speed = self.speed_seen is not None and t - self.speed_seen <= 10.0
+            k, lo = (6.0, 25.0) if has_speed else (4.5, 12.0)
+            thr = max(k * self.sigma_epoch_h(cheap=True), lo)
+            if disp > thr:
+                if self.drift_since is None:
+                    self.drift_since = t
+                elif t - self.drift_since >= 8.0:
+                    self._end_session("moving", t)
+                    return self.state
+            else:
+                self.drift_since = None
+        return self.state
+
+    # -- estimates --
+    def _sample_var(self, i):
+        return self.m2[i][i] / (self.n - 1) if self.n > 1 else 0.0
+
+    def _prior_sigma(self):
+        if self.eph:
+            s = sorted(self.eph)
+            return min(s[len(s) // 2], self.PRIOR_CAP)
+        return 3.0
+
+    def tau_int_seconds(self):
+        """Integrated autocorrelation time in seconds (max over east/north), cached for 60 s of data."""
+        if self._tau_cache[2] >= 0 and self.t_last - self._tau_cache[2] < 60.0:
+            return self._tau_cache[0], self._tau_cache[1]
+        full = [b for b in self.bins if b[4] > 0]
+        best, conv = None, True
+        for axis in (1, 2):
+            series = [b[axis] / b[4] for b in full]
+            tau, c = integrated_autocorr_time(series)
+            if tau is None:
+                continue
+            tau_s = tau * self.BIN_S
+            conv = conv and c
+            best = tau_s if best is None else max(best, tau_s)
+        self._tau_cache = (best, conv if best is not None else False, self.t_last)
+        return self._tau_cache[0], self._tau_cache[1]
+
+    def n_eff(self):
+        if self.n < 2:
+            return 1.0
+        duration = max(self.t_last - self.t0, 1.0)
+        tau_est, _ = self.tau_int_seconds()
+        tau_int = max(tau_est or 0.0, 2.0 * self.tau_prior_s, 2.0 * self.min_tau_s)
+        return max(1.0, min(float(self.n), duration / tau_int))
+
+    def sigma_epoch_h(self, cheap=False):
+        if self.n < 2:
+            return self._prior_sigma()
+        if cheap:                                   # per-epoch movement test: no autocorrelation estimate
+            ne = max(1.0, (self.t_last - self.t0) / (2.0 * self.tau_prior_s))
+        else:
+            ne = self.n_eff()
+        prior2 = self._prior_sigma() ** 2
+        v = (self._sample_var(0) + self._sample_var(1)) / 2.0
+        return math.sqrt((self.k_prior * prior2 + ne * v) / (self.k_prior + ne))
+
+    @staticmethod
+    def ou_mean_var_factor(T, tau):
+        """Variance of the mean of an OU process over a window T, as a fraction of its variance."""
+        if T <= 0 or tau <= 0:
+            return 1.0
+        r = tau / T
+        return min(1.0, 2.0 * r * (1.0 - r * (1.0 - math.exp(-1.0 / r))))
+
+    def result(self):
+        """The averaged position with honest 1-sigma errors, or None while not parked."""
+        if self.state != "parked" or self.frame is None or self.n < 5:
+            return None
+        ne = self.n_eff()
+        prior2 = self._prior_sigma() ** 2
+        lp2 = self.lp_sigma ** 2 * self.ou_mean_var_factor(max(self.t_last - self.t0, 1.0), self.lp_tau_s)
+        sig = []
+        for i, floor in ((0, self.floor_h), (1, self.floor_h), (2, self.floor_v)):
+            k = 4.0 if i == 2 else 1.0                              # vertical is ~2x worse
+            ep2 = (self.k_prior * prior2 * k + ne * self._sample_var(i)) / (self.k_prior + ne)
+            sig.append(math.sqrt(ep2 / ne + lp2 * k + floor * floor))
+        lat, lon = self.frame.ll(self.mean[0], self.mean[1])
+        tau_est, conv = self.tau_int_seconds()
+        return {
+            "lat": lat, "lon": lon,
+            "alt": (self.alt0 + self.mean[2]) if self.alt0 is not None else None,
+            "sigmaE": sig[0], "sigmaN": sig[1], "sigmaU": sig[2],
+            "sigmaH": math.sqrt((sig[0] ** 2 + sig[1] ** 2) / 2.0),
+            "n": self.n, "nEff": ne, "tauIntS": tau_est, "tauConverged": conv,
+            "durationS": self.t_last - self.t0, "session": self.session,
+            "epochSigmaH": self.sigma_epoch_h(),
+        }
+
+    def best_fix(self):
+        """What to report as 'where I am': the average when parked, else the latest fix."""
+        r = self.result()
+        if r:
+            return {"lat": r["lat"], "lon": r["lon"], "alt": r["alt"], "acc": r["sigmaH"], "source": "gps-average", "t": self.t_last, "averaged": r}
+        if self.inst:
+            i = self.inst
+            return {"lat": i["lat"], "lon": i["lon"], "alt": i["alt"], "acc": i["acc"], "source": "gps", "t": i["t"], "averaged": None}
+        return None
+
+
+# ─────────────────────────────── gpsd ───────────────────────────────
+class Gpsd(threading.Thread):
+    """Minimal gpsd JSON client (TPV, SKY, PPS/TOFF, DEVICES) with reconnect."""
+    def __init__(self, host, port, averager, lock, stop, report=None, exit_on_eof=False):
+        super().__init__(daemon=True, name="gpsd")
+        self.host, self.port, self.avg, self.lock, self.stop, self.report, self.exit_on_eof = host, port, averager, lock, stop, report, exit_on_eof
+        self.sky = {}
+        self.pps = None
+        self.devices = []
+        self.tpv = None
+        self.connected = False
+        self.epochs = 0
+        self.eof = threading.Event()
+
+    def run(self):
+        backoff = 1.0
+        while not self.stop.is_set():
+            try:
+                with socket.create_connection((self.host, self.port), timeout=10) as s:
+                    s.settimeout(30)
+                    s.sendall(b'?WATCH={"enable":true,"json":true,"pps":true};\n')
+                    self.connected, backoff = True, 1.0
+                    buf = b""
+                    while not self.stop.is_set():
+                        chunk = s.recv(65536)
+                        if not chunk:
+                            raise ConnectionError("gpsd closed the connection")
+                        buf += chunk
+                        while b"\n" in buf:
+                            line, buf = buf.split(b"\n", 1)
+                            if line.strip():
+                                self.handle(line)
+            except (OSError, ConnectionError, ValueError) as ex:
+                self.connected = False
+                if self.exit_on_eof:
+                    self.eof.set()
+                    return
+                log.debug("gpsd: %s (retry in %.0f s)", ex, backoff)
+                self.stop.wait(backoff)
+                backoff = min(backoff * 2, 60.0)
+
+    def handle(self, line):
+        try:
+            o = json.loads(line)
+        except ValueError:
+            return
+        cls = o.get("class")
+        if cls == "TPV":
+            self.tpv = o
+            if o.get("mode", 0) >= 2 and "lat" in o and "lon" in o:
+                t = parse_iso(o.get("time")) or time.time()
+                alt = o.get("altMSL", o.get("alt", o.get("altHAE")))
+                with self.lock:
+                    st = self.avg.add(t, o["lat"], o["lon"], alt, o.get("eph"), o.get("speed"), o.get("epx"), o.get("epy"))
+                    self.epochs += 1
+                    if self.report:
+                        r = self.avg.result()
+                        self.report.write(json.dumps({"t": t, "state": st, "fix": [o["lat"], o["lon"]], "avg": r}) + "\n")
+        elif cls == "SKY":
+            sats = o.get("satellites") or []
+            used = o.get("uSat", sum(1 for s in sats if s.get("used")))
+            seen = o.get("nSat", len(sats))
+            self.sky = {"used": used, "seen": seen, "hdop": o.get("hdop"), "pdop": o.get("pdop"), "vdop": o.get("vdop")}
+        elif cls in ("PPS", "TOFF"):
+            try:
+                off = (o["clock_sec"] - o["real_sec"]) + (o["clock_nsec"] - o["real_nsec"]) / 1e9
+                self.pps = {"class": cls, "offsetS": off, "t": time.time()}
+            except KeyError:
+                pass
+        elif cls == "DEVICES":
+            self.devices = [d.get("path") for d in o.get("devices", [])]
+
+    def summary(self):
+        tpv = self.tpv or {}
+        return {"connected": self.connected, "mode": tpv.get("mode", 0), "epochs": self.epochs, "sky": self.sky, "devices": self.devices,
+                "pps": self.pps and {"class": self.pps["class"], "offsetUs": round(self.pps["offsetS"] * 1e6, 1), "ageS": round(time.time() - self.pps["t"], 1)}}
+
+
+# ─────────────────────────────── Wi-Fi ───────────────────────────────
+BSS_RE = re.compile(r"^BSS ([0-9a-fA-F:]{17})")
+
+
+def decode_iw_ssid(s):
+    b, i = bytearray(), 0
+    while i < len(s):
+        if s[i] == "\\" and i + 3 < len(s) + 0 and s[i + 1] == "x":
+            try:
+                b.append(int(s[i + 2:i + 4], 16))
+                i += 4
+                continue
+            except ValueError:
+                pass
+        b.extend(s[i].encode("utf-8"))
+        i += 1
+    return b.decode("utf-8", errors="replace").rstrip("\x00")
+
+
+def parse_iw_dump(text):
+    out, cur = [], None
+    for line in text.splitlines():
+        m = BSS_RE.match(line)
+        if m:
+            cur = {"bssid": m.group(1).upper()}
+            out.append(cur)
+            continue
+        if cur is None:
+            continue
+        if line.startswith("\tfreq:"):
+            try:
+                cur["freq"] = int(float(line.split()[1]))
+            except (IndexError, ValueError):
+                pass
+        elif line.startswith("\tsignal:"):
+            try:
+                cur["dbm"] = float(line.split()[1])
+            except (IndexError, ValueError):
+                pass
+        elif line.startswith("\tlast seen:") and line.rstrip().endswith("ms ago"):
+            try:
+                cur["ageMs"] = int(line.split()[2])
+            except (IndexError, ValueError):
+                pass
+        elif line.startswith("\tSSID:"):
+            cur["ssid"] = decode_iw_ssid(line[len("\tSSID:"):].strip())
+    return [b for b in out if "dbm" in b]
+
+
+def nm_strength_to_dbm(strength):
+    """Inverse of NetworkManager's mapping, identical to the desktop (src/wifiscanner.cpp)."""
+    s = max(0, min(100, int(strength)))
+    return -40 - (100 - s) * 60 // 100
+
+
+def wifi_interfaces():
+    rc, out, _ = run(["iw", "dev"], timeout=5)
+    return re.findall(r"Interface (\S+)", out) if rc == 0 else []
+
+
+def scan_wifi(ifname, can_trigger):
+    """Returns (list of BSS dicts, trigger_ok). Uses iw (dBm); falls back to NetworkManager (percent)."""
+    trig = False
+    if can_trigger:
+        rc, _, err = run(["iw", "dev", ifname, "scan", "trigger"], timeout=10)
+        trig = rc == 0
+        if not trig and "Operation not permitted" in err:
+            can_trigger = False
+        if trig:
+            time.sleep(4.0)
+    rc, out, _ = run(["iw", "dev", ifname, "scan", "dump"], timeout=15)
+    if rc == 0:
+        return parse_iw_dump(out), trig, can_trigger
+    try:                                                          # no iw: NetworkManager over D-Bus
+        import dbus
+        bus = dbus.SystemBus()
+        nm = dbus.Interface(bus.get_object("org.freedesktop.NetworkManager", "/org/freedesktop/NetworkManager"), "org.freedesktop.NetworkManager")
+        res = []
+        for dp in nm.GetDevices():
+            props = dbus.Interface(bus.get_object("org.freedesktop.NetworkManager", dp), "org.freedesktop.DBus.Properties")
+            if int(props.Get("org.freedesktop.NetworkManager.Device", "DeviceType")) != 2:
+                continue
+            wl = dbus.Interface(bus.get_object("org.freedesktop.NetworkManager", dp), "org.freedesktop.NetworkManager.Device.Wireless")
+            for ap in wl.GetAllAccessPoints():
+                p = dbus.Interface(bus.get_object("org.freedesktop.NetworkManager", ap), "org.freedesktop.DBus.Properties")
+                a = p.GetAll("org.freedesktop.NetworkManager.AccessPoint")
+                res.append({"bssid": str(a["HwAddress"]).upper(), "ssid": bytes(a["Ssid"]).decode("utf-8", "replace"),
+                            "freq": int(a["Frequency"]), "dbm": float(nm_strength_to_dbm(a["Strength"])), "ageMs": 0})
+        return res, False, can_trigger
+    except Exception as ex:                                        # noqa: BLE001 — optional path
+        log.debug("wifi: no iw and no NetworkManager: %s", ex)
+        return [], False, can_trigger
+
+
+# ─────────────────────────────── BLE ───────────────────────────────
+def ble_tag(identity_id, window):
+    return hashlib.sha256(("beaconfix-ble-v1|%s|%d" % (identity_id, window)).encode()).digest()[:8]
+
+
+def ble_service_data(identity_id, t, tx_power=127, kind=3, api=False, rtt=False, calibrating=False):
+    # §9.1 flags: bit0 RTT, bit1 API, bits 2-4 kind (3 = pi), bit5 calibrating, bits 6-7 version 0
+    flags = (1 if rtt else 0) | (2 if api else 0) | ((kind & 7) << 2) | (0x20 if calibrating else 0)
+    return ble_tag(identity_id, int(t // 900)) + bytes([tx_power & 0xFF, flags])
+
+
+def beacon_id(desktop_identity, device):
+    """The id our own advert's tag is made from. The agent has no identity; it used to advertise the DESKTOP's, so
+    phones counted this Pi as the desktop and the desktop dropped it as its own advert. The desktop derives the same
+    id for every paired device without an identity (src/ranging/rangingservice.cpp agentBeaconId, RANGING.md §9.1)."""
+    return hashlib.sha256(("beaconfix-agent-beacon-v1|%s|%s" % (desktop_identity, device)).encode()).hexdigest()[:26]
+
+
+def max_adv_instances():
+    """Controllers differ (a Pi 4 reports 5); ask btmgmt instead of assuming."""
+    rc, out, err = run(["btmgmt", "--index", "0", "advinfo"], timeout=8)
+    m = re.search(r"Max instances:\s*(\d+)", out or "")
+    return int(m.group(1)) if m else 5
+
+
+def ble_adv_data(identity_id, t, **kw):
+    """The AD structure (type 0x21, service data with a 128-bit UUID, little-endian on air)."""
+    body = uuid.UUID(BLE_UUID).bytes[::-1] + ble_service_data(identity_id, t, **kw)
+    return bytes([1 + len(body), 0x21]) + body
+
+
+def parse_service_data(sd):
+    """10 bytes of BeaconFix service data -> dict (docs/RANGING.md §9.1)."""
+    if len(sd) < 10:
+        return None
+    tx = sd[8] - 256 if sd[8] > 127 else sd[8]
+    fl = sd[9]
+    return {"tag": bytes(sd[:8]), "txPower": tx, "rtt": bool(fl & 1), "api": bool(fl & 2), "kind": KIND_BITS[(fl >> 2) & 7], "calibrating": bool(fl & 0x20)}
+
+
+class Ble:
+    """Advertises our BeaconFix beacon with btmgmt (raw AD, needs CAP_NET_ADMIN) and scans through
+    BlueZ D-Bus (group 'bluetooth'); the scan runs in the GLib main loop of the main thread."""
+    def __init__(self, stop):
+        self.stop = stop
+        self.identity = None                               # what OUR advert's tag is made from (beacon_id)
+        self.watch = None                                  # the desktop's identity: whose adverts we keep
+        self.adv_ok = None
+        self.adv_instance = None
+        self.adv_window = None
+        self.samples = deque(maxlen=2000)
+        self.scan_ok = None
+        self.lock = threading.Lock()
+        self.error = ""
+        self.adv_request = False
+        self.cache = {}                                    # device path -> parsed service data
+        self.txcache = {}                                  # device path -> BlueZ Device1.TxPower (the TX-power AD)
+        self.adv_ident = None                              # the identity the advert on air was made from
+
+    def set_identities(self, desktop_identity, device):
+        self.watch = desktop_identity
+        ident = beacon_id(desktop_identity, device)
+        if ident != self.identity:
+            self.identity = ident
+            self.adv_window = None                         # re-register with the new tag
+
+    def tags(self):
+        if not self.watch:
+            return set()
+        w = int(time.time() // 900)
+        return {ble_tag(self.watch, w + d) for d in (-1, 0, 1)}
+
+    def advertise(self):
+        """Called from the job loop. Broadcom controllers (the Pi's) refuse to START advertising while an LE
+        scan runs, so when we are scanning, hand the request to the BLE loop, which pauses the scan for it."""
+        if not self.identity:
+            return
+        w = int(time.time() // 900)
+        if w == self.adv_window and self.adv_ident == self.identity:
+            return
+        if self.scan_ok:
+            self.adv_request = True                                # the BLE loop advertises through BlueZ D-Bus
+            return
+        self._do_advertise()
+
+    def _do_advertise(self):
+        w = int(time.time() // 900)
+        data = ble_adv_data(self.identity, time.time()).hex()
+        if self.adv_instance:
+            run(["btmgmt", "--index", "0", "remove-adv", str(self.adv_instance)], timeout=8)
+        for inst in ([self.adv_instance] if self.adv_instance else list(range(max_adv_instances(), 0, -1))):
+            rc, out, err = run(["btmgmt", "--index", "0", "add-adv", "-d", data, str(inst)], timeout=8)  # no -p: TX power is in the service data; -p pushes the AD past 31 bytes
+            if rc == 0 and "Failed" not in out and "failed" not in err:
+                self.adv_ok, self.adv_instance, self.adv_window, self.adv_ident = True, inst, w, self.identity
+                log.info("ble: advertising BeaconFix beacon (instance %d, tag window %d)", inst, w)
+                return
+        self.adv_ok = False
+        self.error = "btmgmt add-adv failed: " + (err or out).strip()[:120]
+        log.warning("ble: %s", self.error)
+
+    def stop_advertising(self):
+        if self.adv_instance:
+            run(["btmgmt", "--index", "0", "remove-adv", str(self.adv_instance)], timeout=8)
+
+    def take(self, limit=40):
+        with self.lock:
+            out = []
+            while self.samples and len(out) < limit:
+                out.append(self.samples.popleft())
+            return out
+
+    def run_scan_loop(self):
+        """Blocking: runs the GLib main loop until stop is set. Returns False if BLE scanning is unavailable."""
+        try:
+            import dbus
+            import dbus.mainloop.glib
+            from gi.repository import GLib
+        except ImportError as ex:
+            self.scan_ok, self.error = False, "python3-dbus/python3-gi missing: %s" % ex
+            log.warning("ble: scanning disabled (%s)", self.error)
+            return False
+        dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+        try:
+            bus = dbus.SystemBus()
+            om = dbus.Interface(bus.get_object("org.bluez", "/"), "org.freedesktop.DBus.ObjectManager")
+            objs = om.GetManagedObjects()
+            ad_path = next((p for p, ifs in objs.items() if "org.bluez.Adapter1" in ifs), None)
+            if not ad_path:
+                raise RuntimeError("no Bluetooth adapter (BlueZ sees none; is Bluetooth disabled by dtoverlay=disable-bt?)")
+            adapter = dbus.Interface(bus.get_object("org.bluez", ad_path), "org.bluez.Adapter1")
+            adprops = dbus.Interface(bus.get_object("org.bluez", ad_path), "org.freedesktop.DBus.Properties")
+            if not bool(adprops.Get("org.bluez.Adapter1", "Powered")):
+                adprops.Set("org.bluez.Adapter1", "Powered", dbus.Boolean(True))
+            adapter.SetDiscoveryFilter({"Transport": dbus.String("le"), "DuplicateData": dbus.Boolean(True)})
+            adapter.StartDiscovery()
+            advmgr = dbus.Interface(bus.get_object("org.bluez", ad_path), "org.bluez.LEAdvertisingManager1")
+        except Exception as ex:                                    # noqa: BLE001
+            self.scan_ok, self.error = False, str(ex)[:200]
+            log.warning("ble: scanning unavailable: %s", self.error)
+            return False
+        self.scan_ok = True
+        uuid_key = BLE_UUID.lower()
+
+        def remember(path, props):
+            sd = props.get("ServiceData")
+            if sd is not None:
+                for k, v in sd.items():
+                    if str(k).lower() == uuid_key:
+                        self.cache[path] = parse_service_data(bytes(bytearray(v)))
+            if props.get("TxPower") is not None:
+                self.txcache[path] = int(props.get("TxPower"))
+            rssi = props.get("RSSI")
+            if rssi is not None and self.cache.get(path):
+                info = self.cache[path]
+                if info["tag"] in self.tags():
+                    # byte 8 = 127 (unknown): fall back to the TX-power AD BlueZ exposes (as src/ranging/blelink.cpp does)
+                    tx = info["txPower"] if info["txPower"] != 127 else self.txcache.get(path, 127)
+                    with self.lock:
+                        self.samples.append({"rssi": int(rssi), "time": int(time.time() * 1000), "txPower": tx,
+                                             "from": info["kind"], "addr": str(props.get("Address", path.rsplit("/", 1)[-1]))})
+
+        def on_added(path, ifaces):
+            if "org.bluez.Device1" in ifaces:
+                remember(str(path), ifaces["org.bluez.Device1"])
+
+        def on_props(interface, changed, invalidated, path=None):
+            if interface == "org.bluez.Device1":
+                remember(str(path), changed)
+
+        bus.add_signal_receiver(on_added, dbus_interface="org.freedesktop.DBus.ObjectManager", signal_name="InterfacesAdded")
+        bus.add_signal_receiver(on_props, dbus_interface="org.freedesktop.DBus.Properties", signal_name="PropertiesChanged",
+                                arg0="org.bluez.Device1", path_keyword="path")
+        loop = GLib.MainLoop()
+
+        # Advertising through BlueZ (LEAdvertisingManager1): bluetoothd coordinates it with discovery, which
+        # raw btmgmt cannot (the Pi's controller refuses a new advertisement mid-scan, and btmgmt with a
+        # closed stdin exits before the kernel answers). Registration is asynchronous because bluetoothd
+        # calls back into our object for its properties while the call is in flight.
+        import dbus.service
+        adv_path = "/org/sworrl/beaconfix/adv0"
+        owner = self
+
+        class Advertisement(dbus.service.Object):
+            def __init__(self_, conn):
+                self_.sd = b""
+                dbus.service.Object.__init__(self_, conn, adv_path)
+
+            @dbus.service.method("org.freedesktop.DBus.Properties", in_signature="s", out_signature="a{sv}")
+            def GetAll(self_, iface):
+                return {"Type": dbus.String("broadcast"),
+                        "ServiceData": dbus.Dictionary({BLE_UUID: dbus.Array(list(self_.sd), signature="y")}, signature="sv"),
+                        "IncludeTxPower": dbus.Boolean(False)}
+
+            @dbus.service.method("org.bluez.LEAdvertisement1", in_signature="", out_signature="")
+            def Release(self_):
+                owner.adv_ok = False
+
+        adv = Advertisement(bus)
+        adv_state = {"registered": False, "busy": False}
+
+        def refresh_adv():
+            if not self.identity or adv_state["busy"]:
+                return
+            w = int(time.time() // 900)
+            if adv_state["registered"] and self.adv_window == w and self.adv_ident == self.identity:
+                return
+            adv.sd = ble_service_data(self.identity, time.time())
+            ident = self.identity
+            adv_state["busy"] = True
+
+            def resume():
+                try:
+                    adapter.StartDiscovery()
+                except Exception as ex:                            # noqa: BLE001
+                    log.debug("ble: resume discovery: %s", ex)
+
+            def ok():
+                resume()
+                adv_state.update(registered=True, busy=False)
+                self.adv_ok, self.adv_window, self.adv_ident, self.error = True, w, ident, ""
+                log.info("ble: advertising BeaconFix beacon via BlueZ (tag window %d)", w)
+
+            def fail(e):
+                resume()
+                adv_state["busy"] = False
+                self.adv_ok, self.error = False, "RegisterAdvertisement: %s" % str(e)[:120]
+                log.warning("ble: %s", self.error)
+
+            def register():
+                # The Pi's Broadcom controller rejects a new advertisement (0x03) while an LE scan runs, and
+                # bluetoothd does not pause discovery for it: pause ours for the moment of registration.
+                try:
+                    adapter.StopDiscovery()
+                except Exception:                                  # noqa: BLE001
+                    pass
+
+                def later():                                       # StopDiscovery completes asynchronously in the kernel
+                    advmgr.RegisterAdvertisement(adv_path, dbus.Dictionary({}, signature="sv"), reply_handler=ok, error_handler=fail)
+                    return False
+                GLib.timeout_add(1500, later)
+
+            if adv_state["registered"]:                           # new tag window: replace the advertisement
+                adv_state["registered"] = False
+                advmgr.UnregisterAdvertisement(adv_path, reply_handler=register, error_handler=lambda e: register())
+            else:
+                register()
+
+        def tick():
+            if self.adv_request and not self.stop.is_set():
+                self.adv_request = False
+                try:
+                    refresh_adv()
+                except Exception:                                  # noqa: BLE001
+                    log.exception("ble advertise")
+            if self.stop.is_set():
+                try:
+                    adapter.StopDiscovery()
+                except Exception:                                  # noqa: BLE001
+                    pass
+                loop.quit()
+                return False
+            return True
+
+        def restart():                                             # BlueZ drops stale LE devices; keep discovery alive
+            try:
+                adapter.StopDiscovery()
+            except Exception:                                      # noqa: BLE001
+                pass
+            # The scan is paused here anyway: the only moment the Pi's Broadcom controller accepts a new
+            # advertisement. (Re)register it when the 15-minute tag window changed or it is not on air yet.
+            try:
+                refresh_adv()
+            except Exception:                                      # noqa: BLE001
+                log.exception("ble advertise")
+            try:
+                adapter.StartDiscovery()
+            except Exception as ex:                                # noqa: BLE001
+                log.debug("ble: restart discovery: %s", ex)
+            return True
+
+        GLib.timeout_add(500, tick)
+        GLib.timeout_add_seconds(120, restart)
+        GLib.timeout_add_seconds(8, lambda: (restart(), False)[1])  # first advertisement soon after start
+        loop.run()
+        return True
+
+
+# ─────────────────────────── links and power ───────────────────────────
+def _i2c_word_be(bus, addr, reg):
+    """SMBus read-word, byte-swapped to the big-endian register value these chips use. None on failure."""
+    rc, out, _ = run(["i2cget", "-y", str(bus), "0x%02x" % addr, "0x%02x" % reg, "w"], timeout=3)
+    if rc != 0:
+        return None
+    try:
+        w = int(out.strip(), 16)
+    except ValueError:
+        return None
+    return ((w & 0xFF) << 8) | (w >> 8)
+
+
+class Ups:
+    """Battery level from common Pi UPS/battery HATs. Read-only, and silent when none is present:
+    1. /sys/class/power_supply/* with a 'capacity' (HATs with a kernel driver);
+    2. the PiSugar server's TCP API on 127.0.0.1:8423 ('get battery', 'get battery_charging');
+    3. I2C bus 1 (needs i2c-tools and group i2c): a MAX17040/43/48 fuel gauge at 0x36 (Geekworm X7xx, X1200),
+       then an INA219 at 0x40-0x43 (Waveshare UPS HAT (B) = 0x42, 2S 6.0-8.4 V; (C)/(D) = 0x43, 1S 3.0-4.2 V).
+    Only registers are read; nothing is ever written except the SMBus register pointer."""
+    def __init__(self, mode="auto"):
+        self.mode = mode
+        self.kind = None
+
+    def read(self):
+        if self.mode == "none":
+            return None
+        for fn in (self._sysfs, self._pisugar, self._max1704x, self._ina219):
+            try:
+                r = fn()
+            except Exception:                                  # noqa: BLE001 — a flaky HAT must not stop the agent
+                r = None
+            if r:
+                self.kind = r["source"]
+                return r
+        return None
+
+    def _sysfs(self):
+        base = "/sys/class/power_supply"
+        try:
+            names = os.listdir(base)
+        except OSError:
+            return None
+        for n in names:
+            if read_text("%s/%s/type" % (base, n)) != "Battery":
+                continue
+            cap = read_text("%s/%s/capacity" % (base, n))
+            if cap and cap.isdigit():
+                st = (read_text("%s/%s/status" % (base, n)) or "").lower()
+                uv = read_text("%s/%s/voltage_now" % (base, n))
+                return {"percent": int(cap), "charging": st in ("charging", "full"), "voltage": (int(uv) / 1e6) if uv and uv.isdigit() else None, "source": "sysfs:" + n}
+        return None
+
+    def _pisugar(self):
+        def ask(cmd):
+            with socket.create_connection(("127.0.0.1", 8423), timeout=1.5) as sk:
+                sk.sendall((cmd + "\n").encode())
+                return sk.recv(256).decode("utf-8", "replace").strip()
+        try:
+            b = ask("get battery")
+        except OSError:
+            return None
+        m = re.search(r"battery:\s*([\d.]+)", b)
+        if not m:
+            return None
+        charging = None
+        try:
+            c = ask("get battery_charging")
+            charging = "true" in c.lower()
+        except OSError:
+            pass
+        v = None
+        try:
+            mv = re.search(r"battery_v:\s*([\d.]+)", ask("get battery_v"))
+            v = float(mv.group(1)) if mv else None
+        except OSError:
+            pass
+        return {"percent": round(float(m.group(1))), "charging": charging, "voltage": v, "source": "pisugar"}
+
+    def _max1704x(self):
+        if not os.path.exists("/dev/i2c-1"):
+            return None
+        ver = _i2c_word_be(1, 0x36, 0x08)
+        if ver is None or ver in (0, 0xFFFF):
+            return None
+        soc = _i2c_word_be(1, 0x36, 0x04)
+        vc = _i2c_word_be(1, 0x36, 0x02)
+        if soc is None:
+            return None
+        pct = soc / 256.0
+        volt = None
+        if vc is not None:
+            volt = (vc >> 4) * 0.00125 if ver < 0x10 else vc * 78.125e-6      # MAX17040/43: 1.25 mV per 16 LSB; MAX17048: 78.125 µV
+        if not 0 <= pct <= 110:
+            return None
+        return {"percent": round(min(100.0, pct)), "charging": None, "voltage": volt and round(volt, 3), "source": "max1704x@0x36"}
+
+    def _ina219(self):
+        if not os.path.exists("/dev/i2c-1"):
+            return None
+        for addr in (0x42, 0x43, 0x41, 0x40):
+            vb = _i2c_word_be(1, addr, 0x02)
+            if vb is None or vb in (0, 0xFFFF):
+                continue
+            volt = (vb >> 3) * 0.004
+            if not 2.5 <= volt <= 9.0:
+                continue
+            shunt = _i2c_word_be(1, addr, 0x01)
+            amps = None
+            if shunt is not None:
+                if shunt & 0x8000:
+                    shunt -= 0x10000
+                amps = shunt * 10e-6 / 0.1                     # 10 µV LSB across the HATs' 0.1 Ω shunt
+            lo, hi = (6.0, 8.4) if volt > 5.0 else (3.0, 4.2)
+            pct = max(0.0, min(100.0, (volt - lo) / (hi - lo) * 100.0))
+            return {"percent": round(pct), "charging": (amps is not None and amps > 0.02), "voltage": round(volt, 3),
+                    "current": amps is not None and round(amps, 3), "source": "ina219@0x%02x" % addr}
+        return None
+
+
+class LinkMonitor:
+    """Watches the wired and wireless links and the Pi's supply; turns changes into events."""
+    def __init__(self, ups_mode="auto"):
+        self.state = {}
+        self.events = deque(maxlen=50)
+        self.throttled_seen = 0
+        self.ups = Ups(ups_mode)
+        self.batt_band = None
+
+    @staticmethod
+    def wired_names():
+        try:
+            names = os.listdir("/sys/class/net")
+        except OSError:
+            return []
+        return sorted(n for n in names if (n.startswith(("eth", "end", "enx", "enp")) and not os.path.isdir("/sys/class/net/%s/wireless" % n)))
+
+    def read(self):
+        now_ = {}
+        for n in self.wired_names():
+            base = "/sys/class/net/" + n
+            oper = read_text(base + "/operstate", "unknown")
+            speed = read_text(base + "/speed")
+            duplex = read_text(base + "/duplex")
+            carrier = read_text(base + "/carrier")
+            d = {"type": "wired", "oper": oper, "carrier": carrier == "1",
+                 "speedMbps": int(speed) if speed and speed.lstrip("-").isdigit() and int(speed) > 0 else None,
+                 "duplex": duplex if duplex in ("full", "half") else None}
+            rc, out, _ = run(["ethtool", n], timeout=5)
+            if rc == 0:
+                m = re.search(r"Speed:\s*(\d+)Mb/s", out)
+                if m:
+                    d["speedMbps"] = int(m.group(1))
+                m = re.search(r"Duplex:\s*(\w+)", out)
+                if m and m.group(1).lower() in ("full", "half"):
+                    d["duplex"] = m.group(1).lower()
+                m = re.search(r"Auto-negotiation:\s*(\w+)", out)
+                if m:
+                    d["autoneg"] = m.group(1)
+            now_[n] = d
+        for n in wifi_interfaces():
+            rc, out, _ = run(["iw", "dev", n, "link"], timeout=5)
+            d = {"type": "wifi", "oper": read_text("/sys/class/net/%s/operstate" % n, "unknown"), "connected": rc == 0 and "Connected to" in out}
+            m = re.search(r"Connected to ([0-9a-f:]{17})", out)
+            if m:
+                d["bssid"] = m.group(1).upper()
+            m = re.search(r"signal:\s*(-?\d+) dBm", out)
+            if m:
+                d["signal"] = int(m.group(1))
+            m = re.search(r"tx bitrate:\s*([\d.]+) MBit/s", out)
+            if m:
+                d["txMbps"] = float(m.group(1))
+            now_[n] = d
+        power = {"type": "power"}
+        rc, out, _ = run(["vcgencmd", "get_throttled"], timeout=5)
+        if rc == 0:
+            m = re.search(r"throttled=(0x[0-9a-fA-F]+)", out)
+            if m:
+                power["throttled"] = int(m.group(1), 16)
+        b = self.ups.read()
+        if b:
+            power["battery"] = b
+        if len(power) > 1:
+            now_["power"] = power
+        return now_
+
+    def poll(self):
+        cur = self.read()
+        for name, d in cur.items():
+            old = self.state.get(name)
+            if d["type"] == "wired":
+                up = d["oper"] == "up" and d.get("carrier")
+                was = old and old["oper"] == "up" and old.get("carrier")
+                if old is None or up != was:
+                    self.event(name, "link-up" if up else "link-down",
+                               "%s %s%s" % (name, "up" if up else "down", (" at %s Mb/s %s duplex" % (d.get("speedMbps"), d.get("duplex"))) if up else ""))
+                if up and (d.get("speedMbps") or 1000) < 100 or up and d.get("duplex") == "half":
+                    if not old or (old.get("speedMbps"), old.get("duplex")) != (d.get("speedMbps"), d.get("duplex")):
+                        self.event(name, "degraded", "%s negotiated %s Mb/s %s duplex: a bad cable, a bad port or a damaged jack "
+                                   "(see docs/AGENT.md, 'Power, and a Pi that keeps disappearing')" % (name, d.get("speedMbps"), d.get("duplex")))
+            elif d["type"] == "wifi":
+                if old is None or d.get("connected") != old.get("connected"):
+                    self.event(name, "wifi-up" if d.get("connected") else "wifi-down",
+                               "%s %s" % (name, ("associated with %s at %s dBm" % (d.get("bssid"), d.get("signal"))) if d.get("connected") else "not associated"))
+                elif d.get("bssid") and old.get("bssid") and d["bssid"] != old["bssid"]:
+                    self.event(name, "wifi-roam", "%s roamed to %s (%s dBm)" % (name, d["bssid"], d.get("signal")))
+            elif d["type"] == "power":
+                v = d.get("throttled")
+                if v is not None:
+                    new_bits = v & ~self.throttled_seen
+                    if new_bits & 0x1:
+                        self.event("power", "undervoltage", "under-voltage NOW (get_throttled=0x%x): the battery or supply is sagging; the Pi may drop off the network" % v)
+                    elif new_bits & 0x10000:
+                        self.event("power", "undervoltage", "under-voltage has occurred since boot (get_throttled=0x%x)" % v)
+                    if new_bits & 0x4 or new_bits & 0x40000:
+                        self.event("power", "throttled", "the Pi throttled its CPU (get_throttled=0x%x)" % v)
+                    self.throttled_seen |= v
+                    if v & 0x1 == 0 and old and (old.get("throttled") or 0) & 0x1:
+                        self.event("power", "power-ok", "under-voltage cleared (get_throttled=0x%x)" % v)
+                b = d.get("battery")
+                if b:
+                    band = "critical" if b["percent"] <= 10 else "low" if b["percent"] <= 20 else "ok"
+                    ob = (old or {}).get("battery") or {}
+                    if band != self.batt_band and band != "ok":
+                        self.event("power", "battery-" + band, "battery %d %% (%s)%s" % (b["percent"], b["source"], "" if b.get("charging") else ", not charging"))
+                    if ob and b.get("charging") is not None and ob.get("charging") is not None and b["charging"] != ob["charging"]:
+                        self.event("power", "on-power" if b["charging"] else "on-battery",
+                                   ("external power connected, charging at %d %%" if b["charging"] else "running on battery at %d %%") % b["percent"])
+                    self.batt_band = band
+        self.state = cur
+        return cur
+
+    def event(self, iface, kind, text):
+        e = {"time": iso_utc(), "iface": iface, "kind": kind, "text": text}
+        self.events.append(e)
+        (log.warning if kind in ("degraded", "undervoltage", "link-down", "wifi-down", "throttled") else log.info)("link: %s", text)
+
+    def preferred_source(self, dest_ip):
+        """Local IPv4 to bind for traffic to dest_ip: the wired interface when it is up on the same subnet."""
+        try:
+            dest = ipaddress.ip_address(dest_ip)
+        except ValueError:
+            return None
+        rc, out, _ = run(["ip", "-j", "-4", "addr"], timeout=5)
+        if rc != 0:
+            return None
+        try:
+            ifs = json.loads(out)
+        except ValueError:
+            return None
+        wired, wifi = [], []
+        wl = set(wifi_interfaces())
+        for i in ifs:
+            if i.get("operstate") not in ("UP", "UNKNOWN"):
+                continue
+            for a in i.get("addr_info", []):
+                try:
+                    net = ipaddress.ip_network("%s/%s" % (a["local"], a["prefixlen"]), strict=False)
+                except (KeyError, ValueError):
+                    continue
+                if dest in net:
+                    (wifi if i["ifname"] in wl else wired).append(a["local"])
+        return (wired or wifi or [None])[0]
+
+
+# ─────────────────────────── offline queue ───────────────────────────
+class Queue:
+    def __init__(self, path, cap=200000):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        self.db = sqlite3.connect(path, check_same_thread=False)
+        self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.execute("PRAGMA synchronous=NORMAL")
+        for t in ("obs", "fixes"):
+            self.db.execute("CREATE TABLE IF NOT EXISTS %s(id INTEGER PRIMARY KEY, json TEXT NOT NULL)" % t)
+        self.db.commit()
+        self.cap = cap
+        self.lock = threading.Lock()
+
+    def put(self, table, rows):
+        if not rows:
+            return
+        with self.lock:
+            self.db.executemany("INSERT INTO %s(json) VALUES(?)" % table, [(json.dumps(r, separators=(",", ":")),) for r in rows])
+            n = self.db.execute("SELECT COUNT(*) FROM %s" % table).fetchone()[0]
+            if n > self.cap:                                      # protect the SD card: drop the oldest
+                self.db.execute("DELETE FROM %s WHERE id IN (SELECT id FROM %s ORDER BY id LIMIT ?)" % (table, table), (n - self.cap,))
+            self.db.commit()
+
+    def peek(self, table, limit):
+        with self.lock:
+            rows = self.db.execute("SELECT id, json FROM %s ORDER BY id LIMIT ?" % table, (limit,)).fetchall()
+        return [r[0] for r in rows], [json.loads(r[1]) for r in rows]
+
+    def drop(self, table, ids):
+        if not ids:
+            return
+        with self.lock:
+            self.db.executemany("DELETE FROM %s WHERE id=?" % table, [(i,) for i in ids])
+            self.db.commit()
+
+    def count(self, table):
+        with self.lock:
+            return self.db.execute("SELECT COUNT(*) FROM %s" % table).fetchone()[0]
+
+
+# ─────────────────────────── the desktop ───────────────────────────
+class Desktop:
+    """BeaconFix LAN API client: discovery, bearer token, rate budget, feature detection."""
+    def __init__(self, url, token_file, links, device):
+        self.configured = url.rstrip("/") if url else ""
+        self.token_file = token_file
+        self.links = links
+        self.device = device
+        self.base = None
+        self.hello = {}
+        self.features = set()
+        self.unsupported = {}                    # path -> retry-after epoch
+        self.last_ok = None
+        self.last_error = ""
+        self.sent = deque()
+        self.cooldown_until = 0.0
+
+    def token(self):
+        t = read_text(self.token_file)
+        return t.splitlines()[-1].strip() if t else ""
+
+    def _candidates(self):
+        c = [self.configured] if self.configured else []
+        rc, out, _ = run(["avahi-browse", "-rtpk", "_beaconfix._tcp"], timeout=8)
+        if rc == 0:
+            for line in out.splitlines():
+                f = line.split(";")
+                if len(f) < 10 or f[0] != "=" or f[2] != "IPv4":
+                    continue
+                port, txt = f[8], f[9]
+                addrs = []
+                m = re.search(r'"addr=([^"]+)"', txt)
+                if m:
+                    addrs = [a for a in m.group(1).split(",") if a.count(".") == 3]
+                addrs.append(f[7])
+                for a in addrs:
+                    if a.startswith("172.17.") or a.startswith("169.254."):
+                        continue                       # docker bridges and link-local are never the desktop for us
+                    u = "http://%s:%s" % (a, port)
+                    if u not in c:
+                        c.append(u)
+        return c
+
+    def _conn(self, base, timeout=10):
+        u = base.split("://", 1)[1]
+        host, _, port = u.partition(":")
+        port = int(port or 47822)
+        src = self.links.preferred_source(host) if re.match(r"^\d+\.\d+\.\d+\.\d+$", host) else None
+        return http.client.HTTPConnection(host, port, timeout=timeout, source_address=(src, 0) if src else None), src
+
+    def discover(self):
+        for base in self._candidates():
+            try:
+                c, _ = self._conn(base, timeout=5)
+                c.request("GET", "/api/v1/hello")
+                r = c.getresponse()
+                body = r.read()
+                if r.status == 200:
+                    h = json.loads(body or b"{}")
+                    if h.get("name") == "BeaconFix" and h.get("kind", "desktop") == "desktop":
+                        self.base, self.hello = base, h
+                        self.features = set(h.get("features") or [])
+                        log.info("desktop: %s (BeaconFix %s, %s)", base, h.get("version"), h.get("hostname"))
+                        return True
+            except (OSError, ValueError, http.client.HTTPException) as ex:
+                log.debug("desktop: %s: %s", base, ex)
+        self.base = None
+        return False
+
+    def identity_id(self):
+        i = self.hello.get("identity") or {}
+        return i.get("id") if isinstance(i, dict) else None
+
+    def call(self, method, path, body=None, optional=False):
+        """Returns (status, json). status 0 = no desktop / transport error."""
+        if time.time() < self.cooldown_until:
+            return 0, {"error": "cooling down"}
+        if optional and self.unsupported.get(path, 0) > time.time():
+            return 404, {"error": "not supported (cached)"}
+        if not self.base and not self.discover():
+            self.last_error = "no BeaconFix desktop found"
+            return 0, {"error": self.last_error}
+        now_ = time.time()
+        while self.sent and now_ - self.sent[0] > 60:
+            self.sent.popleft()
+        if len(self.sent) >= 40:                               # the desktop allows 60 requests/min per address
+            return 0, {"error": "rate budget"}
+        self.sent.append(now_)
+        data = json.dumps(body, separators=(",", ":")).encode() if body is not None else None
+        headers = {"Content-Type": "application/json", "User-Agent": "beaconfix-agent/" + VERSION}
+        tok = self.token()
+        if tok:
+            headers["Authorization"] = "Bearer " + tok
+        try:
+            c, src = self._conn(self.base)
+            c.request(method, path, body=data, headers=headers)
+            r = c.getresponse()
+            raw = r.read()
+            try:
+                js = json.loads(raw) if raw else {}
+            except ValueError:
+                js = {"raw": raw[:200].decode("utf-8", "replace")}
+            if r.status == 429:
+                self.cooldown_until = time.time() + int(r.getheader("Retry-After", "60") or 60)
+            elif r.status == 401:
+                self.last_error = "token rejected (401): re-provision with install-on-pi.sh"
+                self.cooldown_until = time.time() + 300
+                log.error("desktop: %s", self.last_error)
+            elif r.status == 403 and (js.get("error") == "unknown device"):
+                self.last_error = "desktop does not know this Pi's address (%s): add it on the desktop with `beaconfix --known-add <mac> --known-name <pi>`" % (src or "?")
+                self.cooldown_until = time.time() + 300
+                log.error("desktop: %s", self.last_error)
+            elif r.status == 404 and optional:
+                self.unsupported[path] = time.time() + 1800
+            elif 200 <= r.status < 300:
+                self.last_ok = time.time()
+                self.last_error = ""
+            return r.status, js
+        except (OSError, http.client.HTTPException) as ex:
+            self.last_error = str(ex)[:160]
+            self.base = None                                  # rediscover next time
+            return 0, {"error": self.last_error}
+
+
+# ─────────────────────────────── agent ───────────────────────────────
+class Agent:
+    def __init__(self, cfg, args):
+        self.cfg, self.args = cfg, args
+        self.stop = threading.Event()
+        self.lock = threading.Lock()
+        g = cfg["averaging"]
+        self.avg = StaticAverager(tau_prior_s=g.getfloat("tau_prior", 90.0), floor_h=g.getfloat("floor", 0.5), floor_v=g.getfloat("floor_vertical", 1.0),
+                                  min_tau_s=g.getfloat("min_tau", 60.0), lp_sigma=g.getfloat("longperiod_sigma", 1.0), lp_tau_s=g.getfloat("longperiod_tau", 1200.0))
+        host, port = cfg["gpsd"].get("host", "127.0.0.1"), cfg["gpsd"].getint("port", 2947)
+        self.gps = Gpsd(host, port, self.avg, self.lock, self.stop)
+        self.links = LinkMonitor(cfg["power"].get("ups", "auto"))
+        self.device = cfg["agent"].get("device", "pi")
+        self.kind = cfg["agent"].get("kind", "pi")
+        self.state_dir = cfg["agent"].get("state_dir", "/var/lib/beaconfix-agent")
+        self.run_dir = cfg["agent"].get("run_dir", "/run/beaconfix-agent")
+        self.queue = Queue(os.path.join(self.state_dir, "queue.db"))
+        self.desk = Desktop(cfg["desktop"].get("url", ""), cfg["desktop"].get("token_file", "/etc/beaconfix-agent/token"), self.links, self.device)
+        self.ble = Ble(self.stop) if cfg["ble"].getboolean("enabled", True) and not args.no_ble else None
+        self.wifi_on = cfg["wifi"].getboolean("enabled", True) and not args.no_wifi
+        self.wifi_if = cfg["wifi"].get("interface", "auto")
+        self.can_trigger = True
+        self.last_scan = {"count": 0, "time": None, "trigger": False}
+        self.seen_obs = {}                           # (bssid, time) -> queued at; skips re-queueing an unchanged scan cache
+        iv = cfg["intervals"]
+        f = 0.2 if args.fast else 1.0
+        self.iv = {k: max(1.0, iv.getfloat(k, d) * f) for k, d in (("position", 10), ("sync", 60), ("fix", 60), ("anchor", 600), ("hello", 300), ("ranging", 5), ("wifi", 30), ("links", 10))}
+        self.anchor_on = cfg["anchor"].getboolean("enabled", True) and not args.no_anchor
+        self.anchor_name = cfg["anchor"].get("name", "%s GPS antenna" % self.device)
+        self.anchor_id = self._load_anchor_id()
+        self.anchor_sent = None
+        self.pending_events = deque(maxlen=20)
+        self.stats = {"obsQueued": 0, "obsSent": 0, "fixesSent": 0, "positions": 0, "anchors": 0, "ranging": 0, "syncErrors": 0}
+
+    def _load_anchor_id(self):
+        p = os.path.join(self.state_dir, "anchor-id")
+        v = read_text(p)
+        if v:
+            return v
+        v = str(uuid.uuid4())
+        try:
+            os.makedirs(self.state_dir, exist_ok=True)
+            with open(p, "w") as fh:
+                fh.write(v + "\n")
+        except OSError:
+            pass
+        return v
+
+    # -- periodic jobs --
+    def job_wifi(self):
+        if not self.wifi_on:
+            return
+        ifs = wifi_interfaces()
+        ifname = ifs[0] if self.wifi_if == "auto" and ifs else self.wifi_if
+        if not ifname:
+            return
+        t_scan = time.time()
+        bss, trig, self.can_trigger = scan_wifi(ifname, self.can_trigger)
+        with self.lock:
+            fix = self.avg.best_fix()
+        self.last_scan = {"count": len(bss), "time": iso_utc(t_scan), "trigger": trig}
+        if not fix or fix["acc"] > 15.0:
+            return
+        max_age = 8000 if trig else 20000
+        rows = []
+        now_ = time.time()
+        for k in [k for k, v in self.seen_obs.items() if now_ - v > 900]:
+            del self.seen_obs[k]
+        for b in bss:
+            age = b.get("ageMs", 0)
+            if age > max_age:
+                continue
+            key = (b["bssid"], iso_utc(t_scan - age / 1000.0))
+            if key in self.seen_obs:                 # the same BSS entry from the same scan: already queued
+                continue
+            self.seen_obs[key] = now_
+            rows.append({"bssid": b["bssid"], "ssid": b.get("ssid", ""), "freq": b.get("freq", 0), "dbm": int(round(max(-100.0, min(-20.0, b["dbm"])))),
+                         "time": iso_utc(t_scan - age / 1000.0), "lat": round(fix["lat"], 8), "lon": round(fix["lon"], 8),
+                         "acc": round(fix["acc"], 2), "source": fix["source"], "device": self.device})
+        self.queue.put("obs", rows)
+        self.stats["obsQueued"] += len(rows)
+
+    def job_fix(self):
+        with self.lock:
+            fix = self.avg.best_fix()
+        if not fix:
+            return
+        row = {"time": iso_utc(fix["t"]), "lat": round(fix["lat"], 8), "lon": round(fix["lon"], 8), "acc": round(fix["acc"], 2),
+               "source": fix["source"], "provider": "gnss", "place": "", "device": self.device}
+        if fix.get("alt") is not None:
+            row["elev"] = round(fix["alt"], 1)
+        self.queue.put("fixes", [row])
+
+    def job_sync(self):
+        oids, obs = self.queue.peek("obs", 2000)
+        fids, fixes = self.queue.peek("fixes", 200)
+        if not obs and not fixes:
+            return
+        st, js = self.desk.call("POST", "/api/v1/db/sync", {"device": self.device, "kind": self.kind, "observations": obs, "fixes": fixes})
+        if st == 200:
+            self.queue.drop("obs", oids)
+            self.queue.drop("fixes", fids)
+            acc = js.get("accepted", {})
+            self.stats["obsSent"] += len(obs)
+            self.stats["fixesSent"] += len(fixes)
+            log.info("sync: sent %d observations, %d fixes (accepted %s)", len(obs), len(fixes), acc)
+        elif st == 413 and len(obs) > 50:
+            # halve by sending the first half now
+            half = len(obs) // 2
+            st2, _ = self.desk.call("POST", "/api/v1/db/sync", {"device": self.device, "kind": self.kind, "observations": obs[:half], "fixes": []})
+            if st2 == 200:
+                self.queue.drop("obs", oids[:half])
+        elif st != 0:
+            self.stats["syncErrors"] += 1
+            log.warning("sync: HTTP %s %s", st, js.get("error", ""))
+
+    def job_position(self):
+        with self.lock:
+            fix = self.avg.best_fix()
+            av = fix and fix.get("averaged")
+        if not fix:
+            return
+        body = {"lat": round(fix["lat"], 8), "lon": round(fix["lon"], 8), "acc": round(fix["acc"], 2), "time": iso_utc(fix["t"]),
+                "source": fix["source"], "kind": self.kind, "beacons": self.last_scan["count"], "place": ""}
+        if av:
+            body["gnss"] = {"nEff": round(av["nEff"], 1), "durationS": int(av["durationS"]), "sigmaU": round(av["sigmaU"], 2),
+                            "sats": (self.gps.sky or {}).get("used"), "hdop": (self.gps.sky or {}).get("hdop")}
+        links = {}
+        for k, v in (self.links.state or {}).items():
+            if v["type"] == "wired":
+                links[k] = {"up": v["oper"] == "up" and v.get("carrier"), "mbps": v.get("speedMbps"), "duplex": v.get("duplex")}
+            elif v["type"] == "wifi":
+                links[k] = {"up": v.get("connected"), "dbm": v.get("signal")}
+            elif v["type"] == "power":
+                p = {}
+                if v.get("throttled") is not None:
+                    p["throttled"] = "0x%x" % v["throttled"]
+                    p["undervoltageNow"] = bool(v["throttled"] & 1)
+                if v.get("battery"):
+                    b = v["battery"]
+                    p["battery"] = {"percent": b["percent"], "charging": b.get("charging"), "voltage": b.get("voltage"), "source": b["source"]}
+                links[k] = p
+        body["link"] = links
+        while self.links.events:
+            self.pending_events.append(self.links.events.popleft())
+        if self.pending_events:
+            body["events"] = list(self.pending_events)[-5:]
+        raw = json.dumps(body, separators=(",", ":"))
+        if len(raw) > 3800:
+            body.pop("events", None)
+        st, _ = self.desk.call("POST", "/api/v1/devices/position", body, optional=True)
+        if st == 200:
+            self.stats["positions"] += 1
+            self.pending_events.clear()
+
+    def job_anchor(self):
+        if not self.anchor_on:
+            return
+        with self.lock:
+            r = self.avg.result()
+        if not r or r["sigmaH"] > 10.0 or r["durationS"] < 120:
+            return
+        if self.anchor_sent:
+            moved = math.hypot((r["lat"] - self.anchor_sent["lat"]) * M_PER_DEG,
+                               (r["lon"] - self.anchor_sent["lon"]) * M_PER_DEG * math.cos(math.radians(r["lat"])))
+            better = r["sigmaH"] < 0.8 * self.anchor_sent["accM"]
+            stale = time.time() - self.anchor_sent["t"] > self.iv["anchor"]
+            if not (better or moved > max(r["sigmaH"], 1.0) or stale):
+                return
+        adv = bool(self.ble and self.ble.adv_ok)
+        a = {"id": self.anchor_id, "name": self.anchor_name, "kind": "ble" if adv else "custom", "lat": round(r["lat"], 8), "lon": round(r["lon"], 8),
+             "accM": round(max(0.05, r["sigmaH"]), 2), "bssids": [], "rv": True, "ref": False, "placedBy": "pi",
+             "placedAt": iso_utc(), "source": "gps-average",
+             "device": self.device, "gnss": {"nEff": round(r["nEff"], 1), "durationS": int(r["durationS"]), "sigmaU": round(r["sigmaU"], 2),
+                                              "sats": (self.gps.sky or {}).get("used"), "hdop": (self.gps.sky or {}).get("hdop")}}
+        if adv:
+            a["ble"] = BLE_UUID
+        if r.get("alt") is not None:
+            a["alt"] = round(r["alt"], 2)
+        st, js = self.desk.call("POST", "/api/v1/anchors", a, optional=True)
+        if st in (200, 201):
+            self.anchor_sent = {"lat": r["lat"], "lon": r["lon"], "accM": a["accM"], "t": time.time()}
+            self.stats["anchors"] += 1
+            log.info("anchor: %s at %.7f, %.7f ±%.2f m (Neff %.0f over %.0f min)", self.anchor_name, r["lat"], r["lon"], a["accM"], r["nEff"], r["durationS"] / 60)
+        elif st == 404:
+            log.debug("anchor: the desktop has no /api/v1/anchors yet; retrying later")
+
+    def job_ranging(self):
+        if not self.ble:
+            return
+        samples = self.ble.take(40)
+        if not samples:
+            return
+        with self.lock:
+            fix = self.avg.best_fix()
+        body = {"device": self.device, "kind": self.kind, "time": iso_utc(), "ble": [dict(rssi=s["rssi"], txPower=s["txPower"], time=s["time"]) for s in samples if s["from"] == "desktop"],
+                "heard": [{"from": s["from"], "rssi": s["rssi"], "txPower": s["txPower"], "time": s["time"]} for s in samples], "moving": self.avg.state == "moving"}
+        if fix:
+            body["fix"] = {"lat": round(fix["lat"], 8), "lon": round(fix["lon"], 8), "acc": round(fix["acc"], 2), "time": int(fix["t"] * 1000), "source": fix["source"]}
+        st, _ = self.desk.call("POST", "/api/v1/ranging", body, optional=True)
+        if st == 200:
+            self.stats["ranging"] += len(samples)
+
+    def job_hello(self):
+        if self.desk.discover() and self.ble:
+            ident = self.desk.identity_id()
+            if ident:
+                self.ble.set_identities(ident, self.device)
+
+    def write_status(self):
+        with self.lock:
+            r = self.avg.result()
+            fix = self.avg.best_fix()
+            last = self.avg.last_parked
+            state = self.avg.state
+        st = {"version": VERSION, "time": iso_utc(), "device": self.device, "state": state, "gps": self.gps.summary(),
+              "average": r and {k: (round(v, 8) if k in ("lat", "lon") else (round(v, 3) if isinstance(v, float) else v)) for k, v in r.items()},
+              "fix": fix and {"lat": round(fix["lat"], 8), "lon": round(fix["lon"], 8), "acc": round(fix["acc"], 2), "source": fix["source"]},
+              "lastParked": last and {"lat": round(last["lat"], 8), "lon": round(last["lon"], 8), "sigmaH": round(last["sigmaH"], 2), "durationS": int(last["durationS"])},
+              "wifi": self.last_scan, "ble": self.ble and {"advertising": self.ble.adv_ok, "scanning": self.ble.scan_ok, "identity": bool(self.ble.identity), "error": self.ble.error},
+              "desktop": {"url": self.desk.base, "lastOk": self.desk.last_ok and iso_utc(self.desk.last_ok), "error": self.desk.last_error, "features": sorted(self.desk.features)},
+              "queue": {"obs": self.queue.count("obs"), "fixes": self.queue.count("fixes")}, "links": self.links.state, "stats": self.stats}
+        try:
+            os.makedirs(self.run_dir, exist_ok=True)
+            tmp = os.path.join(self.run_dir, ".status.tmp")
+            with open(tmp, "w") as fh:
+                json.dump(st, fh, indent=1)
+            os.replace(tmp, os.path.join(self.run_dir, "status.json"))
+        except OSError as ex:
+            log.debug("status: %s", ex)
+        return st
+
+    def uplink(self):
+        last = {k: 0.0 for k in self.iv}
+        jobs = [("links", self.links.poll), ("hello", self.job_hello), ("wifi", self.job_wifi), ("fix", self.job_fix), ("position", self.job_position),
+                ("sync", self.job_sync), ("anchor", self.job_anchor), ("ranging", self.job_ranging)]
+        cycles = 0
+        while not self.stop.is_set():
+            now_ = time.time()
+            for name, fn in jobs:
+                if now_ - last[name] >= self.iv[name]:
+                    last[name] = now_
+                    try:
+                        fn()
+                    except Exception:                          # noqa: BLE001 — one failing job must not stop the others
+                        log.exception("job %s failed", name)
+            if self.links.events and now_ - last["position"] >= 2.0:      # deliver link/power events without waiting
+                last["position"] = now_
+                try:
+                    self.job_position()
+                except Exception:                              # noqa: BLE001
+                    log.exception("job position (event)")
+            if self.ble and self.ble.identity:
+                try:
+                    self.ble.advertise()
+                except Exception:                              # noqa: BLE001
+                    log.exception("ble advertise")
+            self.write_status()
+            cycles += 1
+            if self.args.cycles and cycles >= self.args.cycles:
+                self.stop.set()
+                break
+            self.stop.wait(1.0)
+
+    def run(self):
+        self.gps.start()
+        up = threading.Thread(target=self.uplink, name="uplink", daemon=True)
+        up.start()
+        if self.ble:
+            ok = self.ble.run_scan_loop()           # blocks in the GLib loop until stop
+            if not ok:
+                self.stop.wait()
+        else:
+            self.stop.wait()
+        up.join(timeout=10)
+        if self.ble:
+            self.ble.stop_advertising()
+        # final flush attempt
+        try:
+            self.job_fix()
+            self.job_sync()
+        except Exception:                              # noqa: BLE001
+            pass
+        self.write_status()
+
+
+# ─────────────────────────────── main ───────────────────────────────
+DEFAULTS = {
+    "agent": {"device": socket.gethostname().split(".")[0] or "pi", "kind": "pi", "state_dir": "/var/lib/beaconfix-agent", "run_dir": "/run/beaconfix-agent"},
+    "desktop": {"url": "", "token_file": "/etc/beaconfix-agent/token"},
+    "gpsd": {"host": "127.0.0.1", "port": "2947"},
+    "wifi": {"enabled": "yes", "interface": "auto"},
+    "ble": {"enabled": "yes"},
+    "anchor": {"enabled": "yes", "name": ""},
+    "intervals": {"position": "10", "sync": "60", "fix": "60", "anchor": "600", "hello": "300", "ranging": "5", "wifi": "30", "links": "10"},
+    "averaging": {"tau_prior": "90", "floor": "0.5", "floor_vertical": "1.0", "min_tau": "60", "longperiod_sigma": "1.0", "longperiod_tau": "1200"},
+    "power": {"ups": "auto"},
+}
+
+
+def load_config(path):
+    cfg = configparser.ConfigParser()
+    cfg.read_dict(DEFAULTS)
+    if path and os.path.exists(path):
+        cfg.read(path)
+    if not cfg["anchor"].get("name"):
+        cfg["anchor"]["name"] = "%s GPS antenna" % cfg["agent"].get("device", "pi")
+    return cfg
+
+
+def gnss_only(args, cfg):
+    """Test mode: run gpsd + the averager only, write one JSON line per fix, exit at gpsd EOF."""
+    host, port = cfg["gpsd"].get("host"), cfg["gpsd"].getint("port")
+    g = cfg["averaging"]
+    avg = StaticAverager(tau_prior_s=g.getfloat("tau_prior"), floor_h=g.getfloat("floor"), floor_v=g.getfloat("floor_vertical"), min_tau_s=g.getfloat("min_tau"),
+                         lp_sigma=g.getfloat("longperiod_sigma"), lp_tau_s=g.getfloat("longperiod_tau"))
+    stop = threading.Event()
+    with open(args.report, "w") as rep:
+        gps = Gpsd(host, port, avg, threading.Lock(), stop, report=rep, exit_on_eof=True)
+        gps.start()
+        gps.eof.wait()
+        stop.set()
+    print(json.dumps({"epochs": gps.epochs, "lastParked": avg.last_parked, "final": avg.result()}, indent=1))
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(description="BeaconFix agent for a Raspberry Pi with a GNSS HAT (docs/AGENT.md)")
+    ap.add_argument("--config", default="/etc/beaconfix-agent/agent.conf")
+    ap.add_argument("--status", action="store_true", help="print the running agent's status and exit")
+    ap.add_argument("--desktop", help="BeaconFix desktop URL, e.g. http://<desktop>:47822 (default: config, then mDNS)")
+    ap.add_argument("--token-file")
+    ap.add_argument("--gpsd", help="host:port of gpsd")
+    ap.add_argument("--state-dir")
+    ap.add_argument("--run-dir")
+    ap.add_argument("--device")
+    ap.add_argument("--no-wifi", action="store_true")
+    ap.add_argument("--no-ble", action="store_true")
+    ap.add_argument("--no-anchor", action="store_true")
+    ap.add_argument("--fast", action="store_true", help="5x shorter intervals (tests)")
+    ap.add_argument("--cycles", type=int, default=0, help="exit after N uplink cycles (tests)")
+    ap.add_argument("--gnss-only", action="store_true", help="test mode: average what gpsd sends, write --report, exit at EOF")
+    ap.add_argument("--report", default="gnss-report.jsonl")
+    ap.add_argument("--verbose", "-v", action="store_true")
+    ap.add_argument("--version", action="version", version="beaconfix-agent " + VERSION)
+    args = ap.parse_args()
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO, format="%(levelname)s %(message)s", stream=sys.stderr)
+    cfg = load_config(args.config)
+    if args.desktop:
+        cfg["desktop"]["url"] = args.desktop
+    if args.token_file:
+        cfg["desktop"]["token_file"] = args.token_file
+    if args.gpsd:
+        h, _, p = args.gpsd.rpartition(":")
+        cfg["gpsd"]["host"], cfg["gpsd"]["port"] = h or "127.0.0.1", p
+    if args.state_dir:
+        cfg["agent"]["state_dir"] = args.state_dir
+    if args.run_dir:
+        cfg["agent"]["run_dir"] = args.run_dir
+    if args.device:
+        cfg["agent"]["device"] = args.device
+    if args.status:
+        p = os.path.join(cfg["agent"]["run_dir"], "status.json")
+        s = read_text(p)
+        print(s if s else json.dumps({"error": "no status at %s (is the service running?)" % p}))
+        return 0 if s else 1
+    if args.gnss_only:
+        return gnss_only(args, cfg)
+    agent = Agent(cfg, args)
+
+    def on_signal(*_):
+        agent.stop.set()
+    signal.signal(signal.SIGTERM, on_signal)
+    signal.signal(signal.SIGINT, on_signal)
+    log.info("beaconfix-agent %s starting as %s (%s)", VERSION, agent.device, agent.kind)
+    agent.run()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

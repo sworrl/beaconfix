@@ -1,0 +1,36 @@
+[Unit]
+Description=BeaconFix agent (GNSS averaging, Wi-Fi and BLE observations for the RV desktop)
+Documentation=https://github.com/sworrl/beaconfix/blob/master/docs/AGENT.md
+Wants=network-online.target gpsd.socket bluetooth.service
+After=network-online.target gpsd.socket bluetooth.service
+
+[Service]
+Type=simple
+# A dedicated system user. Groups are added by install-on-pi.sh for the ones that exist:
+# bluetooth (BlueZ D-Bus scanning), video (vcgencmd get_throttled), i2c (UPS/battery HATs), netdev.
+User=beaconfix-agent
+Group=beaconfix-agent
+ExecStart=/usr/local/lib/beaconfix-agent/beaconfix-agent --config /etc/beaconfix-agent/agent.conf
+Restart=always
+RestartSec=10
+# The only privilege: CAP_NET_ADMIN, for `iw ... scan trigger` (fresh Wi-Fi scans) and `btmgmt add-adv`
+# (the BeaconFix BLE beacon). Reading scans, gpsd, BlueZ discovery and the desktop API need none.
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+NoNewPrivileges=yes
+StateDirectory=beaconfix-agent
+RuntimeDirectory=beaconfix-agent
+RuntimeDirectoryMode=0755
+ConfigurationDirectory=beaconfix-agent
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_BLUETOOTH
+RestrictNamespaces=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target
