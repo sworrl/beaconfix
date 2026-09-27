@@ -81,3 +81,26 @@ show-all / hide-all. The compact tooltip adds the resolved time zone and the loc
 number.
 
 Config keys added: none (categories, groups and hidden lists reuse `hiddenCategories`).
+
+## Nearby: pediatric ER (3.8)
+
+With desktop 3.8 or later (`"pediatric"` in the features list) the help card adds, after the
+general ER row (which always stays):
+
+- **🧸 Pediatric ER**: the nearest pediatric emergency department with its distance, bearing,
+  estimated drive time ("~1 h 20 min drive (est.)", straight line × 1.4 at 70 km/h unless the
+  desktop has a road route) and call button, plus a confidence line: *Dedicated pediatric ER*,
+  *Children's hospital · ER on campus: … — call ahead*, *Children's hospital · ER not confirmed —
+  call ahead* or *ER with a pediatrics department*.
+- **🧸 Closer**: a closer but less certain site, only when the pick above is a confirmed one.
+- **🩹 Pediatric urgent care**, always marked *Not an ER*.
+- The desktop's pediatric note in italics ("No pediatric ER mapped within 150 km — go to the
+  nearest ER", "Saved 4 d ago, 38 km from here — may be incomplete", "Overpass busy — will retry").
+
+A **🧸 Kids ER** chip next to the group chips narrows the list to pediatric ERs and pediatric
+urgent care (hidden categories included). Rows show the drive-time estimate when the desktop
+sends one. On the map, a cluster takes the icon of the most urgent help inside it (pediatric ER,
+then an ER, then police or fire) before its most common category, pediatric ER markers draw over
+their neighbours, and the place card adds the ER status, campus ER, drive time and address. The
+category list is re-read whenever the desktop's changes, so new categories appear in *Places to
+show* without re-adding the widget. With an older desktop none of this shows.

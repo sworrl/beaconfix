@@ -1288,17 +1288,23 @@ Item {
                 if (!groups[key]) { groups[key] = {ids: [], mx: 0, my: 0, cats: {}}; order.push(key) }
                 var g = groups[key]; g.ids.push(i); g.mx += m.x; g.my += m.y; g.cats[pt.cat] = (g.cats[pt.cat] || 0) + 1
             } else {
-                out.push({ids: [i], mx: m.x, my: m.y, icon: pt.icon, color: pt.color, count: 1, name: pt.name || "", wifi: !!pt.wifi && pt.cat !== "wifi", d: pt.d || 0})
+                out.push({ids: [i], mx: m.x, my: m.y, icon: pt.icon, color: pt.color, count: 1, name: pt.name || "", wifi: !!pt.wifi && pt.cat !== "wifi", d: pt.d || 0, pri: helpPriority(pt)})
             }
         }
+        // A cluster wears the icon of the most urgent help in it (pediatric ER, then an ER, then police / fire),
+        // else of its most common category: help must not hide behind a cluster of cafés.
         for (var o = 0; o < order.length; o++) {
             var gr = groups[order[o]], top = "", best = 0
             for (var c in gr.cats) if (gr.cats[c] > best) { best = gr.cats[c]; top = c }
-            var first = pois[gr.ids[0]]
-            for (var t = 0; t < gr.ids.length; t++) if (pois[gr.ids[t]].cat === top) { first = pois[gr.ids[t]]; break }
+            var first = null, fp = 0
+            for (var f = 0; f < gr.ids.length; f++) { var fpi = helpPriority(pois[gr.ids[f]]); if (fpi > fp) { fp = fpi; first = pois[gr.ids[f]] } }
+            if (!first) {
+                first = pois[gr.ids[0]]
+                for (var t = 0; t < gr.ids.length; t++) if (pois[gr.ids[t]].cat === top) { first = pois[gr.ids[t]]; break }
+            }
             var mixed = Object.keys(gr.cats).length > 1
             out.push({ids: gr.ids, mx: gr.mx / gr.ids.length, my: gr.my / gr.ids.length, icon: first.icon, color: first.color,
-                      count: gr.ids.length, badge: mixed ? "#e6edf7" : first.color, name: gr.ids.length === 1 ? (first.name || "") : "", wifi: false, d: first.d || 0})
+                      count: gr.ids.length, badge: mixed ? "#e6edf7" : first.color, name: gr.ids.length === 1 ? (first.name || "") : "", wifi: false, d: first.d || 0, pri: fp})
         }
         var slots = slotMarkers(markers, out)
         var js = JSON.stringify(slots)
@@ -1332,6 +1338,7 @@ Item {
         var lj = JSON.stringify(shown)
         if (lj !== _labelsJson) { _labelsJson = lj; markerLabels = shown }
     }
+    function helpPriority(p) { return !p ? 0 : p.cat === "peds_er" ? 3 : p.cat === "health" && p.emergency ? 2 : p.cat === "police" || p.cat === "fire" ? 1 : 0 }
     // A marker keeps the delegate that showed it last time (same places); a new one takes a free delegate that
     // showed the same icon (its emoji is already laid out), else any free one; the pool only grows when full.
     // A delegate with nothing to show keeps its last marker, hidden, so its texts stay laid out.
@@ -1507,7 +1514,7 @@ Item {
                 scale: map.invS
                 // generous bounds: the layer is only re-laid-out every 0.3 zoom levels while moving
                 visible: live && x > -map.width * 0.6 && x < map.width * 1.6 && y > -map.height * 0.6 && y < map.height * 1.6
-                z: hot ? 10 : 1
+                z: hot ? 10 : md.pri === 3 ? 2 : 1       // a pediatric ER is drawn over its neighbours
                 // the delegate now shows another place (or none) under the pointer: the card follows
                 onMdChanged: if (pinArea.containsMouse) map.hover = !md.hid ? {kind: md.count > 1 ? "cluster" : "poi", ids: md.ids} : null
                 Rectangle {
@@ -2020,12 +2027,31 @@ Item {
         var col = sc.rank >= 3 ? sc.color : a.status === "used" ? "#ffd166" : a.status === "active" ? "#6cff8a" : a.status === "travelling" ? "#ff4fd8" : "#8a93a6"
         return {title: (sc.rank >= 3 ? sc.glyph + " " : "📶 ") + (a.ssid || "(hidden network)"), lines: lines, color: col, poi: null}
     }
+    // Desktop 3.8 fields (each optional; an older desktop's detail line already says "emergency dept." / "no ER"):
+    // er "yes" | "no", peds tier 1-4, campusEr, driveS / driveEst.
+    function erStatus(p) {
+        if (!p || (p.er === undefined && p.peds === undefined && p.cat !== "peds_er" && p.cat !== "peds_urgent")) return ""
+        if (p.cat === "peds_urgent" || p.peds === 4) return "Not an ER"
+        if (p.er === "no") return "No ER"
+        if (p.er === "yes") return p.peds === 3 ? "ER · pediatrics dept." : "ER"
+        if (p.cat === "peds_er") return p.campusEr ? `ER on campus: ${p.campusEr} — call ahead` : "ER not confirmed — call ahead"
+        return ""
+    }
+    function driveText(p) {
+        if (!p || !(p.driveS > 0)) return ""
+        var m = Math.max(1, Math.round(p.driveS / 60))
+        return "~" + (m < 60 ? m + " min" : Math.floor(m / 60) + " h" + (m % 60 ? " " + (m % 60) + " min" : "")) + (p.driveEst === false ? " drive" : " drive (est.)")
+    }
     function poiInfo(p, pinned) {
         if (!p) return null
-        var lines = [`${p.label} · ${distText(p.d || 0)} ${compass(p.brg || 0)}` + (src.source === "ip" ? " (from IP estimate)" : "")]
+        var eta = driveText(p)
+        var lines = [`${p.label} · ${distText(p.d || 0)} ${compass(p.brg || 0)}` + (eta ? " · " + eta : "") + (src.source === "ip" ? " (from IP estimate)" : "")]
+        var st = erStatus(p)
+        if (st && (p.detail || "").toLowerCase().indexOf(st.toLowerCase()) < 0) lines.push((/call ahead|not an er|no er/i.test(st) ? "⚠ " : "🏥 ") + st)
         if (p.detail) lines.push(p.detail)
         if (p.hours) lines.push("🕑 " + p.hours)
         if (p.phone) lines.push("☎ " + p.phone)
+        if (p.address) lines.push("📍 " + p.address)
         if (!pinned) lines.push("Click for directions")
         return {title: `${p.icon} ${p.name || p.label}`, lines: lines, color: p.color, poi: p, pinned: pinned}
     }

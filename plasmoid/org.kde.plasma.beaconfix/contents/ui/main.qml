@@ -53,6 +53,8 @@ PlasmoidItem {
     property var    emergency: null
     property var    securitySummary: null
     property var    poiCategories: []
+    property string _catsJson: ""
+    property bool   pedsSupported: false        // the desktop finds pediatric ERs (3.8+: "pediatric" in features)
     property string poiNote:  ""
     property string tileBase: ""
     property string _poisJson: ""
@@ -159,7 +161,11 @@ PlasmoidItem {
                 if (pj !== root._poisJson) { root._poisJson = pj; root.pois = d.pois || [] }
                 var tj = JSON.stringify(d.track || [])
                 if (tj !== root._trackJson) { root._trackJson = tj; root.track = d.track || [] }
-                if (!root.poiCategories.length) root.poiCategories = d.poiCategories || []
+                // The category list follows the desktop (a newer one adds categories, e.g. pediatric ER), but is
+                // only reassigned when it changed: the map's Places menu rebuilds its items on every assignment
+                var cj = JSON.stringify(d.poiCategories || [])
+                if ((d.poiCategories || []).length && cj !== root._catsJson) { root._catsJson = cj; root.poiCategories = d.poiCategories }
+                root.pedsSupported = (d.features || []).indexOf("pediatric") >= 0
                 root.poiNote = d.poiNote || ""
                 root.tileBase = d.tileBase || ""
                 root.knownDevices = d.knownDevices || []
