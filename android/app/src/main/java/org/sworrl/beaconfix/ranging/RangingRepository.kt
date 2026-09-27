@@ -77,6 +77,8 @@ data class RangeSession(
  * motion, POST them to `/api/v1/ranging` (the desktop fuses both directions and replies with its estimate), and fuse
  * locally too with [RangeMath] so the phone has a number even when the desktop is slow. With the presence service alone
  * (collector off, app in the background) only low-power BLE advertising/scanning continues so the desktop can hear us.
+ * RTT bursts are paced ([RttPacer]): one per tick while anything changes, one every 30 s once the distance has held for
+ * 2 min with nothing moving.
  */
 @Singleton
 class RangingRepository @Inject constructor(
@@ -97,6 +99,8 @@ class RangingRepository @Inject constructor(
     private var lastLine = ""; private var lastLineAt = 0L
     /** Wakes the loop's sleep early: Doze ended / RTT became available again (no 2.5–20 s wait for the next burst). */
     private val wake = Channel<Unit>(Channel.CONFLATED)
+    /** Per desktop: when the next RTT burst is due (fast while things change, every 30 s once stable). */
+    private val pacers = java.util.concurrent.ConcurrentHashMap<String, RttPacer>()
 
     init {
         // Android switches Wi-Fi RTT off for the whole device in deep Doze and back on when it ends (unlock, charger,
@@ -111,10 +115,14 @@ class RangingRepository @Inject constructor(
             ContextCompat.registerReceiver(ctx, r, IntentFilter().apply { addAction(PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED); addAction(WifiRttManager.ACTION_WIFI_RTT_STATE_CHANGED) },
                 ContextCompat.RECEIVER_NOT_EXPORTED)
         }
+        // A ranging view (the Home desktop card, the map) collecting [sessions] means the user is looking: measure fast.
+        scope.launch { var before = 0; _sessions.subscriptionCount.collect { n -> if (n > before) boost(); before = n } }
     }
 
     fun presence(on: Boolean) { presence = on; kick() }
-    fun foreground(on: Boolean) { foreground = on; kick() }
+    fun foreground(on: Boolean) { val was = foreground; foreground = on; if (on && !was) boost(); kick() }
+    /** The user opened the app or a ranging view: RTT bursts go back to one per tick (see [RttPacer]). */
+    fun boost() { val now = System.currentTimeMillis(); pacers.values.forEach { it.boost(now) }; wake.trySend(Unit) }
     fun anchorsChanged() { scope.launch { runCatching { refreshAnchors() } } }
     private fun sessionMode() = foreground || status.state.value.running
     private fun active() = presence || foreground
@@ -167,6 +175,7 @@ class RangingRepository @Inject constructor(
             desktopAnchor.value = _sessions.value.values.firstNotNullOfOrNull { it.anchor } ?: s.anchor
         }
         val f = filters.getOrPut(d.id) { RangeFilter() }
+        val pacer = pacers.getOrPut(d.id) { RttPacer() }
         val dt = ((now - (lastTick[d.id] ?: now)) / 1000.0).coerceIn(0.0, 60.0); lastTick[d.id] = now
         val moving = motion.moving
         f.predict(dt, moving)
@@ -176,8 +185,11 @@ class RangingRepository @Inject constructor(
         val rttInfo = s.info?.rtt?.takeIf { it.enabled && it.bssid.isNotEmpty() } ?: rttOverride
         val hold = if (mode && rttInfo != null && rttInfo.enabled && rttInfo.bssid.isNotEmpty()) rttHold(d.id, s, rttInfo.bssid, now) else null
         if (hold != null) s = s.copy(rttError = hold.second, rttState = hold.first)
+        else if (mode && rttInfo != null && rttInfo.enabled && rttInfo.bssid.isNotEmpty() && !pacer.burstDue(now))
+            s = s.copy(rttState = RttState.SLOW, rttError = "steady: one burst every ${RttPacer.SLOW_MS / 1000} s (nothing moved and the distance held for ${RttPacer.STABLE_MS / 60_000} min)")
         else if (mode && rttInfo != null && rttInfo.enabled && rttInfo.bssid.isNotEmpty()) {
             rttSamples = rtt.range(rttInfo)
+            if (rtt.sent) pacer.burst(now)
             s = s.copy(rttError = rtt.lastError, rttState = rtt.state, rttCount = s.rttCount + rttSamples.size)
             // Only a request that went on the air counts as the minute's probe: the Doze ticks call range() too (it returns
             // at once with state=doze), and counting those held the first burst after Doze back by up to a minute.
@@ -227,11 +239,16 @@ class RangingRepository @Inject constructor(
                     else if (haveRange) LocalRange(f.distanceM, f.sigmaM, f.lowM, f.highM, RangeMath.classify(true, f.lowM, f.highM), methods) else s.local
         s = s.copy(local = local)
         // ── tell the desktop (it fuses the reverse BLE link and its own Wi-Fi and replies with its estimate) ──
-        // In Doze only when the RTT state changed or once a minute (it has nothing new to say); never while backing off an unreachable desktop.
-        val stateChanged = s.rttState != s0.rttState
-        val due = (if (dozing) stateChanged || now - s.lastPost > DOZE_TICK_MS else mode || now - s.lastPost > 20_000) && now >= (postNextAt[d.id] ?: 0L)
-        if (s.supported == true && due && (rttSamples.isNotEmpty() || bleNew.isNotEmpty() || wifi.isNotEmpty() || stateChanged)) {
-            val body = RangingPost(identity.deviceName, DateTimeFormatter.ISO_INSTANT.format(Instant.ofEpochMilli(now)), rttSamples, bleNew, wifi,
+        // In Doze only when the RTT state changed or once a minute (it has nothing new to say); while bursts are slow, with each
+        // burst and at least every 10 s; never while backing off an unreachable desktop. ok ↔ slow is the pacing, not news.
+        val stateChanged = s.rttState != s0.rttState && setOf(s.rttState, s0.rttState) != setOf(RttState.OK, RttState.SLOW)
+        val sessionDue = mode && (s.rttState != RttState.SLOW || rttSamples.isNotEmpty() || stateChanged || now - s.lastPost >= SLOW_POST_MS)
+        val due = (if (dozing) stateChanged || now - s.lastPost > DOZE_TICK_MS else sessionDue || now - s.lastPost > 20_000) && now >= (postNextAt[d.id] ?: 0L)
+        // The desktop's advert as heard since the last POST (ticks without a POST keep theirs for the next one)
+        val bleOut = unsentBle.getOrPut(d.id) { ArrayList() }.apply { addAll(bleNew); if (size > 600) subList(0, size - 600).clear() }
+        if (s.supported == true && due && (rttSamples.isNotEmpty() || bleOut.isNotEmpty() || wifi.isNotEmpty() || stateChanged)) {
+            val sent = bleOut.toList(); bleOut.clear()
+            val body = RangingPost(identity.deviceName, DateTimeFormatter.ISO_INSTANT.format(Instant.ofEpochMilli(now)), rttSamples, sent, wifi,
                 motion.hPa?.let { Baro(it) }, moving, pf?.let { RangingFix(it.lat, it.lon, it.acc, it.time, if (it.source == "phone-wifi") "wifi" else "gps") },
                 s.rttState.ifEmpty { null })
             val r = withTimeoutOrNull(6000) { runCatching { api.postRanging(auth, body) }.getOrNull() }
@@ -247,9 +264,12 @@ class RangingRepository @Inject constructor(
         }
         // ── absolute: a ring (or point) around the desktop's anchor ──
         s = s.copy(rangedFix = rangedFix(s, pf))
+        // ── pacing: is anything changing? (either side moving, the distance, the desktop's BLE level) ──
+        pacer.observe(now, s.best?.distanceM, moving, live.views.value[d.id]?.trip?.moving == true, bleNew.map { it.rssi })
         return s
     }
     private val bleBatch = HashMap<String, ArrayList<BleSample>>()
+    private val unsentBle = HashMap<String, ArrayList<BleSample>>()
     private val bleBatchStart = HashMap<String, Long>()
     private val bleFlushed = HashSet<String>()
     private val lastBleAt = HashMap<String, Long>()
@@ -284,6 +304,8 @@ class RangingRepository @Inject constructor(
         const val REACH_MS = 5 * 60_000L
         /** Loop period and POST heartbeat in deep Doze (RTT is off; Doze ending wakes the loop at once). */
         const val DOZE_TICK_MS = 60_000L
+        /** POST heartbeat while RTT bursts are slow ([RttPacer]): the desktop's BLE window is 10 s. */
+        const val SLOW_POST_MS = 10_000L
         /** Delay before the next burst after [k] in a row measured nothing: two quick retries (the first burst after Doze often times out), then 5 s doubling to 2 min. */
         fun backoffMs(k: Int): Long = if (k <= 2) 0L else minOf(2_500L shl minOf(k - 2, 6), 120_000L)
     }
