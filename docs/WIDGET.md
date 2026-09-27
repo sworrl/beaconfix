@@ -35,7 +35,13 @@ BSSID, band and channel, level, status, how it was placed and its security notes
 
 **Cinematic mode**: events glide the camera to their location and back; every `tourMinutes`
 the map eases out to city scale with a caption, alternately continuing to state scale, then
-returns. Any drag, wheel or pinch cancels the tour and pauses it for 45 s.
+returns. All automatic zooms (tours, event glides, re-fits after a real move) share one budget
+of at most one per 10 minutes, and none starts while the pointer is over the widget, for
+3 minutes after you use the map, or while **Follow** is off: once you pan, centre elsewhere or
+pick a place, the camera stays where you left it until you press Follow again. Any press on the
+map or its controls (a drag, a place marker, a toolbar button, the security chip or panel, a
+card button) stops a running glide or tour where it is; switching Cinematic off mid-tour flies
+straight home instead.
 
 **Events**: ripples for new beacons, shrink-and-fade for lost ones, ▲/▼ chevrons with the dB
 delta, a glide with a gold flash when a beacon gets placed, a dashed arrow for a new fix, a
@@ -61,7 +67,8 @@ devices attached to that SSID.
 | `showSsids` | true | Wi-Fi names beside the beacons |
 | `showEvents` | true | event animations and ticker |
 | `animatedMap` | true | cinematic mode |
-| `tourMinutes` | 2 | minutes between overview zoom-outs (1–60) |
+| `tourMinutes` | 20 | minutes between overview zoom-outs (0 never, up to 180; under 10 means every 10) |
+| `spotlightMinutes` | 10 | at most one glide to an event per this many minutes (0 never, up to 240; under 10 means every 10) |
 | `showMapTab` / `showNearbyTab` / `showRadarTab` / `showTripTab` | true | which tabs exist |
 | `binary` | beaconfix | the executable to run |
 

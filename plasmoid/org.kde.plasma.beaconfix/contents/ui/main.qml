@@ -69,6 +69,7 @@ PlasmoidItem {
     property string _linkedJson: ""
     property int    liveScanSeconds: 0
     property int    _seenEventId: -1            // -1 until the first read: never animate history
+    property string _seenEventTime: ""          // the time of that newest event (tells a desktop restart apart)
     property string _eventsJson: ""
     signal newEvents(var list, bool animate)    // events not seen before; animate=false on the first read
     readonly property var hiddenCats: Plasmoid.configuration.hiddenCategories || []
@@ -134,9 +135,9 @@ PlasmoidItem {
                 root.apCount = d.apCount || 0; root.error = d.error || ""; root.busy = !!d.busy
                 // Synthesise ap_refit events from real changes of fitted beacons so the triangulation
                 // animation plays even on desktops that do not emit the event yet. Only for a fit that moved
-                // more than max(5 m, 25 % of its accuracy) or tightened by more than 25 % since it was last
-                // shown (the baseline only advances when it is shown, so slow drift still counts once), at
-                // most 3 per poll. They animate in place and never move the camera (marked synthetic).
+                // beyond its own error or tightened by more than 25 % since it was last shown (refitWorth; the
+                // baseline only advances when it is shown, so slow drift still counts once), at most 3 per
+                // poll. They animate in place and never move the camera (marked synthetic).
                 var newAps = d.aps || [], synth = [], nowIso = new Date().toISOString()
                 var deskRefit = {}
                 for (var ri = 0; ri < (d.events || []).length; ri++) { var re = d.events[ri]; if (re && re.type === "ap_refit") deskRefit[re.bssid] = true }
@@ -148,8 +149,7 @@ PlasmoidItem {
                     pf[na.bssid] = cur
                     if (!prev || deskRefit[na.bssid]) continue            // new, or the desktop reported it itself
                     var movedM = root.distM(prev.lat, prev.lon, cur.lat, cur.lon)
-                    var worth = movedM > Math.max(5, 0.25 * (prev.acc || cur.acc)) || (prev.acc > 0 && cur.acc < prev.acc * 0.75)
-                    if (worth && synth.length < 3)
+                    if (root.refitWorth(prev, cur, movedM) && synth.length < 3)
                         synth.push({type: "ap_refit", bssid: na.bssid, ssid: na.ssid, lat: cur.lat, lon: cur.lon, fromLat: prev.lat, fromLon: prev.lon,
                                     acc: cur.acc, prevAcc: prev.acc || cur.acc, n: na.fit.n, vantage: na.fit.vantage, movedM: movedM, time: nowIso, synthetic: true})
                     else pf[na.bssid] = prev                             // not shown: keep comparing against what was
@@ -186,16 +186,10 @@ PlasmoidItem {
                 var ej = JSON.stringify(ev)
                 if (ej !== root._eventsJson) {
                     root._eventsJson = ej; root.events = ev
-                    var fresh = [], maxId = root._seenEventId, first = root._seenEventId < 0
-                    for (var i = 0; i < ev.length; i++) {
-                        var id = (ev[i] && ev[i].id !== undefined) ? ev[i].id : i
-                        if (id > maxId) maxId = id
-                        if (!first && id > root._seenEventId) fresh.push(ev[i])
-                    }
-                    root._seenEventId = maxId
-                    root.lastEventId = d.lastEventId !== undefined ? d.lastEventId : maxId
-                    var out = first ? ev.slice(-5) : fresh
-                    if (out.length) root.newEvents(out, !first)
+                    var delta = root.eventDelta(ev, d.lastEventId, root._seenEventId, root._seenEventTime)
+                    root._seenEventId = delta.seenId; root._seenEventTime = delta.seenTime
+                    root.lastEventId = d.lastEventId !== undefined ? d.lastEventId : delta.maxId
+                    if (delta.out.length) root.newEvents(delta.out, !delta.first)
                 }
                 if (synth.length) root.newEvents(synth, true)
             } catch(e) { root.error = "beaconfix --json failed" }
@@ -265,6 +259,33 @@ PlasmoidItem {
         _deskAnchors = _deskAnchors.filter(function(x) { return x.id !== id })
         if (anchorsSupported && safe) exec.connectSource(`${root.bin} --anchor-remove '${safe}'`)
         _mergeAnchors()
+    }
+    // A synthesised refit is worth showing when the fit moved beyond its own error (more than 5 m and more than
+    // both the old and the new accuracy) or tightened by more than 25 %: wobble inside the fit's error is not news.
+    function refitWorth(prev, cur, movedM) {
+        return movedM > Math.max(5, prev.acc || 0, cur.acc || 0) || (prev.acc > 0 && cur.acc < prev.acc * 0.75)
+    }
+    // Which of the desktop's events are new to us → {out, first, reset, seenId, seenTime, maxId}. The first read
+    // only fills the ticker (history is never animated). Ids count from 1 in every desktop process, so after a
+    // restart they start again: lastEventId below the newest id we saw, or that id now carrying another time,
+    // means a new desktop instance, and all it reports is new to us (its last five, as on a first read).
+    function eventDelta(ev, lastId, seenId, seenTime) {
+        var first = seenId < 0, maxId = 0, topTime = "", i
+        for (i = 0; i < ev.length; i++) {
+            var id = (ev[i] && ev[i].id !== undefined) ? ev[i].id : i
+            if (id >= maxId) { maxId = id; topTime = (ev[i] && ev[i].time) || "" }
+        }
+        var reset = false
+        if (!first) {
+            if ((lastId !== undefined ? lastId : maxId) < seenId) reset = true
+            for (i = 0; i < ev.length && !reset; i++)
+                if (ev[i] && ev[i].id === seenId && seenTime && ev[i].time && ev[i].time !== seenTime) reset = true
+        }
+        var base = reset ? 0 : seenId, fresh = []
+        if (!first) for (i = 0; i < ev.length; i++) if (((ev[i] && ev[i].id !== undefined) ? ev[i].id : i) > base) fresh.push(ev[i])
+        if (reset && fresh.length > 5) fresh = fresh.slice(-5)
+        var newSeen = Math.max(base, maxId)
+        return {out: first ? ev.slice(-5) : fresh, first: first, reset: reset, maxId: maxId, seenId: newSeen, seenTime: newSeen === maxId ? topTime : seenTime}
     }
     function distM(la1, lo1, la2, lo2) {
         var R = 6371000, d2r = Math.PI / 180
