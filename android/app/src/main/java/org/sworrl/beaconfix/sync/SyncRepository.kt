@@ -20,7 +20,6 @@ import org.sworrl.beaconfix.data.db.AppDatabase
 import org.sworrl.beaconfix.data.db.DesktopEntity
 import org.sworrl.beaconfix.data.db.FixEntity
 import org.sworrl.beaconfix.data.db.ObservationEntity
-import org.sworrl.beaconfix.data.db.PoiEntity
 import org.sworrl.beaconfix.estimate.EstimateRepository
 import java.time.Instant
 import java.time.LocalDateTime
@@ -47,6 +46,7 @@ class SyncRepository @Inject constructor(
     private val identity: org.sworrl.beaconfix.identity.IdentityStore,
     private val widgets: org.sworrl.beaconfix.widget.WidgetUpdater,
     private val anchors: org.sworrl.beaconfix.anchors.AnchorRepository,
+    private val cache: org.sworrl.beaconfix.data.DesktopCache,
 ) {
     suspend fun syncAll(): List<SyncReport> {
         val out = ArrayList<SyncReport>()
@@ -122,16 +122,16 @@ class SyncRepository @Inject constructor(
             api.home(auth).body()?.let { h -> if (h.patterns.isNotEmpty()) prefs.setHomePatterns(h.patterns.toSet()) }
 
             // ── pull: the desktop's fix + track ──────────────────────────────
-            api.location(auth).body()?.let { l -> if (l.valid) db.fixes().insert(FixEntity(time = parseIso(l.time), lat = l.lat, lon = l.lon, acc = l.accuracy, source = "desktop", provider = l.provider, place = l.place)) }
+            val loc = api.location(auth).body()
+            loc?.let { l -> if (l.valid) db.fixes().insert(FixEntity(time = parseIso(l.time), lat = l.lat, lon = l.lon, acc = l.accuracy, source = "desktop", provider = l.provider, place = l.place)) }
             api.track(auth).body()?.track?.let { t ->
                 val have = HashSet<Long>()
                 for (p in t) { val ts = parseIso(p.time); if (have.add(ts)) db.fixes().insert(FixEntity(time = ts, lat = p.lat, lon = p.lon, acc = p.acc, source = "desktop", provider = p.source, place = p.place)); pulledFixes++ }
             }
-            api.pois(auth).body()?.pois?.let { pois ->
-                db.pois().upsertAll(pois.mapNotNull { p ->
-                    val lat = p.num("lat") ?: return@mapNotNull null; val lon = p.num("lon") ?: return@mapNotNull null
-                    PoiEntity(p.str("osmType") ?: "n", p.long("osmId") ?: (lat * 1e6).toLong() xor (lon * 1e6).toLong(), p.str("cat") ?: "", p.str("name") ?: p.str("label") ?: "", p.str("detail") ?: "", lat, lon, p.str("phone") ?: "", p.str("hours") ?: "", p.str("website") ?: "")
-                })
+            // places → the offline cache (per desktop; an empty or failed answer keeps what is cached)
+            runCatching { api.poisTyped(auth) }.getOrNull()?.body()?.let { p ->
+                val origin = p.origin ?: loc?.takeIf { it.valid }?.let { org.sworrl.beaconfix.data.api.OriginDto(lat = it.lat, lon = it.lon) }
+                cache.saveDesktopPois(d.id, p.pois, origin?.lat ?: 0.0, origin?.lon ?: 0.0)
             }
 
             // ── pull: the observations behind those positions (control scope) ──

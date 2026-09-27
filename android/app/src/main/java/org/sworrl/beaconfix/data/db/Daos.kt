@@ -4,6 +4,7 @@ import androidx.room.Dao
 import androidx.room.Insert
 import androidx.room.OnConflictStrategy
 import androidx.room.Query
+import androidx.room.Transaction
 import androidx.room.Upsert
 import kotlinx.coroutines.flow.Flow
 
@@ -47,13 +48,41 @@ interface FixDao {
     @Query("SELECT * FROM fixes WHERE time > :since ORDER BY time") fun since(since: Long): Flow<List<FixEntity>>
     @Query("SELECT * FROM fixes WHERE source='desktop' ORDER BY time DESC LIMIT 500") fun desktopTrack(): Flow<List<FixEntity>>
     @Query("DELETE FROM fixes WHERE time < :before") suspend fun prune(before: Long)
+    @Query("SELECT * FROM fixes WHERE source LIKE 'phone%' ORDER BY time DESC LIMIT 1") suspend fun lastPhone(): FixEntity?
+    @Query("SELECT * FROM fixes WHERE source = 'desktop' ORDER BY time DESC LIMIT 1") suspend fun lastDesktop(): FixEntity?
+    @Query("SELECT EXISTS(SELECT 1 FROM fixes WHERE source = 'desktop' AND time = :time)") suspend fun existsDesktopAt(time: Long): Boolean
+    @Query("SELECT * FROM fixes WHERE source LIKE 'phone%' AND time > :t ORDER BY time") suspend fun phoneSince(t: Long): List<FixEntity>
+    /** Collapse desktop fixes pulled more than once (same timestamp) to the first copy; returns the rows removed. */
+    @Query(DEDUPE_DESKTOP_FIXES) suspend fun dedupeDesktop(): Int
 }
 
+/** Shared with MIGRATION_3_4, which runs the same cleanup once. */
+const val DEDUPE_DESKTOP_FIXES = "DELETE FROM fixes WHERE source='desktop' AND id NOT IN (SELECT MIN(id) FROM fixes WHERE source='desktop' GROUP BY time)"
+
+/** Cached places. Only `data.DesktopCache` writes here; it never deletes rows because a fetch failed or came back empty. */
 @Dao
 interface PoiDao {
-    @Upsert suspend fun upsertAll(rows: List<PoiEntity>)
     @Query("SELECT * FROM pois") fun all(): Flow<List<PoiEntity>>
-    @Query("DELETE FROM pois") suspend fun clear()
+    @Query("SELECT * FROM pois") suspend fun allNow(): List<PoiEntity>
+    @Upsert suspend fun upsertAll(rows: List<PoiEntity>)
+    @Query("DELETE FROM pois WHERE source = :source AND scope = :scope") suspend fun deleteScope(source: String, scope: String)
+    @Query("DELETE FROM pois WHERE source = :source") suspend fun deleteSource(source: String)
+
+    /** Swap one source's rows of one scope for [rows] atomically; other sources and the other scope are untouched. */
+    @Transaction
+    suspend fun replace(source: String, scope: String, rows: List<PoiEntity>) {
+        deleteScope(source, scope)
+        upsertAll(rows.map { if (it.source == source && it.scope == scope) it else it.copy(source = source, scope = scope) })
+    }
+}
+
+/** The last answer per (source, kind); see [SnapshotEntity]. */
+@Dao
+interface SnapshotDao {
+    @Upsert suspend fun put(s: SnapshotEntity)
+    @Query("SELECT * FROM snapshots WHERE source = :source AND kind = :kind") suspend fun get(source: String, kind: String): SnapshotEntity?
+    @Query("SELECT * FROM snapshots WHERE kind = :kind ORDER BY fetchedAt DESC LIMIT 1") fun newest(kind: String): Flow<SnapshotEntity?>
+    @Query("SELECT * FROM snapshots WHERE kind = :kind ORDER BY fetchedAt DESC LIMIT 1") suspend fun newestNow(kind: String): SnapshotEntity?
 }
 
 @Dao
