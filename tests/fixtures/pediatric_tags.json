@@ -1,0 +1,114 @@
+{
+  "about": "Shared pediatric classifier fixture (C5/C6). Read by tests/poiclassify_test.cpp (desktop) and the Android PedsClassifier test. Each scenario: classifyAll(elements) = classify, campus pass (600 m), dedupe (same normalized name within 500 m, the object with amenity/healthcare wins); then the help picks from origin. In expect[] only the keys present are checked: cat (exact), catNot (cat must be none of these), peds, er, campusEr, emergency, phone, detailContains (substring of the classifier detail), dropped (true = removed by the dedupe; nothing else is checked then). help: the picked element id, or null for no pick. Tags are real OpenStreetMap tags (Nominatim extratags plus class/type) except the synthetic traps.",
+  "scenarios": [
+    {
+      "name": "morgantown",
+      "origin": {"lat": 39.6350, "lon": -79.9550},
+      "elements": [
+        {"type": "way", "id": 1135527599, "lat": 39.654058, "lon": -79.955153,
+         "tags": {"building": "hospital", "name": "WVU Medicine Children's", "operator": "WVU Medicine", "contact:phone": "+13045981111", "website": "https://childrens.wvumedicine.org/"}},
+        {"type": "way", "id": 463483594, "lat": 39.654462, "lon": -79.959066,
+         "tags": {"amenity": "hospital", "healthcare": "hospital", "name": "Ruby Memorial Hospital", "emergency": "yes", "opening_hours": "24/7", "phone": "+1 855 988 2273", "operator": "WVU Medicine"}},
+        {"type": "way", "id": 329264979, "lat": 40.467202, "lon": -79.953245,
+         "tags": {"amenity": "hospital", "healthcare": "hospital", "name": "UPMC Children's Hospital of Pittsburgh", "healthcare:speciality": "paediatrics", "emergency": "yes", "opening_hours": "24/7", "phone": "+1 412 692 5325", "wheelchair": "yes"}},
+        {"type": "way", "id": 473666430, "lat": 40.466810, "lon": -79.953126,
+         "tags": {"building": "hospital", "name": "UPMC Children's Hospital of Pittsburgh", "building:levels": "9"}}
+      ],
+      "expect": [
+        {"id": "way/1135527599", "cat": "peds_er", "peds": 2, "er": "", "campusEr": "Ruby Memorial Hospital", "emergency": false, "phone": "+13045981111", "detailContains": "ER on campus: Ruby Memorial Hospital", "dropped": false},
+        {"id": "way/463483594", "cat": "health", "peds": 0, "er": "yes", "campusEr": "", "emergency": true, "dropped": false},
+        {"id": "way/329264979", "cat": "peds_er", "peds": 1, "er": "yes", "campusEr": "", "emergency": true, "dropped": false},
+        {"id": "way/473666430", "dropped": true}
+      ],
+      "help": {"pediatric": "way/1135527599", "pediatricCloser": null, "hospital": "way/463483594", "pediatricUrgent": null}
+    },
+    {
+      "name": "morgantown-no-ruby",
+      "origin": {"lat": 39.6350, "lon": -79.9550},
+      "elements": [
+        {"type": "way", "id": 1135527599, "lat": 39.654058, "lon": -79.955153,
+         "tags": {"building": "hospital", "name": "WVU Medicine Children's", "operator": "WVU Medicine", "contact:phone": "+13045981111", "website": "https://childrens.wvumedicine.org/"}},
+        {"type": "way", "id": 329264979, "lat": 40.467202, "lon": -79.953245,
+         "tags": {"amenity": "hospital", "healthcare": "hospital", "name": "UPMC Children's Hospital of Pittsburgh", "healthcare:speciality": "paediatrics", "emergency": "yes", "opening_hours": "24/7", "phone": "+1 412 692 5325", "wheelchair": "yes"}},
+        {"type": "way", "id": 473666430, "lat": 40.466810, "lon": -79.953126,
+         "tags": {"building": "hospital", "name": "UPMC Children's Hospital of Pittsburgh", "building:levels": "9"}}
+      ],
+      "expect": [
+        {"id": "way/1135527599", "cat": "peds_er", "peds": 2, "er": "", "campusEr": "", "emergency": false, "phone": "+13045981111", "detailContains": "ER not confirmed — call ahead", "dropped": false},
+        {"id": "way/329264979", "cat": "peds_er", "peds": 1, "er": "yes", "campusEr": "", "emergency": true, "dropped": false},
+        {"id": "way/473666430", "dropped": true}
+      ],
+      "help": {"pediatric": "way/329264979", "pediatricCloser": "way/1135527599", "hospital": null, "pediatricUrgent": null}
+    },
+    {
+      "name": "ohio-valley",
+      "origin": {"lat": 39.2667, "lon": -81.5615},
+      "elements": [
+        {"type": "way", "id": 464365604, "lat": 41.079231, "lon": -81.525796,
+         "tags": {"amenity": "hospital", "healthcare": "hospital", "name": "Akron Children's Hospital", "emergency": "yes", "opening_hours": "24/7", "phone": "+1 330 543 1000",
+                  "healthcare:speciality": "general;psychiatry;dentistry;ophthalmology;vaccination;intensive;orthopaedics;orthodontics;dialysis;gynaecology;emergency;dermatology;surgery;cardiology;oncology;radiology;internal;physiatry;pediatric;burn;trauma"}},
+        {"type": "way", "id": 713178711, "lat": 41.079629, "lon": -81.525063,
+         "tags": {"building": "hospital", "name": "Akron Children's Hospital", "layer": "2"}},
+        {"type": "way", "id": 680666379, "lat": 39.282276, "lon": -81.611914,
+         "tags": {"amenity": "hospital", "healthcare": "hospital", "building": "hospital", "name": "Akron Children's Hospital", "emergency": "yes", "website": "https://www.akronchildrens.org/locations/ER-Belpre.html"}},
+        {"type": "relation", "id": 8017287, "lat": 39.952064, "lon": -82.979007,
+         "tags": {"amenity": "hospital", "healthcare": "hospital", "name": "Nationwide Children's Hospital", "emergency": "yes", "opening_hours": "24/7", "phone": "+1 614 722 2000"}},
+        {"type": "way", "id": 328412938, "lat": 38.359297, "lon": -81.637447,
+         "tags": {"amenity": "hospital", "healthcare": "hospital", "name": "Charleston Area Medical Center - Women and Children's Hospital", "emergency": "yes"}},
+        {"type": "way", "id": 149739949, "lat": 40.264203, "lon": -76.674177,
+         "tags": {"amenity": "hospital", "healthcare": "hospital", "building": "hospital", "name": "Penn State Health Children's Hospital", "healthcare:speciality": "paediatrics", "emergency": "yes", "opening_hours": "24/7", "phone": "+1 800 243 1455"}}
+      ],
+      "expect": [
+        {"id": "way/464365604", "cat": "peds_er", "peds": 1, "er": "yes", "emergency": true, "dropped": false},
+        {"id": "way/713178711", "dropped": true},
+        {"id": "way/680666379", "cat": "peds_er", "peds": 1, "er": "yes", "emergency": true, "dropped": false},
+        {"id": "relation/8017287", "cat": "peds_er", "peds": 1, "er": "yes", "emergency": true, "dropped": false},
+        {"id": "way/328412938", "cat": "peds_er", "peds": 1, "er": "yes", "emergency": true, "dropped": false},
+        {"id": "way/149739949", "cat": "peds_er", "peds": 1, "er": "yes", "emergency": true, "dropped": false}
+      ],
+      "help": {"pediatric": "way/680666379", "pediatricCloser": null, "hospital": null, "pediatricUrgent": null}
+    },
+    {
+      "name": "traps",
+      "origin": {"lat": 39.0, "lon": -80.0},
+      "elements": [
+        {"type": "node", "id": 9000000001, "lat": 39.1, "lon": -80.0,
+         "tags": {"amenity": "dentist", "healthcare": "dentist", "name": "Test Kids Smiles Pediatric Dentistry", "healthcare:speciality": "paediatric_dentistry"}},
+        {"type": "node", "id": 9000000002, "lat": 39.2, "lon": -80.0,
+         "tags": {"amenity": "hospital", "name": "Test Children's Behavioral Health"}},
+        {"type": "node", "id": 9000000003, "lat": 39.3, "lon": -80.0,
+         "tags": {"amenity": "hospital", "name": "Test Shriners Children's"}},
+        {"type": "node", "id": 9000000004, "lat": 39.4, "lon": -80.0,
+         "tags": {"amenity": "hospital", "name": "Test Valley Children's Hospital", "emergency": "no"}},
+        {"type": "node", "id": 9000000005, "lat": 39.5, "lon": -80.0,
+         "tags": {"amenity": "hospital", "name": "Test General Hospital", "healthcare:speciality": "general;paediatrics", "emergency": "yes"}},
+        {"type": "node", "id": 9000000006, "lat": 39.6, "lon": -80.0,
+         "tags": {"amenity": "clinic", "name": "Test Kids Express Care"}},
+        {"type": "node", "id": 9000000007, "lat": 39.7, "lon": -80.0,
+         "tags": {"amenity": "clinic", "healthcare": "clinic", "name": "Test Pediatric Urgent Care"}},
+        {"type": "node", "id": 9000000008, "lat": 39.8, "lon": -80.0,
+         "tags": {"amenity": "doctors", "name": "Test Kids First Pediatrics"}},
+        {"type": "node", "id": 9000000009, "lat": 39.9, "lon": -80.0,
+         "tags": {"healthcare": "hospital", "name": "Test City Hospital"}},
+        {"type": "node", "id": 9000000010, "lat": 40.0, "lon": -80.0,
+         "tags": {"amenity": "hospital", "healthcare": "hospital", "name": "Test Children’s Hospital", "emergency": "yes"}},
+        {"type": "node", "id": 9000000011, "lat": 40.1, "lon": -80.0,
+         "tags": {"amenity": "hospital", "name": "Test Children's Medical Center", "opening_hours": "24/7"}}
+      ],
+      "expect": [
+        {"id": "node/9000000001", "cat": "dentist", "peds": 0, "dropped": false},
+        {"id": "node/9000000002", "cat": "health", "peds": 0, "dropped": false},
+        {"id": "node/9000000003", "cat": "health", "peds": 0, "dropped": false},
+        {"id": "node/9000000004", "cat": "health", "peds": 0, "er": "no", "emergency": false, "detailContains": "no ER", "dropped": false},
+        {"id": "node/9000000005", "cat": "health", "peds": 3, "er": "yes", "emergency": true, "detailContains": "ER · pediatrics dept.", "dropped": false},
+        {"id": "node/9000000006", "cat": "peds_urgent", "peds": 4, "emergency": false, "detailContains": "not an ER", "dropped": false},
+        {"id": "node/9000000007", "cat": "peds_urgent", "peds": 4, "emergency": false, "detailContains": "not an ER", "dropped": false},
+        {"id": "node/9000000008", "catNot": ["peds_er", "peds_urgent"], "peds": 0, "dropped": false},
+        {"id": "node/9000000009", "cat": "health", "peds": 0, "dropped": false},
+        {"id": "node/9000000010", "cat": "peds_er", "peds": 1, "er": "yes", "emergency": true, "dropped": false},
+        {"id": "node/9000000011", "cat": "peds_er", "peds": 2, "er": "", "campusEr": "", "emergency": false, "detailContains": "likely ER (24/7) — call ahead", "dropped": false}
+      ],
+      "help": {"pediatric": "node/9000000010", "pediatricCloser": "node/9000000005", "hospital": "node/9000000005", "pediatricUrgent": "node/9000000006"}
+    }
+  ]
+}
