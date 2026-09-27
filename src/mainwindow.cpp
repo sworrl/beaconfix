@@ -149,7 +149,8 @@ MainWindow::MainWindow(Locator *loc, TileSource *tiles, QWidget *parent) : QMain
     m_poiFilter->setClearButtonEnabled(true);
     connect(m_poiFilter, &QLineEdit::textChanged, this, &MainWindow::refreshPois);
     auto *reload = new QPushButton(QIcon::fromTheme(QStringLiteral("view-refresh")), QStringLiteral("Reload"));
-    connect(reload, &QPushButton::clicked, m_loc, [this] { m_loc->refreshPois(true); });
+    reload->setToolTip(QStringLiteral("Ask OpenStreetMap again for the places around here and the pediatric ERs"));
+    connect(reload, &QPushButton::clicked, m_loc, [this] { m_loc->RefreshPlaces(); });
     m_poiNote = new QLabel;
     nbar->addWidget(m_poiFilter, 1); nbar->addWidget(reload);
     nl->addLayout(nbar); nl->addWidget(m_poiNote);
@@ -693,6 +694,15 @@ void MainWindow::refreshFix()
     m_meta->setText(meta);
 }
 
+// "~25 min (est.)", "~1 h 20 min (est.)"
+static QString driveText(int secs, bool estimate)
+{
+    const int min = qMax(1, secs / 60);
+    const QString t = min < 60 ? QStringLiteral("~%1 min").arg(min)
+                    : min % 60 ? QStringLiteral("~%1 h %2 min").arg(min / 60).arg(min % 60) : QStringLiteral("~%1 h").arg(min / 60);
+    return estimate ? t + QStringLiteral(" (est.)") : t;
+}
+
 void MainWindow::refreshPois()
 {
     const Fix &f = m_loc->fix();
@@ -734,20 +744,38 @@ void MainWindow::refreshPois()
             const QJsonValue v = e[key]; if (v.isNull() || v.isUndefined()) return QString();
             const QJsonObject q = v.toObject();
             QString t = QStringLiteral("<b>%1:</b> %2").arg(label, q["name"].toString().toHtmlEscaped());
+            if (q.contains("tier")) {                       // pediatric: always say how sure we are
+                const int tier = q["tier"].toInt();
+                const QString campus = q["campusEr"].toString();
+                const QString conf = tier == 1 ? QStringLiteral("pediatric ER")
+                                   : tier == 2 ? (campus.isEmpty() ? QStringLiteral("ER not confirmed — call ahead") : QStringLiteral("ER on campus: %1 — call ahead").arg(campus))
+                                   : tier == 3 ? QStringLiteral("general ER · pediatrics dept.")
+                                   : tier == 4 ? QStringLiteral("not an ER") : QString();
+                if (!conf.isEmpty()) t += QStringLiteral(" <i>(%1)</i>").arg(conf.toHtmlEscaped());
+            }
             if (q.contains("d")) t += QStringLiteral(" · %1 km %2").arg(q["d"].toDouble() / 1000.0, 0, 'f', 1).arg(Locator::compass(q["brg"].toDouble()));
+            if (q["driveS"].toInt() > 0) t += QStringLiteral(" · %1").arg(driveText(q["driveS"].toInt(), q["driveEst"].toBool(true)));
             if (!q["phone"].toString().isEmpty()) t += QStringLiteral(" · <a href=\"tel:%1\">%2</a>").arg(QString(q["phone"].toString()).remove(QLatin1Char(' ')), q["phone"].toString().toHtmlEscaped());
             if (!q["address"].toString().isEmpty()) t += QStringLiteral(" · %1").arg(q["address"].toString().toHtmlEscaped());
             return t;
         };
         QStringList parts{QStringLiteral("<b>🚨 Emergency number here: %1</b>").arg(e["number"].toString())};
-        for (const auto &k : QList<QPair<const char *, QString>>{{"police", QStringLiteral("🚔 Police")}, {"fire", QStringLiteral("🚒 Fire")}, {"hospital", QStringLiteral("🏥 ER / hospital")}, {"urgent", QStringLiteral("🩺 Urgent care")}, {"pharmacy", QStringLiteral("💊 Pharmacy")}})
+        // The general ER stays above the pediatric one: never hide the nearest ER behind a children's hospital
+        for (const auto &k : QList<QPair<const char *, QString>>{{"police", QStringLiteral("🚔 Police")}, {"fire", QStringLiteral("🚒 Fire")}, {"hospital", QStringLiteral("🏥 ER / hospital")},
+                                                                 {"pediatric", QStringLiteral("🧸 Pediatric ER")}, {"pediatricCloser", QStringLiteral("Closer")},
+                                                                 {"pediatricUrgent", QStringLiteral("🩹 Pediatric urgent care (not an ER)")},
+                                                                 {"urgent", QStringLiteral("🩺 Urgent care")}, {"pharmacy", QStringLiteral("💊 Pharmacy")}})
             { const QString t = one(k.first, k.second); if (!t.isEmpty()) parts << t; }
+        if (!e["pediatricNote"].toString().isEmpty()) parts << QStringLiteral("<i>🧸 %1</i>").arg(e["pediatricNote"].toString().toHtmlEscaped());
         m_emergency->setText(parts.join(QStringLiteral("<br>")));
     }
     m_pois->sortItems(2);
+    int nearCount = 0; for (const Poi &pt : pois) if (pt.scope != QLatin1String("far")) ++nearCount;
     QString note = m_loc->poisLoading() ? m_loc->poiNote()
-                 : QStringLiteral("%1 places within %2 km from OpenStreetMap").arg(pois.size()).arg(m_loc->poiRadiusKm());
+                 : QStringLiteral("%1 places within %2 km from OpenStreetMap").arg(nearCount).arg(m_loc->poiRadiusKm());
     if (!m_loc->poisLoading() && !m_loc->poiNote().isEmpty()) note += QStringLiteral(" — ") + m_loc->poiNote();
+    if (m_loc->pedsLoading()) note += QStringLiteral(" · looking for pediatric ERs within %1 km…").arg(m_loc->pedsRadiusKm());
+    else if (pois.size() > nearCount) note += QStringLiteral(" · %1 pediatric / ER places out to %2 km").arg(pois.size() - nearCount).arg(m_loc->pedsRadiusKm());
     m_poiNote->setText(note);
 }
 

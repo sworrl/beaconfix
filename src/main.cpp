@@ -241,7 +241,7 @@ int main(int argc, char **argv)
             if (q.contains("d")) line += QStringLiteral("  ·  %1 km %2").arg(q["d"].toDouble() / 1000.0, 0, 'f', 1).arg(Locator::compass(q["brg"].toDouble()));
             if (q["driveS"].toInt() > 0) {
                 const int min = q["driveS"].toInt() / 60;
-                line += QStringLiteral("  ·  ~%1%2").arg(min >= 60 ? QStringLiteral("%1 h %2 min").arg(min / 60).arg(min % 60, 2, 10, QLatin1Char('0')) : QStringLiteral("%1 min").arg(min),
+                line += QStringLiteral("  ·  ~%1%2").arg(min < 60 ? QStringLiteral("%1 min").arg(min) : min % 60 ? QStringLiteral("%1 h %2 min").arg(min / 60).arg(min % 60) : QStringLiteral("%1 h").arg(min / 60),
                                                    q["driveEst"].toBool(true) ? QStringLiteral(" (est.)") : QString());
             }
             if (!q["phone"].toString().isEmpty()) line += QStringLiteral("  ·  ☎ ") + q["phone"].toString();
