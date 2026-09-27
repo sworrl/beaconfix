@@ -119,21 +119,29 @@ class HelpWidget : GlanceAppWidget() {
                     if (main.phone.isNotBlank()) { Spacer(GlanceModifier.width(6.dp)); Pill("📞", dial(main.phone)) }
                 }
                 else -> {
-                    TierLine(main)
-                    Body(distEta(main, hs, withEst = true) + originText(hs))
-                    Spacer(GlanceModifier.height(4.dp))
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        if (main.phone.isNotBlank()) { Pill("📞 Call", dial(main.phone)); Spacer(GlanceModifier.width(6.dp)) }
-                        Pill("➜ Go", go(main))
+                    // Glance allows at most 10 children per container (it silently drops the rest: the "saved … ago"
+                    // line went missing), so the root holds groups: header, main block, extras, filler, age (≤ 6).
+                    Column(GlanceModifier.fillMaxWidth()) {
+                        TierLine(main)
+                        Body(distEta(main, hs, withEst = true) + originText(hs))
+                        Spacer(GlanceModifier.height(4.dp))
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            if (main.phone.isNotBlank()) { Pill("📞 Call", dial(main.phone)); Spacer(GlanceModifier.width(6.dp)) }
+                            Pill("➜ Go", go(main))
+                        }
                     }
                     Spacer(GlanceModifier.height(4.dp))
-                    if (peds != null) PlaceLine("ER", er, "No ER found nearby")
+                    Column(GlanceModifier.fillMaxWidth()) {
+                        if (peds != null) PlaceLine("ER", er, "No ER found nearby")
+                        if (level >= 3) {
+                            val urg = hs.first(HelpKind.PEDS_URGENT) ?: hs.first(HelpKind.URGENT)
+                            if (urg != null) PlaceLine("Urgent care (not an ER)", urg, null)
+                            PlaceLine("Police", hs.first(HelpKind.POLICE), null)
+                            PlaceLine("Fire", hs.first(HelpKind.FIRE), null)
+                            if (hs.pedsNote.isNotBlank()) Body(hs.pedsNote, maxLines = 2)
+                        }
+                    }
                     if (level >= 3) {
-                        val urg = hs.first(HelpKind.PEDS_URGENT) ?: hs.first(HelpKind.URGENT)
-                        if (urg != null) PlaceLine("Urgent care (not an ER)", urg, null)
-                        PlaceLine("Police", hs.first(HelpKind.POLICE), null)
-                        PlaceLine("Fire", hs.first(HelpKind.FIRE), null)
-                        if (hs.pedsNote.isNotBlank()) Body(hs.pedsNote, maxLines = 2)
                         Spacer(GlanceModifier.defaultWeight())
                         Body((if (hs.stale) "saved " else "updated ") + ago(hs.fetchedAt, now), size = 10)
                     }
