@@ -3,6 +3,15 @@
 #include "beaconview.h"
 #include "apiserver.h"
 #include "mapdb.h"
+#include "identity.h"
+#include "osintegration.h"
+#include <QProcess>
+#include <QEventLoop>
+#include <QNetworkReply>
+#include <QNetworkAccessManager>
+#include <QPixmap>
+#include <QHostInfo>
+#include <QJsonDocument>
 #include <QApplication>
 #include <QCheckBox>
 #include <QClipboard>
@@ -132,10 +141,35 @@ MainWindow::MainWindow(Locator *loc, TileSource *tiles, QWidget *parent) : QMain
     m_poiNote = new QLabel;
     nbar->addWidget(m_poiFilter, 1); nbar->addWidget(reload);
     nl->addLayout(nbar); nl->addWidget(m_poiNote);
-    m_pois = new QTableWidget(0, 5);
-    m_pois->setHorizontalHeaderLabels({QStringLiteral("Place"), QStringLiteral("Kind"), QStringLiteral("Distance"), QStringLiteral("Details"), QStringLiteral("Hours")});
+    m_emergency = new QLabel; m_emergency->setWordWrap(true); m_emergency->setTextInteractionFlags(Qt::TextBrowserInteraction); m_emergency->setOpenExternalLinks(true);
+    m_emergency->setStyleSheet(QStringLiteral("QLabel { background: rgba(255,77,77,0.10); border: 1px solid rgba(255,77,77,0.45); border-radius: 6px; padding: 6px; }"));
+    nl->addWidget(m_emergency);
+    m_pois = new QTableWidget(0, 7);
+    m_pois->setHorizontalHeaderLabels({QStringLiteral("Place"), QStringLiteral("Kind"), QStringLiteral("Distance"), QStringLiteral("Details"), QStringLiteral("Phone"), QStringLiteral("Address"), QStringLiteral("Hours")});
     m_pois->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
-    m_pois->horizontalHeader()->setSectionResizeMode(3, QHeaderView::Stretch);
+    m_pois->horizontalHeader()->setSectionResizeMode(5, QHeaderView::Stretch);
+    m_pois->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(m_pois, &QTableWidget::customContextMenuRequested, this, [this](const QPoint &pos) {
+        const int row = m_pois->rowAt(pos.y()); if (row < 0) return;
+        const int idx = m_pois->item(row, 0)->data(Qt::UserRole).toInt();
+        if (idx < 0 || idx >= m_loc->pois().size()) return;
+        const Poi pt = m_loc->pois()[idx];
+        QMenu menu(this);
+        QAction *call = pt.phone.isEmpty() ? nullptr : menu.addAction(QIcon::fromTheme(QStringLiteral("call-start")), QStringLiteral("Call %1").arg(pt.phone));
+        QAction *cpPhone = pt.phone.isEmpty() ? nullptr : menu.addAction(QIcon::fromTheme(QStringLiteral("edit-copy")), QStringLiteral("Copy phone number"));
+        QAction *cpAddr = pt.address.isEmpty() ? nullptr : menu.addAction(QIcon::fromTheme(QStringLiteral("edit-copy")), QStringLiteral("Copy address"));
+        QAction *web = pt.website.isEmpty() ? nullptr : menu.addAction(QIcon::fromTheme(QStringLiteral("internet-web-browser")), QStringLiteral("Open website"));
+        QAction *dir = menu.addAction(QIcon::fromTheme(QStringLiteral("go-next")), QStringLiteral("Directions (OpenStreetMap)"));
+        QAction *osm = menu.addAction(QIcon::fromTheme(QStringLiteral("map-globe")), QStringLiteral("Open on OpenStreetMap"));
+        QAction *ch = menu.exec(m_pois->viewport()->mapToGlobal(pos));
+        if (!ch) return;
+        if (ch == call) QDesktopServices::openUrl(QUrl(QStringLiteral("tel:") + QString(pt.phone).remove(QLatin1Char(' '))));
+        else if (ch == cpPhone) QApplication::clipboard()->setText(pt.phone);
+        else if (ch == cpAddr) QApplication::clipboard()->setText(pt.address);
+        else if (ch == web) QDesktopServices::openUrl(QUrl(pt.website));
+        else if (ch == dir && m_loc->fix().valid) QDesktopServices::openUrl(QUrl(QStringLiteral("https://www.openstreetmap.org/directions?engine=fossgis_osrm_car&route=%1,%2;%3,%4").arg(m_loc->fix().lat).arg(m_loc->fix().lon).arg(pt.lat).arg(pt.lon)));
+        else if (ch == osm) QDesktopServices::openUrl(QUrl(QStringLiteral("https://www.openstreetmap.org/%1/%2").arg(pt.osmType).arg(pt.osmId)));
+    });
     m_pois->setEditTriggers(QAbstractItemView::NoEditTriggers);
     m_pois->setSelectionBehavior(QAbstractItemView::SelectRows);
     m_pois->verticalHeader()->hide();
@@ -170,6 +204,8 @@ MainWindow::MainWindow(Locator *loc, TileSource *tiles, QWidget *parent) : QMain
 
     tabs->addTab(buildSettings(), QIcon::fromTheme(QStringLiteral("configure")), QStringLiteral("Settings"));
     if (m_loc->apiServer()) tabs->addTab(buildDevices(), QIcon::fromTheme(QStringLiteral("network-connect")), QStringLiteral("Devices"));
+    m_identityTab = buildIdentity();
+    tabs->addTab(m_identityTab, QIcon::fromTheme(QStringLiteral("user-identity")), QStringLiteral("Identity"));
     outer->addWidget(tabs, 1);
     setCentralWidget(central);
 
@@ -472,6 +508,37 @@ QWidget *MainWindow::buildSettings()
         form->addRow(QStringLiteral("Sync:"), box);
     }
 
+    // ── System: keep the desktop in step with where we are ──
+    {
+        OsIntegration *os = m_loc->os();
+        auto *box = new QWidget; auto *col = new QVBoxLayout(box); col->setContentsMargins(0, 0, 0, 0);
+        m_osTz = new QCheckBox(QStringLiteral("Keep the system time zone in step with the fix (timedated; the shipped polkit rule makes it prompt-free for admins)"));
+        m_osTz->setChecked(os->timeZoneEnabled()); connect(m_osTz, &QCheckBox::toggled, os, &OsIntegration::setTimeZoneEnabled);
+        m_osGeo = new QCheckBox(QStringLiteral("Publish the position to GeoClue (/etc/geolocation) so location-aware apps, browsers and Night Light get it"));
+        m_osGeo->setChecked(os->geoclueEnabled()); connect(m_osGeo, &QCheckBox::toggled, os, &OsIntegration::setGeoclueEnabled);
+        m_osNight = new QCheckBox(QStringLiteral("Point KWin Night Light at the fix (sunset colour follows where you are)"));
+        m_osNight->setChecked(os->nightLightEnabled()); connect(m_osNight, &QCheckBox::toggled, os, &OsIntegration::setNightLightEnabled);
+        m_osLocale = new QCheckBox(QStringLiteral("Expose locale hints (units, emergency number, dialling code) — suggestion only, never changes the system locale"));
+        m_osLocale->setChecked(os->localeEnabled()); connect(m_osLocale, &QCheckBox::toggled, os, &OsIntegration::setLocaleEnabled);
+        m_osStatus = new QLabel; m_osStatus->setWordWrap(true); m_osStatus->setTextInteractionFlags(Qt::TextSelectableByMouse); m_osStatus->setStyleSheet(QStringLiteral("color: palette(mid)"));
+        auto *row = new QHBoxLayout;
+        auto *applyBtn = new QPushButton(QIcon::fromTheme(QStringLiteral("system-run")), QStringLiteral("Apply now"));
+        auto *dryBtn = new QPushButton(QIcon::fromTheme(QStringLiteral("dialog-information")), QStringLiteral("What would change?"));
+        connect(applyBtn, &QPushButton::clicked, this, [this, os] { const QJsonObject r = os->apply(false, true); QMessageBox::information(this, QStringLiteral("OS integration"), QString::fromUtf8(QJsonDocument(r).toJson(QJsonDocument::Indented))); });
+        connect(dryBtn, &QPushButton::clicked, this, [this, os] { const QJsonObject r = os->apply(true, true); QMessageBox::information(this, QStringLiteral("OS integration (dry run)"), QString::fromUtf8(QJsonDocument(r).toJson(QJsonDocument::Indented))); });
+        row->addWidget(applyBtn); row->addWidget(dryBtn); row->addStretch();
+        col->addWidget(m_osTz); col->addWidget(m_osGeo); col->addWidget(m_osNight); col->addWidget(m_osLocale); col->addLayout(row); col->addWidget(m_osStatus);
+        auto refreshOs = [this, os] {
+            const OsIntegration::LocaleHints h = os->locale();
+            m_osStatus->setText(QStringLiteral("System zone: %1 · zone for the fix: %2 (%3) · helper: %4\nLocale hints: %5%6 · units %7 · emergency %8 · dialling %9")
+                .arg(os->systemTimeZone(), os->lastZone().isEmpty() ? QStringLiteral("not resolved yet") : os->lastZone(), os->lastZoneSource().isEmpty() ? QStringLiteral("—") : os->lastZoneSource(),
+                     OsIntegration::helperPath().isEmpty() ? QStringLiteral("beaconfix-osd NOT installed (GeoClue publishing off) — install.sh installs it with polkit") : OsIntegration::helperPath(),
+                     h.country.isEmpty() ? QStringLiteral("unknown country") : h.country, h.countryCode.isEmpty() ? QString() : QStringLiteral(" (%1)").arg(h.countryCode.toUpper()), h.units, h.emergency, h.dialing.isEmpty() ? QStringLiteral("?") : h.dialing));
+        };
+        connect(os, &OsIntegration::changed, this, refreshOs); refreshOs();
+        form->addRow(QStringLiteral("System:"), box);
+    }
+
     m_prefetch = new QCheckBox(QStringLiteral("Save map tiles around each new stop for offline use (~10 km, zoom 10–15, ≤400 tiles)"));
     m_prefetch->setChecked(m_loc->prefetchTiles()); connect(m_prefetch, &QCheckBox::toggled, m_loc, &Locator::setPrefetchTiles);
     form->addRow(QStringLiteral("Offline:"), m_prefetch);
@@ -582,10 +649,29 @@ void MainWindow::refreshPois()
         c2->setData(Qt::UserRole, d);
         c2->setTextAlignment(Qt::AlignRight | Qt::AlignVCenter);
         m_pois->setItem(row, 2, c2);
-        m_pois->setItem(row, 3, new QTableWidgetItem(pt.detail + (pt.phone.isEmpty() ? QString() : QStringLiteral("  ☎ ") + pt.phone)));
-        m_pois->setItem(row, 4, new QTableWidgetItem(pt.hours));
+        m_pois->setItem(row, 3, new QTableWidgetItem(pt.detail));
+        m_pois->setItem(row, 4, new QTableWidgetItem(pt.phone));
+        m_pois->setItem(row, 5, new QTableWidgetItem(pt.address));
+        m_pois->setItem(row, 6, new QTableWidgetItem(pt.hours));
     }
     m_pois->setSortingEnabled(true);
+    // Emergency strip: nearest help + the local number
+    {
+        const QJsonObject e = m_loc->emergencyJson();
+        auto one = [&](const char *key, const QString &label) -> QString {
+            const QJsonValue v = e[key]; if (v.isNull() || v.isUndefined()) return QString();
+            const QJsonObject q = v.toObject();
+            QString t = QStringLiteral("<b>%1:</b> %2").arg(label, q["name"].toString().toHtmlEscaped());
+            if (q.contains("d")) t += QStringLiteral(" · %1 km %2").arg(q["d"].toDouble() / 1000.0, 0, 'f', 1).arg(Locator::compass(q["brg"].toDouble()));
+            if (!q["phone"].toString().isEmpty()) t += QStringLiteral(" · <a href=\"tel:%1\">%2</a>").arg(QString(q["phone"].toString()).remove(QLatin1Char(' ')), q["phone"].toString().toHtmlEscaped());
+            if (!q["address"].toString().isEmpty()) t += QStringLiteral(" · %1").arg(q["address"].toString().toHtmlEscaped());
+            return t;
+        };
+        QStringList parts{QStringLiteral("<b>🚨 Emergency number here: %1</b>").arg(e["number"].toString())};
+        for (const auto &k : QList<QPair<const char *, QString>>{{"police", QStringLiteral("🚔 Police")}, {"fire", QStringLiteral("🚒 Fire")}, {"hospital", QStringLiteral("🏥 ER / hospital")}, {"urgent", QStringLiteral("🩺 Urgent care")}, {"pharmacy", QStringLiteral("💊 Pharmacy")}})
+            { const QString t = one(k.first, k.second); if (!t.isEmpty()) parts << t; }
+        m_emergency->setText(parts.join(QStringLiteral("<br>")));
+    }
     m_pois->sortItems(2);
     QString note = m_loc->poisLoading() ? m_loc->poiNote()
                  : QStringLiteral("%1 places within %2 km from OpenStreetMap").arg(pois.size()).arg(m_loc->poiRadiusKm());
@@ -736,6 +822,12 @@ QWidget *MainWindow::buildDevices()
     m_pendingTable->setMaximumHeight(150);
     v->addWidget(m_pendingTable);
 
+    v->addWidget(new QLabel(QStringLiteral("<b>Identity sign-ins to link</b> — devices that signed in with an identity that is not yours (yet). Link only identities you own.")));
+    m_linkTable = new QTableWidget(0, 5);
+    m_linkTable->setHorizontalHeaderLabels({QStringLiteral("Identity"), QStringLiteral("Device"), QStringLiteral("Address"), QStringLiteral("When"), QString()});
+    m_linkTable->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
+    m_linkTable->verticalHeader()->hide(); m_linkTable->setSelectionMode(QAbstractItemView::NoSelection); m_linkTable->setMaximumHeight(120);
+    v->addWidget(m_linkTable);
     v->addWidget(new QLabel(QStringLiteral("<b>Paired devices</b>")));
     m_devTable = new QTableWidget(0, 6);
     m_devTable->setHorizontalHeaderLabels({QStringLiteral("Device"), QStringLiteral("Scopes"), QStringLiteral("Created"), QStringLiteral("Last seen"), QStringLiteral("From"), QString()});
@@ -840,6 +932,45 @@ void MainWindow::refreshDevices()
     }
     m_pendingTable->resizeColumnsToContents(); m_pendingTable->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
 
+    if (m_linkTable && m_loc->identity()) {
+        const QList<PendingLink> pl = m_loc->identity()->pending();
+        m_linkTable->setRowCount(pl.size());
+        for (int i = 0; i < pl.size(); ++i) {
+            const PendingLink &p = pl[i];
+            m_linkTable->setItem(i, 0, new QTableWidgetItem(QStringLiteral("%1  %2").arg(p.name.isEmpty() ? QStringLiteral("(unnamed)") : p.name, Identity::groupId(p.id))));
+            m_linkTable->setItem(i, 1, new QTableWidgetItem(QStringLiteral("%1 (%2)").arg(p.deviceName, p.deviceKind)));
+            m_linkTable->setItem(i, 2, new QTableWidgetItem(p.ip));
+            m_linkTable->setItem(i, 3, new QTableWidgetItem(p.time.toString(QStringLiteral("d MMM HH:mm"))));
+            auto *cell = new QWidget; auto *h = new QHBoxLayout(cell); h->setContentsMargins(2, 0, 2, 0);
+            auto *link = new QPushButton(QIcon::fromTheme(QStringLiteral("insert-link")), QStringLiteral("Link this identity"));
+            auto *drop = new QPushButton(QIcon::fromTheme(QStringLiteral("dialog-cancel")), QStringLiteral("Dismiss"));
+            const QString id = p.id; const QByteArray pub = p.pub; const QString devName = p.deviceName;
+            connect(link, &QPushButton::clicked, this, [this, id, pub, devName] {
+                Identity *idn = m_loc->identity();
+                if (!idn->unlocked()) { QMessageBox::warning(this, QStringLiteral("Identity"), QStringLiteral("This identity is locked (map-database key missing)")); return; }
+                const LinkStatement st = idn->startLink(id, pub);
+                const QString text = QStringLiteral("BFLINK1:") + QString::fromLatin1(Identity::base64url(QJsonDocument(st.toJson(true)).toJson(QJsonDocument::Compact)));
+                QDialog dlg(this); dlg.setWindowTitle(QStringLiteral("Link with %1").arg(Identity::groupId(id)));
+                auto *lay = new QVBoxLayout(&dlg);
+                lay->addWidget(new QLabel(QStringLiteral("Our half of the link statement is signed. The other device (%1) must co-sign it:\n"
+                                                         "scan this QR or paste the text there (Identity → Link), or let it sign in again — it will POST the completed statement to /api/v1/identity/link.").arg(devName)));
+                auto *img = new QLabel; img->setAlignment(Qt::AlignCenter);
+                const QString bin = QStandardPaths::findExecutable(QStringLiteral("qrencode"));
+                if (!bin.isEmpty()) { QProcess q; q.start(bin, {QStringLiteral("-o"), QStringLiteral("-"), QStringLiteral("-t"), QStringLiteral("PNG"), QStringLiteral("-s"), QStringLiteral("5"), QStringLiteral("-m"), QStringLiteral("2"), text}); q.waitForFinished(5000); QPixmap px; if (px.loadFromData(q.readAllStandardOutput(), "PNG")) img->setPixmap(px); }
+                lay->addWidget(img);
+                auto *ed = new QPlainTextEdit(text); ed->setReadOnly(true); ed->setMaximumHeight(90); lay->addWidget(ed);
+                auto *bb = new QDialogButtonBox(QDialogButtonBox::Close); auto *cp = bb->addButton(QStringLiteral("Copy"), QDialogButtonBox::ActionRole);
+                connect(cp, &QPushButton::clicked, &dlg, [text] { QApplication::clipboard()->setText(text); });
+                connect(bb, &QDialogButtonBox::rejected, &dlg, &QDialog::reject); lay->addWidget(bb);
+                dlg.exec();
+            });
+            connect(drop, &QPushButton::clicked, this, [this, id] { m_loc->identity()->removePending(id); refreshDevices(); });
+            h->addWidget(link); h->addWidget(drop);
+            m_linkTable->setCellWidget(i, 4, cell);
+        }
+        m_linkTable->resizeColumnsToContents(); m_linkTable->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
+    }
+
     const QList<ApiServer::Device> devs = api->devices();
     m_devTable->setRowCount(devs.size());
     for (int i = 0; i < devs.size(); ++i) {
@@ -876,3 +1007,188 @@ void MainWindow::refreshDevices()
     m_knownTable->setSortingEnabled(true);
     m_knownTable->resizeColumnsToContents(); m_knownTable->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
 }
+
+// ── Identity tab (docs/IDENTITY.md) ────────────────────────────────────────────
+static QPixmap qrPixmap(const QString &text, int scale = 5)
+{
+    const QString bin = QStandardPaths::findExecutable(QStringLiteral("qrencode"));
+    QPixmap px;
+    if (bin.isEmpty() || text.isEmpty()) return px;
+    QProcess q; q.start(bin, {QStringLiteral("-o"), QStringLiteral("-"), QStringLiteral("-t"), QStringLiteral("PNG"), QStringLiteral("-s"), QString::number(scale), QStringLiteral("-m"), QStringLiteral("2"), text});
+    q.waitForFinished(8000);
+    px.loadFromData(q.readAllStandardOutput(), "PNG");
+    return px;
+}
+
+QWidget *MainWindow::buildIdentity()
+{
+    auto *w = new QWidget;
+    auto *v = new QVBoxLayout(w);
+    m_idSummary = new QLabel; m_idSummary->setWordWrap(true); m_idSummary->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    { QFont f = m_idSummary->font(); f.setPointSizeF(f.pointSizeF() * 1.1); m_idSummary->setFont(f); }
+    v->addWidget(m_idSummary);
+    auto *row = new QHBoxLayout;
+    m_idCreate = new QPushButton(QIcon::fromTheme(QStringLiteral("list-add-user")), QStringLiteral("Create a new identity…"));
+    m_idImport = new QPushButton(QIcon::fromTheme(QStringLiteral("document-import")), QStringLiteral("Import…"));
+    m_idExport = new QPushButton(QIcon::fromTheme(QStringLiteral("document-export")), QStringLiteral("Export / move to another device…"));
+    m_idLink   = new QPushButton(QIcon::fromTheme(QStringLiteral("insert-link")), QStringLiteral("Link with another identity…"));
+    m_idForget = new QPushButton(QIcon::fromTheme(QStringLiteral("edit-delete")), QStringLiteral("Forget this device"));
+    for (QPushButton *b : {m_idCreate, m_idImport, m_idExport, m_idLink, m_idForget}) row->addWidget(b);
+    row->addStretch(); v->addLayout(row);
+    auto *mid = new QHBoxLayout;
+    m_idQr = new QLabel; m_idQr->setAlignment(Qt::AlignTop | Qt::AlignHCenter); m_idQr->setMinimumWidth(220);
+    m_idQr->setToolTip(QStringLiteral("Our link QR: another BeaconFix (phone, laptop) scans it to link its identity with this one. It carries only public data."));
+    m_idDetails = new QPlainTextEdit; m_idDetails->setReadOnly(true);
+    { QFont mono = m_idDetails->font(); mono.setFamily(QStringLiteral("monospace")); mono.setStyleHint(QFont::Monospace); m_idDetails->setFont(mono); }
+    mid->addWidget(m_idDetails, 1); mid->addWidget(m_idQr);
+    v->addLayout(mid, 1);
+    auto *note = new QLabel(QStringLiteral("An identity is an Ed25519 key pair plus a name. Its private key is sealed with the map-database key and never leaves this machine unencrypted; "
+                                           "exports are scrypt + AES-256-GCM bundles (QR, text or file) protected by a passphrase or a 6-word code. Devices that hold the same identity, "
+                                           "or one linked to it, sign in to the LAN API with a challenge signature — no pairing codes. See docs/IDENTITY.md."));
+    note->setWordWrap(true); note->setStyleSheet(QStringLiteral("color: palette(mid)")); v->addWidget(note);
+
+    Identity *idn = m_loc->identity();
+    connect(m_idCreate, &QPushButton::clicked, this, [this, idn] {
+        if (idn->exists() && QMessageBox::question(this, QStringLiteral("Replace identity?"), QStringLiteral("An identity already exists here (%1). Creating a new one replaces it on this device — export it first if you want to keep it. Continue?").arg(idn->groupedId())) != QMessageBox::Yes) return;
+        bool ok = false;
+        const QString name = QInputDialog::getText(this, QStringLiteral("New identity"), QStringLiteral("Display name (shown to your other devices):"), QLineEdit::Normal, QHostInfo::localHostName(), &ok);
+        if (!ok || name.trimmed().isEmpty()) return;
+        if (idn->exists()) idn->forget();
+        QString err;
+        if (!idn->create(name, QHostInfo::localHostName(), QStringLiteral("desktop"), &err)) { QMessageBox::warning(this, QStringLiteral("Identity"), err); return; }
+        statusBar()->showMessage(QStringLiteral("Identity created: %1").arg(idn->groupedId()), 4000);
+        refreshIdentity();
+    });
+    connect(m_idImport, &QPushButton::clicked, this, [this, idn] {
+        QDialog dlg(this); dlg.setWindowTitle(QStringLiteral("Import an identity"));
+        auto *lay = new QFormLayout(&dlg);
+        auto *text = new QPlainTextEdit; text->setPlaceholderText(QStringLiteral("Paste the BFID1:… text here, or use the buttons below")); text->setMinimumSize(520, 120);
+        auto *fileBtn = new QPushButton(QIcon::fromTheme(QStringLiteral("document-open")), QStringLiteral("Open a bundle file…"));
+        connect(fileBtn, &QPushButton::clicked, &dlg, [text, this] { const QString p = QFileDialog::getOpenFileName(this, QStringLiteral("Open identity bundle")); if (p.isEmpty()) return; QFile f(p); if (f.open(QIODevice::ReadOnly)) text->setPlainText(QString::fromUtf8(f.readAll()).trimmed()); });
+        auto *lanRow = new QHBoxLayout; auto *host = new QLineEdit; host->setPlaceholderText(QStringLiteral("other-beaconfix:47822")); auto *code = new QLineEdit; code->setPlaceholderText(QStringLiteral("6-digit code")); code->setMaximumWidth(110);
+        auto *fetch = new QPushButton(QStringLiteral("Fetch from that BeaconFix"));
+        lanRow->addWidget(host, 1); lanRow->addWidget(code); lanRow->addWidget(fetch);
+        connect(fetch, &QPushButton::clicked, &dlg, [text, host, code, this] {
+            QNetworkAccessManager nam; QString h = host->text().trimmed(); if (!h.contains(QLatin1Char(':'))) h += QStringLiteral(":47822");
+            QNetworkRequest req(QUrl(QStringLiteral("http://%1/api/v1/identity/export/%2").arg(h, code->text().trimmed()))); req.setTransferTimeout(8000);
+            QNetworkReply *rep = nam.get(req); QEventLoop loop; connect(rep, &QNetworkReply::finished, &loop, &QEventLoop::quit); loop.exec();
+            const QJsonObject o = QJsonDocument::fromJson(rep->readAll()).object(); rep->deleteLater();
+            if (o["bundle"].toString().isEmpty()) QMessageBox::warning(this, QStringLiteral("Fetch failed"), o["error"].toString().isEmpty() ? rep->errorString() : o["error"].toString());
+            else text->setPlainText(o["bundle"].toString());
+        });
+        auto *pass = new QLineEdit; pass->setEchoMode(QLineEdit::Password); pass->setPlaceholderText(QStringLiteral("passphrase or the 6-word code"));
+        auto *bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+        lay->addRow(QStringLiteral("Bundle:"), text); lay->addRow(QString(), fileBtn); lay->addRow(QStringLiteral("From the LAN:"), lanRow); lay->addRow(QStringLiteral("Passphrase:"), pass); lay->addRow(bb);
+        connect(bb, &QDialogButtonBox::accepted, &dlg, &QDialog::accept); connect(bb, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+        if (dlg.exec() != QDialog::Accepted) return;
+        if (idn->exists() && QMessageBox::question(this, QStringLiteral("Replace identity?"), QStringLiteral("Importing replaces the identity on this device (%1). Continue?").arg(idn->groupedId())) != QMessageBox::Yes) return;
+        QString err;
+        if (!idn->importBundle(text->toPlainText(), pass->text(), QHostInfo::localHostName(), QStringLiteral("desktop"), &err)) { QMessageBox::warning(this, QStringLiteral("Import failed"), err); return; }
+        statusBar()->showMessage(QStringLiteral("Identity imported: %1").arg(idn->groupedId()), 4000);
+        refreshIdentity();
+    });
+    connect(m_idExport, &QPushButton::clicked, this, [this, idn] {
+        if (!idn->unlocked()) { QMessageBox::warning(this, QStringLiteral("Identity"), QStringLiteral("No unlocked identity to export.")); return; }
+        QDialog dlg(this); dlg.setWindowTitle(QStringLiteral("Export identity"));
+        auto *lay = new QFormLayout(&dlg);
+        auto *words = new QCheckBox(QStringLiteral("Protect with a generated 6-word code (shown once) instead of a passphrase")); words->setChecked(true);
+        auto *pass = new QLineEdit; pass->setEchoMode(QLineEdit::Password); pass->setPlaceholderText(QStringLiteral("8+ characters")); pass->setEnabled(false);
+        connect(words, &QCheckBox::toggled, pass, [pass](bool on) { pass->setEnabled(!on); });
+        auto *lan = new QCheckBox(QStringLiteral("Also hold it for 10 minutes for a device on this network (it enters a 6-digit code instead of scanning)")); lan->setChecked(true);
+        auto *bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+        lay->addRow(words); lay->addRow(QStringLiteral("Passphrase:"), pass); lay->addRow(lan); lay->addRow(bb);
+        connect(bb, &QDialogButtonBox::accepted, &dlg, &QDialog::accept); connect(bb, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+        if (dlg.exec() != QDialog::Accepted) return;
+        const QString secret = words->isChecked() ? Identity::wordCode() : pass->text();
+        QString err; const QString bundle = idn->exportBundle(secret, &err);
+        if (bundle.isEmpty()) { QMessageBox::warning(this, QStringLiteral("Export failed"), err); return; }
+        QString code; if (lan->isChecked() && m_loc->apiServer()) code = m_loc->apiServer()->holdIdentityExport(bundle);
+        QDialog show(this); show.setWindowTitle(QStringLiteral("Identity bundle — scan, paste or fetch on the other device"));
+        auto *sv = new QVBoxLayout(&show);
+        if (words->isChecked()) { auto *wl = new QLabel(QStringLiteral("<b>Word code (shown once, needed on the other device):</b><br><span style='font-size:16pt'>%1</span>").arg(secret.toHtmlEscaped())); wl->setTextInteractionFlags(Qt::TextSelectableByMouse); sv->addWidget(wl); }
+        if (!code.isEmpty()) { auto *cl = new QLabel(QStringLiteral("On the same network: the other BeaconFix can fetch it from <b>%1:%2</b> with code <b style='font-size:16pt'>%3</b> for the next 10 minutes.").arg(QHostInfo::localHostName()).arg(m_loc->apiServer()->boundPort()).arg(code)); cl->setWordWrap(true); sv->addWidget(cl); }
+        auto *img = new QLabel; img->setAlignment(Qt::AlignCenter); img->setPixmap(qrPixmap(bundle, 4)); if (img->pixmap().isNull()) img->setText(QStringLiteral("(install qrencode for a QR code)")); sv->addWidget(img);
+        auto *ed = new QPlainTextEdit(bundle); ed->setReadOnly(true); ed->setMaximumHeight(100); sv->addWidget(ed);
+        auto *sb = new QDialogButtonBox(QDialogButtonBox::Close);
+        auto *cp = sb->addButton(QStringLiteral("Copy text"), QDialogButtonBox::ActionRole); auto *sf = sb->addButton(QStringLiteral("Save to file…"), QDialogButtonBox::ActionRole);
+        connect(cp, &QPushButton::clicked, &show, [bundle] { QApplication::clipboard()->setText(bundle); });
+        connect(sf, &QPushButton::clicked, &show, [bundle, this] { const QString p = QFileDialog::getSaveFileName(this, QStringLiteral("Save identity bundle"), QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation) + QStringLiteral("/beaconfix-identity.bfid"), QStringLiteral("BeaconFix identity (*.bfid)")); if (p.isEmpty()) return; QFile f(p); if (f.open(QIODevice::WriteOnly)) { f.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner); f.write(bundle.toUtf8() + "\n"); } });
+        connect(sb, &QDialogButtonBox::rejected, &show, &QDialog::reject); sv->addWidget(sb);
+        show.exec();
+    });
+    connect(m_idLink, &QPushButton::clicked, this, [this, idn] {
+        if (!idn->unlocked()) { QMessageBox::warning(this, QStringLiteral("Identity"), QStringLiteral("No unlocked identity here.")); return; }
+        QDialog dlg(this); dlg.setWindowTitle(QStringLiteral("Link with another identity"));
+        auto *lay = new QVBoxLayout(&dlg);
+        lay->addWidget(new QLabel(QStringLiteral("Paste what the other device shows: its <b>link payload</b> (BFLNK1:…) to start a link, or a <b>link statement</b> (BFLINK1:… / JSON) it already signed to complete one.")));
+        auto *text = new QPlainTextEdit; text->setMinimumSize(520, 110); lay->addWidget(text);
+        auto *bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel); lay->addWidget(bb);
+        connect(bb, &QDialogButtonBox::accepted, &dlg, &QDialog::accept); connect(bb, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+        if (dlg.exec() != QDialog::Accepted) return;
+        QString t = text->toPlainText().trimmed(); QJsonObject o;
+        if (t.startsWith(QLatin1String("BFLNK1:"))) o = QJsonDocument::fromJson(Identity::fromBase64url(t.mid(7).toLatin1())).object();
+        else if (t.startsWith(QLatin1String("BFLINK1:"))) o = QJsonDocument::fromJson(Identity::fromBase64url(t.mid(8).toLatin1())).object();
+        else o = QJsonDocument::fromJson(t.toUtf8()).object();
+        if (o["t"].toString() == QLatin1String("beaconfix-link") || (o.contains("pub") && o.contains("id") && !o.contains("a"))) {
+            const QByteArray pub = QByteArray::fromBase64(o["pub"].toString().toLatin1()); const QString id = o["id"].toString();
+            if (pub.size() != 32 || Identity::idFor(pub) != id) { QMessageBox::warning(this, QStringLiteral("Link"), QStringLiteral("That payload's id does not match its key.")); return; }
+            const LinkStatement st = idn->startLink(id, pub);
+            const QString out = QStringLiteral("BFLINK1:") + QString::fromLatin1(Identity::base64url(QJsonDocument(st.toJson(true)).toJson(QJsonDocument::Compact)));
+            QDialog show(this); show.setWindowTitle(QStringLiteral("Half-signed link statement")); auto *sv = new QVBoxLayout(&show);
+            sv->addWidget(new QLabel(QStringLiteral("Signed by us. Give this to %1 to co-sign (scan / paste on that device, Identity → Link); once it does, both sides are one owner set.").arg(o["name"].toString().isEmpty() ? Identity::groupId(id) : o["name"].toString())));
+            auto *img = new QLabel; img->setAlignment(Qt::AlignCenter); img->setPixmap(qrPixmap(out, 4)); sv->addWidget(img);
+            auto *ed = new QPlainTextEdit(out); ed->setReadOnly(true); ed->setMaximumHeight(90); sv->addWidget(ed);
+            auto *sb = new QDialogButtonBox(QDialogButtonBox::Close); auto *cp = sb->addButton(QStringLiteral("Copy"), QDialogButtonBox::ActionRole);
+            connect(cp, &QPushButton::clicked, &show, [out] { QApplication::clipboard()->setText(out); }); connect(sb, &QDialogButtonBox::rejected, &show, &QDialog::reject); sv->addWidget(sb);
+            show.exec();
+            return;
+        }
+        QString err; LinkStatement done;
+        if (!idn->acceptLink(LinkStatement::fromJson(o.contains("statement") ? o["statement"].toObject() : o), &err, &done)) { QMessageBox::warning(this, QStringLiteral("Link failed"), err); return; }
+        if (done.complete()) {
+            const QString out = QStringLiteral("BFLINK1:") + QString::fromLatin1(Identity::base64url(QJsonDocument(done.toJson(true)).toJson(QJsonDocument::Compact)));
+            QApplication::clipboard()->setText(out);
+            QMessageBox::information(this, QStringLiteral("Linked"), QStringLiteral("Identities %1 and %2 are now linked here. The completed statement is on the clipboard — paste it on the other device too (or it will pick it up on its next sync).").arg(Identity::groupId(done.a), Identity::groupId(done.b)));
+        }
+        refreshIdentity();
+    });
+    connect(m_idForget, &QPushButton::clicked, this, [this, idn] {
+        if (!idn->exists()) return;
+        if (QMessageBox::question(this, QStringLiteral("Forget this device?"), QStringLiteral("Remove the identity %1 from this machine? Other devices keep their copies; export first if this is the only one.").arg(idn->groupedId()), QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes) return;
+        idn->forget(); refreshIdentity();
+    });
+    connect(idn, &Identity::changed, this, &MainWindow::refreshIdentity);
+    refreshIdentity();
+    return w;
+}
+
+void MainWindow::refreshIdentity()
+{
+    Identity *idn = m_loc->identity();
+    if (!idn || !m_idSummary) return;
+    const bool have = idn->exists();
+    m_idExport->setEnabled(have && idn->unlocked()); m_idLink->setEnabled(have && idn->unlocked()); m_idForget->setEnabled(have);
+    if (!have) {
+        m_idSummary->setText(QStringLiteral("<b>No identity on this BeaconFix yet.</b> Create one, or import the one you made on your phone or laptop."));
+        m_idQr->clear(); m_idDetails->clear();
+        if (m_linkTable) refreshDevices();
+        return;
+    }
+    m_idSummary->setText(QStringLiteral("<b>%1</b> &nbsp; <span style='font-family:monospace'>%2</span> &nbsp;·&nbsp; %3 &nbsp;·&nbsp; %4 device(s) &nbsp;·&nbsp; %5 linked identit%6")
+                         .arg(idn->name().toHtmlEscaped(), idn->groupedId(), idn->unlocked() ? QStringLiteral("unlocked") : QStringLiteral("<span style='color:#ff9f43'>LOCKED — map-database key missing or changed</span>"))
+                         .arg(idn->devices().size()).arg(idn->linkedIds().size()).arg(idn->linkedIds().size() == 1 ? QStringLiteral("y") : QStringLiteral("ies")));
+    QString d = QStringLiteral("id:       %1\npub:      %2\ncreated:  %3\nfile:     %4\n\nDevices:\n").arg(idn->id(), QString::fromLatin1(idn->pub().toBase64()), idn->created().toString(Qt::ISODate), Identity::filePath());
+    for (const IdentityDevice &dv : idn->devices()) d += QStringLiteral("  %1 (%2) added %3\n").arg(dv.name, dv.kind, dv.added.toString(QStringLiteral("d MMM yyyy")));
+    d += QStringLiteral("\nLinks:\n");
+    if (idn->links().isEmpty()) d += QStringLiteral("  none\n");
+    for (const LinkStatement &l : idn->links()) d += QStringLiteral("  %1 ⇄ %2  (%3)\n").arg(Identity::groupId(l.a), Identity::groupId(l.b), l.ts);
+    if (!idn->pending().isEmpty()) { d += QStringLiteral("\nSign-ins waiting to be linked (Devices tab):\n"); for (const PendingLink &p : idn->pending()) d += QStringLiteral("  %1  %2 (%3) from %4\n").arg(Identity::groupId(p.id), p.deviceName, p.deviceKind, p.ip); }
+    m_idDetails->setPlainText(d);
+    const QString payload = QStringLiteral("BFLNK1:") + QString::fromLatin1(Identity::base64url(QJsonDocument(idn->linkPayload()).toJson(QJsonDocument::Compact)));
+    QPixmap px = qrPixmap(payload, 4);
+    if (px.isNull()) m_idQr->setText(QStringLiteral("link QR needs qrencode")); else m_idQr->setPixmap(px);
+    if (m_linkTable) refreshDevices();
+}
+
+void MainWindow::showIdentity() { if (m_identityTab) m_tabs->setCurrentWidget(m_identityTab); show(); raise(); activateWindow(); }
+void MainWindow::showEmergency() { m_tabs->setCurrentIndex(1); show(); raise(); activateWindow(); }

@@ -1,4 +1,9 @@
 #include "locator.h"
+#include <algorithm>
+#include <QHostInfo>
+#include <QStandardPaths>
+#include <QProcess>
+#include "identity.h"
 #include "mainwindow.h"
 #include "beaconview.h"
 #include "tilesource.h"
@@ -72,13 +77,151 @@ int main(int argc, char **argv)
     QCommandLineOption dbImport(QStringLiteral("db-import"), QStringLiteral("Merge a JSON dump (from --db-export) into the internal map database, exit."), QStringLiteral("file"));
     QCommandLineOption refit(QStringLiteral("refit"), QStringLiteral("Re-estimate every beacon's position from all its samples (least squares), print the count, exit."));
     QCommandLineOption sync(QStringLiteral("sync"), QStringLiteral("Sync samples, positions and stops with another BeaconFix: --sync <http://host:47822> --sync-token <token>; exit."), QStringLiteral("url"));
+    QCommandLineOption identity(QStringLiteral("identity"), QStringLiteral("Show this BeaconFix's identity (id, name, devices, links, pending link requests), exit."));
+    QCommandLineOption identityNew(QStringLiteral("identity-new"), QStringLiteral("Create a new identity called <name> (Ed25519 key pair sealed with the map-database key), exit."), QStringLiteral("name"));
+    QCommandLineOption identityExport(QStringLiteral("identity-export"), QStringLiteral("Export the identity as an encrypted BFID1 bundle (text + QR if qrencode is installed); asks for a passphrase or use --words, exit."));
+    QCommandLineOption identityFile(QStringLiteral("file"), QStringLiteral("With --identity-export: also write the bundle to <file>."), QStringLiteral("file"));
+    QCommandLineOption identityWords(QStringLiteral("words"), QStringLiteral("With --identity-export: protect the bundle with a generated 6-word code (shown once) instead of asking for a passphrase."));
+    QCommandLineOption identityPass(QStringLiteral("passphrase"), QStringLiteral("Passphrase for --identity-export / --identity-import (otherwise asked on the terminal)."), QStringLiteral("text"));
+    QCommandLineOption identityImport(QStringLiteral("identity-import"), QStringLiteral("Import an identity from <file> or a BFID1: text (asks for the passphrase / word code), exit."), QStringLiteral("file-or-text"));
+    QCommandLineOption identityLinkQr(QStringLiteral("identity-link-qr"), QStringLiteral("Print our link payload (BFLNK1: text + QR) for another identity to scan and co-sign, exit."));
+    QCommandLineOption identitySelftest(QStringLiteral("identity-selftest"), QStringLiteral("Print the fixed-seed test vectors (seed = 32×0x01), exit."));
+    QCommandLineOption nearby(QStringLiteral("nearby"), QStringLiteral("List places near the fix: <what> is a category (police, fire, health, urgent, pharmacy, library, playground, park, dogpark, pool, …), a group (civic, kids, services), 'emergency' for the nearest help, or 'all'; exit."), QStringLiteral("what"));
+    QCommandLineOption radius(QStringLiteral("radius"), QStringLiteral("With --nearby: only places within <km>."), QStringLiteral("km"));
+    QCommandLineOption tz(QStringLiteral("tz"), QStringLiteral("Print the IANA time zone for the current fix, exit."));
+    QCommandLineOption applyOs(QStringLiteral("apply-os"), QStringLiteral("Apply the OS integration now (time zone, GeoClue, Night Light) and print the report, exit."));
+    QCommandLineOption dryRun(QStringLiteral("dry-run"), QStringLiteral("With --apply-os: only report what would change."));
     QCommandLineOption syncToken(QStringLiteral("sync-token"), QStringLiteral("Bearer token for --sync (remembered for that peer once given)."), QStringLiteral("token"));
     p.addOptions({tray, once, json, refresh, snapshot, gpx, copy, newTrip, prefetch, apiStatus, devices, approve, deny, revoke, token, control, pairing,
-                  homeAdd, homeRemove, homeList, homeSync, homeToken, homeImport, knownImport, knownList, knownAdd, knownName, knownRemove, dbStats, dbExport, dbImport, refit, sync, syncToken});
+                  homeAdd, homeRemove, homeList, homeSync, homeToken, homeImport, knownImport, knownList, knownAdd, knownName, knownRemove, dbStats, dbExport, dbImport, refit, sync, syncToken,
+                  identity, identityNew, identityExport, identityFile, identityWords, identityPass, identityImport, identityLinkQr, identitySelftest, tz, applyOs, dryRun, nearby, radius});
     p.process(app);
 
     QTextStream out(stdout);
     QDBusConnection bus = QDBusConnection::sessionBus();
+
+    if (p.isSet(identitySelftest)) { out << QJsonDocument(Identity::selftest()).toJson(QJsonDocument::Indented); out.flush(); return 0; }
+
+    // ── identity: works on the file directly (sealed with the map-database key); a running tray is told to reload ──
+    if (p.isSet(identity) || p.isSet(identityNew) || p.isSet(identityExport) || p.isSet(identityImport) || p.isSet(identityLinkQr)) {
+        Locator loc(true);
+        Identity *idn = loc.identity();
+        if (!idn->unlocked() && loc.mapDb() && loc.mapDb()->key().isEmpty()) {   // first use before the tray ever ran: make the key now
+            QString src; const QByteArray k = MapDb::bootstrapKey(&src);
+            if (!k.isEmpty()) idn->load(k);
+        }
+        auto reloadTray = [&] { QDBusInterface iface(SVC, PATH, SVC, bus); if (iface.isValid()) iface.call(QStringLiteral("IdentityReload")); };
+        auto askPass = [&](const QString &prompt) -> QString {
+            if (p.isSet(identityPass)) return p.value(identityPass);
+            fprintf(stderr, "%s", qPrintable(prompt)); fflush(stderr);
+            QTextStream in(stdin); return in.readLine().trimmed();
+        };
+        auto qr = [&](const QString &text) {
+            const QString bin = QStandardPaths::findExecutable(QStringLiteral("qrencode"));
+            if (bin.isEmpty()) { out << "(install qrencode to see a QR here)\n"; return; }
+            QProcess q; q.start(bin, {QStringLiteral("-t"), QStringLiteral("ANSIUTF8"), QStringLiteral("-m"), QStringLiteral("1"), text});
+            q.waitForFinished(5000); out << QString::fromUtf8(q.readAllStandardOutput());
+        };
+        int rc = 0;
+        if (p.isSet(identityNew)) {
+            if (idn->exists()) { fprintf(stderr, "beaconfix: an identity already exists (%s). Export it or --identity first; forget it from the app to replace it.\n", qPrintable(idn->groupedId())); return 1; }
+            QString err;
+            if (!idn->create(p.value(identityNew), QHostInfo::localHostName(), QStringLiteral("desktop"), &err)) { fprintf(stderr, "beaconfix: %s\n", qPrintable(err)); return 1; }
+            out << "Identity created: " << idn->name() << "  " << idn->groupedId() << "\n";
+            reloadTray();
+        }
+        if (p.isSet(identityImport)) {
+            QString text = p.value(identityImport).trimmed();
+            if (QFile::exists(text)) { QFile f(text); if (f.open(QIODevice::ReadOnly)) text = QString::fromUtf8(f.readAll()).trimmed(); }
+            const QString pass = askPass(QStringLiteral("Passphrase / word code for the bundle: "));
+            QString err;
+            if (!idn->importBundle(text, pass, QHostInfo::localHostName(), QStringLiteral("desktop"), &err)) { fprintf(stderr, "beaconfix: import failed: %s\n", qPrintable(err)); return 1; }
+            out << "Identity imported: " << idn->name() << "  " << idn->groupedId() << "\n";
+            reloadTray();
+        }
+        if (p.isSet(identityExport)) {
+            if (!idn->unlocked()) { fprintf(stderr, "beaconfix: no unlocked identity here (create one with --identity-new <name>)\n"); return 1; }
+            QString pass;
+            if (p.isSet(identityWords)) { pass = Identity::wordCode(); out << "Word code (shown once — the other device needs it):\n\n    " << pass << "\n\n"; }
+            else pass = askPass(QStringLiteral("Passphrase to protect the bundle (8+ characters): "));
+            QString err; const QString bundle = idn->exportBundle(pass, &err);
+            if (bundle.isEmpty()) { fprintf(stderr, "beaconfix: %s\n", qPrintable(err)); return 1; }
+            if (p.isSet(identityFile)) { QFile f(p.value(identityFile)); if (f.open(QIODevice::WriteOnly)) { f.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner); f.write(bundle.toUtf8() + "\n"); out << "Written to " << p.value(identityFile) << "\n"; } else { fprintf(stderr, "beaconfix: cannot write %s\n", qPrintable(p.value(identityFile))); rc = 1; } }
+            out << bundle << "\n\n"; qr(bundle);
+        }
+        if (p.isSet(identityLinkQr)) {
+            if (!idn->exists()) { fprintf(stderr, "beaconfix: no identity here\n"); return 1; }
+            const QString payload = QStringLiteral("BFLNK1:") + QString::fromLatin1(Identity::base64url(QJsonDocument(idn->linkPayload()).toJson(QJsonDocument::Compact)));
+            out << payload << "\n\n"; qr(payload);
+        }
+        if (p.isSet(identity) || rc == 0) {
+            if (!idn->exists()) { out << "No identity on this BeaconFix yet. Create one: beaconfix --identity-new \"Your name\"  (or import a bundle)\n"; }
+            else {
+                out << "Identity: " << idn->name() << "\n  id:       " << idn->groupedId() << "\n  pub:      " << idn->pub().toBase64() << "\n  created:  " << idn->created().toString(Qt::ISODate)
+                    << "\n  key:      " << (idn->unlocked() ? "unlocked (sealed with the map-database key)" : "LOCKED (map-database key missing or changed)") << "\n  devices:  ";
+                QStringList devs; for (const IdentityDevice &d : idn->devices()) devs << d.name + " (" + d.kind + ")"; out << devs.join(", ") << "\n";
+                const QStringList linked = idn->linkedIds(); out << "  linked:   " << (linked.isEmpty() ? QStringLiteral("none") : linked.join(", ")) << "\n";
+                if (!idn->pending().isEmpty()) { out << "  pending link requests:\n"; for (const PendingLink &pl : idn->pending()) out << "    " << Identity::groupId(pl.id) << "  " << pl.deviceName << " (" << pl.deviceKind << ") from " << pl.ip << "  " << pl.time.toString(Qt::ISODate) << "\n"; }
+                out << "  file:     " << Identity::filePath() << "\n";
+            }
+        }
+        out.flush();
+        return rc;
+    }
+
+    if (p.isSet(nearby)) {
+        QJsonObject st;
+        QDBusInterface iface(SVC, PATH, SVC, bus);
+        if (iface.isValid()) { QDBusReply<QString> r = iface.call(QStringLiteral("StateJson")); st = QJsonDocument::fromJson(r.value().toUtf8()).object(); }
+        else { Locator loc(true); st = QJsonDocument::fromJson(loc.StateJson().toUtf8()).object(); }
+        const QString what = p.value(nearby).trimmed().toLower();
+        const double km = p.isSet(radius) ? p.value(radius).toDouble() : 0;
+        auto fmt = [](const QJsonObject &q) {
+            QString line = QStringLiteral("%1 %2").arg(q["icon"].toString(), q["name"].toString().isEmpty() ? q["label"].toString() : q["name"].toString());
+            if (q.contains("d")) line += QStringLiteral("  ·  %1 km %2").arg(q["d"].toDouble() / 1000.0, 0, 'f', 1).arg(Locator::compass(q["brg"].toDouble()));
+            if (!q["phone"].toString().isEmpty()) line += QStringLiteral("  ·  ☎ ") + q["phone"].toString();
+            if (!q["address"].toString().isEmpty()) line += QStringLiteral("  ·  ") + q["address"].toString();
+            if (!q["hours"].toString().isEmpty()) line += QStringLiteral("  ·  🕑 ") + q["hours"].toString();
+            return line;
+        };
+        if (what == QLatin1String("emergency")) {
+            const QJsonObject e = st["emergency"].toObject();
+            out << "Emergency number here: " << e["number"].toString() << (e["countryCode"].toString().isEmpty() ? "" : "  (" + e["countryCode"].toString().toUpper() + ")") << "\n";
+            for (const char *k : {"police", "fire", "hospital", "urgent", "pharmacy", "vet"}) {
+                const QJsonValue v = e[k];
+                if (v.isNull() || v.isUndefined()) { out << "  " << k << ": none mapped nearby\n"; continue; }
+                QJsonObject q = v.toObject(); q["label"] = QString::fromLatin1(k); q["icon"] = QString();
+                out << "  " << QString::fromLatin1(k).leftJustified(9) << fmt(q).trimmed() << "\n";
+            }
+            out.flush(); return 0;
+        }
+        int n = 0;
+        QList<QJsonObject> rows;
+        for (const QJsonValue &v : st["pois"].toArray()) {
+            const QJsonObject q = v.toObject();
+            if (!(what == QLatin1String("all") || what == q["cat"].toString().toLower() || what == q["group"].toString().toLower())) continue;
+            if (km > 0 && q.contains("d") && q["d"].toDouble() > km * 1000) continue;
+            rows << q;
+        }
+        std::sort(rows.begin(), rows.end(), [](const QJsonObject &a, const QJsonObject &b) { return a["d"].toDouble() < b["d"].toDouble(); });
+        for (const QJsonObject &q : rows) { out << fmt(q) << "\n"; ++n; }
+        if (n == 0) out << "No places matching '" << what << "'" << (km > 0 ? QStringLiteral(" within %1 km").arg(km) : QString()) << ". Categories: police fire health urgent pharmacy dentist vet library townhall court dmv school community playground park dogpark pool splash zoo museum themepark icecream cinema bowling arcade trampoline skate beach picnic trail fuel propane charging grocery food cafe camp water dump shower toilets laundry repair hardware wifi post rest carwash; groups: civic kids services; or emergency / all.\n";
+        out.flush(); return n ? 0 : 1;
+    }
+
+    if (p.isSet(tz) || p.isSet(applyOs)) {
+        QDBusInterface iface(SVC, PATH, SVC, bus);
+        if (iface.isValid()) {
+            if (p.isSet(applyOs)) { QDBusReply<QString> r = iface.call(QStringLiteral("ApplyOs"), p.isSet(dryRun)); out << (r.isValid() ? r.value() : QStringLiteral("{\"error\":\"call failed\"}")) << "\n"; }
+            if (p.isSet(tz)) { QDBusReply<QString> r = iface.call(QStringLiteral("TimeZoneForFix")); out << (r.isValid() && !r.value().isEmpty() ? r.value() : QStringLiteral("(no zone resolved yet)")) << "\n"; }
+            out.flush(); return 0;
+        }
+        Locator loc(true);
+        if (p.isSet(applyOs)) { fprintf(stderr, "beaconfix: --apply-os needs the running instance\n"); return 1; }
+        const QString z = loc.TimeZoneForFix();
+        out << (z.isEmpty() ? QStringLiteral("(no fix / no zone)") : z) << "\n"; out.flush();
+        return z.isEmpty() ? 1 : 0;
+    }
 
     if (p.isSet(once)) {
         Locator loc(true);
@@ -354,6 +497,8 @@ int main(int argc, char **argv)
     Tray trayIcon(loc, &app);
     auto showWin = [&win] { win.show(); win.raise(); win.activateWindow(); };
     QObject::connect(&trayIcon, &Tray::openWindowRequested, &app, showWin);
+    QObject::connect(&trayIcon, &Tray::openIdentityRequested, &app, [&win] { win.showIdentity(); });
+    QObject::connect(&trayIcon, &Tray::openEmergencyRequested, &app, [&win] { win.showEmergency(); });
     QObject::connect(loc, &Locator::showWindowRequested, &app, showWin);
     QObject::connect(&trayIcon, &Tray::quitRequested, &app, &QCoreApplication::quit);
     // Offline map: warm the tile cache around every new stop (and on request)

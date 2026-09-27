@@ -1211,11 +1211,20 @@ void BeaconView::buttonClicked(int b, const QPoint &globalPos)
         QAction *all = menu.addAction(QStringLiteral("Show all"));
         QAction *none = menu.addAction(QStringLiteral("Hide all"));
         menu.addSeparator();
-        for (const PoiCategory &c : Locator::poiCategories()) {
-            QAction *a = menu.addAction(QStringLiteral("%1  %2  (%3)").arg(c.icon, c.label).arg(counts.value(c.key)));
-            a->setCheckable(true); a->setChecked(!m_hiddenCats.contains(c.key));
-            const QString key = c.key;
-            connect(a, &QAction::toggled, this, [this, key](bool on) { setCategoryVisible(key, on); });
+        for (const QString &grp : {QStringLiteral("civic"), QStringLiteral("kids"), QStringLiteral("services")}) {
+            QMenu *gm = menu.addMenu(Locator::poiGroupLabel(grp));
+            QAction *gAll = gm->addAction(QStringLiteral("Show all in this group"));
+            QAction *gNone = gm->addAction(QStringLiteral("Hide all in this group"));
+            connect(gAll, &QAction::triggered, this, [this, grp] { for (const PoiCategory &c : Locator::poiCategories()) if (c.group == grp) m_hiddenCats.remove(c.key); QSettings().setValue("map/hiddenCategories", QStringList(m_hiddenCats.begin(), m_hiddenCats.end())); update(); });
+            connect(gNone, &QAction::triggered, this, [this, grp] { for (const PoiCategory &c : Locator::poiCategories()) if (c.group == grp) m_hiddenCats.insert(c.key); QSettings().setValue("map/hiddenCategories", QStringList(m_hiddenCats.begin(), m_hiddenCats.end())); update(); });
+            gm->addSeparator();
+            for (const PoiCategory &c : Locator::poiCategories()) {
+                if (c.group != grp) continue;
+                QAction *a = gm->addAction(QStringLiteral("%1  %2  (%3)").arg(c.icon, c.label).arg(counts.value(c.key)));
+                a->setCheckable(true); a->setChecked(!m_hiddenCats.contains(c.key));
+                const QString key = c.key;
+                connect(a, &QAction::toggled, this, [this, key](bool on) { setCategoryVisible(key, on); });
+            }
         }
         menu.addSeparator();
         QMenu *rad = menu.addMenu(QStringLiteral("Search radius: %1 km").arg(m_loc->poiRadiusKm()));

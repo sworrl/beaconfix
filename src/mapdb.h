@@ -39,6 +39,8 @@ public:
     QString error() const { return m_error; }
     QString path() const { return m_blobPath; }              // the encrypted file
     QString keySource() const { return m_keySource; }          // "kwallet" | "keyfile"
+    QByteArray key() const { return m_key; }                   // the 256-bit key (also seals the identity file)
+    static QByteArray bootstrapKey(QString *source);           // the key, creating the key file if there is none yet (CLI before the first tray start)
     bool    isEmpty() const;                                   // no aps and no fixes
     QJsonObject stats() const;
 

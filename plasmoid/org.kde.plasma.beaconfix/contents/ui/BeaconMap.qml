@@ -21,6 +21,7 @@ Item {
     property bool showEvents: true             // event animations + ticker
     signal layerPicked(int index)
     signal categoryToggled(string key, bool visible)
+    function groupToggled(group, visible) { var cats = map.src.poiCategories || []; for (var i = 0; i < cats.length; i++) if ((cats[i].group || "services") === group) map.categoryToggled(cats[i].key, visible) }
     signal allCategories(bool visible)
     signal ssidsToggled(bool on)
     signal eventsToggled(bool on)
@@ -1132,21 +1133,37 @@ Item {
         PC3.MenuItem { text: "Show all"; onTriggered: map.allCategories(true) }
         PC3.MenuItem { text: "Hide all"; onTriggered: map.allCategories(false) }
         PC3.MenuSeparator {}
+        // One submenu per group (Emergency & civic · Kids & fun · Services), each with show/hide-all
         Instantiator {
-            model: map.src.poiCategories || []
-            delegate: PC3.MenuItem {
-                required property var modelData
-                text: {
-                    var n = 0, p = map.src.pois || []
-                    for (var i = 0; i < p.length; i++) if (p[i].cat === modelData.key) n++
-                    return `${modelData.icon}  ${modelData.label}  (${n})`
+            model: ["civic", "kids", "services"]
+            delegate: PC3.Menu {
+                id: groupMenu
+                required property string modelData
+                title: modelData === "civic" ? "🚔 Emergency & civic" : modelData === "kids" ? "🛝 Kids & fun" : "⛽ Services"
+                PC3.MenuItem { text: "Show all in this group"; onTriggered: map.groupToggled(modelData, true) }
+                PC3.MenuItem { text: "Hide all in this group"; onTriggered: map.groupToggled(modelData, false) }
+                PC3.MenuSeparator {}
+                Instantiator {
+                    id: groupItems
+                    readonly property string grp: modelData
+                    model: (map.src.poiCategories || []).filter(function(c) { return (c.group || "services") === groupItems.grp })
+                    delegate: PC3.MenuItem {
+                        required property var modelData
+                        text: {
+                            var n = 0, p = map.src.pois || []
+                            for (var i = 0; i < p.length; i++) if (p[i].cat === modelData.key) n++
+                            return `${modelData.icon}  ${modelData.label}  (${n})`
+                        }
+                        checkable: true
+                        checked: map.hiddenCats.indexOf(modelData.key) < 0
+                        onTriggered: map.categoryToggled(modelData.key, checked)
+                    }
+                    onObjectAdded: (index, object) => groupMenu.insertItem(index + 3, object)
+                    onObjectRemoved: (index, object) => groupMenu.removeItem(object)
                 }
-                checkable: true
-                checked: map.hiddenCats.indexOf(modelData.key) < 0
-                onTriggered: map.categoryToggled(modelData.key, checked)
             }
-            onObjectAdded: (index, object) => placesMenu.insertItem(index + 3, object)
-            onObjectRemoved: (index, object) => placesMenu.removeItem(object)
+            onObjectAdded: (index, object) => placesMenu.insertMenu(index + 3, object)
+            onObjectRemoved: (index, object) => placesMenu.removeMenu(object)
         }
     }
 

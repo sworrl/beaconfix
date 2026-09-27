@@ -50,16 +50,20 @@ tab, or `beaconfix --token "Photo frame"` (add `--control` for the control scope
 
 ## Endpoints
 
+Identity endpoints (challenge sign-in, linking, bundle hand-off) are specified in [IDENTITY.md](IDENTITY.md); the table lists them for completeness.
+
 | method | path | scope | response |
 |---|---|---|---|
-| GET | `/api/v1/hello` | none | `{"name","version","hostname","pairing","tls","ts"}` |
+| GET | `/api/v1/hello` | none | `{"name","version","hostname","pairing","tls","ts","api":2,"features":["sync","locate","home","events","stream","estimates","identity"]}` |
 | POST | `/api/v1/pair` body `{"name":"…","scopes":["read"]}` | none | `202 {"id","code","expires","poll"}`; `403` when pairing is closed; `429` when five are pending |
 | GET | `/api/v1/pair/<id>` | none | `{"status":"pending"}` · `{"status":"denied"}` · `{"status":"approved","scopes":[…],"token":"…"}` (token once); `404` unknown/expired |
 | GET | `/api/v1/location` | read | the fix, see below |
 | GET | `/api/v1/state` | read | everything the tray knows (same as D-Bus `StateJson()` / `beaconfix --json`) |
 | GET | `/api/v1/events?since=<id>` | read | `{"events":[…],"lastEventId"}` newer than `id` |
 | GET | `/api/v1/aps` | read | `{"aps":[…]}` beacons with estimates and security |
-| GET | `/api/v1/pois` | read | `{"pois":[…]}` places |
+| GET | `/api/v1/pois` | read | `{"pois":[…]}` places (each with `cat`, `group`, `address`, `phone`, `hours`, `website`, `wheelchair`, `emergency`, `d`, `brg`) |
+| GET | `/api/v1/pois?cat=police,fire&group=kids&radius=<km>` | read | filtered places: categories and/or groups (`civic`, `kids`, `services`), within `radius` km |
+| GET | `/api/v1/emergency` | read | nearest `police`, `fire`, `hospital` (ER preferred), `urgent`, `pharmacy`, `vet` with distance / bearing / phone / address, and `number` — the local emergency number |
 | GET | `/api/v1/track` | read | `{"track":[…]}` the trip log |
 | GET | `/api/v1/trip` | read | `{"stats":{…}}` |
 | GET | `/api/v1/home` | read | `{"patterns":[…],"atHome","awayKm","awayText","homeLat","homeLon","homeTime"}` |
@@ -67,7 +71,15 @@ tab, or `beaconfix --token "Photo frame"` (add `--control` for the control scope
 | POST | `/api/v1/locate` body `{"wifiAccessPoints":[{"macAddress","signalStrength"}]}` | read | `{"location":{"lat","lng"},"accuracy","used"}` from the internal map, or `404` |
 | GET | `/api/v1/db/stats` | read | database statistics |
 | POST | `/api/v1/db/observations` body `{"observations":[{"bssid","ssid","dbm","lat","lon","acc","time"}]}` | control | merges another device's observations into the map |
+| GET | `/api/v1/db/changes?since=<seq>&limit=<n>` | read | sync feed: `{since,cursor,more,count,device,identity,aps[],observations[],fixes[]}` after a cursor, oldest first (every row carries `identity`) |
+| POST | `/api/v1/db/sync` body `{"device","identity"?,"observations":[…],"aps":[…],"fixes":[…],"sinceCursor"?}` | control | merges a peer's data (1 MB bodies), queues refits, returns `{accepted,cursor,refitQueued,identity,changes?}`; `403 identity not linked` when the peer names an identity that is not yours or linked |
 | GET | `/api/v1/db/export` | control | JSON dump of the database |
+| GET | `/api/v1/identity` | none | the public identity record + `linkedIds`, `grouped`, `unlocked`; `404` until one exists |
+| GET | `/api/v1/identity/challenge` | none | `{"nonce","host","expires","id"}` — 60 s, single use |
+| POST | `/api/v1/identity/auth` body `{"id","pub","device":{"name","kind"},"nonce","sig"}` | none | `{"token","scopes":["read","control"],"identity":{id,name},"device"}` when the identity is yours or linked; `403 unknown identity` (listed for linking) otherwise |
+| POST | `/api/v1/identity/link` body: a link statement (`a`,`b`,`ts`,`sigA`,`sigB`, optional `pubA`/`pubB`) | none | verifies, co-signs if we are a party, stores when complete → `{"statement","linkedIds"}` |
+| POST | `/api/v1/identity/export` body `{"passphrase"?}` | control | holds our encrypted bundle 10 min under a one-time code → `{"code","expires","fetch","words"?}` (`words` = generated 6-word code when no passphrase was given) |
+| GET | `/api/v1/identity/export/<code>` | none | `{"bundle":"BFID1:…"}` once; `404` afterwards or after 5 wrong codes |
 | GET | `/api/v1/stream` | read | Server-Sent Events: `event: fix`, `event: beacon` (one event JSON), `event: ping` every 30 s |
 | POST | `/api/v1/refresh` | control | re-check the position now (`202`) |
 | POST | `/api/v1/prefetch` | control | save map tiles around the fix (`202`) |

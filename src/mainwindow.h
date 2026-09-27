@@ -32,6 +32,12 @@ private:
     QWidget *buildTrip();
     QWidget *buildDevices();
     void refreshDevices();
+    QWidget *buildIdentity();
+    void refreshIdentity();
+public:
+    void showIdentity();
+    void showEmergency();
+private:
 
     Locator *m_loc;
     BeaconView *m_map;
@@ -52,4 +58,10 @@ private:
     // Devices (LAN API)
     QCheckBox *m_apiEnabled; QSpinBox *m_apiPort; QLabel *m_apiStatus, *m_pairLabel; QPushButton *m_pairBtn;
     QTableWidget *m_pendingTable, *m_devTable, *m_knownTable; QPlainTextEdit *m_accessLog; class QTimer *m_devTimer; QCheckBox *m_knownOnly;
+    QTableWidget *m_linkTable = nullptr;
+    // System (OS integration)
+    QCheckBox *m_osTz, *m_osGeo, *m_osNight, *m_osLocale; QLabel *m_osStatus;
+    // Identity
+    QWidget *m_identityTab = nullptr; QLabel *m_idSummary, *m_idQr; QPushButton *m_idCreate, *m_idImport, *m_idExport, *m_idLink, *m_idForget; QPlainTextEdit *m_idDetails;
+    QLabel *m_emergency = nullptr;
 };

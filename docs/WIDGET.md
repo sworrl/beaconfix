@@ -68,3 +68,16 @@ devices attached to that SSID.
 Tiles come from the tray's localhost tile server (`http://127.0.0.1:47821/t/<layer>/<z>/<x>/<y>.png`,
 tiles only) because OpenStreetMap refuses QML's generic User-Agent; without the tray the widget
 falls back to Esri tiles.
+
+## Nearby: help, addresses and phone numbers (3.5)
+
+The Nearby tab opens with a **nearest help** card: the local emergency number, then the nearest
+police station, fire station, hospital with an emergency department and urgent care, each with
+distance, bearing, address and a call button (`tel:` link). Three chips filter the list by group
+(🚔 emergency & civic, 🛝 kids & fun, ⛽ services); the filter box also matches addresses and
+group names. Every row shows the phone number (call button; right-click copies it) and the
+address (copy button). The map's *Places to show* menu has one submenu per group with
+show-all / hide-all. The compact tooltip adds the resolved time zone and the local emergency
+number.
+
+Config keys added: none (categories, groups and hidden lists reuse `hiddenCategories`).

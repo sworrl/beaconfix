@@ -29,10 +29,41 @@ from the app's Settings and Devices tabs; all can be edited by hand while the tr
 | `apiPort` | 47822 | its port (the next nine are tried if busy) |
 | `apiKnownOnly` | true | tokens only work from known devices; unknown pairings need manual approval |
 | `apiPairingUntil` | (state) | pairing window end |
+| `osTimeZone` | true | keep the system time zone in step with the fix (timedated; polkit rule shipped) |
+| `osGeoclue` | true | publish the fix to `/etc/geolocation` through `beaconfix-osd` (pkexec) |
+| `osNightLight` | true | point KWin Night Light at the fix (`kwinrc [NightColor] Mode=Location`) |
+| `osLocale` | false | expose locale hints in `stats.locale` as a suggestion (they are exported regardless; this flags them as wanted) |
+| `osLastZone` / `osLastZoneSource` / `osLastTzChange` / `osGeoclueLat` / `osGeoclueLon` / `osNightLat` / `osNightLon` | (state) | what the OS integration last applied |
+| `identityNudged` | (state) | the one-time "create or import your identity" notification was shown |
+| `liveScanSeconds` (see above), `syncPeers` (file) | | see below |
 
 The Plasma widget has its own settings (see WIDGET.md).
 
+### Time zone lookup
+
+The zone for a position comes from `timeapi.io` (keyless), cached for 24 h per ~5 km cell in the
+map database (`kv` rows `tz:<lat>,<lon>`). Offline, the nearest zone of the same country from
+tzdata's `zone1970.tab` is used — a city-list heuristic that can pick a neighbouring zone near a
+border, which is why the zone is only *changed* from a precise fix, at most once per ten minutes,
+and never from an IP-only fix. `beaconfix --tz` prints the zone; `beaconfix --apply-os --dry-run`
+shows what would change.
+
+### System-side files (installed with sudo by `install.sh`, or by the package)
+
+| file | purpose |
+|---|---|
+| `/usr/local/libexec/beaconfix-osd` (`/usr/libexec/…` from the .deb) | root helper: writes `/etc/geolocation` (GeoClue static source) — two validated commands, nothing else |
+| `/usr/share/polkit-1/actions/org.sworrl.beaconfix.policy` | its polkit action (`org.sworrl.beaconfix.osd`, bound to that path) |
+| `/etc/polkit-1/rules.d/50-beaconfix.rules` | lets an active local user in `sudo` / `wheel` set the time zone and run the helper without a prompt; delete it to get the admin prompt back |
+| `/etc/geolocation` | the published position (lat, lon, altitude, accuracy — one per line), read by GeoClue ≥ 2.6 |
+
 ## Files
+
+| file | what |
+|---|---|
+| `~/.config/sworrl/identity.json` | the identity: public record, the seed sealed with the map-database key, pending link requests (0600) — [IDENTITY.md](IDENTITY.md) |
+| `~/.config/sworrl/beaconfix-sync.json` | sync peers (URL, token, interval, last result) for `--sync` / Settings → Sync |
+
 
 | path | contents |
 |---|---|

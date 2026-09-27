@@ -13,6 +13,8 @@ public:
 
 signals:
     void openWindowRequested();
+    void openIdentityRequested();
+    void openEmergencyRequested();
     void quitRequested();
 
 private:
@@ -24,6 +26,6 @@ private:
     QMenu m_menu;
     QAction *m_placeAct = nullptr, *m_coordAct = nullptr, *m_ageAct = nullptr, *m_refreshAct = nullptr;
     QMenu *m_intervalMenu = nullptr, *m_shareMenu = nullptr;
-    QAction *m_tripAct = nullptr, *m_sunAct = nullptr;
+    QAction *m_tripAct = nullptr, *m_sunAct = nullptr, *m_identityAct = nullptr;
     QTimer m_ageTimer;
 };

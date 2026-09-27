@@ -1,0 +1,11 @@
+// BeaconFix: let an active local user who is an administrator (sudo / wheel) keep the
+// system time zone in step with the position fix and publish the fix to GeoClue,
+// without a password prompt every time. Installed by install.sh / the package; remove
+// this file to get polkit's default (an admin prompt) back.
+polkit.addRule(function(action, subject) {
+    if ((action.id == "org.freedesktop.timedate1.set-timezone" || action.id == "org.sworrl.beaconfix.osd")
+        && subject.active && subject.local
+        && (subject.isInGroup("sudo") || subject.isInGroup("wheel"))) {
+        return polkit.Result.YES;
+    }
+});

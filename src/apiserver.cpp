@@ -1,5 +1,6 @@
 #include "apiserver.h"
 #include "locator.h"
+#include "identity.h"
 #include "mapdb.h"
 #include <QCoreApplication>
 #include <QCryptographicHash>
@@ -10,6 +11,7 @@
 #include <QJsonDocument>
 #include <QNetworkInterface>
 #include <QRandomGenerator>
+#include <openssl/rand.h>
 #include <QRegularExpression>
 #include <QSaveFile>
 #include <QSettings>
@@ -107,10 +109,12 @@ QString ApiServer::clientIp(QTcpSocket *s)
 
 QJsonObject ApiServer::Device::toJson(bool full) const
 {
+    // (identity is added below when set)
     QJsonObject o{{"id", id}, {"name", name}, {"created", created.toString(Qt::ISODate)},
                   {"lastSeen", lastSeen.isValid() ? QJsonValue(lastSeen.toString(Qt::ISODate)) : QJsonValue()},
                   {"lastIp", lastIp}, {"scopes", QJsonArray::fromStringList(scopes)}, {"revoked", revoked}};
     if (full) o["hash"] = QString::fromLatin1(hash);
+    if (!identity.isEmpty()) o["identity"] = identity;
     return o;
 }
 
@@ -307,9 +311,10 @@ bool ApiServer::remove(const QString &id)
     return false;
 }
 
-QString ApiServer::createToken(const QString &name, const QStringList &scopes)
+QString ApiServer::createToken(const QString &name, const QStringList &scopes, const QString &identity)
 {
     Device d; d.id = randomId(6); d.name = name.trimmed().isEmpty() ? QStringLiteral("Device") : name.trimmed().left(64);
+    d.identity = identity;
     d.created = QDateTime::currentDateTime();
     d.scopes = QStringList{QStringLiteral("read")};
     if (scopes.contains(QStringLiteral("control"))) d.scopes << QStringLiteral("control");
@@ -343,7 +348,7 @@ void ApiServer::load()
     m_devices.clear();
     for (const QJsonValue &v : arr) {
         const QJsonObject o = v.toObject();
-        Device d; d.id = o["id"].toString(); d.name = o["name"].toString();
+        Device d; d.id = o["id"].toString(); d.name = o["name"].toString(); d.identity = o["identity"].toString();
         d.created = QDateTime::fromString(o["created"].toString(), Qt::ISODate);
         d.lastSeen = QDateTime::fromString(o["lastSeen"].toString(), Qt::ISODate);
         d.lastIp = o["lastIp"].toString(); d.hash = o["hash"].toString().toLatin1(); d.revoked = o["revoked"].toBool();
@@ -682,7 +687,7 @@ void ApiServer::handle(QTcpSocket *s, const Request &r)
         if (r.method != QLatin1String("GET")) { finish(405, QJsonObject{{"error", "method not allowed"}}, {"Allow: GET"}); return; }
         finish(200, QJsonObject{{"name", "BeaconFix"}, {"version", QStringLiteral(BEACONFIX_VERSION)}, {"hostname", QHostInfo::localHostName()},
                                 {"pairing", pairingOpen()}, {"tls", m_tls}, {"ts", QDateTime::currentDateTime().toString(Qt::ISODate)},
-                                {"features", QJsonArray{"sync", "locate", "home", "events", "stream", "estimates"}}, {"api", 2}});
+                                {"features", QJsonArray{"sync", "locate", "home", "events", "stream", "estimates", "identity"}}, {"api", 2}});
         return;
     }
     if (ep == QLatin1String("pair")) {
@@ -736,6 +741,83 @@ void ApiServer::handle(QTcpSocket *s, const Request &r)
         return;
     }
 
+    // ── identity (docs/IDENTITY.md): public record, challenge/auth, link, LAN hand-off ──
+    Identity *idn = m_loc->identity();
+    if (ep == QLatin1String("identity")) {
+        if (r.method != QLatin1String("GET")) { finish(405, QJsonObject{{"error", "method not allowed"}}, {"Allow: GET"}); return; }
+        if (!idn || !idn->exists()) { finish(404, QJsonObject{{"error", "no identity on this BeaconFix yet"}}); return; }
+        finish(200, idn->publicJson());
+        return;
+    }
+    if (ep == QLatin1String("identity/challenge")) {
+        if (r.method != QLatin1String("GET")) { finish(405, QJsonObject{{"error", "method not allowed"}}, {"Allow: GET"}); return; }
+        if (!idn || !idn->exists()) { finish(404, QJsonObject{{"error", "no identity on this BeaconFix yet"}}); return; }
+        const QDateTime now = QDateTime::currentDateTime();
+        for (auto it = m_nonces.begin(); it != m_nonces.end();) { if (it.value() < now) it = m_nonces.erase(it); else ++it; }
+        if (m_nonces.size() > 64) { finish(429, QJsonObject{{"error", "too many open challenges"}}); return; }
+        QByteArray n(32, 0); if (RAND_bytes(reinterpret_cast<unsigned char *>(n.data()), 32) != 1) { finish(500, QJsonObject{{"error", "rng"}}); return; }
+        const QString nonce = QString::fromLatin1(n.toBase64());
+        m_nonces.insert(nonce, now.addSecs(60));
+        finish(200, QJsonObject{{"nonce", nonce}, {"host", QHostInfo::localHostName()}, {"expires", now.addSecs(60).toString(Qt::ISODate)}, {"id", idn->id()}});
+        return;
+    }
+    if (ep == QLatin1String("identity/auth")) {
+        if (r.method != QLatin1String("POST")) { finish(405, QJsonObject{{"error", "method not allowed"}}, {"Allow: POST"}); return; }
+        if (!idn || !idn->exists()) { finish(404, QJsonObject{{"error", "no identity on this BeaconFix yet"}}); return; }
+        const QJsonObject b = QJsonDocument::fromJson(r.body).object();
+        const QString id = b["id"].toString(), nonce = b["nonce"].toString();
+        const QByteArray pub = QByteArray::fromBase64(b["pub"].toString().toLatin1()), sig = QByteArray::fromBase64(b["sig"].toString().toLatin1());
+        const QJsonObject dev = b["device"].toObject();
+        const QString devName = dev["name"].toString().trimmed().left(64), devKind = dev["kind"].toString().trimmed().left(16);
+        if (id.isEmpty() || pub.size() != 32 || sig.size() != 64 || nonce.isEmpty() || devName.isEmpty()) { finish(400, QJsonObject{{"error", "id, pub, nonce, sig and device.name required"}}); return; }
+        const auto nit = m_nonces.find(nonce);
+        if (nit == m_nonces.end() || nit.value() < QDateTime::currentDateTime()) { rateLimited(ip, true); finish(403, QJsonObject{{"error", "unknown or expired nonce"}}); return; }
+        m_nonces.erase(nit);
+        if (Identity::idFor(pub) != id) { rateLimited(ip, true); finish(403, QJsonObject{{"error", "id does not match pub"}}); return; }
+        if (!Identity::verify(pub, Identity::authCanon(QHostInfo::localHostName(), nonce.toLatin1(), id, devName), sig)) { rateLimited(ip, true); finish(403, QJsonObject{{"error", "bad signature"}}); return; }
+        if (!idn->isOwner(id)) {
+            PendingLink p; p.id = id; p.name = b["name"].toString().left(64); p.ip = ip; p.deviceName = devName; p.deviceKind = devKind; p.pub = pub; p.time = QDateTime::currentDateTime();
+            idn->addPending(p);
+            m_loc->notify(QStringLiteral("%1 (%2) asked to sign in with another identity").arg(devName, ip),
+                          QStringLiteral("Identity %1 is not yours or linked. Link it in BeaconFix → Devices if it is one of your own.").arg(Identity::groupId(id)), QStringLiteral("user-identity"));
+            emit changed();
+            finish(403, QJsonObject{{"error", "unknown identity"}, {"hint", "link this identity from the desktop (Devices → Link)"}, {"id", id}});
+            return;
+        }
+        // Ours (or linked): issue a control token, no pairing prompt
+        for (Device &d : m_devices) if (!d.revoked && d.identity == id && d.name == devName) d.revoked = true;   // one live token per device name
+        const QString tok = createToken(devName, {QStringLiteral("read"), QStringLiteral("control")}, id);
+        if (id == idn->id()) idn->addDevice(devName, devKind.isEmpty() ? QStringLiteral("device") : devKind, pub);
+        m_loc->notify(QStringLiteral("%1 signed in").arg(devName), QStringLiteral("Identity %1 (%2) from %3").arg(idn->name(), Identity::groupId(id), ip), QStringLiteral("user-identity"));
+        finish(200, QJsonObject{{"token", tok}, {"scopes", QJsonArray{"read", "control"}}, {"identity", QJsonObject{{"id", idn->id()}, {"name", idn->name()}}}, {"device", devName}});
+        return;
+    }
+    if (ep == QLatin1String("identity/link")) {
+        if (r.method != QLatin1String("POST")) { finish(405, QJsonObject{{"error", "method not allowed"}}, {"Allow: POST"}); return; }
+        if (!idn || !idn->exists()) { finish(404, QJsonObject{{"error", "no identity on this BeaconFix yet"}}); return; }
+        const QJsonObject b = QJsonDocument::fromJson(r.body).object();
+        const QJsonObject st = b.contains("statement") ? b["statement"].toObject() : b;
+        QString err; LinkStatement done;
+        if (!idn->acceptLink(LinkStatement::fromJson(st), &err, &done)) { rateLimited(ip, true); finish(403, QJsonObject{{"error", err}}); return; }
+        emit changed();
+        m_loc->notify(QStringLiteral("Identity linked"), QStringLiteral("%1 is now linked with %2").arg(Identity::groupId(done.a), Identity::groupId(done.b)), QStringLiteral("user-identity"));
+        finish(200, QJsonObject{{"statement", done.toJson(true)}, {"linkedIds", QJsonArray::fromStringList(idn->linkedIds())}});
+        return;
+    }
+    if (ep.startsWith(QLatin1String("identity/export/")) && r.method == QLatin1String("GET")) {   // LAN hand-off: fetch the held bundle with the one-time code
+        const QString code = ep.mid(16);
+        const QDateTime now = QDateTime::currentDateTime();
+        for (auto it = m_exports.begin(); it != m_exports.end();) { if (it.value().expires < now) it = m_exports.erase(it); else ++it; }
+        auto it = m_exports.find(code);
+        if (it == m_exports.end()) {
+            for (auto &h : m_exports) if (++h.tries >= 5) { m_exports.clear(); break; }   // 5 wrong guesses burn every held bundle
+            rateLimited(ip, true); finish(404, QJsonObject{{"error", "no bundle under that code"}}); return;
+        }
+        const QString bundle = it.value().bundle; m_exports.erase(it);
+        finish(200, QJsonObject{{"bundle", bundle}, {"hint", "decrypt with the passphrase / word code shown on the sending BeaconFix"}});
+        return;
+    }
+
     // ── authenticated ──
     if (m_knownOnly && !knownFor(ip)) {                          // tokens only work from OUR devices
         rateLimited(ip, true);
@@ -747,6 +829,21 @@ void ApiServer::handle(QTcpSocket *s, const Request &r)
     const bool control = dev->scopes.contains(QStringLiteral("control"));
     const bool get = r.method == QLatin1String("GET"), post = r.method == QLatin1String("POST");
 
+    if (ep == QLatin1String("identity/export")) {          // hold our bundle for a device on the LAN (one-time code, 10 min)
+        if (!post) { finish(405, QJsonObject{{"error", "method not allowed"}}, {"Allow: POST"}); return; }
+        if (!control) { finish(403, QJsonObject{{"error", "control scope required"}}); return; }
+        if (!idn || !idn->unlocked()) { finish(404, QJsonObject{{"error", "no unlocked identity on this BeaconFix"}}); return; }
+        const QJsonObject b = QJsonDocument::fromJson(r.body).object();
+        QString pass = b["passphrase"].toString();
+        const bool words = pass.isEmpty(); if (words) pass = Identity::wordCode();
+        QString err; const QString bundle = idn->exportBundle(pass, &err);
+        if (bundle.isEmpty()) { finish(400, QJsonObject{{"error", err}}); return; }
+        const QString code = holdIdentityExport(bundle);
+        QJsonObject o{{"code", code}, {"expires", QDateTime::currentDateTime().addSecs(600).toString(Qt::ISODate)}, {"fetch", QStringLiteral("/api/v1/identity/export/%1").arg(code)}};
+        if (words) o["words"] = pass;                            // generated for the caller: shown once here, never stored
+        finish(200, o);
+        return;
+    }
     if (ep == QLatin1String("location")) { if (!get) { finish(405, QJsonObject{{"error", "method not allowed"}}, {"Allow: GET"}); return; } finish(200, locationJson()); return; }
     if (ep == QLatin1String("state"))    { if (!get) { finish(405, QJsonObject{{"error", "method not allowed"}}, {"Allow: GET"}); return; } finish(200, stateObject()); return; }
     if (ep == QLatin1String("events")) {
@@ -755,6 +852,30 @@ void ApiServer::handle(QTcpSocket *s, const Request &r)
         QJsonArray ev;
         for (const BeaconEvent &e : m_loc->events()) if (e.id > since) ev.append(e.toJson());
         finish(200, QJsonObject{{"since", since}, {"lastEventId", m_loc->lastEventId()}, {"events", ev}});
+        return;
+    }
+    if (ep == QLatin1String("emergency")) {                   // nearest police / fire / ER / urgent care / pharmacy / vet + the local number
+        if (!get) { finish(405, QJsonObject{{"error", "method not allowed"}}, {"Allow: GET"}); return; }
+        QJsonObject o = m_loc->emergencyJson(); o["ts"] = QDateTime::currentDateTime().toString(Qt::ISODate);
+        finish(200, o);
+        return;
+    }
+    if (ep == QLatin1String("pois") && (QUrlQuery(r.query).hasQueryItem(QStringLiteral("cat")) || QUrlQuery(r.query).hasQueryItem(QStringLiteral("group")) || QUrlQuery(r.query).hasQueryItem(QStringLiteral("radius")))) {
+        if (!get) { finish(405, QJsonObject{{"error", "method not allowed"}}, {"Allow: GET"}); return; }
+        const QUrlQuery qq(r.query);
+        QStringList keys = (qq.queryItemValue(QStringLiteral("cat")) + QLatin1Char(',') + qq.queryItemValue(QStringLiteral("group"))).split(QLatin1Char(','), Qt::SkipEmptyParts);
+        const double radius = qq.queryItemValue(QStringLiteral("radius")).toDouble();
+        const QJsonArray all = stateObject()["pois"].toArray();
+        QJsonArray out2;
+        for (const QJsonValue &v : all) {
+            const QJsonObject p = v.toObject();
+            bool match = keys.isEmpty();
+            for (const QString &k : keys) if (k.compare(p["cat"].toString(), Qt::CaseInsensitive) == 0 || k.compare(p["group"].toString(), Qt::CaseInsensitive) == 0 || k == QLatin1String("all")) match = true;
+            if (!match) continue;
+            if (radius > 0 && p.contains("d") && p["d"].toDouble() > radius * 1000) continue;
+            out2.append(p);
+        }
+        finish(200, QJsonObject{{"pois", out2}, {"count", out2.size()}, {"filter", QJsonArray::fromStringList(keys)}, {"radiusKm", radius}, {"ts", QDateTime::currentDateTime().toString(Qt::ISODate)}});
         return;
     }
     if (ep == QLatin1String("aps") || ep == QLatin1String("pois") || ep == QLatin1String("track") || ep == QLatin1String("trip")) {
@@ -827,6 +948,14 @@ void ApiServer::handle(QTcpSocket *s, const Request &r)
         bool more = false; qint64 cursor = 0;
         QJsonObject o = db->changesSince(since, limit, &more, &cursor);
         o["device"] = QHostInfo::localHostName();
+        if (idn && idn->exists()) {                              // every row in this feed belongs to our identity
+            o["identity"] = idn->id();
+            for (const char *k : {"aps", "observations", "fixes"}) {
+                QJsonArray arr = o[k].toArray(); QJsonArray out2;
+                for (const QJsonValue &v : arr) { QJsonObject row = v.toObject(); if (!row.contains("identity")) row["identity"] = idn->id(); out2.append(row); }
+                o[k] = out2;
+            }
+        }
         finish(200, o);
         return;
     }
@@ -838,12 +967,18 @@ void ApiServer::handle(QTcpSocket *s, const Request &r)
         const QJsonObject b = QJsonDocument::fromJson(r.body).object();
         if (b.isEmpty()) { finish(400, QJsonObject{{"error", "JSON body required"}}); return; }
         const QString from = b["device"].toString().isEmpty() ? dev->name : b["device"].toString().left(64);
+        // Identity check: a peer that names an identity must be us or linked, unless it holds a (legacy) pairing token
+        const QString peerId = b["identity"].toString();
+        if (!peerId.isEmpty() && idn && idn->exists() && !idn->isOwner(peerId) && !dev->identity.isEmpty()) {
+            finish(403, QJsonObject{{"error", "identity not linked"}, {"identity", peerId}}); return;
+        }
         QString err;
         const int obs = m_loc->ingestObservations(b["observations"].toArray(), from, &err);
         const int aps = m_loc->mergePeerAps(b["aps"].toArray(), from);
         const int fixes = m_loc->appendPeerFixes(b["fixes"].toArray(), from);
         if (obs < 0 || aps < 0 || fixes < 0) { finish(500, QJsonObject{{"error", err.isEmpty() ? QStringLiteral("merge failed") : err}}); return; }
         QJsonObject o{{"accepted", QJsonObject{{"observations", obs}, {"aps", aps}, {"fixes", fixes}}}, {"cursor", double(db->currentSeq())}, {"refitQueued", obs > 0 || aps > 0}, {"device", from}};
+        if (idn && idn->exists()) o["identity"] = idn->id();
         if (b.contains("sinceCursor")) {                        // convenience: the peer's pull in the same round trip
             bool more = false; qint64 cursor = 0;
             o["changes"] = db->changesSince(qint64(b["sinceCursor"].toDouble()), 500, &more, &cursor);
@@ -877,4 +1012,14 @@ void ApiServer::handle(QTcpSocket *s, const Request &r)
         return;
     }
     finish(404, QJsonObject{{"error", "not found"}});
+}
+
+QString ApiServer::holdIdentityExport(const QString &bundle)
+{
+    const QDateTime now = QDateTime::currentDateTime();
+    for (auto it = m_exports.begin(); it != m_exports.end();) { if (it.value().expires < now) it = m_exports.erase(it); else ++it; }
+    QString code;
+    do { code = QStringLiteral("%1").arg(QRandomGenerator::system()->bounded(1000000), 6, 10, QLatin1Char('0')); } while (m_exports.contains(code));
+    m_exports.insert(code, ExportHold{bundle, now.addSecs(600), 0});
+    return code;
 }

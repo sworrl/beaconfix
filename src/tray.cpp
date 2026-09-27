@@ -1,5 +1,7 @@
 #include "tray.h"
 #include "locator.h"
+#include "identity.h"
+#include "osintegration.h"
 #include <QActionGroup>
 #include <QApplication>
 #include <QClipboard>
@@ -72,6 +74,10 @@ Tray::Tray(Locator *loc, QObject *parent) : QObject(parent), m_loc(loc)
     connect(open, &QAction::triggered, this, &Tray::openWindowRequested);
     QAction *offline = m_menu.addAction(QIcon::fromTheme(QStringLiteral("document-save")), QStringLiteral("Save map around here for offline"));
     connect(offline, &QAction::triggered, m_loc, &Locator::PrefetchTiles);
+    QAction *emerg = m_menu.addAction(QIcon::fromTheme(QStringLiteral("dialog-warning")), QStringLiteral("Nearest help (police, fire, ER)…"));
+    connect(emerg, &QAction::triggered, this, &Tray::openEmergencyRequested);
+    m_identityAct = m_menu.addAction(QIcon::fromTheme(QStringLiteral("user-identity")), QStringLiteral("Identity…"));
+    connect(m_identityAct, &QAction::triggered, this, &Tray::openIdentityRequested);
     QAction *trip = m_menu.addAction(QIcon::fromTheme(QStringLiteral("flag")), QStringLiteral("Start a new trip here"));
     connect(trip, &QAction::triggered, m_loc, &Locator::StartTrip);
     QAction *pair = m_menu.addAction(QIcon::fromTheme(QStringLiteral("list-add-user")), QStringLiteral("Allow a device to pair (10 min)"));
@@ -150,6 +156,8 @@ void Tray::rebuild()
     if (su.valid && su.sunrise.isValid()) sunText += (sunText.isEmpty() ? QString() : QStringLiteral(" · ")) + QStringLiteral("☀ %1 – %2").arg(su.sunrise.toString(QStringLiteral("HH:mm")), su.sunset.toString(QStringLiteral("HH:mm")));
     m_sunAct->setText(sunText.isEmpty() ? QStringLiteral("—") : sunText);
     m_sunAct->setVisible(!sunText.isEmpty());
+    if (m_identityAct) m_identityAct->setText(m_loc->identity() && m_loc->identity()->exists() ? QStringLiteral("Identity: %1…").arg(m_loc->identity()->name()) : QStringLiteral("Create or import your identity…"));
+    if (m_loc->os() && !m_loc->os()->lastZone().isEmpty() && !sunText.isEmpty()) m_sunAct->setText(sunText + QStringLiteral(" · 🕓 ") + m_loc->os()->lastZone());
     m_shareMenu->setEnabled(f.valid);
     m_refreshAct->setEnabled(!m_loc->busy());
     for (QAction *a : m_intervalMenu->actions()) a->setChecked(a->data().toInt() == m_loc->intervalMinutes());

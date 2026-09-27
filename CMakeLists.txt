@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(beaconfix VERSION 3.4.0 LANGUAGES CXX)
+project(beaconfix VERSION 3.5.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -17,6 +17,8 @@ add_executable(beaconfix
     src/apiserver.cpp
     src/mapdb.cpp
     src/estimator.cpp
+    src/identity.cpp
+    src/osintegration.cpp
     src/tray.cpp
     src/mainwindow.cpp
 )
@@ -43,6 +45,16 @@ if(BEACONFIX_INSTALL_WIDGET)
     install(DIRECTORY plasmoid/org.kde.plasma.beaconfix
             DESTINATION ${CMAKE_INSTALL_DATADIR}/plasma/plasmoids)
 endif()
+# OS integration: the root helper (GeoClue static source) with its polkit action, and the rules
+# file that lets active admins set the time zone / publish the position without a prompt.
+option(BEACONFIX_INSTALL_POLKIT "Install the beaconfix-osd helper, its polkit action and the prompt-free rules" ON)
+if(BEACONFIX_INSTALL_POLKIT)
+    set(BEACONFIX_OSD_PATH "${CMAKE_INSTALL_FULL_LIBEXECDIR}/beaconfix-osd")
+    configure_file(data/org.sworrl.beaconfix.policy.in ${CMAKE_CURRENT_BINARY_DIR}/org.sworrl.beaconfix.policy @ONLY)
+    install(PROGRAMS data/beaconfix-osd DESTINATION ${CMAKE_INSTALL_LIBEXECDIR})
+    install(FILES ${CMAKE_CURRENT_BINARY_DIR}/org.sworrl.beaconfix.policy DESTINATION ${CMAKE_INSTALL_DATADIR}/polkit-1/actions)
+    install(FILES data/50-beaconfix.rules DESTINATION ${CMAKE_INSTALL_FULL_SYSCONFDIR}/polkit-1/rules.d)
+endif()
 
 # ── Packaging: cpack -G DEB (or RPM) in the build directory ─────────────────
 set(CPACK_PACKAGE_NAME "beaconfix")
@@ -60,7 +72,7 @@ set(CPACK_DEBIAN_PACKAGE_MAINTAINER "sworrl <github@falcontechnix.com>")
 set(CPACK_DEBIAN_PACKAGE_SECTION "utils")
 set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
 set(CPACK_DEBIAN_PACKAGE_DEPENDS "libqt6sql6-sqlite, network-manager")
-set(CPACK_DEBIAN_PACKAGE_RECOMMENDS "plasma-workspace, kf6-kpackage, avahi-utils")
+set(CPACK_DEBIAN_PACKAGE_RECOMMENDS "plasma-workspace, kf6-kpackage, avahi-utils, polkitd, qrencode, geoclue-2.0")
 set(CPACK_DEBIAN_PACKAGE_SUGGESTS "grpcurl")
 set(CPACK_DEBIAN_FILE_NAME DEB-DEFAULT)
 set(CPACK_RPM_PACKAGE_LICENSE "GPL-2.0-or-later")

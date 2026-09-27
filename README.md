@@ -77,8 +77,14 @@ one 500 MB tile cache; the trip track; beacons drawn at their mapped position (g
 multilaterated position (gold dot with a dashed ring), observed position (hollow diamond) or as
 a signal-distance orbit (cyan); Wi-Fi names beside the beacons with collision avoidance and band
 badges; places of interest from OpenStreetMap aimed at life on the road (fuel, propane, camping,
-water, dump stations, laundry, groceries, pharmacies, Wi-Fi, libraries, rest areas), clustered
-and filterable, with a **Nearby** list. Events animate: ripples for new beacons, fade-outs for
+water, dump stations, laundry, groceries, Wi-Fi, rest areas), **emergency & civic** places
+(police, fire stations, hospitals with an ER, urgent care, pharmacies, dentists, vets, libraries,
+town halls, courthouses, DMV, schools, community centres) and **kids & fun** places (playgrounds,
+parks, dog parks, pools, splash pads, zoos, museums, theme parks, ice cream, cinemas, bowling,
+arcades, trampoline and skate parks, beaches, picnic sites, trailheads) — each with its address,
+phone number (tap to call), hours and wheelchair access where OpenStreetMap has them — grouped
+and filterable, with a **Nearby** list and a **nearest help** card (police, fire, ER, urgent
+care and the local emergency number). Events animate: ripples for new beacons, fade-outs for
 lost ones, chevrons for level changes, a glide when a beacon gets placed, an arrow for a new
 fix, a pin for a new stop; a ticker keeps the last five. **Cinematic mode** glides to events
 and periodically zooms out to city and state scale.
@@ -102,7 +108,20 @@ places, trip, home state, a `locate` service for other devices, an SSE stream an
 export. LAN-only, token-only, rate limited, optional TLS. [docs/API.md](docs/API.md).
 
 **Internal map database**: SQLite, encrypted at rest with AES-256-GCM, key in KWallet or a key
-file. [docs/DATABASE.md](docs/DATABASE.md).
+file. [docs/DATABASE.md](docs/DATABASE.md). Every beacon's position is refined as samples
+accumulate (robust weighted least squares on a path-loss model — [docs/ESTIMATION.md](docs/ESTIMATION.md)),
+and two BeaconFix installs, or the Android app, keep each other in step through the sync API.
+
+**Identity**: one Ed25519 identity across the desktop, the laptop and the phone; moved between
+devices as an encrypted bundle (QR, text, file, or a 6-digit code on the LAN); independently
+created identities can be linked; devices sign in to the API with a challenge signature instead
+of pairing codes. [docs/IDENTITY.md](docs/IDENTITY.md).
+
+**OS integration** (each part opt-in): the system **time zone follows the fix** (timedated over
+D-Bus; a shipped polkit rule makes it prompt-free for admins), the fix is **published to GeoClue**
+through a small root helper so location-aware apps, browsers and Night Light see it, **KWin Night
+Light** points at where you are, and **locale hints** (country, units, emergency number, dialling
+code) are exposed for other widgets.
 
 ## Pieces
 
@@ -112,7 +131,8 @@ file. [docs/DATABASE.md](docs/DATABASE.md).
 | `beaconfix --tray` | the background locator and tray icon; owns the state, the database, the API and the tile server; D-Bus activated |
 | Plasma widget `org.kde.plasma.beaconfix` | panel or desktop applet with Map, Nearby, Radar and Trip tabs — [docs/WIDGET.md](docs/WIDGET.md) |
 | D-Bus `org.sworrl.BeaconFix` | properties, methods and signals for scripts and other apps — [docs/DBUS.md](docs/DBUS.md) |
-| CLI | `--once`, `--json`, `--refresh`, `--gpx`, `--copy`, API / home / known-device / database management — `beaconfix --help` |
+| CLI | `--once`, `--json`, `--refresh`, `--gpx`, `--copy`, `--nearby <what>`, `--tz`, `--apply-os`, `--identity…`, `--refit`, `--sync`, API / home / known-device / database management — `beaconfix --help` |
+| `beaconfix-osd` | tiny root helper (pkexec) that writes `/etc/geolocation` for GeoClue; installed with its polkit action and rules by `install.sh` / the package |
 
 ## Privacy
 

@@ -1,4 +1,6 @@
 #include "locator.h"
+#include "identity.h"
+#include "osintegration.h"
 #include "apiserver.h"
 #include "mapdb.h"
 #include <QClipboard>
@@ -132,6 +134,18 @@ Locator::Locator(bool standalone, QObject *parent) : QObject(parent), m_standalo
         if (!standalone || m_db->error() != QLatin1String("no database yet")) qWarning("beaconfix: map database unavailable: %s", qPrintable(m_db->error()));
     }
     m_dbUsable = m_db->isOpen() && !m_db->readOnly();
+    // Identity (docs/IDENTITY.md): sealed with the map-database key; the OS integration follows the fix
+    m_identity = new Identity(this);
+    m_identity->load(m_db->key());
+    connect(m_identity, &Identity::changed, this, [this] { if (m_api) emit scanUpdated(); });
+    m_os = new OsIntegration(this, this);
+    if (!standalone) {
+        connect(this, &Locator::FixChanged, m_os, &OsIntegration::onFixChanged);
+        connect(m_os, &OsIntegration::applied, this, [this](const QString &what) {
+            BeaconEvent ev; ev.type = QStringLiteral("tz"); ev.text = what; logEvent(ev);
+            notify(QStringLiteral("BeaconFix"), what, QStringLiteral("preferences-system-time"));
+        });
+    }
     const bool anyJson = QFile::exists(stateDir() + "/aps.json") || QFile::exists(stateDir() + "/history.jsonl") || QFile::exists(stateDir() + "/pois.json")
                       || QFile::exists(stateDir() + "/elev.json") || QFile::exists(stateDir() + "/achievements.json");
     loadState();
@@ -140,6 +154,7 @@ Locator::Locator(bool standalone, QObject *parent) : QObject(parent), m_standalo
     loadAchievements();
     if (m_dbUsable && m_db->isEmpty() && anyJson) migrateJsonToDb();
     else if (m_db->isOpen()) loadFromDb();
+    if (m_db->isOpen()) m_countryCode = m_db->kv(QStringLiteral("countryCode"));
     for (const Fix &f : m_history) noteVisited(f, false);
     connect(this, &Locator::FixChanged, this, [this] { refreshPois(); fetchElevation(); checkAchievements(); });
     connect(this, &Locator::scanUpdated, this, [this] { checkAchievements(); });
@@ -582,6 +597,12 @@ QString Locator::stateDir()
 
 void Locator::start()
 {
+    if (!m_standalone && m_identity && !m_identity->exists() && !QSettings().value("identityNudged", false).toBool()) {
+        QSettings().setValue("identityNudged", true);
+        notify(QStringLiteral("Create or import your BeaconFix identity"),
+               QStringLiteral("An identity lets your phone and laptop share one map and sign in without pairing codes. Open BeaconFix → Identity."),
+               QStringLiteral("user-identity"));
+    }
     m_timer.start();
     if (m_liveScanSecs > 0 && !m_standalone) m_liveTimer.start();
     Refresh();
@@ -1040,6 +1061,10 @@ QString Locator::StateJson() const
         if (!pt.hours.isEmpty()) a["hours"] = pt.hours;
         if (!pt.phone.isEmpty()) a["phone"] = pt.phone;
         if (!pt.website.isEmpty()) a["website"] = pt.website;
+        if (!pt.address.isEmpty()) a["address"] = pt.address;
+        if (!pt.wheelchair.isEmpty()) a["wheelchair"] = pt.wheelchair;
+        if (pt.emergency) a["emergency"] = true;
+        a["group"] = c ? c->group : QStringLiteral("services");
         a["osm"] = QStringLiteral("https://www.openstreetmap.org/%1/%2").arg(pt.osmType).arg(pt.osmId);
         if (m_fix.valid) {
             a["d"] = qRound(distanceM(m_fix.lat, m_fix.lon, pt.lat, pt.lon));
@@ -1052,8 +1077,9 @@ QString Locator::StateJson() const
     o["tileBase"] = m_tileBase;
     QJsonArray cats;
     for (const PoiCategory &c : poiCategories())
-        cats.append(QJsonObject{{"key", c.key}, {"label", c.label}, {"icon", c.icon}, {"color", c.color.name()}});
+        cats.append(QJsonObject{{"key", c.key}, {"label", c.label}, {"icon", c.icon}, {"color", c.color.name()}, {"group", c.group}, {"groupLabel", poiGroupLabel(c.group)}, {"wide", c.wide}});
     o["poiCategories"] = cats;
+    o["emergency"] = emergencyJson();
     QJsonArray track;
     for (const Stop &s : stops()) {
         const Fix &f = s.fix;
@@ -1097,6 +1123,8 @@ QString Locator::StateJson() const
     sj["movingTripSecs"] = double(st.movingTripSecs); sj["stoppedTripSecs"] = double(st.stoppedTripSecs);
     sj["speedKmh"] = st.speedKmh; sj["headingDeg"] = st.headingDeg; sj["heading"] = compass(st.headingDeg); sj["moving"] = st.moving;
     sj["atHome"] = st.atHome; sj["awayKm"] = st.awayKm; sj["awayText"] = st.awayText; sj["homeNetworks"] = QJsonArray::fromStringList(m_home);
+    if (m_os) { sj["locale"] = m_os->locale().toJson(); sj["timezone"] = m_os->lastZone().isEmpty() ? m_os->systemTimeZone() : m_os->lastZone(); sj["os"] = m_os->status(); }
+    if (m_identity && m_identity->exists()) sj["identity"] = QJsonObject{{"id", m_identity->id()}, {"grouped", m_identity->groupedId()}, {"name", m_identity->name()}, {"linked", m_identity->linkedIds().size()}, {"pendingLinks", m_identity->pending().size()}};
     sj["homeFix"] = st.homeKnown ? QJsonValue(QJsonObject{{"lat", st.homeLat}, {"lon", st.homeLon}, {"time", st.homeTime.toString(Qt::ISODate)}}) : QJsonValue();
     sj["dwellSecs"] = double(st.dwellSecs);
     sj["tripStart"] = st.tripStart.isValid() ? QJsonValue(st.tripStart.toString(Qt::ISODate)) : QJsonValue();
@@ -1726,6 +1754,8 @@ void Locator::reverseGeocode(double lat, double lon)
         const QString country = a["country"].toString();
         // Only apply if we're still at that spot
         if (m_fix.valid && distanceM(m_fix.lat, m_fix.lon, lat, lon) < 50) {
+            m_countryCode = a["country_code"].toString().toLower();
+            if (!m_countryCode.isEmpty() && m_dbUsable) m_db->setKv(QStringLiteral("countryCode"), m_countryCode);
             m_fix.place = place; m_fix.city = city; m_fix.region = region; m_fix.country = country;
             if (!m_history.isEmpty() && distanceM(m_history.last().lat, m_history.last().lon, lat, lon) < 50) {
                 m_history.last().place = place; m_history.last().city = city; m_history.last().region = region; m_history.last().country = country;
@@ -1742,29 +1772,68 @@ void Locator::reverseGeocode(double lat, double lon)
 // Picked for life on the road: fuel, food, water, dump stations, camping, laundry…
 const QList<PoiCategory> &Locator::poiCategories()
 {
+    // key, label, icon, colour, group, wide-radius
     static const QList<PoiCategory> cats = {
-        {QStringLiteral("fuel"),     QStringLiteral("Fuel"),           QStringLiteral("⛽"), QColor(0xff, 0x9f, 0x43)},
-        {QStringLiteral("propane"),  QStringLiteral("Propane"),        QStringLiteral("🔥"), QColor(0xff, 0x6b, 0x3d)},
-        {QStringLiteral("charging"), QStringLiteral("EV charging"),    QStringLiteral("🔌"), QColor(0x2e, 0xd5, 0x73)},
-        {QStringLiteral("grocery"),  QStringLiteral("Groceries"),      QStringLiteral("🛒"), QColor(0x6c, 0xff, 0x8a)},
-        {QStringLiteral("food"),     QStringLiteral("Food"),           QStringLiteral("🍴"), QColor(0xff, 0x6b, 0x81)},
-        {QStringLiteral("cafe"),     QStringLiteral("Café"),           QStringLiteral("☕"), QColor(0xd9, 0xa4, 0x7a)},
-        {QStringLiteral("camp"),     QStringLiteral("Camping / RV"),   QStringLiteral("⛺"), QColor(0x7b, 0xed, 0x9f)},
-        {QStringLiteral("water"),    QStringLiteral("Drinking water"), QStringLiteral("🚰"), QColor(0x4f, 0xc3, 0xf7)},
-        {QStringLiteral("dump"),     QStringLiteral("Dump station"),   QStringLiteral("🚐"), QColor(0xa2, 0x9b, 0xfe)},
-        {QStringLiteral("shower"),   QStringLiteral("Showers"),        QStringLiteral("🚿"), QColor(0x74, 0xb9, 0xff)},
-        {QStringLiteral("toilets"),  QStringLiteral("Toilets"),        QStringLiteral("🚻"), QColor(0x8a, 0x93, 0xa6)},
-        {QStringLiteral("laundry"),  QStringLiteral("Laundry"),        QStringLiteral("🧺"), QColor(0x81, 0xec, 0xec)},
-        {QStringLiteral("health"),   QStringLiteral("Hospital / clinic"), QStringLiteral("🏥"), QColor(0xff, 0x4f, 0x4f)},
-        {QStringLiteral("pharmacy"), QStringLiteral("Pharmacy"),       QStringLiteral("💊"), QColor(0xff, 0x7a, 0xa8)},
-        {QStringLiteral("repair"),   QStringLiteral("Auto / tyres"),   QStringLiteral("🔧"), QColor(0xb2, 0xbe, 0xc3)},
-        {QStringLiteral("hardware"), QStringLiteral("Hardware / outdoor"), QStringLiteral("🧰"), QColor(0xc8, 0xa0, 0x6a)},
-        {QStringLiteral("wifi"),     QStringLiteral("Public Wi-Fi"),   QStringLiteral("📶"), QColor(0x35, 0xd6, 0xff)},
-        {QStringLiteral("library"),  QStringLiteral("Library"),        QStringLiteral("📚"), QColor(0xfd, 0xcb, 0x6e)},
-        {QStringLiteral("post"),     QStringLiteral("Post / parcels"), QStringLiteral("📮"), QColor(0xe1, 0x70, 0x55)},
-        {QStringLiteral("rest"),     QStringLiteral("Rest area"),      QStringLiteral("🅿️"), QColor(0x60, 0xa3, 0xff)},
+        // Services (life on the road)
+        {QStringLiteral("fuel"),     QStringLiteral("Fuel"),              QStringLiteral("⛽"), QColor(0xff, 0x9f, 0x43), QStringLiteral("services"), false},
+        {QStringLiteral("propane"),  QStringLiteral("Propane"),           QStringLiteral("🔥"), QColor(0xff, 0x6b, 0x3d), QStringLiteral("services"), false},
+        {QStringLiteral("charging"), QStringLiteral("EV charging"),       QStringLiteral("🔌"), QColor(0x2e, 0xd5, 0x73), QStringLiteral("services"), false},
+        {QStringLiteral("grocery"),  QStringLiteral("Groceries"),         QStringLiteral("🛒"), QColor(0x6c, 0xff, 0x8a), QStringLiteral("services"), false},
+        {QStringLiteral("food"),     QStringLiteral("Food"),              QStringLiteral("🍴"), QColor(0xff, 0x6b, 0x81), QStringLiteral("services"), false},
+        {QStringLiteral("cafe"),     QStringLiteral("Café"),              QStringLiteral("☕"), QColor(0xd9, 0xa4, 0x7a), QStringLiteral("services"), false},
+        {QStringLiteral("camp"),     QStringLiteral("Camping / RV"),      QStringLiteral("⛺"), QColor(0x7b, 0xed, 0x9f), QStringLiteral("services"), false},
+        {QStringLiteral("water"),    QStringLiteral("Drinking water"),    QStringLiteral("🚰"), QColor(0x4f, 0xc3, 0xf7), QStringLiteral("services"), false},
+        {QStringLiteral("dump"),     QStringLiteral("Dump station"),      QStringLiteral("🚐"), QColor(0xa2, 0x9b, 0xfe), QStringLiteral("services"), false},
+        {QStringLiteral("shower"),   QStringLiteral("Showers"),           QStringLiteral("🚿"), QColor(0x74, 0xb9, 0xff), QStringLiteral("services"), false},
+        {QStringLiteral("toilets"),  QStringLiteral("Toilets"),           QStringLiteral("🚻"), QColor(0x8a, 0x93, 0xa6), QStringLiteral("services"), false},
+        {QStringLiteral("laundry"),  QStringLiteral("Laundry"),           QStringLiteral("🧺"), QColor(0x81, 0xec, 0xec), QStringLiteral("services"), false},
+        {QStringLiteral("repair"),   QStringLiteral("Auto / tyres"),      QStringLiteral("🔧"), QColor(0xb2, 0xbe, 0xc3), QStringLiteral("services"), false},
+        {QStringLiteral("hardware"), QStringLiteral("Hardware / outdoor"),QStringLiteral("🧰"), QColor(0xc8, 0xa0, 0x6a), QStringLiteral("services"), false},
+        {QStringLiteral("wifi"),     QStringLiteral("Public Wi-Fi"),      QStringLiteral("📶"), QColor(0x35, 0xd6, 0xff), QStringLiteral("services"), false},
+        {QStringLiteral("post"),     QStringLiteral("Post / parcels"),    QStringLiteral("📮"), QColor(0xe1, 0x70, 0x55), QStringLiteral("services"), false},
+        {QStringLiteral("rest"),     QStringLiteral("Rest area"),         QStringLiteral("🅿️"), QColor(0x60, 0xa3, 0xff), QStringLiteral("services"), false},
+        {QStringLiteral("carwash"),  QStringLiteral("Car wash"),          QStringLiteral("🫧"), QColor(0x81, 0xec, 0xec), QStringLiteral("services"), false},
+        // Emergency & civic (fetched out to the wide radius)
+        {QStringLiteral("police"),   QStringLiteral("Police"),            QStringLiteral("🚔"), QColor(0x4d, 0x8b, 0xff), QStringLiteral("civic"), true},
+        {QStringLiteral("fire"),     QStringLiteral("Fire station"),      QStringLiteral("🚒"), QColor(0xff, 0x4d, 0x4d), QStringLiteral("civic"), true},
+        {QStringLiteral("health"),   QStringLiteral("Hospital / ER"),     QStringLiteral("🏥"), QColor(0xff, 0x4f, 0x4f), QStringLiteral("civic"), true},
+        {QStringLiteral("urgent"),   QStringLiteral("Urgent care / clinic"), QStringLiteral("🩺"), QColor(0xff, 0x8a, 0x8a), QStringLiteral("civic"), true},
+        {QStringLiteral("pharmacy"), QStringLiteral("Pharmacy"),          QStringLiteral("💊"), QColor(0xff, 0x7a, 0xa8), QStringLiteral("civic"), false},
+        {QStringLiteral("dentist"),  QStringLiteral("Dentist"),           QStringLiteral("🦷"), QColor(0xe6, 0xed, 0xf7), QStringLiteral("civic"), false},
+        {QStringLiteral("vet"),      QStringLiteral("Veterinary"),        QStringLiteral("🐾"), QColor(0xd0, 0xa0, 0x6a), QStringLiteral("civic"), true},
+        {QStringLiteral("library"),  QStringLiteral("Library"),           QStringLiteral("📚"), QColor(0xfd, 0xcb, 0x6e), QStringLiteral("civic"), false},
+        {QStringLiteral("townhall"), QStringLiteral("Town hall"),         QStringLiteral("🏛️"), QColor(0xc9, 0xd4, 0xe5), QStringLiteral("civic"), true},
+        {QStringLiteral("court"),    QStringLiteral("Courthouse"),        QStringLiteral("⚖️"), QColor(0xc9, 0xd4, 0xe5), QStringLiteral("civic"), true},
+        {QStringLiteral("dmv"),      QStringLiteral("DMV / licensing"),   QStringLiteral("🪪"), QColor(0xb2, 0xbe, 0xc3), QStringLiteral("civic"), true},
+        {QStringLiteral("school"),   QStringLiteral("School"),            QStringLiteral("🏫"), QColor(0xff, 0xd1, 0x66), QStringLiteral("civic"), false},
+        {QStringLiteral("community"),QStringLiteral("Community centre"),  QStringLiteral("🏢"), QColor(0x9f, 0xb0, 0xc8), QStringLiteral("civic"), false},
+        // Kids & fun
+        {QStringLiteral("playground"),QStringLiteral("Playground"),       QStringLiteral("🛝"), QColor(0xff, 0xb3, 0x47), QStringLiteral("kids"), false},
+        {QStringLiteral("park"),     QStringLiteral("Park"),              QStringLiteral("🌳"), QColor(0x6c, 0xff, 0x8a), QStringLiteral("kids"), false},
+        {QStringLiteral("dogpark"),  QStringLiteral("Dog park"),          QStringLiteral("🐕"), QColor(0xd0, 0xa0, 0x6a), QStringLiteral("kids"), false},
+        {QStringLiteral("pool"),     QStringLiteral("Swimming pool"),     QStringLiteral("🏊"), QColor(0x4f, 0xc3, 0xf7), QStringLiteral("kids"), false},
+        {QStringLiteral("splash"),   QStringLiteral("Splash pad / water park"), QStringLiteral("💦"), QColor(0x74, 0xb9, 0xff), QStringLiteral("kids"), true},
+        {QStringLiteral("zoo"),      QStringLiteral("Zoo / aquarium"),    QStringLiteral("🦁"), QColor(0xff, 0x9f, 0x43), QStringLiteral("kids"), true},
+        {QStringLiteral("museum"),   QStringLiteral("Museum"),            QStringLiteral("🏛"), QColor(0xa2, 0x9b, 0xfe), QStringLiteral("kids"), true},
+        {QStringLiteral("themepark"),QStringLiteral("Theme park"),        QStringLiteral("🎢"), QColor(0xff, 0x4f, 0xd8), QStringLiteral("kids"), true},
+        {QStringLiteral("icecream"), QStringLiteral("Ice cream"),         QStringLiteral("🍦"), QColor(0xff, 0xc6, 0xe0), QStringLiteral("kids"), false},
+        {QStringLiteral("cinema"),   QStringLiteral("Cinema"),            QStringLiteral("🎬"), QColor(0xe6, 0xed, 0xf7), QStringLiteral("kids"), true},
+        {QStringLiteral("bowling"),  QStringLiteral("Bowling"),           QStringLiteral("🎳"), QColor(0xe6, 0xed, 0xf7), QStringLiteral("kids"), true},
+        {QStringLiteral("arcade"),   QStringLiteral("Arcade"),            QStringLiteral("🕹️"), QColor(0xff, 0x4f, 0xd8), QStringLiteral("kids"), true},
+        {QStringLiteral("trampoline"),QStringLiteral("Trampoline park"),  QStringLiteral("🤸"), QColor(0xff, 0xb3, 0x47), QStringLiteral("kids"), true},
+        {QStringLiteral("skate"),    QStringLiteral("Skate park"),        QStringLiteral("🛹"), QColor(0xb2, 0xbe, 0xc3), QStringLiteral("kids"), false},
+        {QStringLiteral("beach"),    QStringLiteral("Beach"),             QStringLiteral("🏖️"), QColor(0xff, 0xd1, 0x66), QStringLiteral("kids"), true},
+        {QStringLiteral("picnic"),   QStringLiteral("Picnic site"),       QStringLiteral("🧺"), QColor(0x7b, 0xed, 0x9f), QStringLiteral("kids"), false},
+        {QStringLiteral("trail"),    QStringLiteral("Trailhead / nature reserve"), QStringLiteral("🥾"), QColor(0x2e, 0xd5, 0x73), QStringLiteral("kids"), true},
     };
     return cats;
+}
+
+QString Locator::poiGroupLabel(const QString &group)
+{
+    if (group == QLatin1String("civic")) return QStringLiteral("Emergency & civic");
+    if (group == QLatin1String("kids"))  return QStringLiteral("Kids & fun");
+    return QStringLiteral("Services");
 }
 
 const PoiCategory *Locator::poiCategory(const QString &key)
@@ -1776,6 +1845,42 @@ const PoiCategory *Locator::poiCategory(const QString &key)
 static QString poiCategoryFor(const QJsonObject &t)
 {
     const QString am = t["amenity"].toString(), shop = t["shop"].toString(), tour = t["tourism"].toString(), hw = t["highway"].toString();
+    const QString le = t["leisure"].toString(), hc = t["healthcare"].toString(), off = t["office"].toString(), gov = t["government"].toString();
+    const QString name = t["name"].toString().toLower();
+    // Emergency & civic
+    if (am == "police") return "police";
+    if (am == "fire_station") return "fire";
+    if (am == "hospital") return "health";
+    if (am == "clinic" || am == "doctors" || am == "urgent_care" || hc == "urgent_care" || hc == "clinic" || hc == "doctor") return "urgent";
+    if (am == "pharmacy" || shop == "chemist" || hc == "pharmacy") return "pharmacy";
+    if (am == "dentist" || hc == "dentist") return "dentist";
+    if (am == "veterinary") return "vet";
+    if (am == "library") return "library";
+    if (am == "townhall") return "townhall";
+    if (am == "courthouse") return "court";
+    if (off == "government" && (gov == "transportation" || gov == "vehicle_registration" || gov == "driving_license" || name.contains("dmv") || name.contains("motor vehicle") || name.contains("driver")))
+        return "dmv";
+    if (am == "school" || am == "kindergarten") return "school";
+    if (am == "community_centre") return "community";
+    // Kids & fun
+    if (le == "playground") return "playground";
+    if (le == "dog_park") return "dogpark";
+    if (le == "park" || le == "garden") return "park";
+    if (le == "swimming_pool" || le == "swimming_area" || le == "sports_centre" && t["sport"].toString().contains("swimming")) return t["access"].toString() == "private" ? QString() : QStringLiteral("pool");
+    if (le == "water_park" || t["playground"].toString() == "splash_pad" || t["playground:splash_pad"].toString() == "yes") return "splash";
+    if (tour == "zoo" || tour == "aquarium") return "zoo";
+    if (tour == "museum" || tour == "gallery") return "museum";
+    if (tour == "theme_park") return "themepark";
+    if (am == "ice_cream" || shop == "ice_cream") return "icecream";
+    if (am == "cinema") return "cinema";
+    if (le == "bowling_alley") return "bowling";
+    if (le == "amusement_arcade") return "arcade";
+    if (le == "trampoline_park" || (le == "sports_centre" && t["sport"].toString().contains("trampoline"))) return "trampoline";
+    if (le == "skatepark" || (le == "pitch" && t["sport"].toString().contains("skateboard"))) return "skate";
+    if (t["natural"].toString() == "beach" || le == "beach_resort") return "beach";
+    if (tour == "picnic_site" || le == "picnic_table") return "picnic";
+    if (hw == "trailhead" || le == "nature_reserve" || t["boundary"].toString() == "national_park") return "trail";
+    // Services
     if (am == "fuel") return t["fuel:lpg"].toString() == "yes" && t["fuel:diesel"].toString() != "yes" && t["fuel:octane_87"].toString() != "yes" ? "propane" : "fuel";
     if (shop == "gas" || (shop == "bottled_gas")) return "propane";
     if (am == "charging_station") return "charging";
@@ -1788,16 +1893,32 @@ static QString poiCategoryFor(const QJsonObject &t)
     if (am == "shower") return "shower";
     if (am == "toilets") return t["shower"].toString() == "yes" ? "shower" : "toilets";
     if (shop == "laundry" || am == "laundry") return "laundry";
-    if (am == "hospital" || am == "clinic" || am == "doctors" || am == "urgent_care") return "health";
-    if (am == "pharmacy" || shop == "chemist") return "pharmacy";
     if (shop == "car_repair" || shop == "tyres" || shop == "car_parts" || am == "vehicle_inspection") return "repair";
+    if (am == "car_wash") return "carwash";
     if (shop == "hardware" || shop == "doityourself" || shop == "outdoor" || shop == "trade") return "hardware";
-    if (am == "library") return "library";
     if (am == "post_office" || am == "parcel_locker") return "post";
     if (hw == "rest_area" || hw == "services") return "rest";
     const QString ia = t["internet_access"].toString();
     if (ia == "wlan" || ia == "yes") return "wifi";
     return {};
+}
+
+// "123 Main St, Town, ST 12345" from OSM addr:* tags (whatever is present, in that order)
+static QString poiAddress(const QJsonObject &t)
+{
+    QString street = t["addr:street"].toString(), hn = t["addr:housenumber"].toString(), unit = t["addr:unit"].toString();
+    QString line1 = hn.isEmpty() ? street : (street.isEmpty() ? hn : hn + QLatin1Char(' ') + street);
+    if (!unit.isEmpty() && !line1.isEmpty()) line1 += QStringLiteral(" #") + unit;
+    QString city = t["addr:city"].toString(); if (city.isEmpty()) city = t["addr:town"].toString(); if (city.isEmpty()) city = t["addr:village"].toString();
+    QString state = t["addr:state"].toString(); if (state.isEmpty()) state = t["addr:province"].toString();
+    const QString post = t["addr:postcode"].toString();
+    QStringList parts;
+    if (!line1.isEmpty()) parts << line1;
+    if (!city.isEmpty()) parts << city;
+    QString tail = state; if (!post.isEmpty()) tail += (tail.isEmpty() ? QString() : QStringLiteral(" ")) + post;
+    if (!tail.isEmpty()) parts << tail;
+    if (parts.isEmpty() && !t["addr:full"].toString().isEmpty()) parts << t["addr:full"].toString();
+    return parts.join(QStringLiteral(", "));
 }
 
 void Locator::refreshPois(bool force)
@@ -1817,6 +1938,15 @@ void Locator::refreshPois(bool force)
     queryOverpass(m_fix.lat, m_fix.lon, radius, 0);
 }
 
+static QString hcLabel(const QJsonObject &t)
+{
+    const QString hc = t["healthcare"].toString(), am = t["amenity"].toString(), sp = t["healthcare:speciality"].toString();
+    if (hc == "urgent_care" || am == "urgent_care") return QStringLiteral("urgent care");
+    if (am == "doctors" || hc == "doctor") return sp.isEmpty() ? QStringLiteral("doctor's office") : QString(sp).replace('_', ' ');
+    if (am == "clinic" || hc == "clinic") return QStringLiteral("clinic");
+    return {};
+}
+
 void Locator::queryOverpass(double lat, double lon, int radiusM, int mirror)
 {
     static const char *mirrors[] = {"https://overpass-api.de/api/interpreter",
@@ -1825,18 +1955,32 @@ void Locator::queryOverpass(double lat, double lon, int radiusM, int mirror)
     m_poiBusy = true;
     m_poiNote = QStringLiteral("Loading places within %1 km…").arg(radiusM / 1000);
     emit poisUpdated();
-    // A bbox query is ~20× faster than around: on ways; the radius is applied below
-    const double dLat = radiusM / 111320.0, dLon = radiusM / (111320.0 * std::cos(qDegreesToRadians(lat)));
-    const QString bbox = QStringLiteral("%1,%2,%3,%4").arg(lat - dLat, 0, 'f', 5).arg(lon - dLon, 0, 'f', 5).arg(lat + dLat, 0, 'f', 5).arg(lon + dLon, 0, 'f', 5);
+    // A bbox query is ~20× faster than around: on ways; the radius is applied below.
+    // Two boxes: everything within the radius, and the sparse civic / attraction categories out to the wide radius.
+    auto bboxFor = [lat, lon](int rM) {
+        const double dLat = rM / 111320.0, dLon = rM / (111320.0 * std::cos(qDegreesToRadians(lat)));
+        return QStringLiteral("%1,%2,%3,%4").arg(lat - dLat, 0, 'f', 5).arg(lon - dLon, 0, 'f', 5).arg(lat + dLat, 0, 'f', 5).arg(lon + dLon, 0, 'f', 5);
+    };
+    const int wideM = qMax(radiusM, qMin(25000, radiusM * 4));
+    const QString bbox = bboxFor(radiusM), wide = bboxFor(wideM);
     const QString q = QStringLiteral(
-        "[out:json][timeout:25][bbox:%1];("
-        "nwr[amenity~\"^(fuel|charging_station|restaurant|fast_food|food_court|cafe|sanitary_dump_station|drinking_water|water_point|"
-        "shower|toilets|laundry|hospital|clinic|doctors|urgent_care|pharmacy|library|post_office|vehicle_inspection)$\"];"
-        "nwr[shop~\"^(supermarket|convenience|greengrocer|wholesale|gas|bottled_gas|laundry|chemist|car_repair|tyres|car_parts|hardware|doityourself|outdoor|trade)$\"];"
-        "nwr[tourism~\"^(camp_site|caravan_site)$\"];"
-        "nwr[highway~\"^(rest_area|services)$\"];"
-        "nwr[internet_access~\"^(wlan|yes)$\"][name];"
-        ");out center tags qt 1500;").arg(bbox);
+        "[out:json][timeout:25];("
+        "nwr[amenity~\"^(fuel|charging_station|restaurant|fast_food|food_court|pub|cafe|sanitary_dump_station|drinking_water|water_point|"
+        "shower|toilets|laundry|pharmacy|dentist|library|school|kindergarten|community_centre|post_office|parcel_locker|vehicle_inspection|car_wash|ice_cream)$\"](%1);"
+        "nwr[shop~\"^(supermarket|convenience|greengrocer|wholesale|gas|bottled_gas|laundry|chemist|car_repair|tyres|car_parts|hardware|doityourself|outdoor|trade|ice_cream)$\"](%1);"
+        "nwr[tourism~\"^(camp_site|caravan_site|picnic_site)$\"](%1);"
+        "nwr[leisure~\"^(playground|park|garden|dog_park|swimming_pool|swimming_area|skatepark|picnic_table)$\"](%1);"
+        "nwr[highway~\"^(rest_area|services)$\"](%1);"
+        "nwr[internet_access~\"^(wlan|yes)$\"][name](%1);"
+        // wide: emergency / civic / attractions (sparse in the country)
+        "nwr[amenity~\"^(police|fire_station|hospital|clinic|doctors|urgent_care|veterinary|townhall|courthouse|cinema)$\"](%2);"
+        "nwr[healthcare~\"^(urgent_care|clinic|doctor|hospital)$\"](%2);"
+        "nwr[office=government](%2);"
+        "nwr[tourism~\"^(zoo|aquarium|museum|gallery|theme_park)$\"](%2);"
+        "nwr[leisure~\"^(water_park|bowling_alley|amusement_arcade|trampoline_park|nature_reserve|beach_resort)$\"](%2);"
+        "nwr[natural=beach](%2);"
+        "nwr[highway=trailhead](%2);"
+        ");out center tags qt 2500;").arg(bbox, wide);
     QNetworkRequest req{QUrl(QString::fromLatin1(mirrors[mirror]))};
     req.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/x-www-form-urlencoded"));
     req.setHeader(QNetworkRequest::UserAgentHeader, QString::fromLatin1(USER_AGENT));
@@ -1865,7 +2009,9 @@ void Locator::queryOverpass(double lat, double lon, int radiusM, int mirror)
             pt.cat = cat;
             pt.lat = el.contains("lat") ? el["lat"].toDouble() : el["center"].toObject()["lat"].toDouble();
             pt.lon = el.contains("lon") ? el["lon"].toDouble() : el["center"].toObject()["lon"].toDouble();
-            if ((pt.lat == 0 && pt.lon == 0) || distanceM(lat, lon, pt.lat, pt.lon) > radiusM) continue;
+            const PoiCategory *pc = poiCategory(cat);
+            const double dist = distanceM(lat, lon, pt.lat, pt.lon);
+            if ((pt.lat == 0 && pt.lon == 0) || dist > (pc && pc->wide ? qMax(radiusM, qMin(25000, radiusM * 4)) : radiusM)) continue;
             pt.osmType = el["type"].toString(); pt.osmId = qint64(el["id"].toDouble());
             pt.name = t["name"].toString();
             if (pt.name.isEmpty()) pt.name = t["brand"].toString();
@@ -1875,6 +2021,9 @@ void Locator::queryOverpass(double lat, double lon, int radiusM, int mirror)
             pt.hours = t["opening_hours"].toString();
             pt.phone = t["phone"].toString(); if (pt.phone.isEmpty()) pt.phone = t["contact:phone"].toString();
             pt.website = t["website"].toString(); if (pt.website.isEmpty()) pt.website = t["contact:website"].toString();
+            pt.address = poiAddress(t);
+            pt.wheelchair = t["wheelchair"].toString();
+            pt.emergency = cat == "health" && (t["emergency"].toString() == "yes" || t["opening_hours"].toString() == "24/7");
             QStringList d;
             if (!t["brand"].toString().isEmpty() && t["brand"].toString() != pt.name) d << t["brand"].toString();
             if (cat == "fuel") {
@@ -1906,9 +2055,15 @@ void Locator::queryOverpass(double lat, double lon, int radiusM, int mirror)
                     if (!t[k].toString().isEmpty() && t[k].toString() != "no") s << QString::fromLatin1(k).section(':', 1);
                 if (!s.isEmpty()) d << s.join(", ");
             }
+            if (cat == "health") { if (pt.emergency) d << "emergency dept."; if (!t["emergency"].toString().isEmpty() && t["emergency"].toString() != "yes") d << "no ER"; }
+            if (cat == "urgent" && !hcLabel(t).isEmpty()) d << hcLabel(t);
+            if (cat == "park" || cat == "playground" || cat == "dogpark") { if (t["dog"].toString() == "yes" || t["dog"].toString() == "leashed") d << "dogs ok"; if (t["fee"].toString() == "yes") d << "fee"; }
+            if (cat == "pool" && t["indoor"].toString() == "yes") d << "indoor";
+            if (cat == "trail" && !t["sac_scale"].toString().isEmpty()) d << t["sac_scale"].toString().replace('_', ' ');
+            if (!pt.wheelchair.isEmpty() && pt.wheelchair != "no") d << (pt.wheelchair == "yes" ? QStringLiteral("♿") : QStringLiteral("♿ limited"));
             if (pt.wifi && cat != "wifi") d << "Wi-Fi";
             pt.detail = d.join(" · ");
-            if (pt.name.isEmpty() && (cat == "food" || cat == "cafe" || cat == "grocery" || cat == "wifi" || cat == "hardware")) continue;
+            if (pt.name.isEmpty() && (cat == "food" || cat == "cafe" || cat == "grocery" || cat == "wifi" || cat == "hardware" || cat == "museum" || cat == "cinema" || cat == "icecream" || cat == "school" || cat == "community")) continue;
             byCat[cat] << pt;
         }
         // Keep the nearest few dozen per category so a city doesn't bury the map
@@ -1917,7 +2072,8 @@ void Locator::queryOverpass(double lat, double lon, int radiusM, int mirror)
             QList<Poi> &l = it.value();
             std::sort(l.begin(), l.end(), [lat, lon](const Poi &a, const Poi &b) {
                 return distanceM(lat, lon, a.lat, a.lon) < distanceM(lat, lon, b.lat, b.lon); });
-            out += l.mid(0, it.key() == QLatin1String("toilets") || it.key() == QLatin1String("water") ? 15 : 30);
+            const PoiCategory *pc = poiCategory(it.key());
+            out += l.mid(0, it.key() == QLatin1String("toilets") || it.key() == QLatin1String("water") || (pc && pc->wide) ? 15 : 30);
         }
         m_pois = out;
         m_poiLat = lat; m_poiLon = lon; m_poiRadiusM = radiusM;
@@ -2567,4 +2723,119 @@ QString Locator::Sync(const QString &url, const QString &token)
     if (result.isEmpty()) result = QJsonObject{{"ok", false}, {"error", "timed out"}};
     result["peer"] = peerKey(u);
     return QString::fromUtf8(QJsonDocument(result).toJson(QJsonDocument::Compact));
+}
+
+// ── Identity + OS integration (D-Bus / CLI entry points) ─────────────────────
+QString Locator::IdentityJson() const
+{
+    if (!m_identity) return QStringLiteral("{}");
+    QJsonObject o = m_identity->exists() ? m_identity->publicJson() : QJsonObject{{"exists", false}};
+    o["exists"] = m_identity->exists();
+    QJsonArray pend; for (const PendingLink &p : m_identity->pending()) pend.append(p.toJson()); o["pending"] = pend;
+    o["file"] = Identity::filePath();
+    return QString::fromUtf8(QJsonDocument(o).toJson(QJsonDocument::Compact));
+}
+bool Locator::IdentityCreate(const QString &name)
+{
+    if (!m_identity) return false;
+    QString err;
+    const bool ok = m_identity->create(name, QHostInfo::localHostName(), QStringLiteral("desktop"), &err);
+    if (!ok) m_lastError = err;
+    if (ok) { BeaconEvent ev; ev.type = QStringLiteral("identity"); ev.text = QStringLiteral("Identity created: %1 (%2)").arg(m_identity->name(), m_identity->groupedId()); logEvent(ev); }
+    return ok;
+}
+QString Locator::IdentityExport(const QString &passphrase)
+{
+    if (!m_identity) return {};
+    QString err; const QString t = m_identity->exportBundle(passphrase, &err);
+    if (t.isEmpty()) m_lastError = err;
+    return t;
+}
+bool Locator::IdentityImport(const QString &textOrPath, const QString &passphrase)
+{
+    if (!m_identity) return false;
+    QString text = textOrPath.trimmed();
+    if (QFile::exists(text)) { QFile f(text); if (f.open(QIODevice::ReadOnly)) text = QString::fromUtf8(f.readAll()).trimmed(); }
+    QString err;
+    const bool ok = m_identity->importBundle(text, passphrase, QHostInfo::localHostName(), QStringLiteral("desktop"), &err);
+    if (!ok) m_lastError = err;
+    else { BeaconEvent ev; ev.type = QStringLiteral("identity"); ev.text = QStringLiteral("Identity imported: %1 (%2)").arg(m_identity->name(), m_identity->groupedId()); logEvent(ev); }
+    return ok;
+}
+QString Locator::IdentityLinkPayload() const
+{
+    if (!m_identity || !m_identity->exists()) return {};
+    return QStringLiteral("BFLNK1:") + QString::fromLatin1(Identity::base64url(QJsonDocument(m_identity->linkPayload()).toJson(QJsonDocument::Compact)));
+}
+QString Locator::IdentityAcceptLink(const QString &statementJson)
+{
+    if (!m_identity) return QStringLiteral("{\"error\":\"no identity\"}");
+    QString err; LinkStatement done;
+    const QJsonObject o = QJsonDocument::fromJson(statementJson.toUtf8()).object();
+    if (!m_identity->acceptLink(LinkStatement::fromJson(o), &err, &done)) return QString::fromUtf8(QJsonDocument(QJsonObject{{"error", err}}).toJson(QJsonDocument::Compact));
+    BeaconEvent ev; ev.type = QStringLiteral("identity"); ev.text = QStringLiteral("Linked with identity %1").arg(Identity::groupId(done.a == m_identity->id() ? done.b : done.a)); logEvent(ev);
+    return QString::fromUtf8(QJsonDocument(done.toJson(true)).toJson(QJsonDocument::Compact));
+}
+bool Locator::IdentityForget() { return m_identity && m_identity->forget(); }
+void Locator::IdentityReload() { if (m_identity && m_db) m_identity->load(m_db->key()); }
+
+QString Locator::ApplyOs(bool dryRun)
+{
+    if (!m_os) return QStringLiteral("{}");
+    return QString::fromUtf8(QJsonDocument(m_os->apply(dryRun, true)).toJson(QJsonDocument::Compact));
+}
+QString Locator::TimeZoneForFix() const
+{
+    if (!m_os || !m_fix.valid) return {};
+    if (!m_os->lastZone().isEmpty()) return m_os->lastZone();
+    return OsIntegration::zoneFromTab(m_fix.lat, m_fix.lon, m_countryCode);
+}
+
+// ── Nearest help + places by category / group ─────────────────────────────────
+QList<Poi> Locator::poisMatching(const QStringList &catsOrGroups, double radiusKm) const
+{
+    QList<Poi> out;
+    for (const Poi &p : m_pois) {
+        const PoiCategory *c = poiCategory(p.cat);
+        bool match = catsOrGroups.isEmpty();
+        for (const QString &k : catsOrGroups) if (k.compare(p.cat, Qt::CaseInsensitive) == 0 || (c && k.compare(c->group, Qt::CaseInsensitive) == 0) || k == QLatin1String("all")) match = true;
+        if (!match) continue;
+        if (radiusKm > 0 && m_fix.valid && distanceM(m_fix.lat, m_fix.lon, p.lat, p.lon) > radiusKm * 1000) continue;
+        out << p;
+    }
+    if (m_fix.valid) std::sort(out.begin(), out.end(), [this](const Poi &a, const Poi &b) {
+        return distanceM(m_fix.lat, m_fix.lon, a.lat, a.lon) < distanceM(m_fix.lat, m_fix.lon, b.lat, b.lon); });
+    return out;
+}
+
+QJsonObject Locator::emergencyJson() const
+{
+    QJsonObject o;
+    const QString cc = !m_countryCode.isEmpty() ? m_countryCode : (m_os ? m_os->locale().countryCode : QString());   // name-based guess until the geocode lands
+    o["number"] = OsIntegration::emergencyFor(cc);
+    o["countryCode"] = cc;
+    auto nearest = [this](const QString &cat, bool erOnly) -> QJsonValue {
+        const Poi *best = nullptr; double bd = 1e12;
+        for (const Poi &p : m_pois) {
+            if (p.cat != cat || (erOnly && !p.emergency)) continue;
+            if (!m_fix.valid) { best = &p; break; }
+            const double d = distanceM(m_fix.lat, m_fix.lon, p.lat, p.lon);
+            if (d < bd) { bd = d; best = &p; }
+        }
+        if (!best) return QJsonValue();
+        QJsonObject a{{"name", best->name.isEmpty() ? poiCategory(cat)->label : best->name}, {"lat", best->lat}, {"lon", best->lon}};
+        if (m_fix.valid) { a["d"] = qRound(bd); a["brg"] = qRound(bearingDeg(m_fix.lat, m_fix.lon, best->lat, best->lon)); }
+        if (!best->phone.isEmpty()) a["phone"] = best->phone;
+        if (!best->address.isEmpty()) a["address"] = best->address;
+        if (!best->hours.isEmpty()) a["hours"] = best->hours;
+        return a;
+    };
+    o["police"] = nearest(QStringLiteral("police"), false);
+    o["fire"] = nearest(QStringLiteral("fire"), false);
+    QJsonValue er = nearest(QStringLiteral("health"), true); if (er.isNull()) er = nearest(QStringLiteral("health"), false);
+    o["hospital"] = er;
+    o["urgent"] = nearest(QStringLiteral("urgent"), false);
+    o["pharmacy"] = nearest(QStringLiteral("pharmacy"), false);
+    o["vet"] = nearest(QStringLiteral("vet"), false);
+    return o;
 }

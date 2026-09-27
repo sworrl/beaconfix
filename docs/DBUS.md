@@ -72,5 +72,20 @@ dbus-monitor "interface='org.sworrl.BeaconFix',member='FixChanged'"
 | `notificationFallback(summary, body)` | strings | no notification daemon answered |
 | `prefetchRequested()` / `showWindowRequested()` | — | internal |
 
+### Added in 3.4 / 3.5
+
+| method | returns | what |
+|---|---|---|
+| `Refit()` | int | re-estimate every beacon from its samples; valid fits |
+| `Sync(url, token)` | string (JSON) | one sync round with another BeaconFix |
+| `RefreshPlaces()` | — | re-query OpenStreetMap for places around the fix |
+| `ApplyOs(dryRun)` | string (JSON) | run the OS integration now (time zone, GeoClue, Night Light) |
+| `TimeZoneForFix()` | string | the IANA zone resolved for the fix |
+| `IdentityJson()` | string (JSON) | public identity record, linked ids, pending link requests |
+| `IdentityCreate(name)` / `IdentityImport(textOrPath, passphrase)` / `IdentityForget()` / `IdentityReload()` | bool / — | manage the identity |
+| `IdentityExport(passphrase)` | string | `BFID1:` bundle (empty on error) |
+| `IdentityLinkPayload()` | string | `BFLNK1:` link payload |
+| `IdentityAcceptLink(statementJson)` | string (JSON) | verify / co-sign / store a link statement |
+
 Every slot, property and signal is exported (`ExportAllSlots | ExportAllProperties |
 ExportAllSignals`), so `qdbus6 org.sworrl.BeaconFix /org/sworrl/BeaconFix` lists them all.

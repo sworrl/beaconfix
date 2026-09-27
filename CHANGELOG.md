@@ -4,6 +4,55 @@ All notable changes to BeaconFix are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [3.5.0] — 2026-09-27
+
+### Added
+- **OS integration** (Settings → System, each part opt-in): the system **time zone follows the
+  fix** (timeapi.io + cache, tzdata fallback; set through `org.freedesktop.timedate1`; a shipped
+  polkit rules file makes it prompt-free for admins; never from IP-only fixes, at most every ten
+  minutes); the fix is **published to GeoClue** (`/etc/geolocation`) through the root helper
+  `beaconfix-osd` with its own polkit action; **KWin Night Light** follows the fix; **locale
+  hints** (country, region, units, emergency number, dialling code, zone) in `stats.locale`.
+  `beaconfix --tz`, `--apply-os [--dry-run]`, D-Bus `ApplyOs()` / `TimeZoneForFix()`; `tz` events.
+- **Emergency & civic** and **kids & fun** places from OpenStreetMap (48 categories in three
+  groups; sparse civic categories fetched out to 25 km) with **addresses, phone numbers (tap to
+  call), hours and wheelchair access**; a nearest-help card (police, fire, ER, urgent care and the
+  local emergency number) in the app, the widget and the API (`/api/v1/emergency`);
+  `GET /api/v1/pois?cat=…&group=…&radius=…`; `beaconfix --nearby <what> [--radius km]`;
+  grouped *Places to show* menus.
+- **Identity**: an Ed25519 identity shared by every BeaconFix you run — create, export (QR /
+  text / file, passphrase or 6-word code), import, LAN hand-off with a one-time code, linking of
+  independently created identities (co-signed statements), challenge-signature sign-in to the
+  API instead of pairing codes, pending sign-ins to link in the Devices tab, `beaconfix
+  --identity…` commands, `--identity-selftest` vectors, sync feeds tagged with the identity.
+  Specification and implementation notes in [docs/IDENTITY.md](docs/IDENTITY.md).
+- Tray: *Nearest help…* and *Identity…* entries; the zone next to the sun times.
+- Installer: `--no-polkit`; `install.sh` installs the helper, action and rules with sudo once;
+  `uninstall.sh --system` removes them; the .deb ships them.
+
+### Changed
+- `docs/API.md` now documents the 3.4.0 sync endpoints and `--refit` / `--sync`.
+- The emergency number falls back to a country-name guess until the reverse geocode lands.
+
+## [3.4.0] — 2026-09-26
+
+### Added
+- **Position estimation engine**: every beacon's position is refined as samples accumulate —
+  robust weighted nonlinear least squares on a log-distance path-loss model (Gauss–Newton with
+  Levenberg damping, Huber then Tukey weights, per-AP reference power and exponent), vantage-point
+  guards so bad geometry never claims a position, an error ellipse, an incremental Kalman step
+  between batched refits, `beaconfix --refit`, D-Bus `Refit()`, Settings → Positioning.
+  Self-location from fitted beacons uses the same weighted least squares.
+- **Sync API**: `hello.features`, `GET /api/v1/db/changes` (cursor feed with sequence numbers on
+  every table), `POST /api/v1/db/sync` (1 MB bodies), larger `/db/observations`, peer positions;
+  laptop mode `beaconfix --sync <url> --sync-token <token>` with per-peer cursors and a Settings
+  section.
+- **Android app** (`android/`): Kotlin / Compose, Room database, foreground Wi-Fi collector with
+  on-device estimation, pairing, offline collection with sync on reconnect, signed and minified
+  release build.
+- Widget: tile levels cross-fade instead of snapping, label layout pauses while zooming, gentler
+  wheel steps.
+
 ## [3.3.0] — 2026-09-26
 
 ### Added

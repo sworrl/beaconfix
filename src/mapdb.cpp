@@ -126,6 +126,16 @@ QByteArray MapDb::walletKey(bool create, QString *source)
     return {};
 }
 
+QByteArray MapDb::bootstrapKey(QString *source)
+{
+    QString src;
+    QByteArray k = fileKey(false, &src);
+    if (k.isEmpty()) k = walletKey(false, &src);
+    if (k.isEmpty()) k = fileKey(true, &src);
+    if (source) *source = src;
+    return k;
+}
+
 bool MapDb::ensureKey(bool create)
 {
     m_key = fileKey(false, &m_keySource);                     // a key file means the wallet was not there when the key was made
@@ -297,6 +307,7 @@ bool MapDb::schema()
     };
     addCol("observations", "seq", "INTEGER DEFAULT 0"); addCol("observations", "device", "TEXT DEFAULT ''");
     addCol("fixes", "seq", "INTEGER DEFAULT 0"); addCol("fixes", "device", "TEXT DEFAULT ''");
+    addCol("pois", "address", "TEXT DEFAULT ''"); addCol("pois", "wheelchair", "TEXT DEFAULT ''"); addCol("pois", "emergency", "INTEGER DEFAULT 0");
     q.exec(QStringLiteral("CREATE INDEX IF NOT EXISTS obs_seq ON observations(seq)"));
     q.exec(QStringLiteral("CREATE INDEX IF NOT EXISTS aps_seq ON aps(seq)"));
     q.exec(QStringLiteral("CREATE INDEX IF NOT EXISTS fix_seq ON fixes(seq)"));
@@ -674,10 +685,11 @@ bool MapDb::loadPois(QList<Poi> *pois, double *lat, double *lon, int *radiusM, Q
         else if (k == QLatin1String("poi_radius")) *radiusM = q.value(1).toInt(); else *time = QDateTime::fromString(q.value(1).toString(), Qt::ISODate);
     }
     if (!any) return false;
-    q.exec(QStringLiteral("SELECT osm_type, osm_id, cat, name, detail, lat, lon, wifi, hours, phone, website FROM pois"));
+    q.exec(QStringLiteral("SELECT osm_type, osm_id, cat, name, detail, lat, lon, wifi, hours, phone, website, address, wheelchair, emergency FROM pois"));
     while (q.next()) {
         Poi p; p.osmType = q.value(0).toString(); p.osmId = q.value(1).toLongLong(); p.cat = q.value(2).toString(); p.name = q.value(3).toString(); p.detail = q.value(4).toString();
         p.lat = q.value(5).toDouble(); p.lon = q.value(6).toDouble(); p.wifi = q.value(7).toInt() != 0; p.hours = q.value(8).toString(); p.phone = q.value(9).toString(); p.website = q.value(10).toString();
+        p.address = q.value(11).toString(); p.wheelchair = q.value(12).toString(); p.emergency = q.value(13).toInt() != 0;
         pois->append(p);
     }
     return true;
@@ -689,10 +701,10 @@ void MapDb::savePois(const QList<Poi> &pois, double lat, double lon, int radiusM
     m_db.transaction();
     QSqlQuery q(m_db);
     q.exec(QStringLiteral("DELETE FROM pois"));
-    q.prepare(QStringLiteral("INSERT OR REPLACE INTO pois(osm_type, osm_id, cat, name, detail, lat, lon, wifi, hours, phone, website) VALUES(?,?,?,?,?,?,?,?,?,?,?)"));
+    q.prepare(QStringLiteral("INSERT OR REPLACE INTO pois(osm_type, osm_id, cat, name, detail, lat, lon, wifi, hours, phone, website, address, wheelchair, emergency) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)"));
     for (const Poi &p : pois) {
         q.addBindValue(p.osmType); q.addBindValue(p.osmId); q.addBindValue(p.cat); q.addBindValue(p.name); q.addBindValue(p.detail); q.addBindValue(p.lat); q.addBindValue(p.lon);
-        q.addBindValue(p.wifi ? 1 : 0); q.addBindValue(p.hours); q.addBindValue(p.phone); q.addBindValue(p.website); q.exec();
+        q.addBindValue(p.wifi ? 1 : 0); q.addBindValue(p.hours); q.addBindValue(p.phone); q.addBindValue(p.website); q.addBindValue(p.address); q.addBindValue(p.wheelchair); q.addBindValue(p.emergency ? 1 : 0); q.exec();
     }
     q.prepare(QStringLiteral("INSERT OR REPLACE INTO kv(key, value) VALUES(?,?)"));
     const QList<QPair<QString, QString>> kv{{QStringLiteral("poi_lat"), QString::number(lat, 'f', 7)}, {QStringLiteral("poi_lon"), QString::number(lon, 'f', 7)},

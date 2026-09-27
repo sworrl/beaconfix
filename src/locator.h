@@ -79,6 +79,8 @@ struct ApEstimate {
 struct PoiCategory {
     QString key, label, icon;         // icon: emoji glyph
     QColor  color;
+    QString group;                    // services | civic | kids  (menus group by this)
+    bool    wide = false;             // civic: fetched out to the wide radius (police/fire are sparse in the country)
 };
 
 struct Poi {
@@ -87,6 +89,9 @@ struct Poi {
     QString osmType; qint64 osmId = 0;
     bool    wifi = false;             // advertises internet access
     QString hours, phone, website;
+    QString address;                  // "123 Main St, Town, ST 12345" from addr:* tags
+    QString wheelchair;               // yes | limited | no | ""
+    bool    emergency = false;        // hospital with an emergency department / 24 h service
 };
 
 // Local solar times for the fix (computed, no network)
@@ -165,6 +170,8 @@ struct Stats {
 // org.sworrl.BeaconFix so the tray, the plasmoid and other apps share one fix.
 class ApiServer;
 class MapDb;
+class Identity;
+class OsIntegration;
 
 class Locator : public QObject {
     Q_OBJECT
@@ -250,6 +257,9 @@ public:
     // Points of interest around the fix (OpenStreetMap via Overpass)
     static const QList<PoiCategory> &poiCategories();
     static const PoiCategory *poiCategory(const QString &key);
+    static QString poiGroupLabel(const QString &group);           // "Emergency & civic" …
+    QJsonObject emergencyJson() const;                            // nearest police / fire / ER / urgent care + the local number
+    QList<Poi> poisMatching(const QStringList &catsOrGroups, double radiusKm) const;   // nearest first
     const QList<Poi> &pois() const { return m_pois; }
     QString poiNote() const { return m_poiNote; }
     bool    poisLoading() const { return m_poiBusy; }
@@ -308,6 +318,9 @@ public:
     void    setApiServer(ApiServer *api);              // the LAN API, forwarded over D-Bus below
     ApiServer *apiServer() const { return m_api; }
     MapDb  *mapDb() const { return m_db; }
+    Identity *identity() const { return m_identity; }
+    OsIntegration *os() const { return m_os; }
+    QString countryCode() const { return m_countryCode; }   // ISO 3166-1 alpha-2 of the fix, lower-case (from the reverse geocode)
     int     rebuildDbFromJson();                    // re-import the *.migrated JSON files into the database
     bool    apiListening() const;
     bool    exportGpx(const QString &path, QString *error) const;
@@ -332,6 +345,7 @@ public slots:
     bool    CopyToClipboard(const QString &what);       // coords | geo | osm | google | apple | text
     void    StartTrip();
     void    PrefetchTiles();
+    void    RefreshPlaces() { refreshPois(true); }        // re-query OpenStreetMap for places around the fix
     // LAN API management (see apiserver.h)
     QString ApiStatus() const;
     bool    ApproveDevice(const QString &id);
@@ -351,6 +365,18 @@ public slots:
     void    SetHomeNetworks(const QStringList &patterns) { setHomeNetworks(patterns); }
     int     Refit();                                     // full refit of every beacon with enough samples; returns valid fits
     QString Sync(const QString &url, const QString &token);   // one sync round with another BeaconFix; JSON result
+    // Identity (docs/IDENTITY.md)
+    QString IdentityJson() const;                        // public record + linkedIds + pending link requests
+    bool    IdentityCreate(const QString &name);
+    QString IdentityExport(const QString &passphrase);   // "BFID1:…" or "" on error
+    bool    IdentityImport(const QString &textOrPath, const QString &passphrase);
+    QString IdentityLinkPayload() const;                 // BFLNK1:… (what our link QR carries)
+    QString IdentityAcceptLink(const QString &statementJson);   // completed statement JSON, or {"error":…}
+    bool    IdentityForget();
+    void    IdentityReload();                            // re-read the file (after a CLI change)
+    // OS integration
+    QString ApplyOs(bool dryRun);                        // JSON: what was (or would be) applied
+    QString TimeZoneForFix() const;
 
 signals:
     void FixChanged();
@@ -420,6 +446,9 @@ private:
     ApiServer *m_api = nullptr;
     MapDb *m_db = nullptr;
     bool m_dbUsable = false;              // open and writable: persistence goes through it
+    Identity *m_identity = nullptr;
+    OsIntegration *m_os = nullptr;
+    QString m_countryCode;
     void loadFromDb();
     void migrateJsonToDb();
     bool tryInternal(const QList<AccessPoint> &usable);

@@ -42,6 +42,7 @@ PlasmoidItem {
     property var    pois:     []
     property var    track:    []
     property var    knownDevices: []
+    property var    emergency: null
     property var    securitySummary: null
     property var    poiCategories: []
     property string poiNote:  ""
@@ -85,6 +86,7 @@ PlasmoidItem {
     toolTipSubText:  valid ? `±${Math.round(accuracy)} m · ${sourceName} · ${ageText()}`
                                + (stats && stats.rank ? `\n${stats.rank} · Lv ${stats.rankLevel} · today ${(stats.distanceTodayKm || 0).toFixed(1)} km · trip ${(stats.distanceTripKm || 0).toFixed(0)} km` : "")
                                + (elevation !== null ? `\n⛰ ${elevText()}` : "") + (sun && sun.sunrise ? ` · ☀ ${hm(sun.sunrise)} – ${hm(sun.sunset)}` : "")
+                               + (stats && stats.timezone ? ` · 🕓 ${stats.timezone}` : "") + (stats && stats.locale && stats.locale.emergencyNumber ? ` · 🚨 ${stats.locale.emergencyNumber}` : "")
                            : (error || "No location yet")
 
     function ageText() {
@@ -128,6 +130,7 @@ PlasmoidItem {
                 root.poiNote = d.poiNote || ""
                 root.tileBase = d.tileBase || ""
                 root.knownDevices = d.knownDevices || []
+                root.emergency = d.emergency || null
                 root.securitySummary = d.securitySummary || null
                 root.elevation = (d.elevation === undefined) ? null : d.elevation
                 root.elevationNote = d.elevationNote || ""

@@ -48,6 +48,7 @@ public:
         QStringList scopes;               // "read" [, "control"]
         QByteArray hash;                  // SHA-256 of the token, hex
         bool revoked = false;
+        QString identity;                 // set when the token was issued through identity auth (docs/IDENTITY.md)
         QJsonObject toJson(bool full = true) const;
     };
     struct Pending {
@@ -94,7 +95,8 @@ public:
     bool      deny(const QString &id);
     bool      revoke(const QString &nameOrId);
     bool      remove(const QString &id);
-    QString   createToken(const QString &name, const QStringList &scopes);   // returns the token (shown once)
+    QString   createToken(const QString &name, const QStringList &scopes, const QString &identity = QString());   // returns the token (shown once)
+    QString   holdIdentityExport(const QString &bundle);   // LAN hand-off: keeps the bundle 10 min under a one-time 6-digit code
     QJsonObject statusJson() const;
 
     // Known devices (allowlist)
@@ -162,6 +164,9 @@ private:
     QHash<QString, QPair<QString, qint64>> m_neigh;            // ip → (mac, ms looked up)
     QHash<QString, QList<qint64>> m_hits;                     // ip → request timestamps (ms) in the last minute
     QList<Stream> m_streams;
+    QHash<QString, QDateTime> m_nonces;                       // identity challenges: nonce (b64) → expiry
+    struct ExportHold { QString bundle; QDateTime expires; int tries = 0; };
+    QHash<QString, ExportHold> m_exports;                     // one-time codes → bundle
     QTimer m_pingTimer, m_saveTimer, m_sweepTimer;
     bool m_dirty = false;
     QProcess *m_avahi = nullptr;

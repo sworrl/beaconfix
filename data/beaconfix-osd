@@ -1,0 +1,19 @@
+#!/bin/sh
+# BeaconFix OS helper — runs as root through pkexec (polkit action org.sworrl.beaconfix.osd).
+# It does exactly two things and validates every argument:
+#   beaconfix-osd geolocation <lat> <lon> <altitude> <accuracy>   write /etc/geolocation (GeoClue static source)
+#   beaconfix-osd clear-geolocation                                remove it
+set -eu
+num() { case "$1" in ''|*[!0-9.+-]*|*.*.*|*-*-*) echo "beaconfix-osd: bad number: $1" >&2; exit 2 ;; esac; }
+case "${1:-}" in
+    geolocation)
+        [ $# -eq 5 ] || { echo "usage: beaconfix-osd geolocation <lat> <lon> <alt> <acc>" >&2; exit 2; }
+        num "$2"; num "$3"; num "$4"; num "$5"
+        umask 022
+        printf '%s\n%s\n%s\n%s\n' "$2" "$3" "$4" "$5" > /etc/geolocation.tmp
+        mv /etc/geolocation.tmp /etc/geolocation
+        chmod 644 /etc/geolocation
+        ;;
+    clear-geolocation) rm -f /etc/geolocation ;;
+    *) echo "usage: beaconfix-osd geolocation <lat> <lon> <alt> <acc> | clear-geolocation" >&2; exit 2 ;;
+esac

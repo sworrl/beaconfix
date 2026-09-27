@@ -3,17 +3,21 @@
 # ~/.local): the binary, desktop entry, D-Bus activation, tray autostart and the Plasma widget.
 # Re-run to upgrade. See docs/DEVELOPMENT.md for the manual route and packaging.
 #
-#   ./install.sh [-y] [--prefix DIR] [--no-widget] [--no-autostart] [--no-deps] [--no-restart]
+#   ./install.sh [-y] [--prefix DIR] [--no-widget] [--no-autostart] [--no-deps] [--no-restart] [--no-polkit]
+#
+#   --no-polkit  skip the system-side OS integration (root helper for GeoClue + polkit rules for
+#                prompt-free time-zone changes); it needs sudo once. Without it BeaconFix still
+#                works, but time-zone changes prompt for a password and GeoClue publishing is off.
 #
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PREFIX="${PREFIX:-$HOME/.local}"
 PLASMOID_ID="org.kde.plasma.beaconfix"
-ASSUME_YES=0 WANT_WIDGET=1 WANT_AUTOSTART=1 CHECK_DEPS=1 RESTART_PLASMA_OK=1
+ASSUME_YES=0 WANT_WIDGET=1 WANT_AUTOSTART=1 CHECK_DEPS=1 RESTART_PLASMA_OK=1 WANT_POLKIT=1
 [ "${NO_PLASMA_RESTART:-0}" = 1 ] && RESTART_PLASMA_OK=0
 
-usage() { sed -n '2,7p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
+usage() { sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
 while [ $# -gt 0 ]; do
     case "$1" in
         -y|--yes) ASSUME_YES=1 ;;
@@ -23,6 +27,7 @@ while [ $# -gt 0 ]; do
         --no-autostart) WANT_AUTOSTART=0 ;;
         --no-deps) CHECK_DEPS=0 ;;
         --no-restart) RESTART_PLASMA_OK=0 ;;
+        --no-polkit) WANT_POLKIT=0 ;;
         -h|--help) usage ;;
         *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
@@ -79,7 +84,7 @@ fi
 # ── 2. Build + install ────────────────────────────────────────────────────────
 say "Building (prefix $PREFIX)"
 cmake -S "$HERE" -B "$HERE/build" -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$PREFIX" \
-      -DBEACONFIX_INSTALL_WIDGET=OFF >/dev/null
+      -DBEACONFIX_INSTALL_WIDGET=OFF -DBEACONFIX_INSTALL_POLKIT=OFF >/dev/null
 cmake --build "$HERE/build" -j"$(nproc)"
 cmake --install "$HERE/build" >/dev/null
 note "installed $PREFIX/bin/beaconfix"
@@ -102,6 +107,28 @@ if ! command -v grpcurl >/dev/null 2>&1 && [ ! -x "$HOME/go/bin/grpcurl" ]; then
         GOFLAGS=-mod=mod go install github.com/fullstorydev/grpcurl/cmd/grpcurl@latest || note "grpcurl install failed; the Starlink tier stays off"
     else
         note "grpcurl not found: the Starlink dish GPS tier is unavailable (Wi-Fi, map database and IP still work)"
+    fi
+fi
+
+# ── 3b. OS integration (system side, sudo once) ──────────────────────────────
+# The root helper that writes /etc/geolocation for GeoClue, its polkit action, and a rules file
+# that lets an active local admin change the time zone / publish the fix without a prompt.
+if [ "$WANT_POLKIT" = 1 ]; then
+    if command -v pkexec >/dev/null 2>&1 && [ -d /etc/polkit-1 ]; then
+        say "OS integration (needs sudo once: helper + polkit action + rules)"
+        if ask "Install /usr/local/libexec/beaconfix-osd, the polkit action and 50-beaconfix.rules with sudo?"; then
+            sed "s|@BEACONFIX_OSD_PATH@|/usr/local/libexec/beaconfix-osd|" "$HERE/data/org.sworrl.beaconfix.policy.in" > "$HERE/build/org.sworrl.beaconfix.policy"
+            sudo install -d /usr/local/libexec /usr/share/polkit-1/actions /etc/polkit-1/rules.d \
+              && sudo install -m 0755 "$HERE/data/beaconfix-osd" /usr/local/libexec/beaconfix-osd \
+              && sudo install -m 0644 "$HERE/build/org.sworrl.beaconfix.policy" /usr/share/polkit-1/actions/org.sworrl.beaconfix.policy \
+              && sudo install -m 0644 "$HERE/data/50-beaconfix.rules" /etc/polkit-1/rules.d/50-beaconfix.rules \
+              && note "installed (time zone follows the fix without prompts; GeoClue gets /etc/geolocation)" \
+              || note "system-side install failed; BeaconFix will prompt for the time zone and skip GeoClue"
+        else
+            note "skipped — re-run with the same options later, or use --no-polkit to silence this"
+        fi
+    else
+        note "polkit not found: skipping the system-side OS integration"
     fi
 fi
 
@@ -155,6 +182,6 @@ fi
 
 say "Done"
 note "app:     $PREFIX/bin/beaconfix        tray: beaconfix --tray (autostarts)"
-note "status:  beaconfix --json | beaconfix --api-status | beaconfix --db-stats"
+note "status:  beaconfix --json | beaconfix --api-status | beaconfix --db-stats | beaconfix --identity"
 note "docs:    $HERE/README.md and $HERE/docs/"
 note "remove:  $HERE/uninstall.sh"
