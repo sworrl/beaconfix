@@ -113,6 +113,8 @@ data class ObservationDto(val bssid: String, val ssid: String = "", val dbm: Int
                                       val notEr: Boolean = false,
                                       /** `urgent` only: an actual urgent care (desktop 3.8+ never puts a plain clinic there). */
                                       val urgentCare: Boolean = false)
+/** `GET /api/v1/devices/me`: the calling token's device (name, kind, scopes). */
+@Serializable data class DeviceMe(val name: String = "", val kind: String = "", val scopes: List<String> = emptyList())
 /** `/api/v1/emergency`. The `pediatric*` keys and [origin] exist on desktops with the "pediatric" feature (3.8+); a 3.7 desktop leaves them out. */
 @Serializable data class EmergencyDto(val number: String = "", val countryCode: String = "",
                                       val police: HelpPlaceDto? = null, val fire: HelpPlaceDto? = null, val hospital: HelpPlaceDto? = null, val urgent: HelpPlaceDto? = null,

@@ -57,6 +57,12 @@ object Mirror {
      * answers with something we cannot read. Network failures still throw, so an unreachable desktop fails fast
      * instead of timing out once per endpoint.
      */
+    /** A token's scopes as stored on [DesktopEntity.scopes] ("read,control"); only the known ones, "read" first; "" when none. */
+    fun scopesText(scopes: List<String>): String {
+        val known = scopes.map { it.trim().lowercase() }.filter { it == "read" || it == "control" }.toSet()
+        return listOf("read", "control").filter { it in known }.joinToString(",")
+    }
+
     suspend fun <T> bodyOf(call: suspend () -> Response<T>): T? {
         val r = try { call() } catch (e: IllegalArgumentException) { return null }   // kotlinx SerializationException
         return if (r.isSuccessful) r.body() else null

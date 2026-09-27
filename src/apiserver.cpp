@@ -1087,6 +1087,12 @@ void ApiServer::handle(QTcpSocket *s, const Request &r)
         finish(200, o);
         return;
     }
+    if (ep == QLatin1String("devices/me")) {                  // the calling token's own record: its scopes now (after --grant-control)
+        if (!get) { finish(405, QJsonObject{{"error", "method not allowed"}}, {"Allow: GET"}); return; }
+        finish(200, QJsonObject{{"name", dev->name}, {"kind", dev->kind.isEmpty() ? QStringLiteral("device") : dev->kind},
+                                {"scopes", QJsonArray::fromStringList(dev->scopes)}, {"identity", dev->identity.isEmpty() ? QJsonValue() : QJsonValue(dev->identity)}});
+        return;
+    }
     if (ep == QLatin1String("location")) { if (!get) { finish(405, QJsonObject{{"error", "method not allowed"}}, {"Allow: GET"}); return; } finish(200, locationJson()); return; }
     if (ep == QLatin1String("devices/positions")) {           // our other devices: newest position each (docs/API.md "Devices")
         if (!get) { finish(405, QJsonObject{{"error", "method not allowed"}}, {"Allow: GET"}); return; }

@@ -68,7 +68,8 @@ class SyncRepository @Inject constructor(
     /** One sync run's view of the home-network list: [dirty] = edited on this phone since the last push. */
     class HomeRun(val dirty: Boolean, val local: Set<String>) { var pushed = false }
 
-    suspend fun sync(d: DesktopEntity, home: HomeRun? = null): SyncReport {
+    suspend fun sync(desktop: DesktopEntity, home: HomeRun? = null): SyncReport {
+        var d = desktop                                  // every upsert below builds on the newest row (scopes, cursor)
         val api = desktops.api(d)
         val auth = desktops.auth(d) ?: return fail(d, "not paired")
         var pushed = 0; var pulledAps = 0; var pulledObs = 0; var pulledFixes = 0
@@ -76,6 +77,12 @@ class SyncRepository @Inject constructor(
             val hello = api.hello()
             if (!hello.isSuccessful) return fail(d, "desktop unreachable (${hello.code()})")
             val features = hello.body()?.features ?: emptyList()
+            // The scopes stored at pairing go stale: `beaconfix --grant-control` upgrades a token on the desktop. Ask it
+            // what this token may do now (desktops with the "whoami" feature), so push, backup send and prefetch light up.
+            if ("whoami" in features) runCatching { Mirror.bodyOf { api.me(auth) } }.getOrNull()?.let { me ->
+                val sc = Mirror.scopesText(me.scopes)
+                if (sc.isNotEmpty() && sc != d.scopes) { d = d.copy(scopes = sc); desktops.upsert(d) }
+            }
             val canControl = desktops.hasScope(d, "control")
 
             // ── push ────────────────────────────────────────────────────────
@@ -175,7 +182,7 @@ class SyncRepository @Inject constructor(
             if (canControl) {
                 if ("sync" in features) {
                     val ch = api.changes(auth, d.cursor)
-                    if (ch.isSuccessful) ch.body()?.let { c -> pulledObs += importObservations(c.observations); if (c.anchors.isNotEmpty()) anchors.merge(c.anchors); desktops.upsert(d.copy(cursor = c.cursor)) }
+                    if (ch.isSuccessful) ch.body()?.let { c -> pulledObs += importObservations(c.observations); if (c.anchors.isNotEmpty()) anchors.merge(c.anchors); d = d.copy(cursor = c.cursor); desktops.upsert(d) }
                 } else if (d.pulledAps == 0L || System.currentTimeMillis() - d.lastSync > 6 * 3600_000L) {
                     // full export: streamed, parsed once; cheap enough at a few MB and only every 6 h
                     val ex = api.export(auth)

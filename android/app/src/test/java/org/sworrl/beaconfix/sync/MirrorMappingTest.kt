@@ -45,6 +45,14 @@ class MirrorMappingTest {
 
     // ── places ──────────────────────────────────────────────────────────────
 
+    @Test fun tokenScopesFromTheDesktop() {
+        assertEquals("read,control", Mirror.scopesText(listOf("control", "read")))
+        assertEquals("read", Mirror.scopesText(listOf(" READ ")))
+        assertEquals("", Mirror.scopesText(listOf("admin")))
+        val me = ApiFactory.json.decodeFromString(org.sworrl.beaconfix.data.api.DeviceMe.serializer(), """{"name":"Test Phone","kind":"android","scopes":["read","control"],"extra":1}""")
+        assertEquals(listOf("read", "control"), me.scopes)
+    }
+
     @Test fun osmLinkBecomesAKeyAndBack() {
         assertEquals("way/329264979", DesktopCache.osmKey("https://www.openstreetmap.org/way/329264979"))
         val e = DesktopCache.toEntity(src, PoiDto(name = "T", cat = "health", lat = 40.0, lon = -75.0, osm = "https://www.openstreetmap.org/relation/8017287"), 0.0, 0.0, 1)

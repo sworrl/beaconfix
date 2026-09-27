@@ -42,6 +42,8 @@ interface BeaconFixApi {
     @GET("api/v1/pois") suspend fun poisTyped(@Header("Authorization") auth: String): Response<PoisTyped>
     @GET("api/v1/peers") suspend fun peers(): Response<PeersDto>
     @GET("api/v1/devices/positions") suspend fun devicesPositions(@Header("Authorization") auth: String): Response<DevicesPositions>
+    /** This token's own device record (desktops with the "whoami" feature): its current scopes after `--grant-control`. */
+    @GET("api/v1/devices/me") suspend fun me(@Header("Authorization") auth: String): Response<DeviceMe>
     @POST("api/v1/devices/position") suspend fun devicePosition(@Header("Authorization") auth: String, @Body body: DevicePositionBody): Response<ResponseBody>
     @POST("api/v1/identity/export-request") suspend fun identityExportRequest(): Response<ResponseBody>
     // identity (spec v1)
