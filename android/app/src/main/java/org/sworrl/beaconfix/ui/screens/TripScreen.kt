@@ -53,7 +53,10 @@ fun TripScreen(onMap: () -> Unit = {}, live: LiveViewModel = hiltViewModel(), vm
     // each desktop's trip (as of when it was saved, if it is not live), else the newest saved one
     val savedTitle = stringResource(R.string.a9_saved_trip)
     val unnamed = stringResource(R.string.a9_stop_unnamed)
-    val trips: List<Triple<String, Trip, Long>> = views.mapNotNull { v -> v.trip?.let { Triple(v.desktop.name, it, if (v.stale) v.cachedAt else 0L) } }
+    val trips: List<Triple<String, Trip, Long>> = views.mapNotNull { v ->
+        val saved = "trip" in v.cached || (v.stale && v.error.isNotEmpty())      // from the cache, or the desktop stopped answering
+        v.trip?.let { Triple(v.desktop.name, it, if (saved) v.cachedAt else 0L) }
+    }
         .ifEmpty { ui.savedTrip?.let { listOf(Triple(savedTitle, it, ui.savedTripAt)) } ?: emptyList() }
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(vertical = 8.dp)) {
         Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) {
