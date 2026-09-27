@@ -68,7 +68,7 @@ private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
 
 /** Hilt entry point for code that Hilt does not inject (Glance widgets and their action callbacks). */
 @EntryPoint @InstallIn(SingletonComponent::class)
-interface WidgetEntryPoint { fun updater(): WidgetUpdater; fun syncScheduler(): SyncScheduler; fun prefs(): Prefs }
+interface WidgetEntryPoint { fun updater(): WidgetUpdater; fun syncScheduler(): SyncScheduler; fun prefs(): Prefs; fun help(): org.sworrl.beaconfix.help.HelpRepository }
 
 /**
  * Builds the [WidgetState] from the database, prefs, the collector's last scan and the paired desktop, renders the map
@@ -81,6 +81,8 @@ class WidgetUpdater @Inject constructor(
     private val status: CollectorStatus, private val desktops: DesktopStore, private val identity: IdentityStore,
     private val notifier: StatusNotifier,
     private val ranging: dagger.Lazy<org.sworrl.beaconfix.ranging.RangingRepository>,
+    // Lazy: HelpRepository reports back through touch("help"), so a direct edge would be a cycle
+    private val help: dagger.Lazy<org.sworrl.beaconfix.help.HelpRepository>,
 ) {
     /** last few human lines for the notification ("recent") */
     @Volatile var recent: List<String> = emptyList()
@@ -88,12 +90,14 @@ class WidgetUpdater @Inject constructor(
     fun collectorText(): String { val s = status.state.value; return when { !s.running -> "collector paused"; s.throttled -> "scanning (throttled by Android: 4 scans / 2 min)"; s.survey -> "surveying continuously"; else -> "scanning" } }
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private var pending: Job? = null
+    private var pendingHelp: Job? = null
 
     val state: Flow<WidgetState> = ctx.widgetStore.data.map { p -> p[KEY]?.let { runCatching { json.decodeFromString<WidgetState>(it) }.getOrNull() } ?: WidgetState() }
     suspend fun current(): WidgetState = state.first()
 
-    /** Something changed (a scan, a sync, the collector flipped): refresh soon, coalescing bursts. */
-    fun touch(@Suppress("UNUSED_PARAMETER") reason: String) {
+    /** Something changed (a scan, a sync, the collector flipped): refresh soon, coalescing bursts. "help" = only the help surfaces. */
+    fun touch(reason: String) {
+        if (reason == "help") { pendingHelp?.cancel(); pendingHelp = scope.launch { delay(500); runCatching { refreshHelp() } }; return }
         pending?.cancel()
         pending = scope.launch { delay(2500); runCatching { refresh() } }
     }
@@ -167,8 +171,37 @@ class WidgetUpdater @Inject constructor(
         }
         ctx.widgetStore.edit { it[KEY] = json.encodeToString(st) }
         runCatching { LocationWidget().updateAll(ctx); BeaconsWidget().updateAll(ctx); SyncWidget().updateAll(ctx); MapWidget().updateAll(ctx) }
+        runCatching { publishHelp() }
+        runCatching { org.sworrl.beaconfix.tile.CollectorTileService.requestUpdate(ctx) }
         runCatching { notifier.post(st, status.state.value.presence, collectorText(), recent) }
         return st
+    }
+
+    /**
+     * The newest help answer: the live one from [org.sworrl.beaconfix.help.HelpRepository] when it is newer than the
+     * persisted copy (which it then replaces), else the persisted copy, so the widget, tiles and notification keep
+     * showing the last answer after the process was killed. More than a day old = shown as "saved".
+     */
+    suspend fun helpNow(): org.sworrl.beaconfix.help.HelpSnapshot {
+        val saved = runCatching { HelpStore.load(ctx) }.getOrDefault(org.sworrl.beaconfix.help.HelpSnapshot())
+        val live = runCatching { help.get().snapshot.value }.getOrNull()
+        val best = if (live != null && live.fetchedAt > saved.fetchedAt) live.also { runCatching { HelpStore.save(ctx, it) } } else saved
+        return org.sworrl.beaconfix.tile.TileModel.aged(best, System.currentTimeMillis())
+    }
+
+    /** Push the help answer to the Help widget, the "Nearest help" tile and the notification's help line. */
+    private suspend fun publishHelp(): org.sworrl.beaconfix.help.HelpSnapshot {
+        val hs = helpNow()
+        notifier.helpLine = org.sworrl.beaconfix.tile.TileModel.notificationLine(hs)
+        runCatching { HelpWidget().updateAll(ctx) }
+        runCatching { org.sworrl.beaconfix.tile.HelpTileService.requestUpdate(ctx) }
+        return hs
+    }
+
+    /** The light path for touch("help"): help surfaces plus the notification, no desktop round-trips or map render. */
+    suspend fun refreshHelp() {
+        publishHelp()
+        runCatching { notifier.post(current(), status.state.value.presence, collectorText(), recent) }
     }
 
     // ── static map snapshot: OSM tiles through osmdroid's cache, beacons and the fix drawn on top ──
@@ -243,10 +276,13 @@ class WidgetUpdater @Inject constructor(
 
 @HiltWorker
 class WidgetWorker @AssistedInject constructor(@Assisted ctx: Context, @Assisted params: WorkerParameters, private val updater: WidgetUpdater, private val prefs: Prefs, private val status: CollectorStatus,
-                                              private val recorder: org.sworrl.beaconfix.collector.ObservationRecorder) : CoroutineWorker(ctx, params) {
+                                              private val recorder: org.sworrl.beaconfix.collector.ObservationRecorder,
+                                              private val help: org.sworrl.beaconfix.help.HelpRepository) : CoroutineWorker(ctx, params) {
     override suspend fun doWork(): Result {
         // with the status notification hidden there is no foreground service: this 15-min job is all the background collection Android allows
         if (prefs.collectorOn.first() && !status.state.value.presence) runCatching { recorder.scanAndRecord(fresh = true) }
+        // nearest help for the widget / tile / notification: desktop only (refreshIfStale never searches Overpass)
+        runCatching { withTimeoutOrNull(20_000) { help.refreshIfStale() } }
         runCatching { updater.refresh() }
         return Result.success()
     }

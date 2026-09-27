@@ -46,6 +46,9 @@ class StatusNotifier @Inject constructor(@ApplicationContext private val ctx: Co
     /** The last notification we posted, so a dismissal can be undone instantly without rebuilding state. */
     @Volatile private var last: Notification? = null
 
+    /** The nearest-help line for the expanded card ("🧸 Kids ER: … · 38 km — ER: … · 12 km"); set by [WidgetUpdater]. */
+    @Volatile var helpLine: String = ""
+
     /** Build the notification for the current state. [ongoing] = it is the service's foreground notification (the normal case). */
     fun build(st: WidgetState, ongoing: Boolean, collectorState: String, events: List<String>): Notification {
         ensureChannel()
@@ -57,6 +60,7 @@ class StatusNotifier @Inject constructor(@ApplicationContext private val ctx: Co
         val line2 = "${st.inRange} beacons in range" + (if (worst.isNotEmpty()) " · $worst" else "") + (if (st.desktopPaired) " · ${st.desktopName}: synced ${agoShort(st.lastSync)}, ${st.unsynced} waiting" else " · ${st.unsynced} waiting to sync")
         val big = StringBuilder(line1).append('\n').append(line2)
         if (st.rangeLine.isNotEmpty()) big.append('\n').append(st.rangeLine)
+        if (helpLine.isNotEmpty()) big.append('\n').append(helpLine)
         if (events.isNotEmpty()) { big.append("\n— recent —"); events.take(3).forEach { big.append('\n').append(it) } }
         val b = NotificationCompat.Builder(ctx, CHANNEL)
             .setSmallIcon(R.drawable.ic_notification).setColor(0xFF35D6FF.toInt())
@@ -64,18 +68,25 @@ class StatusNotifier @Inject constructor(@ApplicationContext private val ctx: Co
             .setStyle(NotificationCompat.BigTextStyle().bigText(big.toString()))
             .setOngoing(true).setOnlyAlertOnce(true).setSilent(true).setShowWhen(false)
             .setCategory(NotificationCompat.CATEGORY_STATUS).setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
+            .setPublicVersion(publicVersion())                     // the lock screen sees "BeaconFix · running", never a place
             .setContentIntent(open(null, 0))
             .setDeleteIntent(pi(ACTION_DISMISSED, 5))             // swiped away (Android 14+ allows it) → re-posted immediately
+            // Android shows at most three actions: Help first (sync lives in the app, the Sync widget and the worker)
+            .addAction(0, "Help", open("help", 4))
             .addAction(0, "Scan now", pi(ACTION_SCAN, 1))
-            .addAction(0, "Sync now", pi(ACTION_SYNC, 2))
             .addAction(0, if (st.collectorOn) "Pause" else "Resume", pi(if (st.collectorOn) ACTION_PAUSE else ACTION_RESUME, 3))
-            .addAction(0, "Map", open("map", 4))
         if (ongoing) b.setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
         val n = b.build()
         n.flags = n.flags or Notification.FLAG_NO_CLEAR or Notification.FLAG_ONGOING_EVENT
         last = n
         return n
     }
+
+    private fun publicVersion(): Notification = NotificationCompat.Builder(ctx, CHANNEL)
+        .setSmallIcon(R.drawable.ic_notification).setColor(0xFF35D6FF.toInt())
+        .setContentTitle("BeaconFix · running")
+        .setOngoing(true).setSilent(true).setShowWhen(false).setCategory(NotificationCompat.CATEGORY_STATUS)
+        .build()
 
     /** Post the current state (updates the service's foreground notification in place when the service runs). */
     @android.annotation.SuppressLint("MissingPermission")   // guarded by canPost()

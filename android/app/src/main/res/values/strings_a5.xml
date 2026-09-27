@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- A5 quick access: Help widget, Quick Settings tiles, launcher shortcuts, the alerts channel. -->
+<resources>
+    <string name="widget_help_label">BeaconFix · Help</string>
+    <string name="widget_help_description">The nearest children\'s ER, ER, urgent care, police and fire, with a button for the emergency number.</string>
+
+    <string name="tile_help_label">Nearest help</string>
+    <string name="tile_collector_label">Collector</string>
+
+    <string name="shortcut_help_short">Help now</string>
+    <string name="shortcut_help_long">Help now: nearest ER and 911</string>
+    <string name="shortcut_kids_er_short">Kids ER</string>
+    <string name="shortcut_kids_er_long">Kids ER</string>
+    <string name="shortcut_kids_hospital_prefix">Kids hospital (call ahead)</string>
+    <string name="shortcut_share_short">Share location</string>
+    <string name="shortcut_share_long">Share my location</string>
+    <string name="shortcut_rv_short">Find the RV</string>
+    <string name="shortcut_rv_long">Where\'s the RV?</string>
+    <string name="shortcut_pin_kids_er">Pin the children\'s ER to the home screen</string>
+    <string name="shortcut_pin_none">No children\'s ER known yet</string>
+    <string name="shortcut_pin_unsupported">Your launcher cannot pin shortcuts</string>
+
+    <string name="channel_alerts_name">Alerts</string>
+    <string name="channel_alerts_desc">Nearest help after you arrive in a new area, and warnings about open Wi-Fi</string>
+    <string name="alerts_help_title">Nearest help here</string>
+    <string name="alerts_help_public">BeaconFix · nearest help updated</string>
+    <string name="alerts_help_directions">Directions</string>
+</resources>

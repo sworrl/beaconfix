@@ -26,6 +26,7 @@ import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import org.sworrl.beaconfix.BuildConfig
 import org.sworrl.beaconfix.ui.InfoCard
+import org.sworrl.beaconfix.ui.SystemHealthCard
 import org.sworrl.beaconfix.ui.theme.Slate
 import org.sworrl.beaconfix.ui.vm.SettingsViewModel
 
@@ -33,8 +34,11 @@ import org.sworrl.beaconfix.ui.vm.SettingsViewModel
 fun SettingsScreen(onPair: () -> Unit, onIdentity: () -> Unit = {}, onWidgets: () -> Unit = {}, onImport: () -> Unit = {}, vm: SettingsViewModel = hiltViewModel()) {
     val ctx = androidx.compose.ui.platform.LocalContext.current
     val ui by vm.ui.collectAsState()
+    val placesVm: SettingsPlacesViewModel = hiltViewModel()
     var home by remember(ui.home) { mutableStateOf(ui.home.joinToString("\n")) }
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(vertical = 8.dp)) {
+        SettingsPlacesSection(placesVm)
+        SystemHealthCard(compact = false)
         InfoCard("Collector") {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) { Text("Collect in the background"); Switch(ui.collectorOn, { vm.setCollector(it) }) }
             Text("Scan every ${ui.interval} s", style = MaterialTheme.typography.bodyMedium)
@@ -46,11 +50,12 @@ fun SettingsScreen(onPair: () -> Unit, onIdentity: () -> Unit = {}, onWidgets: (
         InfoCard("Home networks") {
             Text("Networks that travel with you (your router, hotspot). Matched against SSID and BSSID, one glob per line. Pulled from the desktop on sync.", color = Slate, style = MaterialTheme.typography.bodySmall)
             OutlinedTextField(home, { home = it }, Modifier.fillMaxWidth(), minLines = 3, placeholder = { Text("MyRouter*\nAA:BB:CC:?D:EE:F?") })
-            OutlinedButton(onClick = { vm.setHome(home) }) { Text("Save") }
+            // edited here = the phone's list is newer than the desktop's: the next sync pushes it (needs control access)
+            OutlinedButton(onClick = { vm.setHome(home); placesVm.markHomeDirty() }) { Text("Save") }
         }
         InfoCard("Status in the shade") {
             val on by vm.statusNotification.collectAsState()
-            Text("BeaconFix keeps one silent, permanent card in the shade while it runs: your fix, beacons in range, sync state and the range to your desktop, with Scan / Sync / Pause / Map buttons. Swiping it away only puts it back.", color = Slate, style = MaterialTheme.typography.bodySmall)
+            Text("BeaconFix keeps one silent, permanent card in the shade while it runs: your fix, beacons in range, sync state and the range to your desktop, with Help / Scan / Pause buttons. The lock screen only shows “BeaconFix · running”. Swiping it away only puts it back.", color = Slate, style = MaterialTheme.typography.bodySmall)
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) { Column(Modifier.weight(1f)) { Text("Hide the status notification"); Text("Not recommended: the card is the foreground service that keeps BeaconFix alive. Without it Android may stop background collection and device ranging.", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }; Switch(!on, { vm.setStatusNotification(!it) }) }
         }
         InfoCard("Import your history") {
@@ -63,11 +68,12 @@ fun SettingsScreen(onPair: () -> Unit, onIdentity: () -> Unit = {}, onWidgets: (
         }
         InfoCard("Desktops") { OutlinedButton(onClick = onPair) { Text("Pair / manage desktops") } }
         InfoCard("Home-screen widgets") {
-            Text("Location · Beacons · Sync · Map. They refresh every 15 minutes and after each scan or sync.", color = Slate, style = MaterialTheme.typography.bodySmall)
+            Text("Help · Location · Beacons · Sync · Map. They refresh every 15 minutes and after each scan or sync.", color = Slate, style = MaterialTheme.typography.bodySmall)
             OutlinedButton(onClick = onWidgets) { Text("Preview the widgets") }
             val pin = org.sworrl.beaconfix.widget.WidgetPinner.supported(ctx)
             if (!pin) Text("Your launcher does not support pinning from apps — long-press the home screen → Widgets → BeaconFix.", color = Slate, style = MaterialTheme.typography.bodySmall)
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(enabled = pin, onClick = { org.sworrl.beaconfix.widget.WidgetPinner.pin(ctx, org.sworrl.beaconfix.widget.HelpWidgetReceiver::class.java) }) { Text("Help") }
                 OutlinedButton(enabled = pin, onClick = { org.sworrl.beaconfix.widget.WidgetPinner.pin(ctx, org.sworrl.beaconfix.widget.LocationWidgetReceiver::class.java) }) { Text("Location") }
                 OutlinedButton(enabled = pin, onClick = { org.sworrl.beaconfix.widget.WidgetPinner.pin(ctx, org.sworrl.beaconfix.widget.BeaconsWidgetReceiver::class.java) }) { Text("Beacons") }
             }
@@ -76,8 +82,9 @@ fun SettingsScreen(onPair: () -> Unit, onIdentity: () -> Unit = {}, onWidgets: (
                 OutlinedButton(enabled = pin, onClick = { org.sworrl.beaconfix.widget.WidgetPinner.pin(ctx, org.sworrl.beaconfix.widget.MapWidgetReceiver::class.java) }) { Text("Map") }
             }
         }
+        DeveloperAutomationCard(placesVm)
         InfoCard("Privacy") {
-            Text("Everything stays on this phone and on the desktops you pair with. No analytics, no crash reporting, no third-party servers. The only other network traffic is map tiles (OpenStreetMap). Tokens are stored in Android's Keystore-backed encrypted preferences; the database is in app-private storage and excluded from backups.", color = Slate, style = MaterialTheme.typography.bodySmall)
+            Text("Everything stays on this phone and on the desktops you pair with. No analytics, no crash reporting, no third-party servers. The only other network traffic is map tiles (OpenStreetMap) and, for Help and Places when no desktop answers, OpenStreetMap place and address lookups around you (“Find places from this phone” above turns the place search off). Tokens are stored in Android's Keystore-backed encrypted preferences; the database is in app-private storage and excluded from backups.", color = Slate, style = MaterialTheme.typography.bodySmall)
             Text("BeaconFix Android ${BuildConfig.VERSION_NAME} · GPL-2.0-or-later", color = Slate, style = MaterialTheme.typography.bodySmall)
         }
     }

@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- A10 settings: units, places preferences, system health, developer automation. -->
+<resources>
+    <string name="a10_places_title">Units &amp; places</string>
+    <string name="a10_units">Units</string>
+    <string name="a10_units_auto">Auto</string>
+    <string name="a10_units_metric">Metric</string>
+    <string name="a10_units_imperial">Imperial</string>
+    <string name="a10_units_hint">Auto uses miles and feet in the US, Liberia and Myanmar, or when your desktop says so.</string>
+    <string name="a10_phone_places">Find places from this phone</string>
+    <string name="a10_phone_places_hint">When no desktop answers, Help and Places search OpenStreetMap from here — only when you open them, never in the background.</string>
+    <string name="a10_phone_places_metered">Use mobile data for place search</string>
+    <string name="a10_phone_places_metered_hint">Off: the phone searches only on Wi-Fi.</string>
+    <string name="a10_peds_radius">Children\'s ER search radius (this phone): %1$s</string>
+    <string name="a10_peds_radius_hint">Children\'s hospitals are rare; a wider radius finds one farther away but takes longer.</string>
+    <string name="a10_help_alerts">Nearest-help heads-up</string>
+    <string name="a10_help_alerts_hint">One notification after you arrive in a new area (25 km or more), naming the nearest children\'s ER and ER. Never at night.</string>
+    <string name="a10_wifi_alerts">Open Wi-Fi alerts</string>
+    <string name="a10_wifi_alerts_hint">Warns when the phone joins an unencrypted network.</string>
+
+    <string name="a10_dev_title">Developer automation</string>
+    <string name="a10_dev_automation">Developer automation</string>
+    <string name="a10_dev_automation_hint">Lets adb test commands reset or import identity and simulate being offline. Leave off unless you are testing.</string>
+    <string name="a10_sim_offline">Simulate offline</string>
+    <string name="a10_sim_offline_hint">Behave as if there were no network: saved data only.</string>
+    <string name="a10_sim_no_desktop">Simulate no desktop</string>
+    <string name="a10_sim_no_desktop_hint">Behave as if no desktop were reachable.</string>
+
+    <string name="a10_health_title">System health</string>
+    <string name="a10_health_title_compact">BeaconFix needs attention</string>
+    <string name="a10_health_all_ok">Everything BeaconFix needs is allowed.</string>
+    <string name="a10_health_precise">Precise location is off</string>
+    <string name="a10_health_precise_ok">Precise location: on</string>
+    <string name="a10_health_precise_detail">Beacons are placed from your fixes; approximate location puts them kilometres off.</string>
+    <string name="a10_health_precise_button">Allow precise location</string>
+    <string name="a10_health_background">Location: Allow all the time</string>
+    <string name="a10_health_background_ok">Location: allowed all the time</string>
+    <string name="a10_health_background_detail">Keeps collection and ranging working after a restart or with the app closed. Choose “Allow all the time”.</string>
+    <string name="a10_health_background_first">Allow location while using the app first.</string>
+    <string name="a10_health_background_button">Allow all the time</string>
+    <string name="a10_health_notifications">Notifications are off</string>
+    <string name="a10_health_notifications_ok">Notifications: on</string>
+    <string name="a10_health_notifications_detail">The status card, the nearest-help heads-up and Wi-Fi alerts need them.</string>
+    <string name="a10_health_notifications_button">Allow notifications</string>
+    <string name="a10_health_nearby">Nearby Wi-Fi devices not allowed</string>
+    <string name="a10_health_nearby_ok">Nearby Wi-Fi devices: allowed</string>
+    <string name="a10_health_nearby_detail">Android 13 and later need it for Wi-Fi scans and ranging.</string>
+    <string name="a10_health_nearby_button">Allow nearby devices</string>
+    <string name="a10_health_battery">Battery optimisation is on</string>
+    <string name="a10_health_battery_ok">Battery: unrestricted</string>
+    <string name="a10_health_battery_detail">Android may pause BeaconFix in the background. Setting it to Unrestricted keeps collection steady.</string>
+    <string name="a10_health_battery_button">Battery settings</string>
+    <string name="a10_health_saver">Battery saver is on</string>
+    <string name="a10_health_saver_ok">Battery saver: off</string>
+    <string name="a10_health_saver_detail">Wi-Fi scans and location updates are throttled until it is off.</string>
+    <string name="a10_health_saver_button">Battery saver settings</string>
+</resources>

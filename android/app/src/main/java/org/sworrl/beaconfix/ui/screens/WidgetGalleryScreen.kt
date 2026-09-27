@@ -31,7 +31,9 @@ import androidx.compose.foundation.layout.Row
 import org.sworrl.beaconfix.R
 import org.sworrl.beaconfix.ui.InfoCard
 import org.sworrl.beaconfix.ui.theme.Slate
+import org.sworrl.beaconfix.quick.PinKidsErButton
 import org.sworrl.beaconfix.widget.BeaconsWidgetReceiver
+import org.sworrl.beaconfix.widget.HelpWidgetReceiver
 import org.sworrl.beaconfix.widget.LocationWidgetReceiver
 import org.sworrl.beaconfix.widget.MapWidgetReceiver
 import org.sworrl.beaconfix.widget.SyncWidgetReceiver
@@ -40,7 +42,7 @@ import org.sworrl.beaconfix.widget.WidgetPinner
 private data class Gallery(val label: String, val receiver: Class<*>, val preview: Int, val heightDp: Int)
 
 /**
- * Live previews of the four home-screen widgets. When this package may bind widgets (a launcher grants that; for
+ * Live previews of the five home-screen widgets. When this package may bind widgets (a launcher grants that; for
  * testing `adb shell cmd appwidget grantbind --package org.sworrl.beaconfix`) the real Glance content is hosted;
  * otherwise the static preview layouts are shown. Each card has a "Add to home screen" button.
  */
@@ -50,6 +52,7 @@ fun WidgetGalleryScreen(onBack: () -> Unit) {
     val host = remember { AppWidgetHost(ctx.applicationContext, HOST_ID) }
     DisposableEffect(Unit) { host.startListening(); onDispose { host.stopListening() } }
     val items = listOf(
+        Gallery("Help", HelpWidgetReceiver::class.java, R.layout.widget_preview_help, 190),
         Gallery("Location", LocationWidgetReceiver::class.java, R.layout.widget_preview_location, 150),
         Gallery("Beacons", BeaconsWidgetReceiver::class.java, R.layout.widget_preview_beacons, 190),
         Gallery("Sync", SyncWidgetReceiver::class.java, R.layout.widget_preview_sync, 130),
@@ -62,6 +65,8 @@ fun WidgetGalleryScreen(onBack: () -> Unit) {
         for (g in items) InfoCard(g.label) {
             AndroidView(modifier = Modifier.fillMaxWidth().height(g.heightDp.dp), factory = { c -> hostOrPreview(c, host, g) })
             OutlinedButton(enabled = canPin, onClick = { WidgetPinner.pin(ctx, g.receiver) }) { Text(if (canPin) "Add to home screen" else "Long-press the home screen → Widgets → BeaconFix") }
+            // the children's ER as its own home-screen icon (a pinned shortcut that opens Help at that card)
+            if (g.receiver == HelpWidgetReceiver::class.java) PinKidsErButton()
         }
     }
 }
