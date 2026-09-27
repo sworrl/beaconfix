@@ -31,6 +31,7 @@ import org.sworrl.beaconfix.ui.Intents
 import org.sworrl.beaconfix.ui.ago
 import org.sworrl.beaconfix.ui.theme.Orange
 import org.sworrl.beaconfix.ui.theme.Slate
+import org.sworrl.beaconfix.ui.vm.HelpBadge
 import org.sworrl.beaconfix.ui.vm.HelpRowModel
 import org.sworrl.beaconfix.ui.vm.HelpViewModel
 
@@ -81,14 +82,26 @@ private fun HelpCardBody(vm: HelpViewModel, onOpen: () -> Unit, modifier: Modifi
     }
 }
 
-/** "🧸 name · 38 km · ~45 min (est.)"; TalkBack hears it without the emoji. */
+/**
+ * "🧸 name · 38 km · ~45 min (est.)" and, under it, the confidence text whenever it is not a plain confirmed ER
+ * ("Children's hospital — ER not confirmed, call ahead", "Not an ER", …; plan §7: never without it). TalkBack hears
+ * both, without the emoji.
+ */
 @Composable
 private fun CardLine(r: HelpRowModel, er: Boolean, bold: Boolean) {
     val name = if (er) stringResource(R.string.help_card_er, r.place.name) else r.place.name
-    val spoken = listOf(name, distanceText(r.place.distM), r.eta).filter { it.isNotBlank() }.joinToString(" · ")
-    Text(
-        r.icon + " " + spoken, modifier = Modifier.semantics { contentDescription = spoken },
-        style = if (bold) MaterialTheme.typography.bodyMedium else MaterialTheme.typography.bodySmall,
-        fontWeight = if (bold) FontWeight.Bold else null, maxLines = 2, overflow = TextOverflow.Ellipsis,
-    )
+    val line = listOf(name, distanceText(r.place.distM), r.eta).filter { it.isNotBlank() }.joinToString(" · ")
+    val tier = if (cardShowsBadge(r.badge)) badgeText(r.badge) else ""
+    val spoken = if (tier.isEmpty()) line else "$line. $tier"
+    Column(Modifier.semantics(mergeDescendants = true) { contentDescription = spoken }) {
+        Text(
+            r.icon + " " + line,
+            style = if (bold) MaterialTheme.typography.bodyMedium else MaterialTheme.typography.bodySmall,
+            fontWeight = if (bold) FontWeight.Bold else null, maxLines = 2, overflow = TextOverflow.Ellipsis,
+        )
+        if (tier.isNotEmpty()) Text(tier, color = badgeColor(r.badge), style = MaterialTheme.typography.labelSmall, maxLines = 2, overflow = TextOverflow.Ellipsis)
+    }
 }
+
+/** The card spells out every confidence level except the plain ones (a confirmed children's ER, a confirmed ER). */
+internal fun cardShowsBadge(b: HelpBadge): Boolean = b != HelpBadge.None && b != HelpBadge.Er && b != HelpBadge.ChildrensEr
