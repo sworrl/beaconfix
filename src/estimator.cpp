@@ -332,7 +332,11 @@ void ellipse(double cxx, double cxy, double cyy, double *major, double *minor, d
     const double disc = std::sqrt(std::max(0.0, tr * tr / 4 - det));
     const double l1 = std::max(0.0, tr / 2 + disc), l2 = std::max(0.0, tr / 2 - disc);
     *major = std::sqrt(l1); *minor = std::sqrt(l2);
-    *orientDeg = std::atan2(l1 - cxx, cxy) * 180.0 / M_PI;
+    // the major axis (cxy, λ1 − cxx) as a bearing: degrees clockwise from north, in [0, 180)
+    double b = 90.0 - std::atan2(l1 - cxx, cxy) * 180.0 / M_PI;
+    while (b < 0) b += 180.0;
+    while (b >= 180.0) b -= 180.0;
+    *orientDeg = b;
     if (std::fabs(cxy) < 1e-12) *orientDeg = cxx >= cyy ? 90.0 : 0.0;   // x = east: major axis along east → 90° bearing
 }
 
