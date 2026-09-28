@@ -41,7 +41,8 @@ import javax.inject.Singleton
  *
  * - Help search: when moved more than 5 km or older than 24 h. Pediatric search: moved more than 40 km, older than
  *   30 days, or the radius changed. `force` skips these freshness checks (and the desktop one), never the others.
- * - Never: while backing off (10 min after any failure), with the fix worse than ±5 km, with phone search off, on a
+ * - Never: while backing off (10, 20, 40 … min after failures in a row, at most 4 h: [backoffMs]), with the fix worse
+ *   than ±5 km, with phone search off, on a
  *   metered network with "use mobile data" off, while simulated offline, or with no network at all.
  * - Not needed: a desktop's cached answer less than 24 h old, searched from within 25 km (its `far` rows count for
  *   the pediatric search).
@@ -52,6 +53,7 @@ object PhonePlacesPolicy {
     const val PEDS_MOVE_M = 40_000.0
     const val PEDS_MAX_AGE_MS = 30 * 86_400_000L
     const val BACKOFF_MS = 10 * 60_000L
+    const val MAX_BACKOFF_MS = 4 * 3_600_000L
     const val GAP_MS = 5_000L
     const val MAX_ACCURACY_M = 5_000.0
     const val DESKTOP_NEAR_M = 25_000.0
@@ -75,6 +77,12 @@ object PhonePlacesPolicy {
     data class DesktopCoverage(val help: Boolean = false, val peds: Boolean = false)
 
     data class Plan(val help: Boolean, val peds: Boolean, val note: String) { val any get() = help || peds }
+
+    /**
+     * The back-off after [failures] failed searches in a row: 10, 20, 40 … minutes, at most 4 h (the desktop's
+     * `pedsBackoffS`). Every failed search costs up to two heavy requests (both mirrors), and a busy server stays busy.
+     */
+    fun backoffMs(failures: Int): Long = if (failures <= 1) BACKOFF_MS else minOf(MAX_BACKOFF_MS, BACKOFF_MS shl minOf(failures - 1, 5))
 
     /** Why nothing may be requested at all, or null. */
     fun blocked(now: Long, c: Conditions, busyUntil: Long): String? = when {
@@ -126,8 +134,8 @@ object PhonePlacesPolicy {
 /**
  * [PhonePlaces] over the Overpass API: the help categories only, only when asked (HelpRepository.refresh, i.e. the
  * user opened Help / Places or pulled to refresh with no desktop in reach), never from a worker. One request at a
- * time; the pediatric request waits at least 5 s after the previous one; any failure backs off 10 minutes and keeps
- * everything already cached. Results go to [DesktopCache] (source `phone`: help rows scope `near`, the wide
+ * time; the pediatric request waits at least 5 s after the previous one; failures in a row back off 10, 20, 40 …
+ * minutes (at most 4 h, [PhonePlacesPolicy.backoffMs]) and keep everything already cached. Results go to [DesktopCache] (source `phone`: help rows scope `near`, the wide
  * children's ER search scope `far`) plus the `phoneplaces` snapshot. Logs with tag `BfOverpass` (no coordinates).
  */
 @Singleton
@@ -145,6 +153,7 @@ class OverpassPhonePlaces internal constructor(
     @Volatile private var lastRequestEnd = 0L
     @Volatile override var busyUntil: Long = 0L
         private set
+    @Volatile private var failures = 0                      // failed searches in a row (the back-off doubles)
 
     override suspend fun refreshAround(lat: Double, lon: Double, force: Boolean, pediatric: Boolean): PhonePlacesResult {
         if (!running.tryLock()) return PhonePlacesResult(false, note = "a phone search is already running", skipped = true)
@@ -215,12 +224,13 @@ class OverpassPhonePlaces internal constructor(
         }
 
         if (failure != null) {
-            busyUntil = clock() + PhonePlacesPolicy.BACKOFF_MS
-            Log.w(TAG, "search failed ($failure); backing off ${PhonePlacesPolicy.BACKOFF_MS / 60_000} min, cached places kept")
+            val backoff = PhonePlacesPolicy.backoffMs(++failures)
+            busyUntil = clock() + backoff
+            Log.w(TAG, "search failed ($failure); backing off ${backoff / 60_000} min (failure $failures in a row), cached places kept")
             if (st.origin != null) saveState(st, st.origin!!.lat, st.origin!!.lon, lastSuccessAt(st), PhonePlacesPolicy.NOTE_BUSY)
             return PhonePlacesResult(anyOk, count, PhonePlacesPolicy.NOTE_BUSY)
         }
-        busyUntil = 0L
+        busyUntil = 0L; failures = 0
         return PhonePlacesResult(true, count, if (count == 0) "no help places mapped nearby" else "")
     }
 

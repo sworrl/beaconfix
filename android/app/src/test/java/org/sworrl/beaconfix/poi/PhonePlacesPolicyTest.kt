@@ -84,6 +84,28 @@ class PhonePlacesPolicyTest {
         assertEquals(0L, places.busyUntil)
     }
 
+    @Test fun failuresInARowBackOffLonger() = runBlocking {
+        assertEquals(listOf(10L, 20L, 40L, 80L, 160L, 240L, 240L), (1..7).map { PhonePlacesPolicy.backoffMs(it) / 60_000L })
+        fake.answer = fail
+        places.refreshAround(lat, lon)
+        assertEquals(10 * 60_000L, places.busyUntil - now)
+        now = places.busyUntil + 1
+        places.refreshAround(lat, lon)
+        assertEquals(20 * 60_000L, places.busyUntil - now)
+        now = places.busyUntil + 1
+        places.refreshAround(lat, lon)
+        assertEquals(40 * 60_000L, places.busyUntil - now)
+        assertEquals(3, fake.requests.size)                  // one (failed) help request per attempt, none while backing off
+        // a success resets the count: the next failure backs off 10 minutes again
+        fake.answer = { OverpassResult(true, sample) }
+        now = places.busyUntil + 1
+        assertTrue(places.refreshAround(lat, lon).ok)
+        fake.answer = fail
+        now += 25 * 3_600_000L
+        places.refreshAround(lat, lon)
+        assertEquals(10 * 60_000L, places.busyUntil - now)
+    }
+
     @Test fun freshDataIsSkippedAndMovesTriggerTheRightSearches() = runBlocking {
         val r = places.refreshAround(lat, lon)
         assertTrue(r.ok); assertEquals(12, r.count)            // 6 help rows + 6 pediatric rows

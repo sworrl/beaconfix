@@ -10,10 +10,12 @@ import kotlin.math.cos
  *
  * - [help]: police, fire, hospitals, clinics, urgent care, pharmacies and vets in a 25 km box (the desktop's "wide"
  *   radius for these categories). Kept: the nearest 15 per category within 25 km, scope `near`.
- * - [pediatric]: the desktop's children's ER query (`Locator::queryPediatric`, 3.8): every hospital in the
- *   `pedsRadiusKm` box (classified here, which also yields the general ERs and a children's hospital's campus ER) plus
- *   pediatric clinics / urgent care in a 50 km box. Only exact-tag lookups: value regexes and `around:` over a 300 km
- *   box ran into the server's timeout. Kept: the nearest 5 confirmed pediatric ERs within the radius plus the nearest 5
+ * - [pediatric]: the desktop's children's ER query (`Locator::queryPediatric`, 3.8): every hospital and hospital
+ *   building in the `pedsRadiusKm` box (classified here, which also yields the general ERs and a children's hospital's
+ *   campus ER) plus every clinic, doctor's office and urgent care in a 50 km box. Only exact key=value lookups: value
+ *   regexes and `around:` over a 300 km box ran into the server's timeout, and so did `[name~…,i]` filters (the live
+ *   query gave up after 79 s where the same query without them answered in 11–13 s), so [PedsClassifier] matches the
+ *   names here. Kept: the nearest 5 confirmed pediatric ERs within the radius plus the nearest 5
  *   other pediatric sites, 5 pediatric urgent care within 50 km and 8 general ERs within 80 km, scope `far`.
  */
 object HelpQuery {
@@ -21,7 +23,7 @@ object HelpQuery {
     const val URGENT_RADIUS_M = 50_000
     const val ER_RADIUS_M = 80_000
     const val HELP_TIMEOUT_S = 25
-    const val PEDS_TIMEOUT_S = 60
+    const val PEDS_TIMEOUT_S = 90
     const val KEEP_PER_CAT = 15
     const val KEEP_PEDS_ER = 5
     const val KEEP_PEDS_URGENT = 5
@@ -40,17 +42,14 @@ object HelpQuery {
             "nwr[healthcare~\"^(hospital|clinic|urgent_care|pharmacy)$\"]($bbox);" +
             ");out center tags qt 1500;"
 
-    fun pediatric(far: String, urg: String): String {
-        val kid = "[name~\"pa?ediatric|kids|child\",i]"
-        val spec = "[\"healthcare:speciality\"~\"pa?ediatric\",i]"
-        return "[out:json][timeout:$PEDS_TIMEOUT_S];(" +
+    /** The desktop's query character for character (locator.cpp `queryPediatric` since 47439ea). */
+    fun pediatric(far: String, urg: String): String =
+        "[out:json][timeout:$PEDS_TIMEOUT_S];(" +
             "nwr[amenity=hospital]($far);nwr[healthcare=hospital]($far);" +
-            "nwr[building=hospital][name~\"child|pa?ediatric\",i]($far);nwr[\"emergency:paediatric\"=yes]($far);" +
-            "nwr[amenity=clinic]$kid($urg);nwr[amenity=doctors]$kid($urg);nwr[amenity=urgent_care]$kid($urg);" +
-            "nwr[healthcare=clinic]$kid($urg);nwr[healthcare=urgent_care]$kid($urg);" +
-            "nwr[healthcare=clinic]$spec($urg);nwr[healthcare=urgent_care]$spec($urg);nwr[healthcare=doctor]$spec($urg);" +
+            "nwr[building=hospital]($far);nwr[\"emergency:paediatric\"=yes]($far);" +
+            "nwr[amenity=clinic]($urg);nwr[amenity=doctors]($urg);nwr[amenity=urgent_care]($urg);" +
+            "nwr[healthcare=clinic]($urg);nwr[healthcare=urgent_care]($urg);nwr[healthcare=doctor]($urg);" +
             ");out center tags qt;"
-    }
 
     /** One element with its classification and distance from the search origin. */
     data class Hit(val el: OsmElement, val r: PedsClassifier.Result, val distM: Double)

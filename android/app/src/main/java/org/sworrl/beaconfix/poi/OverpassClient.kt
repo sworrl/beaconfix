@@ -1,6 +1,7 @@
 package org.sworrl.beaconfix.poi
 
 import android.util.Log
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
@@ -31,32 +32,27 @@ interface OverpassSource {
 
 /**
  * Overpass API over its own OkHttp client (not the desktop API's: different hosts, longer waits). Mirrors are tried in
- * order, overpass-api.de then overpass.kumi.systems. HTTP 429, any other non-2xx answer, an empty body, a body that is
- * not JSON, and a `remark` about a timeout / busy server / error all count as failures (Overpass reports overload as
- * HTTP 200 with a remark and no elements). The body is sent as `data=` form data, like the desktop does.
+ * order, overpass-api.de then overpass.kumi.systems, [MIRROR_GAP_MS] apart. HTTP 429, any other non-2xx answer, an
+ * empty body, a body that is not JSON, and a `remark` about a timeout / busy server / error all count as failures
+ * (Overpass reports overload as HTTP 200 with a remark and no elements). The body is sent as `data=` form data, like
+ * the desktop does. The client waits [WAIT_EXTRA_S] longer than the server's own `[timeout:N]`: hanging up first loses
+ * the server's error remark and leaves it running the query in one of our slots.
  */
 @Singleton
 class OverpassClient internal constructor(
     private val http: OkHttpClient,
     private val userAgent: String,
     private val mirrors: List<String>,
+    private val pause: suspend (Long) -> Unit = { delay(it) },
 ) : OverpassSource {
     @Inject constructor() : this(defaultClient(), USER_AGENT, MIRRORS)
 
-    override suspend fun query(query: String, timeoutS: Int): OverpassResult {
-        var last = OverpassResult(false, error = "no Overpass mirror")
-        for (m in mirrors) {
-            val r = post(m, query, timeoutS)
-            if (r.ok) return r
-            Log.w(TAG, "${host(m)}: ${r.error}")
-            last = r
-        }
-        return last
-    }
+    override suspend fun query(query: String, timeoutS: Int): OverpassResult =
+        tryMirrors(mirrors, pause) { m -> post(m, query, timeoutS) }
 
     private suspend fun post(url: String, query: String, timeoutS: Int): OverpassResult {
-        // the read timeout covers the server's own [timeout:N] plus the transfer
-        val waitS = maxOf(READ_TIMEOUT_S, timeoutS + 15).toLong()
+        // the read timeout covers the server's own [timeout:N] plus queueing and the transfer
+        val waitS = readTimeoutS(timeoutS).toLong()
         val client = if (waitS > READ_TIMEOUT_S) http.newBuilder().readTimeout(waitS, TimeUnit.SECONDS).build() else http
         val req = Request.Builder().url(url).header("User-Agent", userAgent).header("Accept", "application/json")
             .post(FormBody.Builder().add("data", query).build()).build()
@@ -81,6 +77,24 @@ class OverpassClient internal constructor(
     companion object {
         const val TAG = "BfOverpass"
         const val READ_TIMEOUT_S = 30
+        const val WAIT_EXTRA_S = 30
+        const val MIRROR_GAP_MS = 5_000L
+
+        /** How long to wait for an answer to a query with server-side `[timeout:timeoutS]` (the pediatric 90 s: 120 s). */
+        fun readTimeoutS(timeoutS: Int) = maxOf(READ_TIMEOUT_S, timeoutS + WAIT_EXTRA_S)
+
+        /** Each mirror in turn until one answers, [MIRROR_GAP_MS] between them (Overpass etiquette: not back to back). */
+        internal suspend fun tryMirrors(mirrors: List<String>, pause: suspend (Long) -> Unit, post: suspend (String) -> OverpassResult): OverpassResult {
+            var last = OverpassResult(false, error = "no Overpass mirror")
+            for ((i, m) in mirrors.withIndex()) {
+                if (i > 0) pause(MIRROR_GAP_MS)
+                val r = post(m)
+                if (r.ok) return r
+                Log.w(TAG, "${host(m)}: ${r.error}")
+                last = r
+            }
+            return last
+        }
         val MIRRORS = listOf("https://overpass-api.de/api/interpreter", "https://overpass.kumi.systems/api/interpreter")
         val USER_AGENT = "BeaconFix-Android/${BuildConfig.VERSION_NAME} (+https://github.com/sworrl/beaconfix)"
 

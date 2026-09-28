@@ -29,18 +29,39 @@ class HelpQueryTest {
         assertTrue(q, q.endsWith("out center tags qt 1500;"))
     }
 
-    @Test fun pediatricQueryHasBothBoxesAndThePediatricClauses() {
+    @Test fun pediatricQueryIsTheDesktopsExactTagQuery() {
         val far = HelpQuery.bbox(lat, lon, 150_000); val urg = HelpQuery.bbox(lat, lon, HelpQuery.URGENT_RADIUS_M)
         val q = HelpQuery.pediatric(far, urg)
-        assertTrue(q, q.startsWith("[out:json][timeout:60];"))
-        assertTrue(q, q.contains("nwr[amenity=hospital]($far)"))
-        assertTrue(q, q.contains("nwr[healthcare=hospital]($far)"))
-        assertTrue(q, q.contains("nwr[\"emergency:paediatric\"=yes]($far)"))
-        assertTrue(q, q.contains("[name~\"pa?ediatric|kids|child\",i]($urg)"))
-        assertTrue(q, q.contains("[\"healthcare:speciality\"~\"pa?ediatric\",i]($urg)"))
-        assertTrue(q, Regex("pa\\?ediatric").containsMatchIn(q))
-        for (b in far.split(',') + urg.split(',')) assertTrue(b, q.contains(b))
+        // locator.cpp queryPediatric (47439ea): the [name~…,i] filters made the live server give up after 79 s
+        assertEquals(
+            "[out:json][timeout:90];(" +
+                "nwr[amenity=hospital]($far);nwr[healthcare=hospital]($far);" +
+                "nwr[building=hospital]($far);nwr[\"emergency:paediatric\"=yes]($far);" +
+                "nwr[amenity=clinic]($urg);nwr[amenity=doctors]($urg);nwr[amenity=urgent_care]($urg);" +
+                "nwr[healthcare=clinic]($urg);nwr[healthcare=urgent_care]($urg);nwr[healthcare=doctor]($urg);" +
+                ");out center tags qt;", q)
+        assertFalse("no name~ (or any value regex): the names are matched by PedsClassifier", q.contains("~"))
         assertFalse("no around: over a wide box", q.contains("around"))
+        // the client outwaits the server: its error remark arrives, and the query does not linger in our slot
+        assertEquals(90, HelpQuery.PEDS_TIMEOUT_S)
+        assertTrue(OverpassClient.readTimeoutS(HelpQuery.PEDS_TIMEOUT_S) >= 120)
+        assertEquals(55, OverpassClient.readTimeoutS(HelpQuery.HELP_TIMEOUT_S))
+    }
+
+    @Test fun mirrorsAreTriedFiveSecondsApart() = kotlinx.coroutines.runBlocking {
+        val pauses = ArrayList<Long>(); val asked = ArrayList<String>()
+        val r = OverpassClient.tryMirrors(OverpassClient.MIRRORS, { pauses += it }) { m ->
+            asked += OverpassClient.host(m)
+            if (asked.size == 1) OverpassResult(false, error = "HTTP 504", http = 504) else OverpassResult(true)
+        }
+        assertTrue(r.ok)
+        assertEquals(listOf("overpass-api.de", "overpass.kumi.systems"), asked)
+        assertEquals(listOf(OverpassClient.MIRROR_GAP_MS), pauses)
+        assertEquals(5_000L, OverpassClient.MIRROR_GAP_MS)
+        // the first mirror answering: no pause at all
+        pauses.clear()
+        assertTrue(OverpassClient.tryMirrors(OverpassClient.MIRRORS, { pauses += it }) { OverpassResult(true) }.ok)
+        assertTrue(pauses.isEmpty())
     }
 
     @Test fun sampleParsesToTheExpectedCategoriesAndTiers() {
