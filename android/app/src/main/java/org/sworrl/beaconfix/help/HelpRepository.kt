@@ -216,7 +216,8 @@ class HelpRepository(private val io: HelpInputs) {
         val pedsNote = pedsNote(e, pedsPick, pedsKm, supported, desktopData, phoneSnap)
 
         val cc = e?.dto?.countryCode?.takeIf { it.isNotBlank() } ?: runCatching { io.countryCode() }.getOrDefault("")
-        val number = e?.dto?.number?.takeIf { it.isNotBlank() } ?: Emergency.number(cc.ifBlank { null })
+        // the red Call buttons dial this: a desktop's number only when it is a real emergency code (Emergency.accept)
+        val number = Emergency.accept(e?.dto?.number, cc.ifBlank { null })
         val address = if (o.known) runCatching { io.address(o.lat, o.lon, netAddress) }.getOrNull() else null
 
         val snap = HelpSnapshot(

@@ -172,7 +172,7 @@ class HelpWidget : GlanceAppWidget() {
         }
 
     @Composable private fun EmergencyPill(hs: HelpSnapshot) {
-        val number = hs.number.ifBlank { Emergency.number(hs.countryCode.ifBlank { null }) }
+        val number = Emergency.accept(hs.number, hs.countryCode.ifBlank { null })   // a saved copy from before 1.4 is checked too
         Box(GlanceModifier.background(GlanceTheme.colors.error).cornerRadius(12.dp).padding(horizontal = 10.dp, vertical = 4.dp).clickable(dial(number))) {
             Text("Call ${number.substringBefore('/').trim()}", style = TextStyle(color = GlanceTheme.colors.onError, fontSize = 12.sp, fontWeight = FontWeight.Bold), maxLines = 1)
         }

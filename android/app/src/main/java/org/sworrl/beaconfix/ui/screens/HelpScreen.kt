@@ -86,7 +86,7 @@ fun HelpScreen(focus: String?, onBack: () -> Unit, onMap: () -> Unit, vm: HelpVi
     var focused by rememberSaveable { mutableStateOf(false) }
     LaunchedEffect(focus) { if (focus == "peds" && !focused) { focused = true; list.scrollToItem(PEDS_INDEX) } }
     var showMore by rememberSaveable { mutableStateOf(false) }
-    val number = ui.number.ifBlank { Emergency.number(snap.countryCode.ifBlank { null }) }
+    val number = Emergency.accept(ui.number, snap.countryCode.ifBlank { null })
     val guessed = !snap.pediatricSupported && snap.source.startsWith("desktop:")
 
     Column(Modifier.fillMaxSize()) {

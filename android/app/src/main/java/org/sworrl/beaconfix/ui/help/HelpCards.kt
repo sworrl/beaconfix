@@ -59,7 +59,7 @@ private fun HelpCardBody(vm: HelpViewModel, onOpen: () -> Unit, modifier: Modifi
     val ctx = LocalContext.current
     val ui by vm.ui.collectAsState()
     val snap by vm.snapshot.collectAsState()
-    val number = ui.number.ifBlank { Emergency.number(snap.countryCode.ifBlank { null }) }
+    val number = Emergency.accept(ui.number, snap.countryCode.ifBlank { null })
     val callLabel = stringResource(R.string.help_call_number, number)
     val first = ui.peds ?: ui.er
     OutlinedCard(onClick = onOpen, modifier = modifier.fillMaxWidth()) {

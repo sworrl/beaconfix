@@ -128,4 +128,35 @@ object SunCalc {
 object Emergency {
     private val table = mapOf("US" to "911", "CA" to "911", "MX" to "911", "GB" to "999", "IE" to "112 / 999", "AU" to "000", "NZ" to "111", "JP" to "110 / 119", "IN" to "112", "BR" to "190 / 192", "ZA" to "10111", "AR" to "911", "CL" to "131 / 133")
     fun number(countryCode: String?): String = countryCode?.uppercase()?.let { table[it] } ?: (if (countryCode.isNullOrEmpty()) "112 / 911" else "112")
+
+    /** The desktop's own table (OsIntegration::emergencyFor): what a real BeaconFix desktop sends per country. */
+    private val desktop = mapOf(
+        "US" to "911", "CA" to "911", "MX" to "911", "GB" to "999 / 112", "IE" to "112 / 999", "AU" to "000", "NZ" to "111",
+        "IN" to "112", "JP" to "110 / 119", "KR" to "112 / 119", "CN" to "110 / 120 / 119", "BR" to "190 / 192 / 193", "AR" to "911",
+        "CL" to "131 / 132 / 133", "CO" to "123", "PE" to "105", "ZA" to "10111 / 10177", "RU" to "112", "UA" to "112", "TR" to "112",
+        "IL" to "100 / 101 / 102", "AE" to "999", "SA" to "911", "EG" to "122 / 123", "NG" to "112", "KE" to "999 / 112", "TH" to "191 / 1669",
+        "VN" to "113 / 115 / 114", "PH" to "911", "ID" to "112", "MY" to "999", "SG" to "999 / 995", "HK" to "999", "TW" to "110 / 119",
+        "CR" to "911", "PA" to "911", "DO" to "911", "JM" to "119 / 110", "IS" to "112", "NO" to "112 / 113 / 110", "CH" to "112 / 117 / 144 / 118",
+    )
+    private fun codes(s: String) = s.split('/').map { it.trim() }.toSet()
+    /** Every emergency code either table names (a country outside both tables routes 112). */
+    private val KNOWN: Set<String> = (desktop.values + table.values).flatMap { codes(it) }.toSet() + "112"
+    /** One part of a desktop's number: a short code, optionally with words ("110 police", "119 fire+ambulance"). */
+    private val PART = Regex("""\d{2,5}(\s+[A-Za-z][A-Za-z+ ]*)?""")
+
+    /**
+     * The number the red Call buttons dial: a paired desktop's [fromDesktop] (its `/emergency` "number") only when it
+     * reads like the desktop's own emergency numbers — short codes, "112 / 999", "110 police / 119 fire+ambulance" —
+     * that belong to [countryCode] (any known emergency code when the country is not in the tables); otherwise this
+     * phone's own number for [countryCode]. A rogue or broken desktop cannot put an ordinary phone number on the
+     * life-safety button.
+     */
+    fun accept(fromDesktop: String?, countryCode: String?): String {
+        val cc = countryCode?.trim()?.uppercase()?.takeIf { it.isNotEmpty() }
+        val own = number(cc)
+        val parts = fromDesktop?.trim()?.takeIf { it.isNotEmpty() }?.split('/')?.map { it.trim() } ?: return own
+        if (!parts.all { PART.matches(it) }) return own
+        val allowed = cc?.let { c -> (desktop[c]?.let(::codes).orEmpty() + table[c]?.let(::codes).orEmpty()).takeIf { it.isNotEmpty() } } ?: KNOWN
+        return if (parts.all { it.takeWhile(Char::isDigit) in allowed }) fromDesktop.trim() else own
+    }
 }

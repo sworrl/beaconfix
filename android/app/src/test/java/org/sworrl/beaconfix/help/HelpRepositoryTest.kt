@@ -184,6 +184,15 @@ class HelpRepositoryTest {
         assertEquals(1, io.searches.size)
     }
 
+    @Test fun aDesktopCannotPutAPhoneNumberOnTheCallButton() = runBlocking {
+        val spoofed = res("emergency_peds.json").replace("\"number\": \"911\"", "\"number\": \"+1 555 0100\"")
+        assertTrue(spoofed.contains("+1 555 0100"))
+        assertEquals("911", HelpRepository(Fake().apply { emergencyJson = spoofed }).refresh().number)
+        val jp = res("emergency_peds.json").replace("\"number\": \"911\"", "\"number\": \"110 police / 119 fire+ambulance\"")
+            .replace("\"countryCode\": \"US\"", "\"countryCode\": \"JP\"")
+        assertEquals("110 police / 119 fire+ambulance", HelpRepository(Fake().apply { emergencyJson = jp }).refresh().number)
+    }
+
     @Test fun theFixAgeComesFromTheFixNotFromTheLastRun() = runBlocking {
         // a cold start (no previous run: lastRunAt 0) whose refresh does a phone search: the snapshot published while the
         // search runs said the fix was ~20000 days old ("now − lastRunAt")
