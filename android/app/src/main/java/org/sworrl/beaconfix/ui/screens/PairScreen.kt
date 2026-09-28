@@ -32,17 +32,32 @@ import org.sworrl.beaconfix.ui.KeyValue
 import org.sworrl.beaconfix.ui.theme.Slate
 import org.sworrl.beaconfix.ui.vm.PairViewModel
 
+/**
+ * Pair with a desktop. [autoHost]/[autoPort]: an address from a launch. With [autoPair] (adb automation only: a debug
+ * build or Developer automation on) the screen connects and pairs at once; otherwise the address is only filled in and
+ * the user is asked first — a link or another app must never pair this phone with a host of its choosing.
+ */
 @Composable
-fun PairScreen(onDone: () -> Unit, autoHost: String? = null, autoPort: Int = 47822, vm: PairViewModel = hiltViewModel()) {
+fun PairScreen(onDone: () -> Unit, autoHost: String? = null, autoPort: Int = 47822, autoPair: Boolean = false, vm: PairViewModel = hiltViewModel()) {
     val st by vm.state.collectAsState()
     val found by vm.found.collectAsState()
     val idNote by vm.identityNote.collectAsState()
     var host by remember { mutableStateOf(autoHost ?: "") }
     var port by remember { mutableStateOf(autoPort.toString()) }
-    androidx.compose.runtime.LaunchedEffect(autoHost) { if (!autoHost.isNullOrBlank()) vm.probe(autoHost, autoPort, false) }
-    androidx.compose.runtime.LaunchedEffect(st) { if (!autoHost.isNullOrBlank() && st is PairState.Found && !(st as PairState.Found).desktop.paired) vm.pair() }
+    var asked by remember { mutableStateOf(!autoPair && !autoHost.isNullOrBlank()) }   // an outside request waits for a yes
+    androidx.compose.runtime.LaunchedEffect(autoHost, autoPair) { if (autoPair && !autoHost.isNullOrBlank()) vm.probe(autoHost, autoPort, false) }
+    androidx.compose.runtime.LaunchedEffect(st) { if (autoPair && !autoHost.isNullOrBlank() && st is PairState.Found && !(st as PairState.Found).desktop.paired) vm.pair() }
     var tls by remember { mutableStateOf(false) }
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(vertical = 8.dp)) {
+        if (asked) InfoCard("Pair with $autoHost:$autoPort?") {
+            Text("A link or another app asked this phone to pair with this address. Pair only if it is your RV's BeaconFix desktop: " +
+                "a paired desktop receives this phone's location history, and its answers fill the Help screen, the widget and the Call button.",
+                style = MaterialTheme.typography.bodyMedium)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(onClick = { asked = false; vm.probe(host, port.toIntOrNull() ?: 47822, tls) }) { Text("Check this desktop") }
+                OutlinedButton(onClick = { asked = false; onDone() }) { Text("Cancel") }
+            }
+        }
         InfoCard("Desktops on this network") {
             if (found.isEmpty()) Text("Searching for _beaconfix._tcp… (the desktop advertises itself only when avahi is installed; otherwise type its address below)", color = Slate, style = MaterialTheme.typography.bodySmall)
             for (f in found) Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {

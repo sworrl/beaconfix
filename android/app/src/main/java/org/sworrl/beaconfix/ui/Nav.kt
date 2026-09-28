@@ -92,7 +92,13 @@ fun BeaconFixRoot(launch: LaunchArgs = LaunchArgs()) {
     val nav = rememberNavController()
     val shareVm: ShareViewModel = hiltViewModel()
     LaunchedEffect(launch.seq) {
-        if (!launch.pairHost.isNullOrBlank()) nav.navigate("pair?host=${launch.pairHost}&port=${launch.pairPort}")
+        // A pairing request from outside (a tapped beaconfix://pair link, any app's pair_host extra) only fills in the
+        // address and asks: a paired desktop receives this phone's location history and feeds the Help screen, widget,
+        // tile and Call button. Only adb automation (a debug build, or Developer automation on) still pairs at once.
+        if (!launch.pairHost.isNullOrBlank()) {
+            val dev = BuildConfig.DEBUG || prefs.devAutomation.first()
+            org.sworrl.beaconfix.nav.PairRequest.route(launch.pairHost, launch.pairPort, dev) { android.net.Uri.encode(it) }?.let { nav.navigate(it) }
+        }
         // A link offer / statement from outside (a tapped link, another app) is never acted on unasked: it waits on the
         // Identity screen for the user's yes (linking lets that device sign in as us and receive our history).
         if (!launch.linkPayload.isNullOrBlank()) { if (!launch.linkPayload.startsWith(org.sworrl.beaconfix.identity.IdentityOps.PREFIX)) idVm.offerIncoming(launch.linkPayload); nav.navigate("identity") }
@@ -132,7 +138,10 @@ private fun Graph(nav: NavHostController, idVm: IdentityViewModel, modifier: Mod
         composable("survey") { SurveyScreen() }
         composable("sync") { SyncScreen(onPair = { nav.navigate("pair") }) }
         composable("settings") { SettingsScreen(onPair = { nav.navigate("pair") }, onIdentity = { nav.navigate("identity") }, onWidgets = { nav.navigate("widgets") }, onImport = { nav.navigate("import") }) }
-        composable("pair?host={host}&port={port}") { entry -> PairScreen(onDone = { nav.popBackStack() }, autoHost = entry.arguments?.getString("host"), autoPort = entry.arguments?.getString("port")?.toIntOrNull() ?: 47822) }
+        composable("pair?host={host}&port={port}&auto={auto}") { entry ->
+            PairScreen(onDone = { nav.popBackStack() }, autoHost = entry.arguments?.getString("host"),
+                autoPort = entry.arguments?.getString("port")?.toIntOrNull() ?: 47822, autoPair = entry.arguments?.getString("auto") == "true")
+        }
         composable("identity") { IdentityScreen(onBack = { nav.popBackStack() }, vm = idVm) }
         composable("anchors") { org.sworrl.beaconfix.ui.screens.AnchorsScreen(onBack = { nav.popBackStack() }, onMap = { nav.navigate("map") }) }
         composable("widgets") { WidgetGalleryScreen(onBack = { nav.popBackStack() }) }

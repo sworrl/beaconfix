@@ -143,7 +143,9 @@ am start -a android.intent.action.VIEW -d 'beaconfix://map?lat=40.0&lon=-75.0&la
 
 `--ez show_when_locked true` lets a launch draw over the lock screen for screenshots. The activity
 is exported, so on a release build `import_*`, `action forget_identity` and the `sim_*` switches
-work only with *Settings → Developer automation* on.
+work only with *Settings → Developer automation* on. `pair_host` and `beaconfix://pair?host=&port=`
+pair at once only then too; otherwise they open the Pair screen with the address filled in and ask
+first (a paired desktop receives the phone's history and feeds the Help screen).
 
 ## Permissions
 
