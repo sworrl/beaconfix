@@ -58,6 +58,14 @@ drops.
 - **The Urgent care pick could be a chiropractor**: `urgent` in `/emergency` (the Nearby tab, the widget,
   the phone) is now the nearest actual urgent care — tagged `urgent_care` or named like one — with
   `urgentCare: true`, or none; the `urgent` category still lists every clinic.
+- **A psychiatric centre, a medical office building and a hospital department were listed as
+  children's ERs** (tier 2, two of them "ER on campus"), and being nearer they pushed a confirmed
+  pediatric ER inside the radius off the kept five. A hospital is no longer a pediatric ER when all
+  its `healthcare:speciality` values are non-emergency ones (psychiatry, rehabilitation, dentistry, …)
+  or its name reads like a residential or adolescent centre, an office or medical building, or a single
+  department (cardiology, oncology, imaging, …); the same rules on the phone, with four new traps in the
+  shared fixture. The far list keeps the nearest 5 confirmed pediatric ERs first, then the nearest 5
+  other sites. A saved list classified by the old rules is searched again once.
 
 #### Changed
 - The map database keeps near places in `pois` with `scope`, `peds`, `er`, `campus`, `drive_s` and
@@ -89,6 +97,13 @@ drops.
   up.
 - The context menu did not hold automatic motion while opening and closing, and the Places menu
   logged "Menu.qml:30:26: TypeError: Cannot read property 'width' of null" at start.
+- **The widget crashed plasmashell** (panel, desktop and every widget; twice on 2026-09-27, each
+  after a tray restart). The radar's flash timer deleted keys from a property-var object that its
+  flash() then added keys to, which crashes Qt 6.11's V4 engine (`QV4::Object::insertMember`). The
+  object is now replaced, never changed in place; a stress copy of the old code crashed within seconds
+  under `qml6`, the new code ran for minutes. The map's tile refresh no longer deletes keys either. (The
+  pattern dates from 3.3.0.)
+- Zooming in and back out before the new level loaded left the map blank until the view moved.
 
 ### Android 1.4.0
 
@@ -176,6 +191,18 @@ drops.
 - A token upgraded with `beaconfix --grant-control` after pairing stayed `read` on the phone (no push,
   no "Send to the RV"); sync re-reads the scopes from desktops with `whoami`, and the incremental-sync
   cursor is kept (every sync overwrote it with the old one).
+- **The phone's own children's ER search never finished**: it still sent the desktop's old query, whose
+  `[name~…,i]` filters made Overpass give up after 79 s while the phone hung up at 75 s, on both mirrors
+  back to back, every time Help or Places opened after the back-off. It now sends the desktop's
+  exact-tag query (`[timeout:90]`, the phone waits 120 s) and matches names locally with the same
+  classifier rules as the desktop, waits 5 s before trying the second mirror, and backs off 10, 20, 40 …
+  minutes (at most 4 h) after failures in a row.
+- **"For the dispatcher" said the fix was about 20 000 days old** while a refresh ran after a cold
+  start (tile, widget and shortcut launches): the age was counted from the previous refresh, 0 then.
+  The snapshot now carries the fix's own time; Copy / Share use it for "Fix taken HH:MM".
+- **After the phone moved with no new data, the Help widget, the tile, the notification and the Kids ER
+  shortcut kept the old spot's nearest places**: they took the newer data, not the newer computation.
+  They now take the most recently computed answer.
 
 #### Security
 - `MainActivity` is exported, so any app could send `--es action forget_identity` (wiping the
@@ -190,6 +217,17 @@ drops.
   receive your history. It waits on the Identity screen for Link / Cancel; only the in-app QR scanner
   acts at once. A place's "Website" opens http(s) addresses only (an OSM `website` tag could hold
   `beaconfix://…`).
+- **Any link or app could pair the phone with a host of its choosing** (`beaconfix://pair?host=&port=`,
+  a browsable link, or the `pair_host` extras): the Pair screen connected and paired without asking,
+  and a rogue host approves itself. A paired desktop receives the phone's unsynced history and feeds
+  Help, the widget, the tile and the Call button. An outside request now only fills in the address and
+  asks ("Pair with …? Check this desktop / Cancel"); only adb automation (a debug build or Developer
+  automation on) pairs at once. The host must look like a host name or address and is encoded into the
+  route (it could add `&…` route parameters). (Since 1.3.)
+- **The red Call buttons dialled whatever number a paired desktop sent** (Help, the Home and Places help
+  cards, the Help widget). A desktop's number is used only when it is made of the emergency codes the
+  desktop's own table has for the country (e.g. "911", "112 / 999", "110 police / 119
+  fire+ambulance"); anything else falls back to the phone's own number for the country.
 
 #### Changed
 - No new permissions; background location is asked for only from the System health card. Predictive
@@ -232,6 +270,12 @@ drops.
   `−max(1 m, 3σ)` (`calib.rttStale`, an event, a line on the phone's range card): RTT stays out of the
   fusion until the next calibration, the range's interval widens, and learning also needs the range to
   have held within ±12 % for 30 s with no RTT outlier. Recalibrate a pair that shows it.
+- **A stale RTT offset left the BLE models it had taught at full confidence**: only the range's variance
+  was widened, once, and BLE updates through those models narrowed it again within minutes (0.21–0.33 m
+  ± 0.1 m 55 minutes later, models at P0 −68 / −83 dBm against the calibration's −79 / −94). A manual
+  calibration now keeps a copy of both links' models (`rlsDownCal` / `rlsUpCal` in `ranging.json`); a
+  stale offset puts them back and returns both BLE offsets to their prior, so the interval stays wide
+  (×/÷ 2) until a recalibration.
 - **The desktop's BLE advert never recovered from a failed registration**: a `RegisterAdvertisement`
   that bluetoothd answered late (NoReply, then AlreadyExists) was read as "TX power not supported" and
   given up for good, leaving a stale advert on the air with `txPower` 127. Only shape errors drop the
