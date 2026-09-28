@@ -155,10 +155,6 @@ devices (Android 13+, scans and Wi-Fi RTT), Nearby devices / Bluetooth scan+adve
 (Android 12+, BLE ranging), notifications, camera (QR scanning only). 1.4 adds none. Android 10+ throttles foreground scans to 4 per 2 minutes; for a survey turn
 off *Developer options → Networking → Wi-Fi scan throttling*.
 
-## Screenshots
-
-_(to be added: Home, Map, Beacons, Places, Trip, Events, Identity, Anchors, Settings, Widgets, status notification)_
-
 ## License
 
 GPL-2.0-or-later, like the desktop app.

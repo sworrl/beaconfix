@@ -18,9 +18,12 @@ so places you have been before resolve again with no network at all.
   computer can ask "where are we?".
 - **Home networks**: mark the networks that travel with you; they are never used for
   positioning and give an "at home / 12 km from home" state.
-- A **tray icon**, a **Qt window**, a **Plasma widget**, a **D-Bus** interface and a **CLI**.
-
-> Screenshots: `docs/img/` (map, trip, widget, security panel). Not included yet.
+- **Nearest help**: police, fire, the nearest ER and the nearest pediatric ER with phone numbers,
+  addresses and drive times, plus the local emergency number.
+- **Android app** that records beacons with the phone's GPS, mirrors the desktop offline, ranges
+  to it in metres and adds a Help screen, widgets and Quick Settings tiles.
+- A **tray icon**, a **Qt window**, a **Plasma widget**, a **D-Bus** interface, a **CLI** and an
+  optional **Raspberry Pi agent**.
 
 ## Install
 
@@ -54,6 +57,10 @@ sudo apt install ./build-pkg/beaconfix_*.deb
 
 Then add **BeaconFix** through *Add Widgets* on the desktop or a panel. The tray starts at
 login; the first start migrates any older JSON state into the database.
+
+**Android app**: install `beaconfix-<version>.apk` from the
+[releases](https://github.com/sworrl/beaconfix/releases) page (Android 8+), open it and pair it
+with the desktop from *Link*. Building it yourself: [android/README.md](android/README.md).
 
 ### Optional: device ranging and the Pi agent
 
@@ -90,22 +97,28 @@ anything heard at two places further apart than the fixes' own error, hotspot-li
 one 500 MB tile cache; the trip track; beacons drawn at their mapped position (gold diamond),
 multilaterated position (gold dot with a dashed ring), observed position (hollow diamond) or as
 a signal-distance orbit (cyan); Wi-Fi names beside the beacons with collision avoidance and band
-badges; places of interest from OpenStreetMap aimed at life on the road (fuel, propane, camping,
-water, dump stations, laundry, groceries, Wi-Fi, rest areas), **emergency & civic** places
-(police, fire stations, hospitals with an ER, **pediatric ERs** — searched out to 150 km, each with
-its confidence: dedicated pediatric ER, children's hospital with an ER on campus or not confirmed
-("call ahead"), general ER with a pediatrics department — **pediatric urgent care** (marked "not
-an ER"), urgent care, pharmacies, dentists, vets, libraries, town halls, courthouses, DMV,
-schools, community centres) and **kids & fun** places (playgrounds, parks, dog parks, pools,
-splash pads, zoos, museums, theme parks, ice cream, cinemas, bowling, arcades, trampoline and
-skate parks, beaches, picnic sites, trailheads) — each with its address, phone number (tap to
-call), hours and wheelchair access where OpenStreetMap has them — grouped and filterable, with a
-**Nearby** list and a **nearest help** card (police, fire, ER, the nearest pediatric ER and a
-closer one when it is less certain, urgent care, estimated drive times and the local emergency
-number; the general ER is never hidden behind a pediatric one). Events animate: ripples for new
-beacons, fade-outs for lost ones, chevrons for level changes, a glide when a beacon gets placed,
-an arrow for a new fix, a pin for a new stop; a ticker keeps the last five. **Cinematic mode**
-glides to events and periodically zooms out to city and state scale.
+badges. Events animate: ripples for new beacons, fade-outs for lost ones, chevrons for level
+changes, a glide when a beacon gets placed, an arrow for a new fix, a pin for a new stop; a
+ticker keeps the last five. **Cinematic mode** glides to significant events and zooms out to
+city and state scale every 20 minutes by default, never while you are using the map.
+
+**Places** from OpenStreetMap, each with its address, phone number (tap to call), hours and
+wheelchair access where OpenStreetMap has them, grouped and filterable in a **Nearby** list:
+
+- **On the road**: fuel, propane, camping, water, dump stations, laundry, groceries, Wi-Fi,
+  rest areas.
+- **Emergency and civic**: police, fire stations, hospitals with an ER, **pediatric ERs**
+  (searched out to 150 km, each with its confidence: dedicated pediatric ER; children's hospital
+  with an ER on campus, or not confirmed, "call ahead"; general ER with a pediatrics
+  department), **pediatric urgent care** (marked "not an ER"), urgent care, pharmacies,
+  dentists, vets, libraries, town halls, courthouses, DMV, schools, community centres.
+- **Kids and fun**: playgrounds, parks, dog parks, pools, splash pads, zoos, museums, theme
+  parks, ice cream, cinemas, bowling, arcades, trampoline and skate parks, beaches, picnic
+  sites, trailheads.
+
+The **nearest help** card lists police, fire, the nearest ER, the nearest pediatric ER (and a
+closer one when that one is less certain), urgent care, estimated drive times and the local
+emergency number. The general ER is never hidden behind a pediatric one.
 
 **Security**: every beacon carries NetworkManager's RSN/WPA flags and is graded (open, WEP,
 WPA1, WPA2 with TKIP, WPA2-PSK, WPA2-Enterprise, WPA2/3 transition, WPA3-SAE, WPA3-192, OWE).
@@ -135,6 +148,10 @@ devices as an encrypted bundle (QR, text, file, or a 6-digit code on the LAN); i
 created identities can be linked; devices sign in to the API with a challenge signature instead
 of pairing codes. [docs/IDENTITY.md](docs/IDENTITY.md).
 
+**Device ranging**: the phone and the Pi agent measure their distance to the desktop with Wi-Fi
+RTT (802.11mc, about a metre) and BLE, fused with the maths in [docs/RANGING.md](docs/RANGING.md);
+antenna positions can be placed on the map as anchors.
+
 **OS integration** (each part opt-in): the system **time zone follows the fix** (timedated over
 D-Bus; a shipped polkit rule makes it prompt-free for admins), the fix is **published to GeoClue**
 through a small root helper so location-aware apps, browsers and Night Light see it, **KWin Night
@@ -150,6 +167,8 @@ code) are exposed for other widgets.
 | Plasma widget `org.kde.plasma.beaconfix` | panel or desktop applet with Map, Nearby, Radar and Trip tabs — [docs/WIDGET.md](docs/WIDGET.md) |
 | D-Bus `org.sworrl.BeaconFix` | properties, methods and signals for scripts and other apps — [docs/DBUS.md](docs/DBUS.md) |
 | CLI | `--once`, `--json`, `--refresh`, `--gpx`, `--copy`, `--nearby <what>`, `--tz`, `--apply-os`, `--identity…`, `--refit`, `--sync <peer>`, `--peers`, `--import <file>`, API / home / known-device / database management — `beaconfix --help` |
+| Android app `org.sworrl.beaconfix` | beacon recording, offline mirror, Help, ranging, widgets, tiles — [android/README.md](android/README.md) |
+| Pi agent `agent/beaconfix-agent` | a Raspberry Pi with a GPS HAT as position witness, BLE radio and NTP server — [docs/AGENT.md](docs/AGENT.md) |
 | `beaconfix-osd` | tiny root helper (pkexec) that writes `/etc/geolocation` for GeoClue; installed with its polkit action and rules by `install.sh` / the package |
 
 ## Privacy
@@ -165,6 +184,7 @@ What leaves the machine, and to whom:
 | places are refreshed | Overpass (OpenStreetMap) | the coordinates and a radius |
 | a precise stop is logged (can be disabled) | Open Topo Data | the coordinates, for elevation |
 | the map is shown | the tile servers of the selected style (OpenStreetMap, Esri, OpenTopoMap) | tile coordinates |
+| you open Help on the phone with no desktop in reach | Overpass (OpenStreetMap) | the phone's coordinates and a radius |
 | optional, only with a token | WiGLE | BSSIDs, one at a time |
 | Starlink tier | the dish on your own LAN | nothing leaves the LAN |
 
