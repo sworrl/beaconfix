@@ -178,14 +178,18 @@ class WidgetUpdater @Inject constructor(
     }
 
     /**
-     * The newest help answer: the live one from [org.sworrl.beaconfix.help.HelpRepository] when it is newer than the
-     * persisted copy (which it then replaces), else the persisted copy, so the widget, tiles and notification keep
-     * showing the last answer after the process was killed. More than a day old = shown as "saved".
+     * The newest help answer ([org.sworrl.beaconfix.tile.TileModel.newest]): the live one from
+     * [org.sworrl.beaconfix.help.HelpRepository] when it was computed after the persisted copy (which it then replaces),
+     * else the persisted copy, so the widget, tiles and notification keep showing the last answer after the process was
+     * killed. Compared by when it was computed, not by the data's age: after the phone moved with no new data the live
+     * picks and distances are from the new origin, and the old copy named another "nearest" ER. More than a day old =
+     * shown as "saved".
      */
     suspend fun helpNow(): org.sworrl.beaconfix.help.HelpSnapshot {
         val saved = runCatching { HelpStore.load(ctx) }.getOrDefault(org.sworrl.beaconfix.help.HelpSnapshot())
         val live = runCatching { help.get().snapshot.value }.getOrNull()
-        val best = if (live != null && live.fetchedAt > saved.fetchedAt) live.also { runCatching { HelpStore.save(ctx, it) } } else saved
+        val best = org.sworrl.beaconfix.tile.TileModel.newest(live, saved)
+        if (best !== saved) runCatching { HelpStore.save(ctx, best) }
         return org.sworrl.beaconfix.tile.TileModel.aged(best, System.currentTimeMillis())
     }
 

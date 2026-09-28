@@ -78,6 +78,23 @@ class TileModelTest {
         assertFalse(TileModel.aged(HelpSnapshot(), 10 * 24 * 3600_000L).stale)
     }
 
+    @Test fun theNewestComputationWinsNotTheNewestData() {
+        // saved at 10:00 from the old origin; at 11:00 the phone moved and recomputed from the same (older) data
+        val saved = snap(tier1, er, at = 5_000L).copy(computedAt = 10_000L)
+        val moved = snap(tier1.copy(distM = 2_000.0), er.copy(distM = 30_000.0), at = 4_000L).copy(computedAt = 11_000L, originLat = 40.2)
+        assertEquals(moved, TileModel.newest(moved, saved))
+        // the live snapshot before its first computation (process just started) never replaces the saved copy
+        assertEquals(saved, TileModel.newest(HelpSnapshot(), saved))
+        assertEquals(saved, TileModel.newest(null, saved))
+        // an older computation loses; a copy saved before computedAt existed (0) loses to any computed answer
+        assertEquals(saved, TileModel.newest(moved.copy(computedAt = 9_000L), saved))
+        assertEquals(moved, TileModel.newest(moved, saved.copy(computedAt = 0L)))
+        // a newer answer with nothing in reach keeps the saved places; with nothing saved either it is shown
+        val empty = HelpSnapshot(number = "911", computedAt = 12_000L, fetchedAt = 0L)
+        assertEquals(saved, TileModel.newest(empty, saved))
+        assertEquals(empty, TileModel.newest(empty, HelpSnapshot()))
+    }
+
     @Test fun urgentCareIsNeverAnEr() {
         val urg = HelpPlace(HelpKind.PEDS_URGENT, "Test Kids Express Care", 40.05, -75.0, tier = 4, notEr = true, distM = 5_000.0)
         assertEquals("Not an ER", TileModel.tierText(urg))

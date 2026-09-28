@@ -95,7 +95,7 @@ object Shortcuts {
         val help = remember { EntryPointAccessors.fromApplication(ctx.applicationContext, WidgetEntryPoint::class.java).help() }
         val live by help.snapshot.collectAsState()
         val stored by produceState(HelpSnapshot()) { value = runCatching { HelpStore.load(ctx) }.getOrDefault(HelpSnapshot()) }
-        val kids = (if (live.fetchedAt >= stored.fetchedAt) live else stored).first(HelpKind.PEDS_ER)
+        val kids = org.sworrl.beaconfix.tile.TileModel.newest(live, stored).first(HelpKind.PEDS_ER)
         val supported = remember { ShortcutManagerCompat.isRequestPinShortcutSupported(ctx) }
         OutlinedButton(enabled = supported && kids != null, onClick = {
             kids?.let { runCatching { ShortcutManagerCompat.requestPinShortcut(ctx, info(ctx, kidsSpec(ctx, it)), null) } }

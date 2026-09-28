@@ -57,6 +57,15 @@ object TileModel {
     fun aged(s: HelpSnapshot, now: Long): HelpSnapshot =
         if (!s.stale && s.fetchedAt > 0 && now - s.fetchedAt > MAX_FRESH_MS) s.copy(stale = true) else s
 
+    /**
+     * The answer the surfaces should show: the live one from HelpRepository when it was computed after the saved copy
+     * ([HelpSnapshot.computedAt], not the data's age: the phone moving recomputes picks and distances from the same, or
+     * older, data) and has places, or the saved copy is empty too; otherwise the saved copy (process restarted, or a
+     * refresh that found nothing in reach). A copy saved before 1.4's computedAt reads 0, so any live answer beats it.
+     */
+    fun newest(live: HelpSnapshot?, saved: HelpSnapshot): HelpSnapshot =
+        if (live != null && live.computedAt > saved.computedAt && (live.places.isNotEmpty() || saved.places.isEmpty())) live else saved
+
     fun collector(on: Boolean): CollectorTile = CollectorTile(if (on) "On" else "Paused", on)
 
     /** Tile / widget word for a pediatric site by tier. */
