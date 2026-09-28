@@ -56,7 +56,8 @@ data class AddressLine(
 
 /**
  * Everything the Help surfaces show, computed by HelpRepository.
- * [origin]: "phone" | "rv" | "none" — where distances are measured from ([originLat]/[originLon], [originAgeMs] old).
+ * [origin]: "phone" | "rv" | "none" — where distances are measured from ([originLat]/[originLon], taken at [originAt]
+ * epoch ms, 0 = unknown; [originAgeMs] old when the snapshot was computed, at [computedAt] epoch ms).
  * [source]: who found the places ("desktop:<id>" | "phone" | ""). [pediatricSupported]: the desktop has the 3.8
  * "pediatric" feature (otherwise the tiers come from the phone-side fallback). [stale]: old or far from the fetch origin.
  */
@@ -78,7 +79,12 @@ data class HelpSnapshot(
     val lastError: String = "",
     val poisonControl: String? = null,
     val address: AddressLine? = null,
+    val originAt: Long = 0,
+    val computedAt: Long = 0,
 ) {
+    /** How old the origin fix is at [now]: from its own time, not from when some refresh ran (null = unknown). */
+    fun originAgeAt(now: Long): Long? = if (originAt > 0) (now - originAt).coerceAtLeast(0) else null
+
     /** The first place of [kind] (see [HelpKind]), or null. */
     fun first(kind: String): HelpPlace? = places.firstOrNull { it.kind == kind }
 }

@@ -184,6 +184,27 @@ class HelpRepositoryTest {
         assertEquals(1, io.searches.size)
     }
 
+    @Test fun theFixAgeComesFromTheFixNotFromTheLastRun() = runBlocking {
+        // a cold start (no previous run: lastRunAt 0) whose refresh does a phone search: the snapshot published while the
+        // search runs said the fix was ~20000 days old ("now − lastRunAt")
+        val fixAt = NOW - 90_000L
+        val io = Fake().apply {
+            desktopAnswers = false; desk = null; rows = listOf(general.copy(fetchedAt = NOW - 3 * 86_400_000L))
+            phoneFixV = FixEntity(time = fixAt, lat = 40.001, lon = -75.001, acc = 8.0, source = "phone-gps")
+        }
+        val repo = HelpRepository(io)
+        var during: HelpSnapshot? = null
+        io.onSearch = { during = repo.snapshot.value }
+        val s = repo.refresh()
+        assertEquals(1, io.searches.size)
+        for (snap in listOf(during!!, s)) {
+            assertEquals(fixAt, snap.originAt)
+            assertEquals(90_000L, snap.originAgeAt(NOW))
+            assertEquals(NOW, snap.computedAt)
+        }
+        assertEquals(0L, HelpSnapshot().originAt); assertNull(HelpSnapshot().originAgeAt(NOW))
+    }
+
     @Test fun phoneSearchRespectsTheSwitch() = runBlocking {
         val io = Fake().apply { desktopAnswers = false; phonePlacesEnabled = false; phoneFixV = FixEntity(time = NOW, lat = 40.0, lon = -75.0, acc = 5.0, source = "phone-gps") }
         HelpRepository(io).refresh(force = true)

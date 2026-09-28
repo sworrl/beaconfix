@@ -160,7 +160,9 @@ private fun DispatcherCard(s: HelpSnapshot, meta: HelpMeta, now: Long) {
     Section(stringResource(R.string.help_dispatcher_title)) {
         if (s.origin == Origin.NONE) { Text(stringResource(R.string.help_dispatcher_none)); return@Section }
         Text(String.format(Locale.US, "%.5f, %.5f", s.originLat, s.originLon), fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-        val age = (s.originAgeMs + (now - meta.lastRunAt).coerceAtLeast(0)).let { if (it < 60_000) "now" else durText(it / 1000) + " ago" }
+        // from the fix's own time: an early publish during a refresh carries the previous run's lastRunAt (0 after a cold
+        // start, which read "20724 d ago")
+        val age = (s.originAgeAt(now) ?: s.originAgeMs).let { if (it < 60_000) "now" else durText(it / 1000) + " ago" }
         Text(
             if (meta.originAccM > 0) stringResource(R.string.help_dispatcher_acc_age, metres(meta.originAccM), age) else stringResource(R.string.help_dispatcher_age, age),
             color = Slate, style = MaterialTheme.typography.bodySmall,
@@ -179,7 +181,7 @@ private fun DispatcherCard(s: HelpSnapshot, meta: HelpMeta, now: Long) {
         fun text(at: Long) = ShareText.location(
             s.originLat, s.originLon, meta.originAccM.takeIf { it > 0 }, dispatcherAddress(s.address),
             label = if (s.origin == Origin.RV) ShareText.RV_POSITION else null,
-            fixAtMs = if (s.originAgeMs > 0 && meta.lastRunAt > 0) meta.lastRunAt - s.originAgeMs else 0L, nowMs = at,
+            fixAtMs = s.originAt, nowMs = at,
         )
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             OutlinedButton(onClick = { clip.setText(AnnotatedString(text(System.currentTimeMillis()))); copied = true }, modifier = Modifier.heightIn(min = 48.dp)) {

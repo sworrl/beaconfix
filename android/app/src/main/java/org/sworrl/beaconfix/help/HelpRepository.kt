@@ -224,6 +224,7 @@ class HelpRepository(private val io: HelpInputs) {
             pediatricSupported = supported, origin = o.kind, originLat = o.lat, originLon = o.lon, originAgeMs = o.ageMs(now),
             source = newest?.source.orEmpty(), fetchedAt = fetchedAt, stale = stale, lastError = "",
             poisonControl = NearestHelp.poisonControl(cc), address = address,
+            originAt = if (o.known && o.time > 0) o.time else 0L, computedAt = now,
         )
         val meta = prevMeta.copy(originAccM = o.accM, dataLat = if (dataValid) newest!!.originLat else 0.0, dataLon = if (dataValid) newest!!.originLon else 0.0, dataDistM = dataDist)
         return Built(snap, meta)
