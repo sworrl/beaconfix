@@ -1234,6 +1234,12 @@ void ApiServer::handle(QTcpSocket *s, const Request &r)
         finish(200, QJsonObject{{"deleted", id}});
         return;
     }
+    // ── the estimator: calibration, device offsets, BSSID groups, grade counts, where to sample next (docs/GRADING.md) ──
+    if (ep == QLatin1String("estimator")) {
+        if (!get) { finish(405, QJsonObject{{"error", "method not allowed"}}, {"Allow: GET"}); return; }
+        finish(200, m_loc->estimatorJson());
+        return;
+    }
     // ── device ranging (docs/RANGING.md §7) ──
     if (ep == QLatin1String("ranging/info")) {
         if (!get) { finish(405, QJsonObject{{"error", "method not allowed"}}, {"Allow: GET"}); return; }

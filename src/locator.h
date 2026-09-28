@@ -63,6 +63,7 @@ struct ApRecord {
     bool adhoc = false;
     Estimator::Fit fit;               // our own multilateration from obs (valid when the geometry allows it)
     bool   fitDirty = false;          // new observations since the last full fit
+    bool   fitCurrent = false;        // the fit came from this estimator version (else it is recomputed at start-up)
     double peerLat = 0, peerLon = 0, peerAcc = 0;   // a position another BeaconFix / the phone synced to us
     QString peerFrom;                 // which device ("" = none)
     bool   hasPeer() const { return !peerFrom.isEmpty() && peerAcc > 0; }
@@ -70,7 +71,7 @@ struct ApRecord {
 
 // Where we think an AP is, for the map
 struct ApEstimate {
-    enum Kind { None, Ring, Centroid, Wigle, Observed, Trilat, Peer, Anchor } kind = None;   // Observed: one place we heard it · Trilat: our fit · Peer: synced from another device · Anchor: surveyed (docs/RANGING.md §4)
+    enum Kind { None, Ring, Centroid, Wigle, Observed, Trilat, Peer, Anchor, Region, Mobile } kind = None;   // Observed: one place we heard it · Trilat: our fit · Peer: synced from another device · Anchor: surveyed (docs/RANGING.md §4) · Region: our fit, region only (grade R) · Mobile: travels (grade M)
     double lat = 0, lon = 0;          // Centroid / Wigle / Trilat / Peer: the estimate. Ring: our own position.
     double radiusM = 0;               // Ring: RSSI distance. Others: uncertainty.
     double bearingDeg = 0;            // Ring only: stable pseudo-bearing (bearing is unknown)
@@ -78,7 +79,7 @@ struct ApEstimate {
     Estimator::Fit fit;               // Trilat: the fit statistics
     // When a placement (WiGLE / Apple) and our own fit disagree by more than 3× their accuracy, both are reported
     bool   hasAlt = false; Kind altKind = None; double altLat = 0, altLon = 0, altAcc = 0;
-    static const char *kindName(Kind k) { switch (k) { case Ring: return "ring"; case Centroid: return "centroid"; case Wigle: return "wigle"; case Observed: return "observed"; case Trilat: return "trilat"; case Peer: return "peer"; case Anchor: return "anchor"; default: return "none"; } }
+    static const char *kindName(Kind k) { switch (k) { case Ring: return "ring"; case Centroid: return "centroid"; case Wigle: return "wigle"; case Observed: return "observed"; case Trilat: return "trilat"; case Peer: return "peer"; case Anchor: return "anchor"; case Region: return "region"; case Mobile: return "mobile"; default: return "none"; } }
 };
 
 // Point-of-interest category (OpenStreetMap tags → icon, colour, label)
@@ -383,6 +384,11 @@ public:
     // Environment calibration from anchors (§4.3.3): per band P0 / n of the path-loss model, and the n the AP fits start from
     double  environmentN(int freqMHz) const;
     QJsonObject environmentJson() const;
+    // The estimator (docs/GRADING.md): priors per band, calibration, device offsets, BSSID groups, grade counts
+    Estimator::Options estimatorOptions(int freqMHz) const;
+    QJsonObject estimatorJson() const;
+    static QJsonObject fitJson(const Estimator::Fit &f);  // the "fit" object of the AP JSON (API / D-Bus / sync)
+    void    calibrateEstimator();                        // anchor leave-one-out κ + per-device offsets + BSSID groups
     // Device ranging (docs/RANGING.md §5–§8); set by the tray
     void    setRanging(RangingService *r) { m_ranging = r; }
     RangingService *ranging() const { return m_ranging; }
@@ -435,7 +441,8 @@ public slots:
     bool    KnownRemove(const QString &mac);
     int     KnownImport(const QString &path);
     void    SetHomeNetworks(const QStringList &patterns) { setHomeNetworks(patterns); }
-    int     Refit();                                     // full refit of every beacon with enough samples; returns valid fits
+    int     Refit();                                     // full refit of every beacon with samples; returns valid fits
+    QString EstimatorJson() const;                       // JSON: GET /api/v1/estimator (calibration, device offsets, groups, grades)
     QString Sync(const QString &url, const QString &token);   // one sync round with another BeaconFix; JSON result.
                                                               // url may be a peer's name / hostname / address (resolved through mDNS);
                                                               // token may be empty when our identity is the peer's or linked to it
@@ -509,6 +516,15 @@ private:
     void refitQueued();
     bool refitOne(const QString &bssid, qint64 now);
     QList<Estimator::Obs> obsFor(const ApRecord &r, const QString &bssid) const;
+    Estimator::Context contextFor(const ApRecord &r, const QString &bssid, const QList<Estimator::Obs> &obs) const;
+    QList<Estimator::Miss> missesFor(const QList<Estimator::Obs> &obs) const;
+    void noteScanCell(const Fix &at);
+    void thinObservations(ApRecord &r);
+    void rebuildGroups();
+    void calibrateDeviceOffsets();
+    void calibrateAnchors();
+    void finishUpgradeRefit();
+    void queueUpgradeRefits();
     void loadSyncPeers();
     void saveSyncPeers() const;
     void syncStep(int peerIndex);
@@ -641,6 +657,18 @@ private:
     QHash<QString, QDateTime> m_insecureNoted; // ap_insecure once per BSSID per 24 h
     QSet<QString> m_refitQueue;         // BSSIDs with new samples, refit in a batch
     QTimer m_refitTimer;
+    // Estimator state (docs/GRADING.md)
+    struct ScanCell { double lat = 0, lon = 0; int count = 0; qint64 first = 0, last = 0; };
+    QHash<QString, ScanCell> m_scanCells;                // ~15 m cells this host scanned from (misses)
+    QHash<QString, QStringList> m_scanIndex;             // 0.01° bucket → scan cell keys
+    struct GroupInfo { QString ref; double offsetDb = 0; int size = 1; };
+    QHash<QString, GroupInfo> m_groups;                  // member BSSID → its group (multi-BSSID pooling)
+    QHash<QString, double> m_devOffsets;                 // device → dB it hears louder than this host
+    double m_kappa = 1.0;                                // anchor calibration (σ multiplier)
+    QJsonObject m_calibration;                           // last anchor leave-one-out result
+    QSet<QString> m_upgradePending;                      // estimates still to recompute with the new engine
+    bool   m_upgradeActive = false;
+    QTimer m_calibrateTimer;
     QList<SyncPeer> m_syncPeers;
     QTimer m_syncTimer;
     bool m_syncBusy = false;

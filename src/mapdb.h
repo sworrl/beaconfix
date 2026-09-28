@@ -51,6 +51,12 @@ public:
                        const QHash<QString, int> &flags);      // flags: bit0 home, bit1 travelling, bit2 ignored; assigns observation ids
     void saveRecord(const QString &bssid, ApRecord &r, int flags);   // one record (new / changed observations only)
     void saveEstimate(const QString &bssid, const Estimator::Fit &fit);
+    void appendEstimateHistory(const QString &bssid, const Estimator::Fit &fit);   // the last 20 per beacon
+    QJsonArray estimateHistory(const QString &bssid) const;
+    // Cells (~15 m) this host scanned from: where a beacon was NOT heard (docs/GRADING.md §1.7)
+    struct ScanCellRow { QString key; double lat = 0, lon = 0; int count = 0; qint64 first = 0, last = 0; };
+    QList<ScanCellRow> loadScanCells() const;
+    void saveScanCell(const ScanCellRow &c);
     // Change sequence for sync: every stored/changed AP position, observation and fix gets the next number
     qint64 currentSeq() const { return m_seq; }
     QJsonObject changesSince(qint64 since, int limit, bool *more, qint64 *cursor) const;

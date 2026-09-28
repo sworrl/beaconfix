@@ -110,6 +110,7 @@ int main(int argc, char **argv)
     QCommandLineOption importTo(QStringLiteral("to"), QStringLiteral("With --import: only entries at or before <date>."), QStringLiteral("date"));
     QCommandLineOption importWhat(QStringLiteral("what"), QStringLiteral("With --import: what to take, comma-separated from positions,wifi,places (default all)."), QStringLiteral("list"));
     QCommandLineOption refit(QStringLiteral("refit"), QStringLiteral("Re-estimate every beacon's position from all its samples (least squares), print the count, exit."));
+    QCommandLineOption estimatorOpt(QStringLiteral("estimator"), QStringLiteral("Print the estimator's state (grade counts, anchor calibration, device offsets, BSSID groups, where to sample next) as JSON, exit."));
     QCommandLineOption sync(QStringLiteral("sync"), QStringLiteral("Sync samples, positions and stops with another BeaconFix: --sync <peer name | host | http://host:47822> [--sync-token <token>]; without a token our identity signs in when the peer shares or links it; exit."), QStringLiteral("peer"));
     QCommandLineOption noMdns(QStringLiteral("no-mdns"), QStringLiteral("With --tray: do not advertise this BeaconFix on the network (mDNS); browsing for others still works. Test instances with a non-default XDG_CONFIG_HOME never advertise."));
     QCommandLineOption peers(QStringLiteral("peers"), QStringLiteral("List the BeaconFix devices on this network (mDNS), exit."));
@@ -138,7 +139,7 @@ int main(int argc, char **argv)
     QCommandLineOption rangingCal(QStringLiteral("ranging-calibrate"), QStringLiteral("Calibrate ranging with a device lying at a known distance: <device>@<metres>[@<seconds>], e.g. \"Pixel 10@0.61\", exit."), QStringLiteral("device@metres"));
     p.addOptions({anchorsOpt, anchorSet, anchorRemove, grantControl, rangingOpt, rangingCal});
     p.addOptions({tray, once, json, refresh, snapshot, gpx, copy, newTrip, prefetch, apiStatus, devices, approve, deny, revoke, token, control, pairing,
-                  homeAdd, homeRemove, homeList, homeSync, homeToken, homeImport, knownImport, knownList, knownAdd, knownName, knownRemove, dbStats, dbExport, dbImport, importOpt, importFrom, importTo, importWhat, refit, sync, syncToken, noMdns, peers, scan, allPeers,
+                  homeAdd, homeRemove, homeList, homeSync, homeToken, homeImport, knownImport, knownList, knownAdd, knownName, knownRemove, dbStats, dbExport, dbImport, importOpt, importFrom, importTo, importWhat, refit, estimatorOpt, sync, syncToken, noMdns, peers, scan, allPeers,
                   identity, identityNew, identityExport, identityFile, identityWords, identityPass, identityImport, identityLinkQr, identitySelftest, tz, applyOs, dryRun, nearby, radius});
     p.process(app);
 
@@ -528,6 +529,15 @@ int main(int argc, char **argv)
         return 0;
     }
 
+    if (p.isSet(estimatorOpt)) {
+        QDBusInterface iface(SVC, PATH, SVC, bus);
+        if (!iface.isValid()) { fprintf(stderr, "beaconfix: --estimator needs the running instance\n"); return 1; }
+        QDBusReply<QString> r = iface.call(QStringLiteral("EstimatorJson"));
+        if (!r.isValid()) { fprintf(stderr, "beaconfix: %s\n", qPrintable(r.error().message())); return 1; }
+        out << QJsonDocument::fromJson(r.value().toUtf8()).toJson(QJsonDocument::Indented);
+        out.flush();
+        return 0;
+    }
     if (p.isSet(refit) || p.isSet(sync)) {
         QDBusInterface iface(SVC, PATH, SVC, bus);
         if (!iface.isValid()) { fprintf(stderr, "beaconfix: %s needs the running instance\n", p.isSet(refit) ? "--refit" : "--sync"); return 1; }

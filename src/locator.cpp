@@ -6,6 +6,7 @@
 #include "mdns.h"
 #include "notify.h"
 #include "mapdb.h"
+#include "fitjson.h"
 #include "importers.h"
 #include "poiclassify.h"
 #include <QClipboard>
@@ -25,6 +26,7 @@
 #include <QSettings>
 #include <QSharedPointer>
 #include <QEventLoop>
+#include <QElapsedTimer>
 #include <QHostInfo>
 #include <QSaveFile>
 #include <QSysInfo>
@@ -93,6 +95,18 @@ QJsonObject DevicePos::toJson() const
 }
 
 // ── Locator ───────────────────────────────────────────────────────────────────
+// ~15 m cells this host scanned from, with the time span (misses: docs/GRADING.md §1.7)
+static QString scanCellKey(double lat, double lon, int *ky = nullptr)
+{
+    const int y = int(std::floor(lat / 0.000135));
+    const double c = std::max(0.05, std::cos((y * 0.000135) * M_PI / 180.0));
+    const int x = int(std::floor(lon * c / 0.000135));
+    if (ky) *ky = y;
+    return QStringLiteral("%1:%2").arg(y).arg(x);
+}
+static QString scanBucket(double lat, double lon) { return QStringLiteral("%1:%2").arg(qFloor(lat * 100)).arg(qFloor(lon * 100)); }
+
+
 Locator::Locator(bool standalone, QObject *parent) : QObject(parent), m_standalone(standalone)
 {
     QSettings s;
@@ -189,6 +203,26 @@ Locator::Locator(bool standalone, QObject *parent) : QObject(parent), m_standalo
     if (m_dbUsable && m_db->isEmpty() && anyJson) migrateJsonToDb();
     else if (m_db->isOpen()) loadFromDb();
     loadAnchors();
+    // The estimator's state (docs/GRADING.md): device offsets, calibration, the cells we scanned from
+    if (m_db->isOpen()) {
+        const QJsonObject offs = QJsonDocument::fromJson(m_db->kv(QStringLiteral("device_offsets")).toUtf8()).object();
+        for (auto it = offs.begin(); it != offs.end(); ++it) m_devOffsets.insert(it.key(), it.value().toDouble());
+        const double k = m_db->kv(QStringLiteral("estimator_kappa")).toDouble();
+        if (k > 0) m_kappa = k;
+        m_calibration = QJsonDocument::fromJson(m_db->kv(QStringLiteral("estimator_calibration")).toUtf8()).object();
+        for (const MapDb::ScanCellRow &c : m_db->loadScanCells()) {
+            m_scanCells.insert(c.key, ScanCell{c.lat, c.lon, c.count, c.first, c.last});
+            m_scanIndex[scanBucket(c.lat, c.lon)] << c.key;
+        }
+    }
+    if (!standalone) {
+        rebuildGroups();
+        calibrateAnchors();
+        queueUpgradeRefits();
+        m_calibrateTimer.setInterval(6 * 3600 * 1000);
+        connect(&m_calibrateTimer, &QTimer::timeout, this, &Locator::calibrateEstimator);
+        m_calibrateTimer.start();
+    }
     rebuildMergedPois();
     if (m_db->isOpen()) m_countryCode = m_db->kv(QStringLiteral("countryCode"));
     for (const Fix &f : m_history) noteVisited(f, false);
@@ -855,13 +889,21 @@ ApEstimate Locator::estimateFor(const AccessPoint &ap) const
     const QString st = apStatus(ap);
     // Our own gear rides along: wherever it was "located" before is meaningless now
     const ApRecord *r = st == QLatin1String("travelling") || st == QLatin1String("active") ? nullptr : record(ap.bssid);
-    const bool fit = r && r->fit.valid && r->fit.quality != QLatin1String("none");
+    // Our fit: a fix (graded A–F; "none" = a fit from before 3.9 still waiting for its recompute), a region (R) or mobile (M)
+    const bool fit = r && r->fit.valid && r->fit.quality != QLatin1String("none")
+                     && (r->fit.kind == QLatin1String("fix") || r->fit.kind == QLatin1String("none"));
+    const bool region = r && r->fit.valid && r->fit.kind == QLatin1String("region");
+    if (r && r->fit.kind == QLatin1String("mobile") && !r->wigle) {
+        e.kind = ApEstimate::Mobile; e.fit = r->fit; e.lat = r->fit.lat; e.lon = r->fit.lon; e.radiusM = 0;
+        if (!r->obs.isEmpty()) { e.lat = r->obs.last().lat; e.lon = r->obs.last().lon; }
+        return e;
+    }
     // A placement (WiGLE / Apple, ±25 m) and our own multilateration: the tighter one is the answer,
     // and when they disagree by more than 3× their accuracy the card shows both.
     if (r && (fit || r->wigle)) {
         const bool useFit = fit && (!r->wigle || r->fit.acc <= 25.0);
         if (useFit) { e.kind = ApEstimate::Trilat; e.lat = r->fit.lat; e.lon = r->fit.lon; e.radiusM = r->fit.acc; e.vantage = r->fit.vantage; e.fit = r->fit; }
-        else        { e.kind = ApEstimate::Wigle; e.lat = r->wLat; e.lon = r->wLon; e.radiusM = 25; if (fit) e.fit = r->fit; }
+        else        { e.kind = ApEstimate::Wigle; e.lat = r->wLat; e.lon = r->wLon; e.radiusM = 25; if (fit || region) e.fit = r->fit; }
         if (fit && r->wigle) {
             const double d = distanceM(r->fit.lat, r->fit.lon, r->wLat, r->wLon);
             if (d > 3.0 * qMax(25.0, r->fit.acc)) {
@@ -872,8 +914,13 @@ ApEstimate Locator::estimateFor(const AccessPoint &ap) const
         }
         return e;
     }
-    if (r && r->hasPeer()) {                            // another device worked it out and synced it to us
+    if (r && r->hasPeer() && (!region || r->peerAcc * 2.45 < r->fit.r95)) {   // another device worked it out and synced it to us
         e.kind = ApEstimate::Peer; e.lat = r->peerLat; e.lon = r->peerLon; e.radiusM = r->peerAcc;
+        if (region) e.fit = r->fit;
+        return e;
+    }
+    if (region) {                                       // our own answer, but only an area (grade R): a disc of radius R95
+        e.kind = ApEstimate::Region; e.lat = r->fit.lat; e.lon = r->fit.lon; e.radiusM = r->fit.r95; e.vantage = r->fit.vantage; e.fit = r->fit;
         return e;
     }
     // Two vantage points only (the engine wants three): the old signal-weighted centroid, honestly wide.
@@ -927,7 +974,7 @@ Stats Locator::stats() const
         if (s == QLatin1String("used")) ++st.usedNow;
         if (s == QLatin1String("travelling") || s == QLatin1String("active")) ++st.travellingNow;
         const ApEstimate::Kind k = estimateFor(ap).kind;
-        if (k == ApEstimate::Centroid || k == ApEstimate::Wigle || k == ApEstimate::Observed || k == ApEstimate::Trilat || k == ApEstimate::Peer) ++st.locatedNow;
+        if (k == ApEstimate::Centroid || k == ApEstimate::Wigle || k == ApEstimate::Observed || k == ApEstimate::Trilat || k == ApEstimate::Peer || k == ApEstimate::Region) ++st.locatedNow;
     }
     for (const Fix &f : m_history)
         if (f.accuracy >= 0 && (st.bestAccuracy < 0 || f.accuracy < st.bestAccuracy)) st.bestAccuracy = f.accuracy;
@@ -1063,9 +1110,11 @@ QJsonArray Locator::apsJson() const
         a["kind"] = QLatin1String(ApEstimate::kindName(e.kind));
         a["lat"] = e.lat; a["lon"] = e.lon; a["r"] = e.radiusM; a["bearing"] = e.bearingDeg;
         if (e.vantage) a["vantage"] = e.vantage;
-        if (e.fit.valid) a["fit"] = QJsonObject{{"n", e.fit.n}, {"vantage", e.fit.vantage}, {"rms", e.fit.rms}, {"acc", e.fit.acc}, {"p0", e.fit.p0}, {"pathloss", e.fit.pathloss},
-                                                {"quality", e.fit.quality}, {"rejected", e.fit.rejected}, {"semiMajor", e.fit.semiMajor}, {"semiMinor", e.fit.semiMinor}, {"orient", e.fit.orientDeg},
-                                                {"updated", e.fit.updated > 0 ? QJsonValue(QDateTime::fromSecsSinceEpoch(e.fit.updated).toString(Qt::ISODate)) : QJsonValue()}};
+        if (e.fit.valid || e.fit.kind == QLatin1String("mobile")) {
+            a["fit"] = fitJson(e.fit);
+            if (!e.fit.grade.isEmpty()) { a["grade"] = e.fit.grade; a["score"] = std::round(e.fit.score * 10) / 10; }
+            if (e.fit.r95 > 0) a["r95"] = e.fit.r95;
+        }
         if (e.hasAlt) a["alt"] = QJsonObject{{"kind", QLatin1String(ApEstimate::kindName(e.altKind))}, {"lat", e.altLat}, {"lon", e.altLon}, {"acc", e.altAcc}};
         if (const ApRecord *rr = record(ap.bssid)) { a["samples"] = rr->obs.size(); if (rr->hasPeer()) a["peer"] = QJsonObject{{"from", rr->peerFrom}, {"lat", rr->peerLat}, {"lon", rr->peerLon}, {"acc", rr->peerAcc}}; }
         const int f = ap.frequency;
@@ -2534,6 +2583,7 @@ void Locator::appendHistory(const Fix &fx)
 void Locator::noteObservations(const QList<AccessPoint> &aps, const Fix &at)
 {
     const QString cell = QStringLiteral("%1,%2").arg(qRound(at.lat * 20)).arg(qRound(at.lon * 20));
+    noteScanCell(at);
     for (const AccessPoint &ap : aps) {
         ApRecord &r = m_apRecords[ap.bssid];
         if (!ap.ssid.isEmpty()) r.ssid = ap.ssid;
@@ -2544,9 +2594,12 @@ void Locator::noteObservations(const QList<AccessPoint> &aps, const Fix &at)
         if (!add) {
             const ApObservation &last = r.obs.last();
             const double moved = distanceM(last.lat, last.lon, at.lat, at.lon);
-            // Only count it as a new vantage point if we've clearly moved beyond both fixes' error
-            add = moved >= qMax(60.0, last.acc + at.accuracy);
-            if (!add && qAbs(last.dbm - ap.dbm) >= 6 && at.accuracy < last.acc) {
+            // A new sample once we moved about half the fixes' error (at least 12 m), or ten minutes later at the
+            // same spot: the estimator clusters places and takes each place's median itself, so denser samples help
+            // and a long stay cannot outvote the rest (docs/GRADING.md §5). Memory is thinned past 600 samples.
+            add = moved >= qMax(12.0, 0.5 * qMax(last.acc, at.accuracy)) || !last.device.isEmpty()
+                  || (last.time.isValid() && at.time.isValid() && last.time.secsTo(at.time) >= 600);
+            if (!add && at.accuracy < last.acc) {
                 // same spot, better fix: replace the last observation
                 r.obs.last().lat = at.lat; r.obs.last().lon = at.lon; r.obs.last().acc = at.accuracy;
                 r.obs.last().dbm = ap.dbm; r.obs.last().time = at.time; r.obs.last().dirty = true;
@@ -2556,7 +2609,7 @@ void Locator::noteObservations(const QList<AccessPoint> &aps, const Fix &at)
         if (add) {
             ApObservation ob; ob.lat = at.lat; ob.lon = at.lon; ob.acc = at.accuracy; ob.dbm = ap.dbm; ob.time = at.time; ob.dirty = true;
             r.obs.append(ob);
-            while (r.obs.size() > 500) r.obs.removeFirst();
+            thinObservations(r);
             // Nudge the existing fit right away; the full refit follows in the 10 s batch
             if (r.fit.valid) { Estimator::Obs eo; eo.lat = at.lat; eo.lon = at.lon; eo.acc = at.accuracy; eo.dbm = ap.dbm; eo.t = at.time.toSecsSinceEpoch(); r.fit = Estimator::update(r.fit, eo); }
             r.fitDirty = true; queueRefit(ap.bssid);
@@ -2569,16 +2622,116 @@ void Locator::noteObservations(const QList<AccessPoint> &aps, const Fix &at)
 // ── position refinement ──────────────────────────────────────────────────────
 QList<Estimator::Obs> Locator::obsFor(const ApRecord &r, const QString &bssid) const
 {
+    Q_UNUSED(bssid)
     QList<Estimator::Obs> out; out.reserve(r.obs.size());
-    AccessPoint probe; probe.bssid = bssid; probe.ssid = r.ssid;
-    const bool rides = isTravelling(bssid) || isHome(probe);           // moves with us: no fit at all
-    if (rides) return out;
     for (const ApObservation &o : r.obs) {
         if (o.acc <= 0 || o.acc > 300) continue;                         // a coarse fix says nothing about the beacon
         Estimator::Obs e; e.lat = o.lat; e.lon = o.lon; e.acc = o.acc; e.dbm = o.dbm; e.t = o.time.isValid() ? o.time.toSecsSinceEpoch() : 0; e.device = o.device;
         out << e;
     }
     return out;
+}
+
+// Priors per band (docs/GRADING.md §3): P0 from the free-space loss at 1 m, n from the anchors' environment
+// calibration when there is one, and the calibration κ from the anchors' leave-one-out test.
+Estimator::Options Locator::estimatorOptions(int freqMHz) const
+{
+    Estimator::Options o;
+    const QString band = freqMHz >= 5925 ? QStringLiteral("6") : freqMHz >= 4900 ? QStringLiteral("5") : QStringLiteral("2.4");
+    if (freqMHz <= 0) { o.p0Mean = -42; o.p0Sd = 10; o.defaultN = 2.5; }            // unknown band: wide enough for 2.4 and 5 GHz
+    else if (band == QLatin1String("2.4")) { o.p0Mean = -40; o.defaultN = 2.4; }
+    else if (band == QLatin1String("5")) { o.p0Mean = -47; o.defaultN = 2.7; }
+    else { o.p0Mean = -48; o.defaultN = 2.7; }
+    if (freqMHz > 0 && m_envSamples.value(band) >= 3 && m_envRls.contains(band)) {
+        const RangeMath::Rls2 &e = m_envRls[band];
+        o.defaultN = std::clamp(e.n, 1.6, 4.5);
+        o.nSd = std::clamp(std::sqrt(std::max(0.0, e.S[1][1])) + 0.3, 0.3, 0.6);
+    }
+    o.kappa = m_kappa;
+    return o;
+}
+
+void Locator::noteScanCell(const Fix &at)
+{
+    if (!at.valid || at.accuracy <= 0 || at.accuracy > 60 || at.source == QLatin1String("ip")) return;
+    const QString key = scanCellKey(at.lat, at.lon);
+    const qint64 t = at.time.isValid() ? at.time.toSecsSinceEpoch() : QDateTime::currentSecsSinceEpoch();
+    ScanCell &c = m_scanCells[key];
+    if (c.count == 0) { c.lat = at.lat; c.lon = at.lon; c.first = t; m_scanIndex[scanBucket(at.lat, at.lon)] << key; }
+    else { c.lat += (at.lat - c.lat) / (c.count + 1); c.lon += (at.lon - c.lon) / (c.count + 1); }
+    ++c.count; c.last = std::max(c.last, t);
+    if (m_dbUsable) m_db->saveScanCell({key, c.lat, c.lon, c.count, c.first, c.last});
+}
+
+QList<Estimator::Miss> Locator::missesFor(const QList<Estimator::Obs> &obs) const
+{
+    QList<Estimator::Miss> out;
+    if (obs.isEmpty() || m_scanCells.isEmpty()) return out;
+    double lat = 0, lon = 0; qint64 first = 0, last = 0; int own = 0;
+    QSet<QString> heard;
+    for (const Estimator::Obs &o : obs) {
+        lat += o.lat / obs.size(); lon += o.lon / obs.size();
+        if (!o.device.isEmpty()) continue;
+        ++own; heard.insert(scanCellKey(o.lat, o.lon));
+        if (o.t > 0) { first = first ? std::min(first, o.t) : o.t; last = std::max(last, o.t); }
+    }
+    if (!own) return out;                               // only our own scans say where it was NOT heard
+    if (first == 0) { first = 0; last = std::numeric_limits<qint64>::max() / 2; }
+    struct C { double d; Estimator::Miss m; };
+    QList<C> cand;
+    for (int dy = -1; dy <= 1; ++dy) for (int dx = -1; dx <= 1; ++dx) {
+        const QString b = QStringLiteral("%1:%2").arg(qFloor(lat * 100) + dy).arg(qFloor(lon * 100) + dx);
+        const auto keys = m_scanIndex.constFind(b);
+        if (keys == m_scanIndex.constEnd()) continue;
+        for (const QString &k : *keys) {
+            if (heard.contains(k)) continue;
+            const ScanCell &c = m_scanCells[k];
+            if (c.last < first - 7 * 86400 || c.first > last + 30 * 86400) continue;   // not while the AP was around
+            const double d = distanceM(lat, lon, c.lat, c.lon);
+            if (d > 600) continue;
+            // a heard sample nearby means this cell is not a miss
+            bool near = false; for (const Estimator::Obs &o : obs) if (distanceM(o.lat, o.lon, c.lat, c.lon) < 15) { near = true; break; }
+            if (near) continue;
+            Estimator::Miss m; m.lat = c.lat; m.lon = c.lon; m.count = c.count;
+            cand.append({d, m});
+        }
+    }
+    std::sort(cand.begin(), cand.end(), [](const C &a, const C &b) { return a.d < b.d; });
+    for (int i = 0; i < cand.size() && i < 150; ++i) out << cand[i].m;
+    return out;
+}
+
+Estimator::Context Locator::contextFor(const ApRecord &r, const QString &bssid, const QList<Estimator::Obs> &obs) const
+{
+    Estimator::Context c;
+    c.deviceOffset = m_devOffsets;
+    c.misses = missesFor(obs);
+    if (r.wigle) { c.external.has = true; c.external.lat = r.wLat; c.external.lon = r.wLon; c.external.acc = 50; c.external.source = QStringLiteral("placed"); }
+    if (r.fit.valid || r.fit.kind == QLatin1String("mobile")) { c.hasPrev = true; c.prev = r.fit; }
+    AccessPoint probe; probe.bssid = bssid; probe.ssid = r.ssid;
+    c.mobile = isTravelling(bssid) || isHome(probe);                     // moves with us: graded M, never placed
+    return c;
+}
+
+// Keep the in-memory sample list bounded: drop the oldest sample of the most crowded ~15 m cell (the database keeps them all)
+void Locator::thinObservations(ApRecord &r)
+{
+    if (r.obs.size() <= 600) return;
+    while (r.obs.size() > 500) {
+        QHash<QString, QList<int>> cells;
+        for (int i = 0; i < r.obs.size(); ++i)
+            if (r.obs[i].id != 0 && !r.obs[i].dirty) cells[scanCellKey(r.obs[i].lat, r.obs[i].lon) + r.obs[i].device].append(i);   // only rows already stored
+        int drop = 0, most = 0;
+        for (auto it = cells.constBegin(); it != cells.constEnd(); ++it) if (it->size() > most) { most = it->size(); drop = it->first(); }
+        if (most <= 1) { int i = 0; while (i < r.obs.size() && (r.obs[i].id == 0 || r.obs[i].dirty)) ++i; if (i >= r.obs.size()) break; r.obs.removeAt(i); continue; }
+        // several at once: the oldest half of the crowded cells above 4 samples
+        QList<int> kill;
+        for (auto it = cells.constBegin(); it != cells.constEnd() && r.obs.size() - kill.size() > 500; ++it)
+            if (it->size() > 4) for (int j = 0; j < it->size() / 2 && r.obs.size() - kill.size() > 500; ++j) kill << it->at(j);
+        if (kill.isEmpty()) kill << drop;
+        std::sort(kill.begin(), kill.end(), std::greater<int>());
+        for (int i : kill) r.obs.removeAt(i);
+    }
 }
 
 void Locator::queueRefit(const QString &bssid)
@@ -2592,74 +2745,150 @@ bool Locator::refitOne(const QString &bssid, qint64 now)
 {
     auto it = m_apRecords.find(bssid);
     if (it == m_apRecords.end()) return false;
-    ApRecord &r = it.value();
-    if (m_pins.contains(bssid.toUpper())) { r.fitDirty = false; return false; }   // anchored: never refitted
-    const QList<Estimator::Obs> obs = obsFor(r, bssid);
-    const Estimator::Fit before = r.fit;
-    Estimator::Options opt; opt.defaultN = environmentN(r.freq);         // the environment's n from anchor calibration (§4.3.3)
-    if (obs.size() < 3) { r.fit = Estimator::Fit(); r.fit.n = obs.size(); r.fit.quality = QStringLiteral("none"); }
-    else r.fit = Estimator::fitAp(obs, now, opt);
-    r.fitDirty = false;
-    if (m_dbUsable) { m_db->saveEstimate(bssid, r.fit); saveRecord(bssid); }
-    // "Refined": the fit moved or tightened noticeably → an ap_refit event with the vantage points that made it
-    if (r.fit.valid && before.valid) {
-        const double moved = distanceM(before.lat, before.lon, r.fit.lat, r.fit.lon);
-        const bool movedEnough = moved > qMax(5.0, 0.10 * before.acc), tighter = r.fit.acc < before.acc * 0.85;
-        if (movedEnough || tighter) {
-            BeaconEvent ev; ev.type = QStringLiteral("ap_refit"); ev.bssid = bssid; ev.ssid = r.ssid; ev.kind = QStringLiteral("trilat");
-            ev.hasPos = true; ev.lat = r.fit.lat; ev.lon = r.fit.lon; ev.hasFrom = true; ev.fromLat = before.lat; ev.fromLon = before.lon;
-            // Vantage points: strongest sample per 25 m cell, at least one per contributing device, ≤ 6
-            struct Cell { double lat, lon; int dbm; QString device; };
-            QList<Cell> cells;
-            for (const Estimator::Obs &o : obs) {
-                bool merged = false;
-                for (Cell &c : cells) if (distanceM(c.lat, c.lon, o.lat, o.lon) < 25) { if (o.dbm > c.dbm) { c.dbm = o.dbm; c.lat = o.lat; c.lon = o.lon; c.device = o.device; } merged = true; break; }
-                if (!merged) cells.append({o.lat, o.lon, o.dbm, o.device});
+    if (m_pins.contains(bssid.toUpper())) { it->fitDirty = false; m_upgradePending.remove(bssid); return false; }   // anchored: never refitted
+    // A multi-BSSID group (one radio, several networks) is fitted once, from all its members' samples
+    QStringList members{bssid}; QHash<QString, double> offs{{bssid, 0.0}}; QString ref = bssid;
+    const auto g = m_groups.constFind(bssid);
+    if (g != m_groups.constEnd() && g->size > 1) {
+        ref = g->ref; members.clear(); offs.clear();
+        for (auto m = m_groups.constBegin(); m != m_groups.constEnd(); ++m)
+            if (m->ref == ref && m_apRecords.contains(m.key()) && !m_pins.contains(m.key().toUpper())) { members << m.key(); offs.insert(m.key(), m->offsetDb); }
+        std::sort(members.begin(), members.end());
+        if (members.isEmpty()) { members << bssid; offs.insert(bssid, 0.0); ref = bssid; }
+    }
+    QList<Estimator::Obs> obs; int freq = 0;
+    for (const QString &m : members) {
+        const ApRecord &mr = m_apRecords[m];
+        if (!freq && mr.freq) freq = mr.freq;
+        for (Estimator::Obs o : obsFor(mr, m)) { o.dbm = int(std::lround(o.dbm - offs.value(m))); obs << o; }
+    }
+    const ApRecord &r0 = m_apRecords.contains(ref) ? m_apRecords[ref] : it.value();
+    Estimator::Context ctx = contextFor(r0, ref, obs);
+    for (const QString &m : members) { AccessPoint pr; pr.bssid = m; pr.ssid = m_apRecords[m].ssid; if (isTravelling(m) || isHome(pr)) ctx.mobile = true; }
+    const Estimator::Fit fit = obs.isEmpty() && !ctx.mobile ? Estimator::Fit() : Estimator::fitAp(obs, now, estimatorOptions(freq), ctx);
+    const bool upgrading = m_upgradePending.contains(bssid);
+    for (const QString &m : members) {
+        Estimator::Fit fm = fit;
+        fm.p0 += offs.value(m);
+        if (members.size() > 1) { fm.groupRef = ref; fm.groupSize = members.size(); }
+        ApRecord &r = m_apRecords[m];
+        const Estimator::Fit before = r.fit;
+        r.fit = fm; r.fitDirty = false; r.fitCurrent = true;
+        m_upgradePending.remove(m);
+        const bool changed = before.kind != fm.kind || before.grade != fm.grade || distanceM(before.lat, before.lon, fm.lat, fm.lon) > 1.0
+                             || std::fabs(before.r95 - fm.r95) > 1.0;
+        if (m_dbUsable) { m_db->saveEstimate(m, fm); if (changed && (fm.valid || fm.kind == QLatin1String("mobile"))) m_db->appendEstimateHistory(m, fm); saveRecord(m); }
+        if (upgrading || m != (members.contains(bssid) ? bssid : members.first())) continue;   // one event per group; none while recomputing on upgrade
+        const bool fixNow = fm.valid && fm.kind == QLatin1String("fix"), fixBefore = before.valid && before.kind != QLatin1String("region");
+        // "Refined": the fit moved or tightened noticeably → an ap_refit event with the vantage points that made it
+        if (fixNow && fixBefore) {
+            const double moved = distanceM(before.lat, before.lon, fm.lat, fm.lon);
+            const bool movedEnough = moved > qMax(5.0, 0.10 * before.acc), tighter = fm.acc < before.acc * 0.85;
+            if (movedEnough || tighter || before.grade != fm.grade) {
+                BeaconEvent ev; ev.type = QStringLiteral("ap_refit"); ev.bssid = m; ev.ssid = r.ssid; ev.kind = QStringLiteral("trilat");
+                ev.hasPos = true; ev.lat = fm.lat; ev.lon = fm.lon; ev.hasFrom = true; ev.fromLat = before.lat; ev.fromLon = before.lon;
+                // Vantage points: strongest sample per 25 m cell, at least one per contributing device, ≤ 6
+                struct Cell { double lat, lon; int dbm; QString device; };
+                QList<Cell> cells;
+                for (const Estimator::Obs &o : obs) {
+                    bool merged = false;
+                    for (Cell &c : cells) if (distanceM(c.lat, c.lon, o.lat, o.lon) < 25) { if (o.dbm > c.dbm) { c.dbm = o.dbm; c.lat = o.lat; c.lon = o.lon; c.device = o.device; } merged = true; break; }
+                    if (!merged) cells.append({o.lat, o.lon, o.dbm, o.device});
+                }
+                std::sort(cells.begin(), cells.end(), [](const Cell &a, const Cell &b) { return a.dbm > b.dbm; });
+                QList<Cell> pick; QSet<QString> devs;
+                for (const Cell &c : cells) if (!devs.contains(c.device)) { devs.insert(c.device); pick << c; }   // one per device first
+                for (const Cell &c : cells) { if (pick.size() >= 6) break; bool dup = false; for (const Cell &p : pick) if (p.lat == c.lat && p.lon == c.lon) dup = true; if (!dup) pick << c; }
+                if (pick.size() > 6) pick = pick.mid(0, 6);
+                QJsonArray vps; for (const Cell &c : pick) vps.append(QJsonObject{{"lat", c.lat}, {"lon", c.lon}, {"dbm", c.dbm}, {"device", c.device.isEmpty() ? ourDeviceName() : c.device}});
+                ev.extra = QJsonObject{{"acc", fm.acc}, {"prevAcc", before.acc}, {"n", fm.n}, {"vantage", fm.vantage}, {"rms", fm.rms}, {"movedM", moved}, {"vantagePoints", vps},
+                                       {"grade", fm.grade}, {"prevGrade", before.grade}, {"score", fm.score}, {"r95", fm.r95}};
+                ev.text = QStringLiteral("Refined %1: ±%2 m → ±%3 m, grade %4 (%5 samples, %6 places)").arg(r.ssid.isEmpty() ? QStringLiteral("(hidden)") : r.ssid)
+                              .arg(qRound(before.r95 > 0 ? before.r95 : before.acc * 2.45)).arg(qRound(fm.r95)).arg(fm.grade).arg(fm.n).arg(fm.vantage);
+                logEvent(ev);
             }
-            std::sort(cells.begin(), cells.end(), [](const Cell &a, const Cell &b) { return a.dbm > b.dbm; });
-            QList<Cell> pick; QSet<QString> devs;
-            for (const Cell &c : cells) if (!devs.contains(c.device)) { devs.insert(c.device); pick << c; }   // one per device first
-            for (const Cell &c : cells) { if (pick.size() >= 6) break; bool dup = false; for (const Cell &p : pick) if (p.lat == c.lat && p.lon == c.lon) dup = true; if (!dup) pick << c; }
-            if (pick.size() > 6) pick = pick.mid(0, 6);
-            QJsonArray vps; for (const Cell &c : pick) vps.append(QJsonObject{{"lat", c.lat}, {"lon", c.lon}, {"dbm", c.dbm}, {"device", c.device.isEmpty() ? ourDeviceName() : c.device}});
-            ev.extra = QJsonObject{{"acc", r.fit.acc}, {"prevAcc", before.acc}, {"n", r.fit.n}, {"vantage", r.fit.vantage}, {"rms", r.fit.rms}, {"movedM", moved}, {"vantagePoints", vps}};
-            ev.text = QStringLiteral("Refined %1: ±%2 m → ±%3 m (%4 samples, %5 vantage points)").arg(r.ssid.isEmpty() ? QStringLiteral("(hidden)") : r.ssid).arg(qRound(before.acc)).arg(qRound(r.fit.acc)).arg(r.fit.n).arg(r.fit.vantage);
+        }
+        if (fixNow && !fixBefore) {
+            BeaconEvent ev; ev.type = QStringLiteral("ap_placed"); ev.bssid = m; ev.ssid = r.ssid; ev.kind = QStringLiteral("trilat");
+            ev.hasPos = true; ev.lat = fm.lat; ev.lon = fm.lon;
+            ev.extra = QJsonObject{{"grade", fm.grade}, {"score", fm.score}, {"r95", fm.r95}};
+            ev.text = QStringLiteral("%1 positioned from %2 of your samples (±%3 m, grade %4)").arg(r.ssid.isEmpty() ? QStringLiteral("(hidden)") : r.ssid).arg(fm.n).arg(qRound(fm.r95)).arg(fm.grade);
             logEvent(ev);
         }
     }
-    if (r.fit.valid && !before.valid) {
-        BeaconEvent ev; ev.type = QStringLiteral("ap_placed"); ev.bssid = bssid; ev.ssid = r.ssid; ev.kind = QStringLiteral("trilat");
-        ev.hasPos = true; ev.lat = r.fit.lat; ev.lon = r.fit.lon;
-        ev.text = QStringLiteral("%1 positioned from %2 of your samples (±%3 m)").arg(r.ssid.isEmpty() ? QStringLiteral("(hidden)") : r.ssid).arg(r.fit.n).arg(qRound(r.fit.acc));
-        logEvent(ev);
-    }
-    return r.fit.valid;
+    return fit.valid;
 }
 
 void Locator::refitQueued()
 {
-    if (m_refitQueue.isEmpty()) return;
-    const QSet<QString> batch = m_refitQueue; m_refitQueue.clear();
+    // Time-boxed batches: a few hundred fits at start-up (or after an import) must not freeze the tray
+    if (m_refitQueue.isEmpty()) { finishUpgradeRefit(); return; }
     const qint64 now = QDateTime::currentSecsSinceEpoch();
-    int fitted = 0;
-    for (const QString &b : batch) if (refitOne(b, now)) ++fitted;
+    QElapsedTimer clock; clock.start();
+    QSet<QString> done;
+    QStringList order = m_refitQueue.values(); std::sort(order.begin(), order.end());
+    int n = 0;
+    for (const QString &b : order) {
+        m_refitQueue.remove(b);
+        const auto g = m_groups.constFind(b);
+        const QString key = g != m_groups.constEnd() && g->size > 1 ? g->ref : b;
+        if (done.contains(key)) continue;                // the group was fitted in this batch already
+        done.insert(key);
+        refitOne(b, now); ++n;
+        if (clock.elapsed() > 150) break;
+    }
     if (m_dbUsable) m_db->flush();
-    emit refitDone(batch.size());
+    emit refitDone(n);
     emit scanUpdated();
+    if (!m_refitQueue.isEmpty()) { m_refitTimer.start(50); return; }
+    m_refitTimer.setInterval(10000);
+    finishUpgradeRefit();
     checkAchievements();
+}
+
+// Estimates from an older engine (or imported ones) are recomputed in time-boxed batches — none deleted
+void Locator::queueUpgradeRefits()
+{
+    if (m_standalone || !m_dbUsable) return;
+    for (auto it = m_apRecords.constBegin(); it != m_apRecords.constEnd(); ++it)
+        if (!it->fitCurrent && (!it->obs.isEmpty() || it->fit.valid)) { m_upgradePending.insert(it.key()); m_refitQueue.insert(it.key()); }
+    if (m_upgradePending.isEmpty()) { finishUpgradeRefit(); return; }
+    m_upgradeActive = true;
+    QTimer::singleShot(3000, this, [this] { if (!m_refitTimer.isActive()) m_refitTimer.start(50); });
+}
+
+void Locator::finishUpgradeRefit()
+{
+    if (!m_upgradePending.isEmpty() || !m_dbUsable) return;
+    if (m_db->kv(QStringLiteral("estimator_version")).toInt() < Estimator::kVersion) {
+        m_db->setKv(QStringLiteral("estimator_version"), QString::number(Estimator::kVersion));
+        m_db->flush();
+    }
+    if (!m_upgradeActive) return;
+    m_upgradeActive = false;
+    emit statusMessage(QStringLiteral("Every beacon's estimate was recomputed and graded"));
+    QTimer::singleShot(2000, this, [this] { calibrateEstimator(); });     // groups and device offsets from the new fits
 }
 
 int Locator::Refit()
 {
     const qint64 now = QDateTime::currentSecsSinceEpoch();
     int fitted = 0, tried = 0;
-    m_refitQueue.clear(); m_refitTimer.stop();
-    for (auto it = m_apRecords.begin(); it != m_apRecords.end(); ++it) {
-        if (it->obs.size() < 3) continue;
+    m_refitQueue.clear(); m_refitTimer.stop(); m_refitTimer.setInterval(10000);
+    QSet<QString> done;
+    QStringList keys = m_apRecords.keys(); std::sort(keys.begin(), keys.end());
+    for (const QString &b : keys) {
+        const ApRecord &r = m_apRecords[b];
+        if (r.obs.isEmpty()) continue;
+        const auto g = m_groups.constFind(b);
+        const QString key = g != m_groups.constEnd() && g->size > 1 ? g->ref : b;
+        if (done.contains(key)) continue;
+        done.insert(key);
         ++tried;
-        if (refitOne(it.key(), now)) ++fitted;
+        if (refitOne(b, now)) ++fitted;
     }
     if (m_dbUsable) m_db->flush();
+    finishUpgradeRefit();
     emit statusMessage(QStringLiteral("Refit %1 beacons: %2 positioned").arg(tried).arg(fitted));
     emit refitDone(tried);
     emit scanUpdated();
@@ -2670,7 +2899,7 @@ int Locator::Refit()
 int Locator::refitCount() const
 {
     int n = 0;
-    for (const ApRecord &r : m_apRecords) if (r.fit.valid && r.fit.quality != QLatin1String("none")) ++n;
+    for (const ApRecord &r : m_apRecords) if (r.fit.valid && r.fit.quality != QLatin1String("none") && r.fit.kind != QLatin1String("region")) ++n;
     return n;
 }
 
@@ -2687,9 +2916,9 @@ int Locator::ingestObservations(const QJsonArray &observations, const QString &d
         ApRecord &r = m_apRecords[it.key()];
         if (const auto nm = names.constFind(it.key()); nm != names.constEnd()) { if (r.ssid.isEmpty()) r.ssid = nm->first; if (!r.freq && nm->second > 0) r.freq = nm->second; }
         for (const ApObservation &o : it.value()) { r.obs.append(o); if (r.fit.valid) { Estimator::Obs eo; eo.lat = o.lat; eo.lon = o.lon; eo.acc = o.acc; eo.dbm = o.dbm; eo.t = o.time.toSecsSinceEpoch(); r.fit = Estimator::update(r.fit, eo); } }
-        while (r.obs.size() > 500) r.obs.removeFirst();
+        thinObservations(r);
         r.fitDirty = true;
-        if (!m_bulkImport || r.obs.size() >= 3) queueRefit(it.key());   // an import queues only beacons that can be fitted at all
+        queueRefit(it.key());                           // even one sample gives a region (docs/GRADING.md §5)
     }
     if (!m_bulkImport) emit scanUpdated();          // an import repaints once at the end, not per batch
     return n;
@@ -2961,7 +3190,7 @@ int Locator::DbImport(const QString &path)
     if (!f.open(QIODevice::ReadOnly)) return -1;
     QString err;
     const int n = m_db->importJson(QJsonDocument::fromJson(f.readAll()).object(), &err);
-    if (n >= 0) { loadFromDb(); emit FixChanged(); emit scanUpdated(); emit statusMessage(QStringLiteral("Imported %1 rows from %2").arg(n).arg(path)); }
+    if (n >= 0) { loadFromDb(); rebuildGroups(); queueUpgradeRefits(); emit FixChanged(); emit scanUpdated(); emit statusMessage(QStringLiteral("Imported %1 rows from %2").arg(n).arg(path)); }
     return n;
 }
 
@@ -3627,6 +3856,222 @@ QJsonObject Locator::environmentJson() const
                                   {"sigmaP0", std::sqrt(std::max(0.0, it->S[0][0]))}, {"sigmaN", std::sqrt(std::max(0.0, it->S[1][1]))}};
     return o;
 }
+
+// ── the estimator's calibration (docs/GRADING.md §2.3, §3, §4.1) ─────────────
+QJsonObject Locator::fitJson(const Estimator::Fit &f) { return Estimator::toApi(f); }
+
+static double medianOf(QList<double> v)
+{
+    if (v.isEmpty()) return 0;
+    std::sort(v.begin(), v.end());
+    const int h = v.size() / 2;
+    return v.size() % 2 ? v[h] : 0.5 * (v[h - 1] + v[h]);
+}
+
+// The same radio behind several BSSIDs (guest network, 2.4/5 GHz, mesh backhaul): same MAC apart from the
+// locally-administered bit and the last nibble, heard together in ≥ 5 scans at a steady level difference.
+static QString groupKeyOf(const QString &bssid)
+{
+    const QStringList o = bssid.toUpper().split(QLatin1Char(':'));
+    if (o.size() != 6) return QString();
+    bool ok = false; const int first = o[0].toInt(&ok, 16);
+    if (!ok) return QString();
+    return QStringLiteral("%1:%2:%3:%4:%5:%6").arg(first & ~0x02, 2, 16, QLatin1Char('0')).arg(o[1], o[2], o[3], o[4]).arg(o[5].left(1)).toUpper();
+}
+
+void Locator::rebuildGroups()
+{
+    m_groups.clear();
+    QHash<QString, QStringList> buckets;
+    for (auto it = m_apRecords.constBegin(); it != m_apRecords.constEnd(); ++it) {
+        if (it->obs.size() < 5 || m_pins.contains(it.key().toUpper()) || isTravelling(it.key())) continue;
+        AccessPoint probe; probe.bssid = it.key(); probe.ssid = it->ssid;
+        if (isHome(probe)) continue;
+        const QString k = groupKeyOf(it.key());
+        if (!k.isEmpty()) buckets[k] << it.key();
+    }
+    for (auto b = buckets.begin(); b != buckets.end(); ++b) {
+        QStringList mem = b.value();
+        if (mem.size() < 2) continue;
+        std::sort(mem.begin(), mem.end());
+        // each member's samples by (device, second)
+        QList<QHash<QString, int>> byScan;
+        for (const QString &m : mem) {
+            QHash<QString, int> h;
+            for (const ApObservation &o : m_apRecords[m].obs) if (o.time.isValid()) h.insert(o.device + QLatin1Char('|') + QString::number(o.time.toSecsSinceEpoch()), o.dbm);
+            byScan << h;
+        }
+        struct Edge { int a, b; double d; };
+        QList<Edge> edges;
+        for (int i = 0; i < mem.size(); ++i)
+            for (int j = i + 1; j < mem.size(); ++j) {
+                QList<double> diffs;
+                for (auto it = byScan[i].constBegin(); it != byScan[i].constEnd(); ++it) {
+                    const int bar = it.key().lastIndexOf(QLatin1Char('|'));
+                    const QString dev = it.key().left(bar); const qint64 t = it.key().mid(bar + 1).toLongLong();
+                    for (qint64 dt = -2; dt <= 2; ++dt) {
+                        const auto hit = byScan[j].constFind(dev + QLatin1Char('|') + QString::number(t + dt));
+                        if (hit != byScan[j].constEnd()) { diffs << double(hit.value() - it.value()); break; }
+                    }
+                }
+                if (diffs.size() < 5) continue;
+                const double med = medianOf(diffs);
+                QList<double> dev; for (double d : diffs) dev << std::fabs(d - med);
+                if (std::fabs(med) > 10 || 1.4826 * medianOf(dev) > 4) continue;
+                // two good fixes far apart are two radios after all
+                const Estimator::Fit &fa = m_apRecords[mem[i]].fit, &fb = m_apRecords[mem[j]].fit;
+                if (fa.valid && fb.valid && fa.kind == QLatin1String("fix") && fb.kind == QLatin1String("fix") && fa.cxx > 0 && fb.cxx > 0) {
+                    const Estimator::Frame fr(fa.lat, fa.lon);
+                    const double dx = fr.x(fb.lon), dy = fr.y(fb.lat); double inv[3];
+                    if (Estimator::invert2(fa.cxx + fb.cxx, fa.cxy + fb.cxy, fa.cyy + fb.cyy, inv) && dx * dx * inv[0] + 2 * dx * dy * inv[1] + dy * dy * inv[2] > 6) continue;
+                }
+                edges.append({i, j, med});
+            }
+        if (edges.isEmpty()) continue;
+        // connected components; offsets relative to the member with the most samples (BFS over the verified pairs)
+        QList<int> comp(mem.size(), -1);
+        for (int s0 = 0; s0 < mem.size(); ++s0) {
+            if (comp[s0] >= 0) continue;
+            QList<int> stack{s0}; comp[s0] = s0; QList<int> members;
+            while (!stack.isEmpty()) {
+                const int c = stack.takeLast(); members << c;
+                for (const Edge &e : edges) {
+                    const int o = e.a == c ? e.b : e.b == c ? e.a : -1;
+                    if (o >= 0 && comp[o] < 0) { comp[o] = s0; stack << o; }
+                }
+            }
+            if (members.size() < 2) continue;
+            int ref = members.first();
+            for (int m : members) if (m_apRecords[mem[m]].obs.size() > m_apRecords[mem[ref]].obs.size()) ref = m;
+            QHash<int, double> off{{ref, 0.0}}; QList<int> queue{ref};
+            while (!queue.isEmpty()) {
+                const int c = queue.takeFirst();
+                for (const Edge &e : edges) {
+                    if (e.a == c && !off.contains(e.b)) { off.insert(e.b, off[c] + e.d); queue << e.b; }
+                    else if (e.b == c && !off.contains(e.a)) { off.insert(e.a, off[c] - e.d); queue << e.a; }
+                }
+            }
+            for (int m : members) m_groups.insert(mem[m], GroupInfo{mem[ref], off.value(m), int(members.size())});
+        }
+    }
+}
+
+// Per-device level offsets: how much louder another device hears the same beacons than this host (§4 of the plan:
+// shrunk towards 0, this host fixed at 0), from graded fixes heard by both
+void Locator::calibrateDeviceOffsets()
+{
+    QHash<QString, QList<double>> perDev;
+    for (auto it = m_apRecords.constBegin(); it != m_apRecords.constEnd(); ++it) {
+        const Estimator::Fit &f = it->fit;
+        if (!f.valid || f.kind != QLatin1String("fix") || f.grade.isEmpty() || f.grade > QLatin1String("D")) continue;
+        QHash<QString, QList<double>> res;
+        for (const ApObservation &o : it->obs) {
+            if (o.acc <= 0 || o.acc > 100) continue;
+            const double d = std::sqrt(std::pow(distanceM(o.lat, o.lon, f.lat, f.lon), 2) + 9.0);
+            res[o.device] << double(o.dbm) - m_devOffsets.value(o.device, 0.0) - Estimator::modelDbm(f.p0, f.pathloss, d);
+        }
+        if (res.size() < 2 || !res.contains(QString())) continue;
+        const double host = medianOf(res.value(QString()));
+        for (auto d = res.constBegin(); d != res.constEnd(); ++d) if (!d.key().isEmpty() && d->size() >= 2) perDev[d.key()] << medianOf(*d) - host;
+    }
+    QSet<QString> changed;
+    for (auto it = perDev.constBegin(); it != perDev.constEnd(); ++it) {
+        if (it->size() < 3) continue;
+        double sum = 0; for (double v : *it) sum += v;
+        const double step = sum / (it->size() + 0.25);
+        if (std::fabs(step) < 0.25) continue;
+        m_devOffsets[it.key()] = std::clamp(m_devOffsets.value(it.key(), 0.0) + step, -25.0, 25.0);
+        if (std::fabs(step) > 1.0) changed.insert(it.key());
+    }
+    if (m_dbUsable) {
+        QJsonObject o; for (auto it = m_devOffsets.constBegin(); it != m_devOffsets.constEnd(); ++it) o[it.key()] = std::round(it.value() * 100) / 100;
+        m_db->setKv(QStringLiteral("device_offsets"), QString::fromUtf8(QJsonDocument(o).toJson(QJsonDocument::Compact)));
+    }
+    if (changed.isEmpty()) return;
+    for (auto it = m_apRecords.constBegin(); it != m_apRecords.constEnd(); ++it)
+        for (const ApObservation &o : it->obs) if (changed.contains(o.device)) { queueRefit(it.key()); break; }
+}
+
+// Anchors hide their pin: fit them from their samples and compare with the survey (leave-one-out). The mean
+// NEES of the fixes gives κ (docs/GRADING.md §2.3), and the error per grade says what a letter means here.
+void Locator::calibrateAnchors()
+{
+    QList<double> nees; int fixes = 0, regions = 0, inside = 0, regionInside = 0, withSamples = 0;
+    QHash<QString, QList<double>> errByGrade;
+    const qint64 now = QDateTime::currentSecsSinceEpoch();
+    for (auto pin = m_pins.constBegin(); pin != m_pins.constEnd(); ++pin) {
+        QString key = pin.key();
+        if (!m_apRecords.contains(key)) { for (auto r = m_apRecords.constBegin(); r != m_apRecords.constEnd(); ++r) if (r.key().toUpper() == key) { key = r.key(); break; } }
+        const auto rec = m_apRecords.constFind(key);
+        if (rec == m_apRecords.constEnd() || rec->obs.isEmpty()) continue;
+        ++withSamples;
+        const QList<Estimator::Obs> obs = obsFor(*rec, key);
+        Estimator::Context c; c.deviceOffset = m_devOffsets; c.misses = missesFor(obs);
+        Estimator::Options o = estimatorOptions(rec->freq); o.kappa = 1.0;
+        const Estimator::Fit f = Estimator::fitAp(obs, now, o, c);
+        if (!f.valid) continue;
+        const Estimator::Frame fr(f.lat, f.lon);
+        const double ex = fr.x(pin->lon), ey = fr.y(pin->lat), err = std::hypot(ex, ey);
+        if (f.kind == QLatin1String("region")) { ++regions; if (err <= f.r95) ++regionInside; errByGrade[QStringLiteral("R")] << err; continue; }
+        ++fixes; if (err <= f.r95) ++inside;
+        errByGrade[f.grade] << err;
+        double inv[3];
+        if (Estimator::invert2(f.cxx, f.cxy, f.cyy, inv)) nees << ex * ex * inv[0] + 2 * ex * ey * inv[1] + ey * ey * inv[2];
+    }
+    double meanNees = 0; for (double v : nees) meanNees += v; if (!nees.isEmpty()) meanNees /= nees.size();
+    if (nees.size() >= 3) m_kappa = std::sqrt(std::clamp(meanNees / 2.0, 0.25, 25.0));
+    QJsonObject byGrade;
+    for (auto it = errByGrade.constBegin(); it != errByGrade.constEnd(); ++it) byGrade[it.key()] = QJsonObject{{"n", int(it->size())}, {"medianErrorM", std::round(medianOf(*it) * 10) / 10}};
+    m_calibration = QJsonObject{{"anchors", int(m_pins.size())}, {"withSamples", withSamples}, {"fixes", fixes}, {"regions", regions},
+                                {"meanNees", nees.isEmpty() ? QJsonValue() : QJsonValue(std::round(meanNees * 100) / 100)}, {"kappa", std::round(m_kappa * 1000) / 1000},
+                                {"coverage95", fixes ? QJsonValue(double(inside) / fixes) : QJsonValue()},
+                                {"regionCoverage95", regions ? QJsonValue(double(regionInside) / regions) : QJsonValue()},
+                                {"byGrade", byGrade}, {"updated", QDateTime::currentDateTime().toString(Qt::ISODate)}};
+    if (m_dbUsable) {
+        m_db->setKv(QStringLiteral("estimator_calibration"), QString::fromUtf8(QJsonDocument(m_calibration).toJson(QJsonDocument::Compact)));
+        m_db->setKv(QStringLiteral("estimator_kappa"), QString::number(m_kappa, 'g', 10));
+    }
+}
+
+void Locator::calibrateEstimator()
+{
+    calibrateAnchors();
+    rebuildGroups();
+    calibrateDeviceOffsets();
+}
+
+QJsonObject Locator::estimatorJson() const
+{
+    QJsonObject grades, kinds;
+    for (auto it = m_apRecords.constBegin(); it != m_apRecords.constEnd(); ++it) {
+        const QString g = it->fit.grade.isEmpty() ? QStringLiteral("none") : it->fit.grade;
+        grades[g] = grades[g].toInt() + 1;
+        const QString k = it->fit.kind.isEmpty() ? QStringLiteral("none") : it->fit.kind;
+        kinds[k] = kinds[k].toInt() + 1;
+    }
+    QJsonObject offs; for (auto it = m_devOffsets.constBegin(); it != m_devOffsets.constEnd(); ++it) offs[it.key()] = it.value();
+    QHash<QString, QJsonArray> groups;
+    for (auto it = m_groups.constBegin(); it != m_groups.constEnd(); ++it) groups[it->ref].append(QJsonObject{{"bssid", it.key()}, {"offsetDb", it->offsetDb}});
+    QJsonArray ga; for (auto it = groups.constBegin(); it != groups.constEnd(); ++it) ga.append(QJsonObject{{"ref", it.key()}, {"members", it.value()}});
+    // where sampling next helps most: the largest expected information gains within 2 km of the fix
+    struct Sug { double gain; QJsonObject o; };
+    QList<Sug> sug;
+    for (auto it = m_apRecords.constBegin(); it != m_apRecords.constEnd(); ++it) {
+        const Estimator::Fit &f = it->fit;
+        if (!f.valid || f.suggestGain <= 0) continue;
+        const double d = m_fix.valid ? distanceM(m_fix.lat, m_fix.lon, f.suggestLat, f.suggestLon) : -1;
+        if (m_fix.valid && d > 2000) continue;
+        sug.append({f.suggestGain, QJsonObject{{"bssid", it.key()}, {"ssid", it->ssid}, {"grade", f.grade}, {"lat", f.suggestLat}, {"lon", f.suggestLon},
+                                               {"gain", f.suggestGain}, {"distanceM", d < 0 ? QJsonValue() : QJsonValue(std::round(d))}}});
+    }
+    std::sort(sug.begin(), sug.end(), [](const Sug &a, const Sug &b) { return a.gain > b.gain; });
+    QJsonArray sa; for (int i = 0; i < sug.size() && i < 10; ++i) sa.append(sug[i].o);
+    return QJsonObject{{"version", Estimator::kVersion}, {"kappa", m_kappa}, {"calibration", m_calibration}, {"deviceOffsets", offs}, {"groups", ga},
+                       {"grades", grades}, {"kinds", kinds}, {"upgradePending", int(m_upgradePending.size())}, {"scanCells", int(m_scanCells.size())},
+                       {"suggestions", sa}, {"environment", environmentJson()}};
+}
+
+QString Locator::EstimatorJson() const { return QString::fromUtf8(QJsonDocument(estimatorJson()).toJson(QJsonDocument::Compact)); }
 
 // §4.3.7: a linked Pi / GNSS receiver in the RV knows where the RV is to a few metres
 bool Locator::tryRvGnss()

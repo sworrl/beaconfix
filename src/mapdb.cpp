@@ -1,4 +1,5 @@
 #include "mapdb.h"
+#include "fitjson.h"
 #include <QCoreApplication>
 #include <QDBusConnection>
 #include <QDBusConnectionInterface>
@@ -323,6 +324,15 @@ bool MapDb::schema()
                           " campus, drive_s, drive_m) SELECT osm_type, osm_id, cat, name, detail, lat, lon, wifi, hours, phone, website, address, wheelchair, emergency, 'far', peds,"
                           " er, campus, drive_s, drive_m FROM pois WHERE scope='far'"));
     q.exec(QStringLiteral("DELETE FROM pois WHERE scope='far'"));
+    // Estimator 2 (3.9, docs/GRADING.md): graded estimates, their history, the cells this host scanned from
+    addCol("estimates", "kind", "TEXT DEFAULT ''"); addCol("estimates", "grade", "TEXT DEFAULT ''"); addCol("estimates", "score", "REAL");
+    addCol("estimates", "r95", "REAL"); addCol("estimates", "cep50", "REAL"); addCol("estimates", "p_within25", "REAL");
+    addCol("estimates", "cxx", "REAL"); addCol("estimates", "cxy", "REAL"); addCol("estimates", "cyy", "REAL");
+    addCol("estimates", "metrics", "TEXT DEFAULT ''"); addCol("estimates", "version", "INTEGER DEFAULT 0");
+    q.exec(QStringLiteral("CREATE TABLE IF NOT EXISTS estimate_history (id INTEGER PRIMARY KEY, bssid TEXT NOT NULL, time TEXT, lat REAL, lon REAL,"
+                          " cxx REAL, cxy REAL, cyy REAL, r95 REAL, score REAL, grade TEXT, kind TEXT)"));
+    q.exec(QStringLiteral("CREATE INDEX IF NOT EXISTS esthist_bssid ON estimate_history(bssid)"));
+    q.exec(QStringLiteral("CREATE TABLE IF NOT EXISTS scan_cells (cell TEXT PRIMARY KEY, lat REAL, lon REAL, count INTEGER DEFAULT 0, first INTEGER, last INTEGER)"));
     q.exec(QStringLiteral("CREATE INDEX IF NOT EXISTS obs_seq ON observations(seq)"));
     q.exec(QStringLiteral("CREATE INDEX IF NOT EXISTS aps_seq ON aps(seq)"));
     q.exec(QStringLiteral("CREATE INDEX IF NOT EXISTS fix_seq ON fixes(seq)"));
@@ -381,6 +391,10 @@ QJsonObject MapDb::stats() const
     q.exec(QStringLiteral("SELECT COUNT(*) FROM aps WHERE home=1")); o["apsHome"] = q.next() ? q.value(0).toInt() : 0;
     q.exec(QStringLiteral("SELECT COUNT(*) FROM estimates WHERE quality<>'none'")); o["estimates"] = q.next() ? q.value(0).toInt() : 0;
     q.exec(QStringLiteral("SELECT COUNT(*) FROM estimates WHERE quality='good'")); o["estimatesGood"] = q.next() ? q.value(0).toInt() : 0;
+    {   QJsonObject g; q.exec(QStringLiteral("SELECT grade, COUNT(*) FROM estimates WHERE grade<>'' GROUP BY grade"));
+        while (q.next()) g[q.value(0).toString()] = q.value(1).toInt();
+        o["grades"] = g; }
+    q.exec(QStringLiteral("SELECT COUNT(*) FROM scan_cells")); o["scanCells"] = q.next() ? q.value(0).toInt() : 0;
     q.exec(QStringLiteral("SELECT COUNT(*) FROM aps WHERE source='trilat'")); o["apsTrilat"] = q.next() ? q.value(0).toInt() : 0;
     q.exec(QStringLiteral("SELECT COUNT(*) FROM aps WHERE peer_from IS NOT NULL AND peer_from<>''")); o["apsFromPeers"] = q.next() ? q.value(0).toInt() : 0;
     q.exec(QStringLiteral("SELECT COUNT(DISTINCT device) FROM observations WHERE device<>''")); o["observingDevices"] = q.next() ? q.value(0).toInt() : 0;
@@ -398,7 +412,8 @@ static bool positionFrom(const ApRecord &r, double *lat, double *lon, double *ac
 {
     // Our own fit beats a placement when it is at least as tight; a placement (WiGLE / Apple, ±25 m)
     // beats a loose fit; a peer's position fills in when we have neither.
-    const bool fit = r.fit.valid && r.fit.quality != QLatin1String("none");
+    const bool fit = r.fit.valid && r.fit.quality != QLatin1String("none")
+                  && (r.fit.kind == QLatin1String("fix") || r.fit.kind == QLatin1String("none"));   // a region (grade R) is not a position; "none" = a fit from before 3.9
     if (fit && (!r.wigle || r.fit.acc <= 25.0)) { *lat = r.fit.lat; *lon = r.fit.lon; *acc = r.fit.acc; *source = QStringLiteral("trilat"); return true; }
     if (r.wigle) { *lat = r.wLat; *lon = r.wLon; *acc = 25; *source = QStringLiteral("placed"); return true; }
     if (r.hasPeer()) { *lat = r.peerLat; *lon = r.peerLon; *acc = r.peerAcc; *source = QStringLiteral("peer"); return true; }
@@ -480,10 +495,15 @@ QHash<QString, ApRecord> MapDb::loadApRecords(QSet<QString> *travelling, QSet<QS
         o.id = q.value(6).toLongLong(); o.device = q.value(7).toString();
         it->obs.append(o);
     }
-    q.exec(QStringLiteral("SELECT bssid, lat, lon, acc, semi_major, semi_minor, orient, rms, p0, pathloss, fitted_n, n, vantage, rejected, quality, updated FROM estimates"));
+    q.exec(QStringLiteral("SELECT bssid, lat, lon, acc, semi_major, semi_minor, orient, rms, p0, pathloss, fitted_n, n, vantage, rejected, quality, updated, metrics FROM estimates"));
     while (q.next()) {
         auto it = out.find(q.value(0).toString()); if (it == out.end()) continue;
         Estimator::Fit &f = it->fit;
+        const QString metrics = q.value(16).toString();
+        if (!metrics.isEmpty()) {                       // estimator 2: every field
+            const QJsonObject j = QJsonDocument::fromJson(metrics.toUtf8()).object();
+            if (!j.isEmpty()) { f = Estimator::fromStorage(j); it->fitCurrent = j["v"].toInt() >= Estimator::kVersion; continue; }
+        }
         f.lat = q.value(1).toDouble(); f.lon = q.value(2).toDouble(); f.acc = q.value(3).toDouble(); f.semiMajor = q.value(4).toDouble(); f.semiMinor = q.value(5).toDouble();
         f.orientDeg = q.value(6).toDouble(); f.rms = q.value(7).toDouble(); f.p0 = q.value(8).toDouble(); f.pathloss = q.value(9).toDouble(); f.fittedN = q.value(10).toInt() != 0;
         f.n = q.value(11).toInt(); f.vantage = q.value(12).toInt(); f.rejected = q.value(13).toInt(); f.quality = q.value(14).toString();
@@ -637,13 +657,65 @@ void MapDb::saveEstimate(const QString &bssid, const Estimator::Fit &fit)
 {
     if (!m_db.isOpen() || m_readOnly) return;
     QSqlQuery q(m_db);
-    q.prepare(QStringLiteral("INSERT OR REPLACE INTO estimates(bssid, lat, lon, acc, semi_major, semi_minor, orient, rms, p0, pathloss, fitted_n, n, vantage, rejected, quality, updated, seq)"
-                             " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"));
+    q.prepare(QStringLiteral("INSERT OR REPLACE INTO estimates(bssid, lat, lon, acc, semi_major, semi_minor, orient, rms, p0, pathloss, fitted_n, n, vantage, rejected, quality, updated, seq,"
+                             " kind, grade, score, r95, cep50, p_within25, cxx, cxy, cyy, metrics, version) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"));
     q.addBindValue(bssid); q.addBindValue(fit.lat); q.addBindValue(fit.lon); q.addBindValue(fit.acc); q.addBindValue(fit.semiMajor); q.addBindValue(fit.semiMinor); q.addBindValue(fit.orientDeg);
     q.addBindValue(fit.rms); q.addBindValue(fit.p0); q.addBindValue(fit.pathloss); q.addBindValue(fit.fittedN ? 1 : 0); q.addBindValue(fit.n); q.addBindValue(fit.vantage); q.addBindValue(fit.rejected);
     q.addBindValue(fit.valid ? fit.quality : QStringLiteral("none"));
     q.addBindValue(QDateTime::fromSecsSinceEpoch(fit.updated > 0 ? fit.updated : QDateTime::currentSecsSinceEpoch()).toString(Qt::ISODate));
     q.addBindValue(double(nextSeq()));
+    q.addBindValue(fit.kind); q.addBindValue(fit.grade); q.addBindValue(fit.score); q.addBindValue(fit.r95); q.addBindValue(fit.cep50); q.addBindValue(fit.pWithin25);
+    q.addBindValue(fit.cxx); q.addBindValue(fit.cxy); q.addBindValue(fit.cyy);
+    q.addBindValue(QString::fromUtf8(QJsonDocument(Estimator::toStorage(fit)).toJson(QJsonDocument::Compact)));
+    q.addBindValue(Estimator::kVersion);
+    q.exec();
+    markDirty();
+}
+
+void MapDb::appendEstimateHistory(const QString &bssid, const Estimator::Fit &fit)
+{
+    if (!m_db.isOpen() || m_readOnly) return;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("INSERT INTO estimate_history(bssid, time, lat, lon, cxx, cxy, cyy, r95, score, grade, kind) VALUES(?,?,?,?,?,?,?,?,?,?,?)"));
+    q.addBindValue(bssid); q.addBindValue(QDateTime::fromSecsSinceEpoch(fit.updated > 0 ? fit.updated : QDateTime::currentSecsSinceEpoch()).toString(Qt::ISODate));
+    q.addBindValue(fit.lat); q.addBindValue(fit.lon); q.addBindValue(fit.cxx); q.addBindValue(fit.cxy); q.addBindValue(fit.cyy);
+    q.addBindValue(fit.r95); q.addBindValue(fit.score); q.addBindValue(fit.grade); q.addBindValue(fit.kind);
+    q.exec();
+    // the last 20 per beacon are plenty for drift and trends
+    q.prepare(QStringLiteral("DELETE FROM estimate_history WHERE bssid=? AND id NOT IN (SELECT id FROM estimate_history WHERE bssid=? ORDER BY id DESC LIMIT 20)"));
+    q.addBindValue(bssid); q.addBindValue(bssid); q.exec();
+    markDirty();
+}
+
+QJsonArray MapDb::estimateHistory(const QString &bssid) const
+{
+    QJsonArray out;
+    if (!m_db.isOpen()) return out;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("SELECT time, lat, lon, cxx, cxy, cyy, r95, score, grade, kind FROM estimate_history WHERE bssid=? ORDER BY id"));
+    q.addBindValue(bssid); q.exec();
+    while (q.next()) out.append(QJsonObject{{"time", q.value(0).toString()}, {"lat", q.value(1).toDouble()}, {"lon", q.value(2).toDouble()}, {"cxx", q.value(3).toDouble()},
+                                            {"cxy", q.value(4).toDouble()}, {"cyy", q.value(5).toDouble()}, {"r95", q.value(6).toDouble()}, {"score", q.value(7).toDouble()},
+                                            {"grade", q.value(8).toString()}, {"kind", q.value(9).toString()}});
+    return out;
+}
+
+QList<MapDb::ScanCellRow> MapDb::loadScanCells() const
+{
+    QList<ScanCellRow> out;
+    if (!m_db.isOpen()) return out;
+    QSqlQuery q(m_db);
+    q.exec(QStringLiteral("SELECT cell, lat, lon, count, first, last FROM scan_cells"));
+    while (q.next()) out << ScanCellRow{q.value(0).toString(), q.value(1).toDouble(), q.value(2).toDouble(), q.value(3).toInt(), q.value(4).toLongLong(), q.value(5).toLongLong()};
+    return out;
+}
+
+void MapDb::saveScanCell(const ScanCellRow &c)
+{
+    if (!m_db.isOpen() || m_readOnly) return;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("INSERT OR REPLACE INTO scan_cells(cell, lat, lon, count, first, last) VALUES(?,?,?,?,?,?)"));
+    q.addBindValue(c.key); q.addBindValue(c.lat); q.addBindValue(c.lon); q.addBindValue(c.count); q.addBindValue(double(c.first)); q.addBindValue(double(c.last));
     q.exec();
     markDirty();
 }
@@ -916,8 +988,14 @@ bool MapDb::estimate(const QList<QPair<QString, int>> &heard, double *lat, doubl
     for (const ApPos &p : ps) {
         if (p.home || p.travelling || p.ignored) continue;
         Estimator::Known k; k.bssid = p.bssid; k.lat = p.lat; k.lon = p.lon; k.acc = p.acc; k.dbm = dbm.value(p.bssid.toUpper(), -80);
-        q.prepare(QStringLiteral("SELECT p0, pathloss, quality FROM estimates WHERE bssid=?")); q.addBindValue(p.bssid); q.exec();
-        if (q.next() && q.value(2).toString() != QLatin1String("none")) { k.p0 = q.value(0).toDouble(); k.pathloss = q.value(1).toDouble(); k.haveModel = true; }
+        q.prepare(QStringLiteral("SELECT p0, pathloss, quality, kind, grade, cxx, cxy, cyy FROM estimates WHERE bssid=?")); q.addBindValue(p.bssid); q.exec();
+        if (q.next() && q.value(2).toString() != QLatin1String("none") && q.value(3).toString() != QLatin1String("region") && q.value(3).toString() != QLatin1String("mobile")) {
+            k.p0 = q.value(0).toDouble(); k.pathloss = q.value(1).toDouble(); k.haveModel = true;
+            if (p.source == QLatin1String("trilat")) { k.cxx = q.value(5).toDouble(); k.cxy = q.value(6).toDouble(); k.cyy = q.value(7).toDouble(); }
+            // a beacon we placed badly counts less (docs/GRADING.md §4.6)
+            const QString g = q.value(4).toString();
+            k.weight = g == QLatin1String("A") || g == QLatin1String("B") ? 1.0 : g == QLatin1String("C") ? 0.8 : g == QLatin1String("D") ? 0.6 : g == QLatin1String("E") ? 0.4 : g == QLatin1String("F") ? 0.3 : 1.0;
+        }
         known << k;
     }
     *used = known.size();
@@ -1011,8 +1089,18 @@ QJsonObject MapDb::changesSince(qint64 since, int limit, bool *more, qint64 *cur
         QJsonObject a{{"bssid", q.value(0).toString()}, {"ssid", q.value(1).toString()}, {"freq", q.value(2).toInt()}, {"source", q.value(6).toString()},
                       {"home", q.value(7).toInt() != 0}, {"travelling", q.value(8).toInt() != 0}, {"ignored", q.value(9).toInt() != 0}, {"security", q.value(10).toString()}, {"seq", q.value(11).toDouble()}};
         if (!q.value(3).isNull()) { a["lat"] = q.value(3).toDouble(); a["lon"] = q.value(4).toDouble(); a["acc"] = q.value(5).toDouble(); }
-        QSqlQuery e(m_db); e.prepare(QStringLiteral("SELECT n, vantage, rms, acc, p0, pathloss, quality, updated FROM estimates WHERE bssid=? AND quality<>'none'")); e.addBindValue(q.value(0).toString()); e.exec();
-        if (e.next()) a["fit"] = QJsonObject{{"n", e.value(0).toInt()}, {"vantage", e.value(1).toInt()}, {"rms", e.value(2).toDouble()}, {"acc", e.value(3).toDouble()}, {"p0", e.value(4).toDouble()}, {"pathloss", e.value(5).toDouble()}, {"quality", e.value(6).toString()}, {"updated", e.value(7).toString()}};
+        QSqlQuery e(m_db); e.prepare(QStringLiteral("SELECT n, vantage, rms, acc, p0, pathloss, quality, updated, metrics FROM estimates WHERE bssid=? AND quality<>'none'")); e.addBindValue(q.value(0).toString()); e.exec();
+        if (e.next()) {
+            QJsonObject fit{{"n", e.value(0).toInt()}, {"vantage", e.value(1).toInt()}, {"rms", e.value(2).toDouble()}, {"acc", e.value(3).toDouble()}, {"p0", e.value(4).toDouble()}, {"pathloss", e.value(5).toDouble()}, {"quality", e.value(6).toString()}, {"updated", e.value(7).toString()}};
+            const QJsonObject m = QJsonDocument::fromJson(e.value(8).toString().toUtf8()).object();
+            if (!m.isEmpty()) {         // 3.9: the graded estimate (older peers ignore the extra keys)
+                const QJsonObject api = Estimator::toApi(Estimator::fromStorage(m));
+                for (const char *k : {"kind", "grade", "score", "r95", "cep50", "pWithin25", "cxx", "cxy", "cyy", "semiMajor", "semiMinor", "orient", "lat", "lon",
+                                      "devices", "sessions", "inHull", "ambiguous", "modes", "moved", "flags"})
+                    fit[QLatin1String(k)] = api.value(QLatin1String(k));
+            }
+            a["fit"] = fit;
+        }
         aps.append(a); maxSeq = qMax(maxSeq, q.value(11).toLongLong()); ++total;
     }
     q.prepare(QStringLiteral("SELECT bssid, time, lat, lon, acc, dbm, device, seq FROM observations WHERE seq>? ORDER BY seq LIMIT ?")); q.addBindValue(double(since)); q.addBindValue(limit + 1); q.exec();
@@ -1125,6 +1213,8 @@ QJsonObject MapDb::exportJson() const
     o["aps"] = dumpTable(m_db, QStringLiteral("SELECT * FROM aps"));
     o["observations"] = dumpTable(m_db, QStringLiteral("SELECT bssid, time, lat, lon, acc, dbm, fix_source, device FROM observations ORDER BY id"));
     o["estimates"] = dumpTable(m_db, QStringLiteral("SELECT * FROM estimates"));
+    o["estimateHistory"] = dumpTable(m_db, QStringLiteral("SELECT bssid, time, lat, lon, cxx, cxy, cyy, r95, score, grade, kind FROM estimate_history ORDER BY id"));
+    o["scanCells"] = dumpTable(m_db, QStringLiteral("SELECT * FROM scan_cells"));
     o["sightings"] = dumpTable(m_db, QStringLiteral("SELECT bssid, lat, lon, acc, time FROM sightings ORDER BY id"));
     o["cells"] = dumpTable(m_db, QStringLiteral("SELECT bssid, cell FROM cells"));
     o["flags"] = dumpTable(m_db, QStringLiteral("SELECT kind, bssid FROM flags"));
@@ -1168,6 +1258,8 @@ int MapDb::importJson(const QJsonObject &dump, QString *error)
     insertRows(QStringLiteral("elevation"), dump["elevation"].toArray(), true);
     insertRows(QStringLiteral("achievements"), dump["achievements"].toArray(), true);
     insertRows(QStringLiteral("estimates"), dump["estimates"].toArray(), true);
+    insertRows(QStringLiteral("estimate_history"), dump["estimateHistory"].toArray(), true);
+    insertRows(QStringLiteral("scan_cells"), dump["scanCells"].toArray(), true);
     m_db.commit();
     for (const QJsonValue &v : dump["anchors"].toArray()) if (putAnchor(Anchors::Anchor::fromJson(v.toObject()), false)) ++n;
     if (n) markDirty();
