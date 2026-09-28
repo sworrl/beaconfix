@@ -1,4 +1,5 @@
 #include "poiclassify.h"
+#include <algorithm>
 #include <QJsonArray>
 #include <QRegularExpression>
 #include <QSet>
@@ -142,7 +143,23 @@ Result classify(const QJsonObject &t)
     static const QSet<QString> pedTokens{QStringLiteral("paediatrics"), QStringLiteral("pediatrics"), QStringLiteral("paediatric"), QStringLiteral("pediatric"),
                                          QStringLiteral("paediatrician"), QStringLiteral("pediatrician"), QStringLiteral("specialist_pediatrician")};
     static const QRegularExpression pedNameRe(QStringLiteral("\\b(children'?s?|child|pa?ediatric\\w*|kids?)\\b"));
-    static const QRegularExpression notErRe(QStringLiteral("rehab|behavio|psychiat|hospice|home\\b|dental|outpatient|specialty (care|center)|medical office|pavilion|therapy|surgery center|shriners"));
+    // Names of places that are not an emergency department: rehab, psychiatric and residential centres, offices,
+    // outpatient buildings and single departments ("<Children's Hospital> - Cardiology")
+    static const QRegularExpression notErRe(QStringLiteral(
+        "rehab|behavio|psychiat|hospice|home\\b|dental|outpatient|specialty (care|center)|medical office|pavilion|therapy|surgery center|shriners"
+        "|medical building|office building|cent(er|re) for children|adolescent|residential"
+        "|\\b(cardiology|oncology|hematology|neurology|neurosurgery|orthopa?edics?|radiology|imaging|urology|dermatology|endocrinology"
+        "|gastroenterology|pulmonology|nephrology|rheumatology|audiology|ophthalmology|sports medicine|infusion|dialysis|laboratory)\\b"));
+    // Specialities that are never an emergency department: a hospital tagged only with these is not an ER, whatever its
+    // name says (a psychiatric centre "for Children and Adolescents" was listed as a children's ER)
+    static const QSet<QString> nonErSpec{QStringLiteral("psychiatry"), QStringLiteral("child_psychiatry"), QStringLiteral("paediatric_psychiatry"),
+                                         QStringLiteral("pediatric_psychiatry"), QStringLiteral("psychotherapy"), QStringLiteral("psychology"),
+                                         QStringLiteral("addiction"), QStringLiteral("substance_abuse"), QStringLiteral("rehabilitation"),
+                                         QStringLiteral("physiotherapy"), QStringLiteral("occupational_therapy"), QStringLiteral("speech_therapy"),
+                                         QStringLiteral("dentistry"), QStringLiteral("orthodontics"), QStringLiteral("paediatric_dentistry"),
+                                         QStringLiteral("pediatric_dentistry"), QStringLiteral("oral_surgery"), QStringLiteral("hospice"),
+                                         QStringLiteral("palliative"), QStringLiteral("dialysis"), QStringLiteral("ophthalmology"),
+                                         QStringLiteral("dermatology"), QStringLiteral("fertility")};
     static const QRegularExpression urgentRe(QStringLiteral("urgent|express care|after.?hours|walk.?in|immediate care"));
 
     const QString am = t["amenity"].toString(), hc = t["healthcare"].toString(), bld = t["building"].toString();
@@ -159,7 +176,9 @@ Result classify(const QJsonObject &t)
     nm.replace(QChar(0x2019), QLatin1Char('\''));
     if (nm.contains(QLatin1String("dent"))) dental = true;
     const bool pedName = pedNameRe.match(nm).hasMatch();
-    const bool notEr = notErRe.match(nm).hasMatch();
+    bool specNotEr = !tokens.isEmpty();
+    for (const QString &tok : tokens) if (!nonErSpec.contains(tok)) { specNotEr = false; break; }
+    const bool notEr = specNotEr || notErRe.match(nm).hasMatch();
     const bool isHosp = am == QLatin1String("hospital") || hc == QLatin1String("hospital");
     const bool erYes = t["emergency"].toString() == QLatin1String("yes") || t["emergency:paediatric"].toString() == QLatin1String("yes")
                     || tokens.contains(QLatin1String("emergency")) || tokens.contains(QLatin1String("paediatric_emergency")) || tokens.contains(QLatin1String("pediatric_emergency"));
@@ -273,6 +292,17 @@ QList<Result> classifyAll(const QList<Element> &els)
             if (dropI) break;
         }
     }
+    return out;
+}
+
+QList<int> keepPediatricEr(const QList<int> &tiers, const QList<double> &distM, int perGroup)
+{
+    QList<int> idx;
+    for (int i = 0; i < tiers.size() && i < distM.size(); ++i) idx << i;
+    std::stable_sort(idx.begin(), idx.end(), [&](int a, int b) { return distM[a] < distM[b]; });
+    QList<int> out, rest;
+    for (int i : idx) { if (tiers[i] == 1 && out.size() < perGroup) out << i; else rest << i; }
+    for (int i = 0; i < rest.size() && i < perGroup; ++i) out << rest[i];
     return out;
 }
 

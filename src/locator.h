@@ -391,6 +391,9 @@ public:
     // The pediatric ER search: the server-side [timeout:] (the client waits 30 s longer), and the back-off after
     // `failures` failed searches in a row: 10, 20, 40 … minutes, at most 4 h
     static constexpr int kPedsServerTimeoutS = 90;
+    // The pediatric classifier's rules version: a saved far list classified by older rules is searched again once
+    // (2: not-an-ER specialities, offices and departments; confirmed pediatric ERs kept first)
+    static constexpr int kPedsClassifierVersion = 2;
     static int pedsBackoffS(int failures) { return failures <= 1 ? 600 : std::min(4 * 3600, 600 << std::min(failures - 1, 5)); }
     // Our other devices on the map (docs/API.md "Devices")
     QJsonArray linkedDevices() const;
@@ -608,6 +611,7 @@ private:
     int  m_pedsRadiusKm = 150;
     bool m_pedsBusy = false, m_pedsFailed = false;
     int  m_pedsFailCount = 0;                        // failed pediatric searches in a row (back-off: pedsBackoffS)
+    int  m_pedsClassifier = 1;                      // the rules version the saved far list was classified with (settings)
     QString m_pedsNote;                             // the last search's own message ("Overpass busy — will retry" …)
     QTimer m_pedsRetryTimer;
     // Overpass etiquette: one query in flight, 5 s between queries, a minute's pause after 429 / 504

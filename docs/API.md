@@ -188,7 +188,10 @@ Place fields added in 3.8 (left out at their default): `osmType`, `osmId`, `peds
 `peds_er`, `peds_urgent`, `health`, `urgent`, `police`, `fire`: `driveS`, `driveM`, `driveEst` —
 the straight-line distance × 1.4 at 70 km/h, rounded to 5 minutes (at least 5), `driveEst: true`.
 The classifier rules are in `src/poiclassify.cpp`, with the shared test fixture
-`tests/fixtures/pediatric_tags.json`.
+`tests/fixtures/pediatric_tags.json`. A hospital is never a pediatric ER when its name reads like a
+rehab, psychiatric, residential or outpatient site, an office or medical building, or a single
+department ("… - Cardiology"), or when all of its `healthcare:speciality` values are non-emergency
+ones (psychiatry, rehabilitation, dentistry, …); it stays a general hospital.
 
 `/emergency` additions:
 
@@ -223,9 +226,10 @@ The classifier rules are in `src/poiclassify.cpp`, with the shared test fixture
   mapped only as a building, and pediatric urgent care within 50 km. Only exact key=value
   lookups (every hospital, hospital building and clinic in the boxes, `[timeout:90]`, the client
   waits 120 s): name regexes made the server time out, so the names are matched here. It keeps the nearest 5
-  pediatric ERs, 5 pediatric urgent cares and 8 general ERs (within 80 km), merged with the
-  places list (the places query wins for an object both found). It runs again only when the fix
-  moved a quarter of the radius, the answer is 30 days old, the radius changed, or when asked
+  confirmed pediatric ERs (tier 1) plus the nearest 5 other pediatric sites, 5 pediatric urgent cares
+  and 8 general ERs (within 80 km), merged with the places list (the places query wins for an object
+  both found). It runs again only when the fix moved a quarter of the radius, the answer is 30 days
+  old, the radius changed, the answer was classified by older rules (once after an update), or when asked
   (D-Bus `RefreshPlaces()`, the window's and the map's "reload places"). It never runs at the
   same time as the places query (one Overpass query at a time, 5 s apart), and only in the tray
   (`--once`, `--snapshot` and other one-shot commands never query Overpass); failures in a row

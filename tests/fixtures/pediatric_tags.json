@@ -93,7 +93,15 @@
         {"type": "node", "id": 9000000010, "lat": 40.0, "lon": -80.0,
          "tags": {"amenity": "hospital", "healthcare": "hospital", "name": "Test Children’s Hospital", "emergency": "yes"}},
         {"type": "node", "id": 9000000011, "lat": 40.1, "lon": -80.0,
-         "tags": {"amenity": "hospital", "name": "Test Children's Medical Center", "opening_hours": "24/7"}}
+         "tags": {"amenity": "hospital", "name": "Test Children's Medical Center", "opening_hours": "24/7"}},
+        {"type": "node", "id": 9000000012, "lat": 39.997, "lon": -80.0,
+         "tags": {"amenity": "hospital", "healthcare": "hospital", "name": "Test Children's Hope Campus", "healthcare:speciality": "psychiatry;child_psychiatry"}},
+        {"type": "node", "id": 9000000013, "lat": 39.996, "lon": -80.001,
+         "tags": {"amenity": "hospital", "name": "Test Center for Children and Adolescents", "healthcare:speciality": "psychiatry"}},
+        {"type": "node", "id": 9000000014, "lat": 39.998, "lon": -80.002,
+         "tags": {"building": "hospital", "name": "Test Children's Medical Building"}},
+        {"type": "node", "id": 9000000015, "lat": 39.995, "lon": -80.0,
+         "tags": {"healthcare": "hospital", "name": "Test Children's Hospital - Cardiology"}}
       ],
       "expect": [
         {"id": "node/9000000001", "cat": "dentist", "peds": 0, "dropped": false},
@@ -106,7 +114,11 @@
         {"id": "node/9000000008", "catNot": ["peds_er", "peds_urgent"], "peds": 0, "dropped": false},
         {"id": "node/9000000009", "cat": "health", "peds": 0, "dropped": false},
         {"id": "node/9000000010", "cat": "peds_er", "peds": 1, "er": "yes", "emergency": true, "dropped": false},
-        {"id": "node/9000000011", "cat": "peds_er", "peds": 2, "er": "", "campusEr": "", "emergency": false, "detailContains": "likely ER (24/7) — call ahead", "dropped": false}
+        {"id": "node/9000000011", "cat": "peds_er", "peds": 2, "er": "", "campusEr": "", "emergency": false, "detailContains": "likely ER (24/7) — call ahead", "dropped": false},
+        {"id": "node/9000000012", "cat": "health", "peds": 0, "er": "", "emergency": false, "dropped": false},
+        {"id": "node/9000000013", "cat": "health", "peds": 0, "er": "", "emergency": false, "dropped": false},
+        {"id": "node/9000000014", "catNot": ["peds_er", "peds_urgent"], "peds": 0, "dropped": false},
+        {"id": "node/9000000015", "cat": "health", "peds": 0, "er": "", "emergency": false, "dropped": false}
       ],
       "help": {"pediatric": "node/9000000010", "pediatricCloser": "node/9000000005", "hospital": "node/9000000005", "pediatricUrgent": "node/9000000006"}
     }

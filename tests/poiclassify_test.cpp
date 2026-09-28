@@ -129,6 +129,24 @@ int main(int argc, char **argv)
     CHECK(classify(QJsonObject{{"amenity", "hospital"}, {"name", "Anytown General"}, {"opening_hours", "24/7"}}).emergency, "a general hospital open 24/7 counts as an ER");
     CHECK(!classify(QJsonObject{{"amenity", "hospital"}, {"name", "Anytown General"}, {"opening_hours", "24/7"}, {"emergency", "no"}}).emergency, "emergency=no beats 24/7");
 
+    // The far list keeps confirmed pediatric ERs first: 6 nearer tier-2 sites no longer push the tier-1 site at 141 km off
+    {
+        const QList<int> tiers{2, 2, 2, 2, 2, 2, 1, 1};
+        const QList<double> d{10e3, 20e3, 30e3, 40e3, 50e3, 60e3, 141e3, 70e3};
+        const QList<int> k = keepPediatricEr(tiers, d, 5);
+        CHECK(k == QList<int>({7, 6, 0, 1, 2, 3, 4}), "keepPediatricEr: tier 1 by distance, then the 5 nearest others (got %d kept)", int(k.size()));
+        // more than 5 tier-1 sites: the 5 nearest, then the rest (the 6th tier-1 included) by distance
+        const QList<int> t2{1, 1, 1, 1, 1, 1, 2};
+        const QList<double> d2{1e3, 2e3, 3e3, 4e3, 5e3, 6e3, 5.5e3};
+        CHECK(keepPediatricEr(t2, d2, 5) == QList<int>({0, 1, 2, 3, 4, 6, 5}), "keepPediatricEr: 6 tier-1 sites");
+        CHECK(keepPediatricEr({}, {}, 5).isEmpty(), "keepPediatricEr: nothing to keep");
+    }
+    // Not an ER by speciality alone, whatever the name says; a general hospital with a psychiatry ward still is one
+    CHECK(classify(QJsonObject{{"amenity", "hospital"}, {"name", "Test Children's Place"}, {"healthcare:speciality", "psychiatry"}}).cat == QLatin1String("health"),
+          "a psychiatric hospital with a children's name is not a pediatric ER");
+    CHECK(classify(QJsonObject{{"amenity", "hospital"}, {"name", "Test Children's Hospital"}, {"healthcare:speciality", "paediatrics;psychiatry"}, {"emergency", "yes"}}).peds == 1,
+          "a children's hospital with a psychiatry department stays a pediatric ER");
+
     // The Urgent care help pick: an actual urgent care, not the nearest clinic (a chiropractor was shown under it)
     CHECK(isUrgentCare(QStringLiteral("Test Health Center"), QStringLiteral("urgent care")), "tagged urgent_care (detail \"urgent care\")");
     CHECK(isUrgentCare(QStringLiteral("Test MedExpress"), QStringLiteral("clinic")), "a MedExpress by name");

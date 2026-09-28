@@ -56,6 +56,11 @@ double distanceM(double lat1, double lon1, double lat2, double lon2);
 // Straight-line distance × 1.4 at 70 km/h, rounded to 5 minutes (at least 5 minutes)
 void driveEstimate(double distM, int *driveS, int *driveM);
 
+// The pediatric search's peds_er places to keep (indices, tier-1 first): the nearest `perGroup` confirmed pediatric ERs
+// (tier 1), then the nearest `perGroup` of the rest. Nearer uncertain sites can no longer push a confirmed pediatric ER
+// inside the radius off the list.
+QList<int> keepPediatricEr(const QList<int> &tiers, const QList<double> &distM, int perGroup = 5);
+
 // ── Nearest help ─────────────────────────────────────────────────────────────
 // rank 0 = tier 1, or tier 2 with an ER on the same campus; rank 1 = tier 2 without one, or tier 3
 int pedsRank(int peds, const QString &campus);

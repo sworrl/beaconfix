@@ -11,8 +11,8 @@ import java.util.Locale
 object PedsFallback {
     /** C6 `pedName`, on the normalized name. */
     val PED_NAME = Regex("""\b(children'?s?|child|pa?ediatric\w*|kids?)\b""")
-    /** C6 `notEr`, on the normalized name. */
-    val NOT_ER = Regex("""rehab|behavio|psychiat|hospice|home\b|dental|outpatient|specialty (care|center)|medical office|pavilion|therapy|surgery center|shriners""")
+    /** C6 `notEr`, on the normalized name (the classifier's own list). */
+    val NOT_ER = org.sworrl.beaconfix.poi.PedsClassifier.NOT_ER
 
     /** Lower case with typographic apostrophes made plain, as C6 `nm`. */
     fun norm(name: String): String = name.lowercase(Locale.ROOT).replace('’', '\'')

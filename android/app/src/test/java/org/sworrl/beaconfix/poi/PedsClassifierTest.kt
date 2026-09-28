@@ -110,6 +110,19 @@ class PedsClassifierTest {
         assertEquals("1 Test Street #2, Testville, WV 00000", PedsClassifier.address(mapOf("addr:housenumber" to "1", "addr:street" to "Test Street", "addr:unit" to "2",
             "addr:city" to "Testville", "addr:state" to "WV", "addr:postcode" to "00000")))
         assertEquals("children's hospital — ER not confirmed", PedsClassifier.tierLabel(2))
+        // not an ER by speciality alone, whatever the name says; a children's hospital with a psychiatry ward still is one
+        assertEquals("health", PedsClassifier.classify(mapOf("amenity" to "hospital", "name" to "Test Children's Place", "healthcare:speciality" to "psychiatry")).cat)
+        assertEquals(1, PedsClassifier.classify(mapOf("amenity" to "hospital", "name" to "Test Children's Hospital", "healthcare:speciality" to "paediatrics;psychiatry", "emergency" to "yes")).peds)
+    }
+
+    @Test fun farListKeepsConfirmedPediatricErsFirst() {   // the C++ keepPediatricEr checks, same numbers
+        data class P(val i: Int, val tier: Int, val d: Double)
+        fun keep(tiers: List<Int>, d: List<Double>) = PedsClassifier.keepPediatricEr(tiers.indices.map { P(it, tiers[it], d[it]) }, 5, { it.tier }, { it.d }).map { it.i }
+        // 6 nearer tier-2 sites no longer push the tier-1 site at 141 km off
+        assertEquals(listOf(7, 6, 0, 1, 2, 3, 4), keep(listOf(2, 2, 2, 2, 2, 2, 1, 1), listOf(10e3, 20e3, 30e3, 40e3, 50e3, 60e3, 141e3, 70e3)))
+        // more than 5 tier-1 sites: the 5 nearest, then the rest (the 6th tier-1 included) by distance
+        assertEquals(listOf(0, 1, 2, 3, 4, 6, 5), keep(listOf(1, 1, 1, 1, 1, 1, 2), listOf(1e3, 2e3, 3e3, 4e3, 5e3, 6e3, 5.5e3)))
+        assertTrue(keep(emptyList(), emptyList()).isEmpty())
     }
 
     @Test fun elementFromOverpassJson() {

@@ -124,6 +124,7 @@ Locator::Locator(bool standalone, QObject *parent) : QObject(parent), m_standalo
     m_wigleToken     = s.value("wigleToken").toString();
     m_poiRadiusKm    = qBound(1, s.value("poiRadiusKm", 6).toInt(), 30);
     m_pedsRadiusKm   = qBound(50, s.value("pedsRadiusKm", 150).toInt(), 300);
+    m_pedsClassifier = s.value("pedsClassifier", 1).toInt();
     m_overpassTimer.setSingleShot(true);
     connect(&m_overpassTimer, &QTimer::timeout, this, &Locator::pumpOverpass);
     m_pedsRetryTimer.setSingleShot(true);
@@ -2194,7 +2195,8 @@ void Locator::refreshPediatric(bool force)
     const QDateTime now = QDateTime::currentDateTime();
     const bool have = m_pedsTime.isValid();
     const double moved = have ? distanceM(m_pedsLat, m_pedsLon, m_fix.lat, m_fix.lon) : 1e12;
-    const bool stale = !have || m_pedsTime.secsTo(now) > 30LL * 86400;
+    // a list classified by older rules is searched again (once: the search stores the current version)
+    const bool stale = !have || m_pedsTime.secsTo(now) > 30LL * 86400 || m_pedsClassifier != kPedsClassifierVersion;
     if (!force && !stale && moved <= radiusM / 4.0 && m_pedsRadiusM == radiusM) return;
     if (!force && m_pedsBusyUntil.isValid() && now < m_pedsBusyUntil) return;
     if (!overpassSlot(true, force)) return;
@@ -2276,14 +2278,22 @@ void Locator::queryPediatric(double lat, double lon, int radiusM, int mirror)
             QList<Poi> out; for (int i = 0; i < l.size() && i < n; ++i) out << l[i].second;
             return out;
         };
-        m_pedsPois = nearest(peds, 5) + nearest(urgent, 5) + nearest(ers, 8);
+        // Pediatric ERs: the nearest 5 confirmed ones (tier 1) first, then the nearest 5 others. By distance alone, three
+        // nearer false positives (a psychiatric centre, an office building, a department) pushed a real pediatric ER
+        // inside the radius off the list.
+        QList<int> tiers; QList<double> pedsDist;
+        for (const auto &x : peds) { tiers << x.second.peds; pedsDist << x.first; }
+        QList<Poi> keptPeds;
+        for (int i : PoiClassify::keepPediatricEr(tiers, pedsDist, 5)) keptPeds << peds[i].second;
+        m_pedsPois = keptPeds + nearest(urgent, 5) + nearest(ers, 8);
         m_pedsLat = lat; m_pedsLon = lon; m_pedsRadiusM = radiusM;
         m_pedsTime = QDateTime::currentDateTime();
         m_pedsBusy = false; m_pedsFailed = false; m_pedsBusyUntil = QDateTime(); m_pedsFailCount = 0;
+        if (m_pedsClassifier != kPedsClassifierVersion) { m_pedsClassifier = kPedsClassifierVersion; QSettings().setValue("pedsClassifier", m_pedsClassifier); }
         m_pedsNote.clear();
         m_pedsRetryTimer.stop();
         qInfo("beaconfix: pediatric ER search: %d pediatric ER, %d pediatric urgent care, %d ER within reach (%d elements)",
-              int(qMin<qsizetype>(5, peds.size())), int(qMin<qsizetype>(5, urgent.size())), int(qMin<qsizetype>(8, ers.size())), int(els.size()));
+              int(keptPeds.size()), int(qMin<qsizetype>(5, urgent.size())), int(qMin<qsizetype>(8, ers.size())), int(els.size()));
         savePedsPois();
         rebuildMergedPois();
         emit poisUpdated();

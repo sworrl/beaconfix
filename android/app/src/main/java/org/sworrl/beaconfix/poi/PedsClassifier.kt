@@ -76,7 +76,21 @@ object PedsClassifier {
 
     private val PED_TOKENS = setOf("paediatrics", "pediatrics", "paediatric", "pediatric", "paediatrician", "pediatrician", "specialist_pediatrician")
     private val PED_NAME = Regex("""\b(children'?s?|child|pa?ediatric\w*|kids?)\b""")
-    private val NOT_ER = Regex("""rehab|behavio|psychiat|hospice|home\b|dental|outpatient|specialty (care|center)|medical office|pavilion|therapy|surgery center|shriners""")
+    /** Names of places that are not an emergency department (C6 `notEr`): rehab, psychiatric and residential centres,
+     *  offices, outpatient buildings and single departments ("<Children's Hospital> - Cardiology"). */
+    val NOT_ER = Regex(
+        """rehab|behavio|psychiat|hospice|home\b|dental|outpatient|specialty (care|center)|medical office|pavilion|therapy|surgery center|shriners""" +
+            """|medical building|office building|cent(er|re) for children|adolescent|residential""" +
+            """|\b(cardiology|oncology|hematology|neurology|neurosurgery|orthopa?edics?|radiology|imaging|urology|dermatology|endocrinology""" +
+            """|gastroenterology|pulmonology|nephrology|rheumatology|audiology|ophthalmology|sports medicine|infusion|dialysis|laboratory)\b""")
+    /** Specialities that are never an emergency department (C6 `specNotEr`): a hospital tagged only with these is not an
+     *  ER, whatever its name says (a psychiatric centre "for Children and Adolescents" was listed as a children's ER). */
+    private val NON_ER_SPEC = setOf(
+        "psychiatry", "child_psychiatry", "paediatric_psychiatry", "pediatric_psychiatry", "psychotherapy", "psychology",
+        "addiction", "substance_abuse", "rehabilitation", "physiotherapy", "occupational_therapy", "speech_therapy",
+        "dentistry", "orthodontics", "paediatric_dentistry", "pediatric_dentistry", "oral_surgery", "hospice",
+        "palliative", "dialysis", "ophthalmology", "dermatology", "fertility",
+    )
     private val URGENT = Regex("""urgent|express care|after.?hours|walk.?in|immediate care""")
     private val SPACES = Regex("""\s+""")
 
@@ -137,7 +151,8 @@ object PedsClassifier {
         val nm = (t.s("name") + " " + t.s("alt_name") + " " + t.s("official_name")).lowercase(Locale.ROOT).replace('’', '\'')
         if (nm.contains("dent")) dental = true
         val pedName = PED_NAME.containsMatchIn(nm)
-        val notEr = NOT_ER.containsMatchIn(nm)
+        val specNotEr = tokens.isNotEmpty() && tokens.all { it in NON_ER_SPEC }
+        val notEr = specNotEr || NOT_ER.containsMatchIn(nm)
         val isHosp = am == "hospital" || hc == "hospital"
         val erYes = t.s("emergency") == "yes" || t.s("emergency:paediatric") == "yes" ||
             "emergency" in tokens || "paediatric_emergency" in tokens || "pediatric_emergency" in tokens
@@ -244,6 +259,17 @@ object PedsClassifier {
         val road = max(0.0, distM) * 1.4
         val secs = road / (70.0 / 3.6)
         return max(300, (secs / 300.0).roundToLong().toInt() * 300) to road.roundToLong().toInt()
+    }
+
+    /**
+     * The pediatric search's peds_er places to keep (C++ `keepPediatricEr`): the nearest [perGroup] confirmed pediatric
+     * ERs (tier 1) first, then the nearest [perGroup] of the rest, so nearer uncertain sites cannot push a confirmed
+     * pediatric ER inside the radius off the list.
+     */
+    fun <T> keepPediatricEr(items: List<T>, perGroup: Int, tier: (T) -> Int, distM: (T) -> Double): List<T> {
+        val first = ArrayList<T>(); val rest = ArrayList<T>()
+        for (x in items.sortedBy(distM)) if (tier(x) == 1 && first.size < perGroup) first += x else rest += x
+        return first + rest.take(perGroup)
     }
 
     // ── Nearest help (the desktop's pickHelp, for the fixture's help picks) ──────

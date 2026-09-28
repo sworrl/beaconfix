@@ -13,8 +13,8 @@ import kotlin.math.cos
  * - [pediatric]: the desktop's children's ER query (`Locator::queryPediatric`, 3.8): every hospital in the
  *   `pedsRadiusKm` box (classified here, which also yields the general ERs and a children's hospital's campus ER) plus
  *   pediatric clinics / urgent care in a 50 km box. Only exact-tag lookups: value regexes and `around:` over a 300 km
- *   box ran into the server's timeout. Kept: the nearest 5 pediatric ERs within the radius, 5 pediatric urgent care
- *   within 50 km and 8 general ERs within 80 km, scope `far`.
+ *   box ran into the server's timeout. Kept: the nearest 5 confirmed pediatric ERs within the radius plus the nearest 5
+ *   other pediatric sites, 5 pediatric urgent care within 50 km and 8 general ERs within 80 km, scope `far`.
  */
 object HelpQuery {
     const val HELP_RADIUS_M = 25_000
@@ -67,11 +67,15 @@ object HelpQuery {
         hits(els, res, lat, lon).filter { it.distM <= HELP_RADIUS_M }
             .groupBy { it.r.cat }.values.flatMap { l -> l.sortedBy { it.distM }.take(KEEP_PER_CAT) }
 
-    /** From the pediatric answer: pediatric ERs within [radiusM], pediatric urgent care within 50 km, general ERs within 80 km. */
+    /**
+     * From the pediatric answer: pediatric ERs within [radiusM] (the nearest [KEEP_PEDS_ER] tier-1 sites first, then the
+     * nearest [KEEP_PEDS_ER] others: [PedsClassifier.keepPediatricEr]), pediatric urgent care within 50 km, general ERs
+     * within 80 km.
+     */
     fun selectPediatric(els: List<OsmElement>, res: List<PedsClassifier.Result>, lat: Double, lon: Double, radiusM: Int): List<Hit> {
         val all = hits(els, res, lat, lon)
         fun nearest(l: List<Hit>, n: Int) = l.sortedBy { it.distM }.take(n)
-        return nearest(all.filter { it.r.cat == "peds_er" && it.distM <= radiusM }, KEEP_PEDS_ER) +
+        return PedsClassifier.keepPediatricEr(all.filter { it.r.cat == "peds_er" && it.distM <= radiusM }, KEEP_PEDS_ER, { it.r.peds }, { it.distM }) +
             nearest(all.filter { it.r.cat == "peds_urgent" && it.distM <= URGENT_RADIUS_M }, KEEP_PEDS_URGENT) +
             nearest(all.filter { it.r.cat == "health" && it.r.emergency && it.distM <= ER_RADIUS_M }, KEEP_ER)
     }

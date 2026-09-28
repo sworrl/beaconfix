@@ -92,7 +92,8 @@ class HelpQueryTest {
     @Test fun pediatricSelectionKeepsPedsErsUrgentCareAndErs() {
         val r = OverpassClient.parse(200, sample())
         val hits = HelpQuery.selectPediatric(r.elements, PedsClassifier.classifyAll(r.elements), oLat, oLon, 150_000)
-        assertEquals(listOf("way/1135527599", "node/9000000010", "way/329264979"), hits.filter { it.r.cat == "peds_er" }.map { it.el.key })   // nearest first
+        // confirmed pediatric ERs (tier 1) nearest first, then the other pediatric sites
+        assertEquals(listOf("node/9000000010", "way/329264979", "way/1135527599"), hits.filter { it.r.cat == "peds_er" }.map { it.el.key })
         assertEquals(listOf("node/9000000006"), hits.filter { it.r.cat == "peds_urgent" }.map { it.el.key })
         assertEquals(listOf("way/463483594", "node/9000000005"), hits.filter { it.r.cat == "health" }.map { it.el.key })   // ERs only
         // a smaller radius drops the far children's hospital
