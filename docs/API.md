@@ -101,7 +101,7 @@ Identity endpoints (challenge sign-in, linking, bundle hand-off) are specified i
 
 | method | path | scope | response |
 |---|---|---|---|
-| GET | `/api/v1/hello` | none | `{"name","version","hostname","pairing","tls","ts","api":2,"kind":"desktop","mdns":<bool>,"identity":{"id","name"}|null,"features":["sync","locate","home","events","stream","estimates","identity","peers","anchors","ranging","aps-paging","grant-control","pediatric","whoami"]}` (`pediatric`: 3.8, the pediatric ER fields below; `whoami`: 3.8, `GET /devices/me`) |
+| GET | `/api/v1/hello` | none | `{"name","version","hostname","pairing","tls","ts","api":2,"kind":"desktop","mdns":<bool>,"identity":{"id","name"}|null,"features":["sync","locate","home","events","stream","estimates","identity","peers","anchors","ranging","aps-paging","grant-control","pediatric","whoami","grades"]}` (`pediatric`: 3.8, the pediatric ER fields below; `whoami`: 3.8, `GET /devices/me`; `grades`: 3.9, graded estimates below) |
 | POST | `/api/v1/pair` body `{"name","kind","scopes":["read"],"identity":{id,pub,name}?,"sas":{"pub"},"proximity":{beacons[],lat,lon,acc,source,ts}}` | none | `202 {"id","code","expires","poll","proximity":{…},"sas":{"pub"},"autoApproved"?}`; `403` when pairing is closed; `429` when five are pending |
 | GET | `/api/v1/pair/<id>` | none | `{"status":"pending","proximity":{…},"sas":{"picked":<bool>}}` · `{"status":"denied","reason":"wrong pictures"?}` · `{"status":"cancelled"}` · `{"status":"approved","scopes":[…],"token":"…"}` (token once); `404` unknown/expired |
 | POST | `/api/v1/pair/<id>/cancel` | none | the device withdraws its request → `{"status":"cancelled"}` |
@@ -131,7 +131,8 @@ Identity endpoints (challenge sign-in, linking, bundle hand-off) are specified i
 | GET | `/api/v1/home` | read | `{"patterns":[…],"atHome","awayKm","awayText","homeLat","homeLon","homeTime"}` |
 | PUT | `/api/v1/home` body `{"patterns":[…]}` | control | replaces the home networks |
 | POST | `/api/v1/locate` body `{"wifiAccessPoints":[{"macAddress","signalStrength"}]}` | read | `{"location":{"lat","lng"},"accuracy","used"}` from the internal map, or `404` |
-| GET | `/api/v1/db/stats` | read | database statistics |
+| GET | `/api/v1/db/stats` | read | database statistics (3.9 adds `grades` {letter: count} and `scanCells`) |
+| GET | `/api/v1/estimator` | read | the estimator's state (3.9, [GRADING.md](GRADING.md)): `{"version","kappa","calibration":{"anchors","withSamples","fixes","regions","meanNees","kappa","coverage95","regionCoverage95","byGrade":{"A":{"n","medianErrorM"},…},"updated"},"deviceOffsets":{device: dB},"groups":[{"ref","members":[{"bssid","offsetDb"}]}],"grades":{letter: count},"kinds":{"fix","region","mobile","none"},"upgradePending","scanCells","suggestions":[{"bssid","ssid","grade","lat","lon","gain","distanceM"}],"environment"}` — also D-Bus `EstimatorJson()` and `beaconfix --estimator` |
 | POST | `/api/v1/db/observations` body `{"observations":[{"bssid","ssid","dbm","lat","lon","acc","time"}]}` | control | merges another device's observations into the map |
 | GET | `/api/v1/db/changes?since=<seq>&limit=<n>` | read | sync feed: `{since,cursor,more,count,device,identity,aps[],observations[],fixes[],anchors[]}` after a cursor, oldest first (every row carries `identity`; `anchors` holds anchors and tombstones, 3.7) |
 | POST | `/api/v1/db/sync` body `{"device","identity"?,"observations":[…],"aps":[…],"fixes":[…],"anchors"?:[…],"sinceCursor"?}` | control | merges a peer's data (1 MB bodies), queues refits, returns `{accepted:{observations,aps,fixes,anchors},cursor,refitQueued,identity,changes?}`; anchors merge by newest `placedAt` / `deletedAt`; `403 identity not linked` when the peer names an identity that is not yours or linked |
@@ -168,6 +169,35 @@ each id), `--anchor-remove <id>`, `--ranging` (info + every ranged device), `--r
 path-loss fit learned from anchors: `{"2.4"|"5"|"6": {"p0","n","sigmaP0","sigmaN","samples"}}`).
 | POST | `/api/v1/refresh` | control | re-check the position now (`202`) |
 | POST | `/api/v1/prefetch` | control | save map tiles around the fix (`202`) |
+
+### Graded estimates (3.9, feature `grades`)
+
+Every AP object (`/aps`, `/state`, D-Bus `StateJson()`) whose position is our own estimate carries
+a grade ([GRADING.md](GRADING.md)). New values of `kind`: **`region`** (only an area is known:
+`lat`/`lon` the centre, `r` = R95) and **`mobile`** (it travels: `lat`/`lon` where it was last
+heard). New top-level fields: `grade` (`A`–`F`, `R` region, `M` mobile), `score` (0–100),
+`r95` (m). The `fit` object keeps its 3.6 keys (`n`, `vantage`, `rms`, `acc`, `p0`, `pathloss`,
+`quality`, `rejected`, `semiMajor`, `semiMinor`, `orient`, `updated`; `acc`/`semiMajor` are 1-σ,
+`orient` the bearing of the major axis) and adds:
+
+| key | meaning |
+|---|---|
+| `kind` | `fix` · `region` · `mobile` |
+| `grade`, `pendingGrade`?, `score` | the letter, a letter change waiting for confirmation (hysteresis), 0–100 |
+| `r95`, `cep50`, `pWithin25` | radius holding 95 % / 50 % of the probability (m); P(error < 25 m) |
+| `cxx`, `cxy`, `cyy` | position covariance (m², x east, y north); the 95 % ellipse is 2.4477 × the 1-σ one |
+| `lat`, `lon` | the estimate (equal to the AP's `lat`/`lon` when it is shown) |
+| `devices`, `sessions`, `inHull`, `ambiguous`, `modes`, `moved` | see GRADING.md §2 |
+| `flags` | `extrapolated`, `ambiguous`, `moved`, `fragile`, `rangeScale` |
+| `components` | `{"P","G","E","F","S","T","X"?}` score components 0–1 (X only with a WiGLE/Apple placement) |
+| `metrics` | `{"rssDop","crlbR95","rbar","maxGapDeg","inHull","linRatio","chi2nu","sigmaDb","outlierFrac","ess","spearman","p0RangeCorr","dminRatio","modes","driftD2","jackMax","nisEwma","fadingDb","extD2"?,"altLat"?,"altLon"?}` |
+| `suggest` | `{"lat","lon","gain"}` where one more sample helps most (gain in nats), when useful |
+| `group` | `{"ref","size"}` when pooled with other BSSIDs of the same radio |
+
+`quality` stays for older clients: A/B `good`, C/D `fair`, E/F/R `poor`. `GET /db/changes` puts the
+graded keys (`kind` … `flags`, without `components`/`metrics`) into each AP's `fit`; older peers
+ignore them. `ap_refit` / `ap_placed` events add `grade`, `prevGrade`, `score`, `r95`, and their text
+reads "Refined <ssid>: ±300 m → ±80 m, grade C (…)" (R95 now, not 1-σ).
 
 ### Pediatric ER (3.8, feature `pediatric`)
 

@@ -4121,7 +4121,7 @@ QStringList Locator::features()
 {
     return {QStringLiteral("sync"), QStringLiteral("locate"), QStringLiteral("home"), QStringLiteral("events"), QStringLiteral("stream"), QStringLiteral("estimates"),
             QStringLiteral("identity"), QStringLiteral("peers"), QStringLiteral("anchors"), QStringLiteral("ranging"), QStringLiteral("aps-paging"), QStringLiteral("grant-control"),
-            QStringLiteral("pediatric"), QStringLiteral("whoami")};
+            QStringLiteral("pediatric"), QStringLiteral("whoami"), QStringLiteral("grades")};
 }
 
 // ── D-Bus ────────────────────────────────────────────────────────────────────

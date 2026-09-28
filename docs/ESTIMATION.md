@@ -1,8 +1,8 @@
 # Position estimation
 
 How BeaconFix turns signal-strength samples into positions, for access points and for
-itself. The code is `src/estimator.h` (pure functions, no I/O) and the tests are
-`tests/estimator_test.cpp`.
+itself. The code is `src/estimator.{h,cpp}` (pure functions, no I/O) with a Kotlin twin on
+Android; the tests are `tests/estimator_test.cpp` and `tests/estimator_golden.cpp`.
 
 ## Why not FFTs
 
@@ -15,61 +15,69 @@ from enough different places, pin it down. That is what this does.
 ## The model
 
 ```
-RSSI = P0 − 10 · n · log10(d)
+RSSI = P0 − 10 · n · log10(d),   d = √(horizontal distance² + h²)
 ```
 
-* `P0` is the level at 1 m. Radios differ by 20 dB, so it is fitted per beacon.
+* `P0` is the level at 1 m. Radios differ by 20 dB, so it is fitted per beacon, with a
+  Gaussian prior per band (−40 / −47 / −48 dBm at 2.4 / 5 / 6 GHz, ± 8 dB).
 * `n` is the path-loss exponent: 2 in free space, 2.4 outdoors with clutter, 3–4 indoors.
-  It is fixed at 2.4 until a beacon has 8 samples, then fitted within [1.8, 4].
-* `d` is the distance between the observer's fix and the beacon.
+  Always fitted, with a prior (2.4 or 2.7 ± 0.5; the anchors' environment calibration sets
+  the mean when there is one).
+* `h` = 3 m, the AP's height above the observer.
 
-## The fit
+Since 3.9 (estimator 2) every estimate is **graded**: docs/GRADING.md defines the numbers,
+the formulas and the letters. This page is the overview.
 
-For one beacon with samples `{lat, lon, acc, dBm, time}`:
+## The fit (estimator 2)
 
-1. **Weights.** A sample counts less when the observer's own fix was loose
-   (`1 / (1 + (acc / 25 m)²)`), when it is older than 30 days, and when the beacon's status
-   says it may move ("travels with you" gets 0.3; home networks are never fitted).
-2. **Seeds.** Three starting points: the signal-weighted centroid, the plain centroid, and
-   the centroid of the loudest quarter. A single loud outlier captures one seed; the others
-   escape it.
-3. **IRLS.** From each seed, Gauss–Newton with Levenberg damping on `(x, y, P0[, n])` in a
-   local metric frame. The first half of the iterations use Huber weights (6 dB), the second
-   half the redescending Tukey biweight (12 dB) so gross outliers end with zero weight. The
-   objective is the corresponding ρ function, which is *bounded* for Tukey: a "solution" that
-   rejects every sample has the worst cost, not the best. Steps are capped at 300 m.
-4. **Pick.** The seed whose solution explains the most samples wins; ties go to the lower cost.
-5. **Uncertainty.** `(JᵀWJ)⁻¹ · σ²` at the solution gives the covariance of `(x, y)`; its
-   eigen-decomposition is the 1-σ error ellipse. The observers' median fix accuracy is added
-   in quadrature. The circular accuracy reported is the semi-major axis (conservative).
-6. **Quality.** `good` (≤ 40 m, ≥ 5 vantage points, RMS ≤ 6 dB), `fair` (≤ 120 m, ≥ 3
-   vantage points), else `poor`.
+For one beacon with samples `{lat, lon, acc, dBm, time, device}`:
 
-### The geometry guard
+1. **Places.** Samples within `max(15 m, median fix accuracy)` of each other are one place;
+   its level is their median, its variance the shadowing (shared within the place) plus the
+   observer's own fix error mapped through the model's slope (errors-in-variables).
+   Fixes worse than 100 m are used only when nothing better exists.
+2. **Grid posterior.** P0 and n are integrated out in closed form at every cell of a 48 × 48
+   grid, with a range prior, Wi-Fi RTT ranges when a sample has one, and the cells this host
+   scanned from without hearing the beacon (misses). This finds the global optimum, the
+   number of modes and the 95 % region, even for one or two samples.
+3. **Robust polish.** Levenberg–Marquardt from the grid maxima, the classic centroids and
+   the mirror across the places' principal axis, with a Gaussian + uniform outlier mixture
+   (EM weights) at a pooled robust scale.
+4. **Uncertainty.** Laplace covariance, widened by the design effect of correlated
+   shadowing and the correlated fix error, floored by the Cramér–Rao bound, the
+   leave-one-place-out jackknife and a cluster bootstrap, scaled by the anchor calibration.
+5. **Kind.** A **fix** (grades A–F) needs ≥ 3 places and R95 ≤ 150 m (and a geometry that
+   allows it); otherwise a **region** (R): a disc of radius R95 around the posterior mean;
+   an AP that travels is **mobile** (M). A moved AP keeps only its recent epoch.
+6. **Grade.** Precision, geometry, evidence, fit, stability, freshness and agreement with a
+   WiGLE/Apple placement combine into a 0–100 score and a letter, with hysteresis.
 
-Standing in one spot and hearing a beacon fifty times tells you nothing about where it is.
-Samples closer together than 25 m, or than 1.5× the larger of their fix errors, count as
-one **vantage point**. Fewer than three vantage points, or a spread smaller than 1.5× the
-worst fix accuracy, and no position is claimed; the map keeps the RSSI ring.
+Samples: a new one every ~12 m (or half the fixes' error), or ten minutes later at the same
+spot; the estimator clusters them itself. Memory keeps at most ~600 per beacon (the
+database keeps every row). BSSIDs of one radio are pooled (docs/GRADING.md §3.1), and each
+device's level offset is calibrated against this host's (§3.3).
 
 ### Between refits
 
-Beacons with new samples are refit in a batch ten seconds after the scan (`refitQueued`).
-Until then the new sample nudges the existing fit with a one-dimensional Kalman step along
-the observer–beacon line: the sample's range from the beacon's own `P0`/`n` is the
-measurement, its variance the dB noise mapped to metres plus the fix accuracy.
+Beacons with new samples are refit in time-boxed batches ten seconds after the scan
+(`refitQueued`). Until then the new sample nudges the existing fit with a 2-D Kalman step
+along the observer–beacon line, keeping the full covariance, and the grade follows.
 
-`beaconfix --refit` (D-Bus `Refit()`, Settings → Positioning) refits everything.
+`beaconfix --refit` (D-Bus `Refit()`, Settings → Positioning) refits everything;
+`beaconfix --estimator` prints grade counts, calibration, device offsets, groups and where
+to sample next.
 
 ## Precedence on the map
 
 | have | shown as |
 |---|---|
-| our fit with acc ≤ 25 m, or a fit and no placement | **trilat** (our fit) |
+| our fix with acc ≤ 25 m, or a fix and no placement | **trilat** (95 % ellipse in the grade colour) |
 | a WiGLE / Apple placement (±25 m) | **wigle** |
-| a position a synced device worked out | **peer** |
-| two vantage points only | **centroid** (wide, honest) |
-| one place we heard it | **observed** |
+| a position a synced device worked out (tighter than our region) | **peer** |
+| our region only | **region** (disc of radius R95, grade R) |
+| it travels | **mobile** (grade M) |
+| two vantage points only, not yet refit | **centroid** (wide, honest) |
+| one place we heard it, not yet refit | **observed** |
 | nothing but the current scan | **ring** (RSSI distance, pseudo-bearing) |
 
 When a placement and our fit disagree by more than 3× their accuracy the card shows both
@@ -79,10 +87,12 @@ When a placement and our fit disagree by more than 3× their accuracy the card s
 
 The internal tier (before BeaconDB) uses the same maths the other way round: each heard
 beacon with a known position says "you are `d` metres from me", `d` from *its* fitted
-`P0`/`n` when it has a fit (the default model otherwise), with variance from 6 dB of
-shadowing plus the beacon's own accuracy. Weighted least squares on those ranges, Huber
-weights, accuracy from the covariance and the range residuals. Two beacons give a
-weighted midpoint; three or more a real solution.
+`P0`/`n` when it has a fix (the default model otherwise). The range variance is 6 dB of
+shadowing mapped to metres plus the beacon's own covariance along the line of sight, and
+each beacon is weighted by its grade. Weighted least squares on those ranges, Huber
+weights, then an integrity check: a χ² test on the normalised range residuals excludes the
+worst beacon and solves again (up to twice); the result says `ok`, `repaired`, `failed` or
+`unverified` (fewer than four beacons). Regions and mobile APs are never used.
 
 ## Sync
 
@@ -97,11 +107,12 @@ back to the device it came from.
 ## Tests
 
 ```
-g++ -std=c++17 -O2 -Wall -Wextra -fPIC $(pkg-config --cflags Qt6Core) tests/estimator_test.cpp -o build/estimator_test $(pkg-config --libs Qt6Core)
-./build/estimator_test
+cmake -S . -B build -DBEACONFIX_TESTS=ON && cmake --build build -j3 && (cd build && ctest)
 ```
 
-Synthetic geometry: 40 noisy samples around a beacon fit within 15 m (typically 5–12);
-twelve samples from one spot claim nothing; three loud samples from 300 m away are rejected
-without moving the fit; five known beacons locate the observer within 30 m; incremental
-updates converge and never diverge.
+`tests/estimator_test.cpp`: synthetic geometry (a ring fits within 15 m and grades A/B; one
+spot or one sample gives a region that covers the truth; loud outliers are rejected; a
+straight road is capped for extrapolation/ambiguity; misses shrink a region; a moved AP
+keeps its recent epoch; a device offset, RTT ranges, hysteresis, external agreement; R95
+covers the truth ≥ 85 % of the time on random geometry). `tests/estimator_golden.cpp`
+checks the golden vectors shared with the Android twin (docs/GRADING.md §7).

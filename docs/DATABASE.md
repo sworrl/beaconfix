@@ -15,9 +15,12 @@ SECURITY.md): `~/.local/state/beaconfix/beaconfix.db`.
 | `fixes` | `id`, `time`, `lat`, `lon`, `acc`, `source`, `provider`, `place`, `city`, `region`, `country`, `elev`, `ap_count`, `ap_used`, `departed` | the trip log |
 | `pois` | `osm_type`, `osm_id`, `cat`, `name`, `detail`, `lat`, `lon`, `wifi`, `hours`, `phone`, `website`, `address`, `wheelchair`, `emergency`, `scope`, `peds`, `er`, `campus`, `drive_s`, `drive_m` | places of interest cache: the places query around the fix (`scope` = `near`). `peds` = pediatric tier (API.md "Pediatric ER"), `drive_s`/`drive_m` a routed drive time (0 = use the estimate) |
 | `pois_far` | the same columns as `pois` | the pediatric ER search's answer (`scope` = `far`, 3.8). Its own table so that neither save touches the other's rows: sharing `pois`' key, a near save replaced every far row inside the near radius and a restart lost the closest ERs. An object both searches found is stored in both and merged in memory (near wins). Opening a database written by an earlier 3.8 build moves its `far` rows here |
+| `estimates` | `bssid` PK, `lat`, `lon`, `acc`, `semi_major`, `semi_minor`, `orient`, `rms`, `p0`, `pathloss`, `fitted_n`, `n`, `vantage`, `rejected`, `quality`, `updated`, `seq`; 3.9: `kind`, `grade`, `score`, `r95`, `cep50`, `p_within25`, `cxx`, `cxy`, `cyy`, `metrics` (every field of the fit as JSON), `version` | our own graded estimate per AP ([GRADING.md](GRADING.md)); rows written by an older engine (no `metrics`) are recomputed at start-up, never deleted |
+| `estimate_history` | `id`, `bssid`, `time`, `lat`, `lon`, `cxx`, `cxy`, `cyy`, `r95`, `score`, `grade`, `kind` | 3.9: the last 20 estimates per AP (drift, trends) |
+| `scan_cells` | `cell` PK (`y:x` of a ~15 m grid), `lat`, `lon`, `count`, `first`, `last` (epoch s) | 3.9: where this host scanned from, so the estimator knows where an AP was *not* heard |
 | `elevation` | `cell`, `elev`, `time` | elevation cache per ~100 m cell |
 | `achievements` | `key`, `unlocked` | milestones |
-| `kv` | `key`, `value` | misc: `poi_lat`/`poi_lon`/`poi_radius`/`poi_time` (where and when the places were fetched), `peds_lat`/`peds_lon`/`peds_radius`/`peds_time` (the same for the pediatric ER search), `countryCode`, `environment`, `sync:<peer>:pulled`/`pushed`, `seq`, `schema`, `created` |
+| `kv` | `key`, `value` | misc: `poi_lat`/`poi_lon`/`poi_radius`/`poi_time` (where and when the places were fetched), `peds_lat`/`peds_lon`/`peds_radius`/`peds_time` (the same for the pediatric ER search), `countryCode`, `environment`, `sync:<peer>:pulled`/`pushed`, `seq`, `schema`, `created`; 3.9: `estimator_version`, `estimator_kappa`, `estimator_calibration` (JSON), `device_offsets` (JSON, device → dB) |
 
 ## Migration
 

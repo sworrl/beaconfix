@@ -77,6 +77,7 @@ dbus-monitor "interface='org.sworrl.BeaconFix',member='FixChanged'"
 | method | returns | what |
 |---|---|---|
 | `Refit()` | int | re-estimate every beacon from its samples; valid fits |
+| `EstimatorJson()` | string | the estimator's state: grade counts, anchor calibration (κ), device offsets, BSSID groups, where to sample next (`beaconfix --estimator`, `GET /api/v1/estimator`; docs/GRADING.md) |
 | `Sync(url, token)` | string (JSON) | one sync round with another BeaconFix |
 | `RefreshPlaces()` | — | re-query OpenStreetMap for places around the fix |
 | `ApplyOs(dryRun)` | string (JSON) | run the OS integration now (time zone, GeoClue, Night Light) |
