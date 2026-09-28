@@ -4,6 +4,92 @@ All notable changes to BeaconFix are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [3.9.0] — 2026-09-28
+
+Desktop 3.9.0, Plasma widget 3.9.0 and Android 1.5.0: every access point BeaconFix positions
+itself now comes with an honest, graded answer: where it is, how sure we are (the 95 % region,
+the chance of being within 25 m), a 0–100 score and a letter, on every map. The definitions are
+in [docs/GRADING.md](docs/GRADING.md).
+
+### Desktop
+
+#### Added
+- **Estimator 2** (`src/estimator.{h,cpp}`). Samples are clustered into places (median level, the
+  observer's own fix error folded in as an errors-in-variables term); a grid posterior with P0 and
+  n integrated out in closed form (Gaussian priors per band, a range prior, Wi-Fi RTT ranges, and
+  the places this host scanned from without hearing the AP) finds the global optimum, its modes and
+  the 95 % region; a robust Levenberg–Marquardt polish (Gaussian + uniform outlier mixture with EM
+  weights, AP height 3 m) runs from the grid maxima, the classic centroids and the mirror across
+  the places' principal axis. The covariance is widened by the design effect of correlated
+  shadowing and the correlated fix error, floored by the Cramér–Rao bound, a leave-one-place-out
+  jackknife and a cluster bootstrap, and scaled by the anchor calibration.
+- **Grades.** Each estimate is a *fix* (A–F), a *region* (R: one or two places, or R95 > 150 m,
+  shown as a disc) or *mobile* (M: it travels, was heard 5 km apart, or its level does not fall
+  with distance). The score is a weighted geometric mean of precision, geometry, evidence, fit,
+  stability, freshness and agreement with a WiGLE/Apple placement, capped for ambiguous or
+  extrapolated fits, with hysteresis. A moved AP keeps only its recent epoch (flag `moved`).
+- **Calibration.** Anchored APs are fitted with their pin hidden (leave-one-out); the mean NEES
+  sets κ, and the median error per letter is reported. Per-device level offsets are learned from
+  APs heard by this host and another device. BSSIDs of one radio (same MAC but the
+  locally-administered bit and the last nibble, a steady level difference in shared scans) are
+  pooled into one fit.
+- **Where to sample next**: the spot around each weak estimate whose sample adds the most
+  information (matrix determinant lemma), in the AP JSON (`fit.suggest`) and the ten best nearby
+  in `GET /api/v1/estimator` / D-Bus `EstimatorJson()` / `beaconfix --estimator`.
+- The AP JSON (D-Bus, `/api/v1/aps`, `/state`) gains `grade`, `score`, `r95` and a richer `fit`
+  object (`kind`, R95/CEP50/P(<25 m), the covariance, `components`, `metrics`, `flags`, `suggest`,
+  `group`); `kind` gains `region` and `mobile`; `/db/changes` carries the graded fields; `hello`
+  lists `grades`; `ap_refit`/`ap_placed` events add `grade`, `prevGrade`, `score`, `r95`.
+- Database (additive): `estimates` gains `kind`, `grade`, `score`, `r95`, `cep50`, `p_within25`,
+  the covariance, a `metrics` JSON and `version`; new tables `estimate_history` (the last 20 per
+  AP) and `scan_cells`; export/import carry them. Estimates from 3.8 (or imported ones) are
+  recomputed once at start-up in 150 ms batches; nothing is deleted.
+- Map and beacon table: 95 % ellipses in the grade colour (Okabe–Ito, colour-blind safe), dashed
+  when extrapolated or ambiguous, region discs, M markers, a grade column and the grade line
+  "B · 72% within 25 m · 9 places · 3 devices" in tooltips and details.
+- Tests: `cmake -DBEACONFIX_TESTS=ON` builds `estimator_test` (synthetic geometry, coverage of
+  R95 on random layouts, drive-by, misses, moved/mobile APs, device offsets, RTT, hysteresis) and
+  `estimator_golden`, which checks `tests/fixtures/estimator_golden.json`, the vectors the
+  Android twin must reproduce exactly (`ctest`).
+
+#### Changed
+- Sampling: a new sample every ~12 m (or half the fixes' error) instead of 60 m, or ten minutes
+  later at the same spot; the estimator clusters places itself. In memory an AP keeps at most
+  ~600 samples (the oldest of the most crowded cell go first); the database keeps every row.
+- Travelling and home APs are graded M instead of being skipped silently; one or two samples give
+  a region instead of nothing.
+- Self-location weighs known APs by grade and by their covariance along the line of sight, never
+  uses regions or mobile APs, and runs an integrity check that excludes an inconsistent AP
+  (`ok` / `repaired` / `failed` / `unverified`).
+- Refit batches are time-boxed (150 ms) so hundreds of refits never freeze the tray.
+
+#### Fixed
+- The error ellipse's `orient` was a mathematical angle (anticlockwise from east) while every
+  consumer read it as a bearing; it is now the bearing of the major axis in [0, 180) (0 for a
+  circle).
+- The old fit claimed tiny ellipses with three samples (no residual degrees of freedom, a 2 dB
+  floor); the noise level now has a prior and the Cramér–Rao bound is a floor.
+
+### Plasma widget 3.9.0
+- 95 % ellipses in the grade colour (dashed when extrapolated or ambiguous, a ghost at the
+  alternative), region discs batched into one path, M markers, the grade line first in the hover
+  card, flags and the grade on its way in the pinned card, a "sample here" target for the
+  hovered or pinned AP, an A–F legend button, and grade badges in the security list.
+
+### Android 1.5.0
+- The estimator is the desktop's, ported line by line (`estimate/Estimator.kt`) and checked
+  against the same golden vectors (`EstimatorGoldenTest`); the phone grades its own fits and
+  shows the desktop's when synced.
+- Room 5 (migration 4→5, additive): each AP gains the grade, score, R95/CEP50/P(<25 m), the
+  covariance and ellipse, places, devices and a metrics JSON; a new `estimate_history` table. Every
+  AP is recomputed once after the update.
+- Map: 95 % ellipses in the grade colour (dashed when extrapolated or ambiguous), region discs,
+  M markers. Beacon details: grade and score, "72% within 25 m", R95/CEP50, places, devices, the
+  score components and flags.
+- Self-location uses the desktop's integrity-checked solver, weighing known APs by grade.
+- The collector refits an AP at most every two minutes (sync, import and "refit all" always do);
+  the desktop's graded fit is taken over on sync when it is the AP's shown position.
+
 ## [3.8.0] — 2026-09-27
 
 Desktop 3.8.0, Plasma widget 3.8.0, Android 1.4.0 and Pi agent 1.1.0: finding the right emergency

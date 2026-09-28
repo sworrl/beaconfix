@@ -8,9 +8,10 @@ import androidx.sqlite.db.SupportSQLiteDatabase
  * identity, anchors and unsynced observations, so an update must never wipe the database.
  *
  * The CREATE statements are copied verbatim from the exported schemas (android/app/schemas/…/N.json, `${TABLE_NAME}`
- * filled in); MigrationSqlTest checks that they still match, and the instrumented MigrationTest runs 1→4, 2→4 and 3→4.
+ * filled in); MigrationSqlTest checks that they still match, and the instrumented MigrationTest runs 1→5, 2→5, 3→5 and 4→5.
  *
- * Tables the migrations must never alter: aps, observations, fixes (schema), desktops, identity, pending_links, anchors.
+ * Tables the migrations must never alter: observations, fixes (schema), desktops, identity, pending_links, anchors.
+ * `aps` only ever gains nullable columns (v5), so every existing row and position survives.
  */
 object MigrationSql {
     // v2 (1.2): cross-app identity
@@ -26,6 +27,16 @@ object MigrationSql {
     const val CREATE_POIS_CAT = "CREATE INDEX IF NOT EXISTS `index_pois_cat` ON `pois` (`cat`)"
     const val CREATE_POIS_SOURCE_SCOPE = "CREATE INDEX IF NOT EXISTS `index_pois_source_scope` ON `pois` (`source`, `scope`)"
     const val CREATE_SNAPSHOTS = "CREATE TABLE IF NOT EXISTS `snapshots` (`source` TEXT NOT NULL, `kind` TEXT NOT NULL, `json` TEXT NOT NULL, `lat` REAL NOT NULL, `lon` REAL NOT NULL, `fetchedAt` INTEGER NOT NULL, PRIMARY KEY(`source`, `kind`))"
+
+    // v5 (1.5): the graded estimate on each AP (nullable columns, additive) + the estimate history
+    val APS_V5_COLUMNS: List<Pair<String, String>> = listOf(
+        "fitKind" to "TEXT", "grade" to "TEXT", "score" to "REAL", "r95" to "REAL", "cep50" to "REAL", "pWithin25" to "REAL",
+        "cxx" to "REAL", "cxy" to "REAL", "cyy" to "REAL", "semiMajor" to "REAL", "semiMinor" to "REAL", "orient" to "REAL",
+        "vantage" to "INTEGER", "devices" to "INTEGER", "fitMetrics" to "TEXT", "gradedAt" to "INTEGER",
+    )
+    val ALTER_APS_V5: List<String> = APS_V5_COLUMNS.map { (name, type) -> "ALTER TABLE `aps` ADD COLUMN `$name` $type" }
+    const val CREATE_ESTIMATE_HISTORY = "CREATE TABLE IF NOT EXISTS `estimate_history` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `bssid` TEXT NOT NULL, `time` INTEGER NOT NULL, `lat` REAL, `lon` REAL, `cxx` REAL, `cxy` REAL, `cyy` REAL, `score` REAL, `grade` TEXT)"
+    const val CREATE_ESTIMATE_HISTORY_BSSID = "CREATE INDEX IF NOT EXISTS `index_estimate_history_bssid` ON `estimate_history` (`bssid`)"
 }
 
 /** 1.0/1.1 → 1.2: the identity and pending-link tables. */
@@ -58,5 +69,17 @@ val MIGRATION_3_4 = object : Migration(3, 4) {
     }
 }
 
+/**
+ * 1.4 → 1.5: additive only. `aps` gains the graded-estimate columns (all nullable: existing positions stay as they are)
+ * and `estimate_history` is new. The app recomputes every estimate once afterwards (Prefs.estimatorVersion).
+ */
+val MIGRATION_4_5 = object : Migration(4, 5) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        for (sql in MigrationSql.ALTER_APS_V5) db.execSQL(sql)
+        db.execSQL(MigrationSql.CREATE_ESTIMATE_HISTORY)
+        db.execSQL(MigrationSql.CREATE_ESTIMATE_HISTORY_BSSID)
+    }
+}
+
 /** In order; register all of them (AppModule, MigrationTest). */
-val ALL_MIGRATIONS: Array<Migration> = arrayOf(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
+val ALL_MIGRATIONS: Array<Migration> = arrayOf(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5)

@@ -81,7 +81,7 @@ class ImportRepository @Inject constructor(@ApplicationContext private val ctx: 
             // desktop-export beacon notes (ssid/security only)
             for (n in res.notes.filter { it.startsWith("ap:") }) { val p = n.removePrefix("ap:").split('|'); if (p.size == 3 && p[0] !in known) { db.aps().upsert(ApEntity(bssid = p[0], ssid = p[1], security = p[2], firstSeen = now, lastSeen = now)); apsN++ } }
             progress.value = "refitting ${touched.size} beacons…"
-            val refit = estimates.refit(touched.take(2000))
+            val refit = estimates.refit(touched.take(2000), force = true)
             widgets.touch("import")
             return@withContext ImportSummary(res.format, positions, res.scans.size, obsN, apsN, if (o.places) res.stops.count { inRange(it.start) } else 0, res.firstTime ?: 0, res.lastTime ?: 0, refit, skipped).also { progress.value = "done"; storeStops(res, o) }
         }

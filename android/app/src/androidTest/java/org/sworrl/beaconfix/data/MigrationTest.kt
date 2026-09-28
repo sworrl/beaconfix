@@ -22,7 +22,7 @@ import org.sworrl.beaconfix.data.db.ALL_MIGRATIONS
 import org.sworrl.beaconfix.data.db.AppDatabase
 
 /**
- * Every database a released build can have (v1: 1.0/1.1, v2: 1.2, v3: 1.3.x) must reach v4 with its data intact.
+ * Every database a released build can have (v1: 1.0/1.1, v2: 1.2, v3: 1.3.x, v4: 1.4.x) must reach v5 with its data intact.
  * Run on a device against the debug package (the release install is untouched):
  *   ./gradlew :app:connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=org.sworrl.beaconfix.data.MigrationTest
  */
@@ -38,19 +38,24 @@ class MigrationTest {
     @Before fun clean() { ctx.deleteDatabase(name) }
     @After fun cleanUp() { ctx.deleteDatabase(name) }
 
-    @Test fun threeToFour() {
+    @Test fun fourToFive() {
+        helper.createDatabase(name, 4).use { seed(it, 4) }
+        helper.runMigrationsAndValidate(name, 5, true, *ALL_MIGRATIONS).use { verify(it, 4) }
+    }
+
+    @Test fun threeToFive() {
         helper.createDatabase(name, 3).use { seed(it, 3) }
-        helper.runMigrationsAndValidate(name, 4, true, *ALL_MIGRATIONS).use { verify(it, 3) }
+        helper.runMigrationsAndValidate(name, 5, true, *ALL_MIGRATIONS).use { verify(it, 3) }
     }
 
-    @Test fun twoToFour() {
+    @Test fun twoToFive() {
         createRaw(2)
-        helper.runMigrationsAndValidate(name, 4, true, *ALL_MIGRATIONS).use { verify(it, 2) }
+        helper.runMigrationsAndValidate(name, 5, true, *ALL_MIGRATIONS).use { verify(it, 2) }
     }
 
-    @Test fun oneToFour() {
+    @Test fun oneToFive() {
         createRaw(1)
-        helper.runMigrationsAndValidate(name, 4, true, *ALL_MIGRATIONS).use { verify(it, 1) }
+        helper.runMigrationsAndValidate(name, 5, true, *ALL_MIGRATIONS).use { verify(it, 1) }
     }
 
     /** The app's own builder (AppModule: migrations, no destructive fallback) opens a migrated v3 file and its DAOs work. */
@@ -66,6 +71,12 @@ class MigrationTest {
             assertEquals(0, db.fixes().dedupeDesktop())
             db.snapshots().put(org.sworrl.beaconfix.data.db.SnapshotEntity("phone", "address", "{}", fetchedAt = 1))
             assertEquals("phone", db.snapshots().newestNow("address")?.source)
+            // v5: the old position survives ungraded; the history keeps the last 20 per AP
+            val ap = db.aps().get("02:00:00:00:00:01")
+            assertEquals(40.0, ap?.lat ?: 0.0, 0.0); assertEquals(null, ap?.grade)
+            repeat(25) { db.estimateHistory().append(org.sworrl.beaconfix.data.db.EstimateHistoryEntity(bssid = "02:00:00:00:00:01", time = it.toLong(), lat = 40.0, lon = -75.0, grade = "B")) }
+            assertEquals(20, db.estimateHistory().forAp("02:00:00:00:00:01").size)
+            assertEquals(24L, db.estimateHistory().forAp("02:00:00:00:00:01").first().time)
         } finally { db.close() }
     }
 
@@ -106,14 +117,15 @@ class MigrationTest {
             "VALUES ('02:00:00:00:00:01', 'Test AP', 2412, '2.4', 1, 1000, 2000, 3, 40.0, -75.0, 25.0, 'observed', 1, 0, 0, 'wpa2', 0, 0)")
         exec("INSERT INTO observations (bssid, time, lat, lon, acc, dbm, freq, source, synced, remote) VALUES ('02:00:00:00:00:01', 1500, 40.0, -75.0, 8.0, -61, 2412, 'phone-gps', 0, 0)")
         exec("INSERT INTO fixes (time, lat, lon, acc, source, provider, place) VALUES (1000, 40.0, -75.0, 8.0, 'phone-gps', 'fused', '')")
-        repeat(3) { exec("INSERT INTO fixes (time, lat, lon, acc, source, provider, place) VALUES (3000, 40.001, -75.001, 20.0, 'desktop', 'wifi', 'Testville')") }
-        exec("INSERT INTO pois (osmType, osmId, cat, name, detail, lat, lon, phone, hours, website) VALUES ('way', 1, 'health', 'Test General', '', 40.0, -75.0, '', '', '')")
+        repeat(if (v >= 4) 1 else 3) { exec("INSERT INTO fixes (time, lat, lon, acc, source, provider, place) VALUES (3000, 40.001, -75.001, 20.0, 'desktop', 'wifi', 'Testville')") }
+        if (v < 4) exec("INSERT INTO pois (osmType, osmId, cat, name, detail, lat, lon, phone, hours, website) VALUES ('way', 1, 'health', 'Test General', '', 40.0, -75.0, '', '', '')")
         exec("INSERT INTO desktops (id, host, port, name, hostname, version, tls, scopes, paired, lastSeen, lastSync, lastError, pushedObs, pulledAps, cursor) " +
             "VALUES ('192.0.2.1:47822', '192.0.2.1', 47822, 'desktop', 'desktop', '3.7.0', 0, 'read control', 1, 0, 0, '', 5, 6, '')")
         if (v >= 2) {
             exec("INSERT INTO identity (id, name, created, pub, recordJson) VALUES ('test-id', 'Test Name', '2026-01-01T00:00:00Z', 'test-pub', '{}')")
             exec("INSERT INTO pending_links (id, pub, name, ts, statementJson) VALUES ('other-id', 'other-pub', 'pi', '2026-01-01T00:00:00Z', '')")
         }
+        if (v >= 4) exec("INSERT INTO snapshots (source, kind, json, lat, lon, fetchedAt) VALUES ('phone', 'address', '{}', 40.0, -75.0, 1)")
         if (v >= 3) exec("INSERT INTO anchors (id, json, name, kind, lat, lon, rv, ref, deleted, placedAt, seq, dirty) VALUES ('a1', '{}', 'Test anchor', 'custom', 40.0, -75.0, 1, 0, 0, '2026-01-01T00:00:00Z', 1, 0)")
     }
 
@@ -135,6 +147,13 @@ class MigrationTest {
         assertEquals(if (from >= 3) 1L else 0L, long(db, "SELECT COUNT(*) FROM anchors"))
         if (from >= 2) assertEquals("Test Name", text(db, "SELECT name FROM identity"))
         assertEquals("pois is a fresh cache", 0L, long(db, "SELECT COUNT(*) FROM pois"))
-        assertEquals(0L, long(db, "SELECT COUNT(*) FROM snapshots"))
+        assertEquals(if (from >= 4) 1L else 0L, long(db, "SELECT COUNT(*) FROM snapshots"))
+        // v5: positions survive, the new columns start empty, the history table exists
+        assertEquals(40.0, double(db, "SELECT lat FROM aps WHERE bssid = '02:00:00:00:00:01'"), 0.0)
+        assertEquals(25.0, double(db, "SELECT acc FROM aps WHERE bssid = '02:00:00:00:00:01'"), 0.0)
+        assertEquals("observed", text(db, "SELECT posSource FROM aps"))
+        assertEquals(1L, long(db, "SELECT COUNT(*) FROM aps WHERE grade IS NULL AND fitKind IS NULL AND r95 IS NULL AND fitMetrics IS NULL"))
+        assertEquals(0L, long(db, "SELECT COUNT(*) FROM estimate_history"))
     }
+    private fun double(db: SupportSQLiteDatabase, sql: String): Double = db.query(sql).use { c -> c.moveToFirst(); c.getDouble(0) }
 }

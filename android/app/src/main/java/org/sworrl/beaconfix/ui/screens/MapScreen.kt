@@ -47,6 +47,8 @@ import org.sworrl.beaconfix.ui.screens.AnchorEditorSheet
 import org.sworrl.beaconfix.data.api.PoiDto
 import org.sworrl.beaconfix.data.db.ApEntity
 import org.sworrl.beaconfix.ui.EmptyState
+import org.sworrl.beaconfix.ui.FixGrade
+import kotlin.math.roundToInt
 import org.sworrl.beaconfix.ui.SecurityText
 import org.sworrl.beaconfix.ui.gradeGlyph
 import org.sworrl.beaconfix.ui.secName
@@ -138,12 +140,33 @@ fun MapScreen(live: LiveViewModel = hiltViewModel(), anchorsVm: AnchorsViewModel
                     val p = GeoPoint(a.lat!!, a.lon!!)
                     val g = SecurityText.grade(a.security)
                     val col = when { a.home -> "#FF4FD8"; g == "critical" -> "#FF4D4D"; g == "weak" && a.posSource != "placed" -> "#FF9F43"; a.posSource == "observed" -> "#35D6FF"; a.posSource == "placed" -> "#FFD166"; else -> "#9FB0C8" }
-                    map.overlays.add(Polygon(map).apply { points = Polygon.pointsAsCircle(p, (a.acc ?: 50.0).coerceIn(5.0, 1500.0)); fillPaint.color = AColor.parseColor("#22" + col.drop(1)); outlinePaint.color = AColor.parseColor(col); outlinePaint.strokeWidth = 1.5f })
+                    val graded = FixGrade.graded(a)
+                    val mobile = graded && FixGrade.isMobile(a)
+                    when {
+                        // travels with us: no uncertainty to draw, just a small "M"
+                        mobile -> {}
+                        // a region: a faint disc of radius R95
+                        graded && FixGrade.isRegion(a) && a.r95 != null -> map.overlays.add(Polygon(map).apply {
+                            points = Polygon.pointsAsCircle(p, a.r95.coerceIn(5.0, 3000.0)); fillPaint.color = FixGrade.argb(a.grade, 0x18)
+                            outlinePaint.color = FixGrade.argb(a.grade, 0x66); outlinePaint.strokeWidth = 1f })
+                        // a graded fix: the 95 % ellipse, coloured by grade, dashed when extrapolated or ambiguous
+                        graded && a.semiMajor != null && a.semiMajor > 0 -> map.overlays.add(Polygon(map).apply {
+                            points = FixGrade.ellipse95(a).map { GeoPoint(it.first, it.second) }
+                            fillPaint.color = FixGrade.argb(a.grade, 0x33); outlinePaint.color = FixGrade.argb(a.grade); outlinePaint.strokeWidth = 2f
+                            if (FixGrade.dashed(a)) outlinePaint.pathEffect = android.graphics.DashPathEffect(floatArrayOf(10f, 8f), 0f) })
+                        else -> map.overlays.add(Polygon(map).apply { points = Polygon.pointsAsCircle(p, (a.acc ?: 50.0).coerceIn(5.0, 1500.0)); fillPaint.color = AColor.parseColor("#22" + col.drop(1)); outlinePaint.color = AColor.parseColor(col); outlinePaint.strokeWidth = 1.5f })
+                    }
+                    val gradeLine = when {
+                        !graded -> ""
+                        mobile -> "\n" + map.context.getString(R.string.fit_map_mobile)
+                        else -> "\n" + map.context.getString(R.string.fit_map_snippet, a.grade ?: "", (a.score ?: 0.0).toInt(), org.sworrl.beaconfix.ui.metres(a.r95 ?: (a.acc ?: 0.0) * 2.45), ((a.pWithin25 ?: 0.0) * 100).roundToInt())
+                    }
                     map.overlays.add(Marker(map).apply {
                         position = p; setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
-                        icon = labelIcon(map, cache, if (g == "critical" || g == "weak") gradeGlyph(g) else "", if (labels && (zoomed >= 15 || g == "critical")) a.ssid.ifEmpty { "(hidden)" } else "", AColor.parseColor(col), true)
+                        icon = if (mobile) labelIcon(map, cache, "M", if (labels && zoomed >= 15) a.ssid.ifEmpty { "(hidden)" } else "", FixGrade.argb("M"), false)
+                            else labelIcon(map, cache, if (g == "critical" || g == "weak") gradeGlyph(g) else "", if (labels && (zoomed >= 15 || g == "critical")) a.ssid.ifEmpty { "(hidden)" } else "", AColor.parseColor(col), true)
                         title = a.ssid.ifEmpty { "(hidden)" }
-                        snippet = "${a.bssid} · ${a.band} GHz ch ${a.ch}\n${secName(a.security)} · ${g}\n±${(a.acc ?: 0.0).toInt()} m (${a.posSource})" + (a.residual?.let { "\nfit ${it.toInt()} m" } ?: "") + "\n" + (SecurityText.forSecurity(a.security).firstOrNull()?.nerd ?: "")
+                        snippet = "${a.bssid} · ${a.band} GHz ch ${a.ch}\n${secName(a.security)} · ${g}\n±${(a.acc ?: 0.0).toInt()} m (${a.posSource})" + (a.residual?.let { "\nfit ${it.toInt()} m" } ?: "") + gradeLine + "\n" + (SecurityText.forSecurity(a.security).firstOrNull()?.nerd ?: "")
                     })
                 }
                 // linked devices: glyph by kind, name + age, accuracy ring, dashed line + distance to this phone when close
@@ -188,7 +211,12 @@ fun MapScreen(live: LiveViewModel = hiltViewModel(), anchorsVm: AnchorsViewModel
             },
         )
         Column(Modifier.align(Alignment.TopStart).padding(8.dp)) {
-            Surface(tonalElevation = 3.dp, shape = MaterialTheme.shapes.small) { Text("  ${aps.size} beacons placed · ${pois.size} places · gold = mapped · cyan = fitted here · red = insecure · magenta = home  ", style = MaterialTheme.typography.labelSmall) }
+            Surface(tonalElevation = 3.dp, shape = MaterialTheme.shapes.small) {
+                Column {
+                    Text("  ${aps.size} beacons placed · ${pois.size} places · gold = mapped · cyan = fitted here · red = insecure · magenta = home  ", style = MaterialTheme.typography.labelSmall)
+                    if (aps.any { FixGrade.graded(it) }) Text("  " + stringResource(R.string.fit_map_legend) + "  ", style = MaterialTheme.typography.labelSmall)
+                }
+            }
             Row { FilterChip(selected = labels, onClick = { labels = !labels }, label = { Text("Aa") }); FilterChip(selected = devicesLayer, onClick = { devicesLayer = !devicesLayer }, label = { Text("Devices") }, modifier = Modifier.padding(start = 6.dp)); MapStyleChip(style, { placesVm.setStyle(it) }, Modifier.padding(start = 6.dp)); FilterChip(selected = anchorsLayer, onClick = { anchorsLayer = !anchorsLayer }, label = { Text("⌖") }, modifier = Modifier.padding(start = 6.dp)) }
             MapFilterRow(filter, { placesVm.setFilter(it) })
         }

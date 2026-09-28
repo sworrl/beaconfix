@@ -39,7 +39,24 @@ data class ApDto(
     val bssid: String = "", val ssid: String = "", val dbm: Int = -100, val freq: Int = 0, val ch: Int = 0, val band: String = "",
     val kind: String = "", val lat: Double? = null, val lon: Double? = null, val r: Double? = null, val status: String = "",
     val security: String = "", val rsnFlags: Int = 0, val wpaFlags: Int = 0, val home: Boolean = false, val insecure: Boolean = false,
+    /** the desktop's own fit, when it has one (graded fields from desktop 3.9 / estimator 2; older desktops send only the first group) */
+    val fit: ApFitDto? = null,
 )
+/**
+ * An AP's `fit` object (`/api/v1/aps`, `/api/v1/db/changes`). Everything is optional: n … updated came with the first
+ * engine, kind … moved with the graded one (docs/GRADING.md). [orient] is passed through as the desktop reports it.
+ */
+@Serializable data class ApFitDto(
+    val n: Int? = null, val vantage: Int? = null, val rms: Double? = null, val acc: Double? = null, val p0: Double? = null, val pathloss: Double? = null,
+    val quality: String? = null, val rejected: Int? = null, val updated: String? = null,
+    val kind: String? = null, val grade: String? = null, val score: Double? = null, val r95: Double? = null, val cep50: Double? = null, val pWithin25: Double? = null,
+    val cxx: Double? = null, val cxy: Double? = null, val cyy: Double? = null, val semiMajor: Double? = null, val semiMinor: Double? = null, val orient: Double? = null,
+    val lat: Double? = null, val lon: Double? = null, val devices: Int? = null, val sessions: Int? = null,
+    val inHull: Boolean? = null, val ambiguous: Boolean? = null, val modes: Int? = null, val moved: Boolean? = null,
+) {
+    /** The graded part is present (a desktop with the graded estimator). */
+    val graded: Boolean get() = !grade.isNullOrEmpty()
+}
 @Serializable data class ApsDto(val aps: List<ApDto> = emptyList())
 @Serializable data class PoisDto(val pois: List<JsonObject> = emptyList())
 @Serializable data class TrackPoint(val lat: Double = 0.0, val lon: Double = 0.0, val acc: Double = 0.0, val source: String = "", val time: String = "", val place: String = "")

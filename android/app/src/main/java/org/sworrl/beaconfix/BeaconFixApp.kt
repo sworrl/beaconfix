@@ -12,6 +12,7 @@ import javax.inject.Inject
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 
 @HiltAndroidApp
@@ -25,6 +26,7 @@ class BeaconFixApp : Application(), Configuration.Provider {
     @Inject lateinit var help: org.sworrl.beaconfix.help.HelpRepository
     @Inject lateinit var helpAlerts: org.sworrl.beaconfix.notify.HelpAlerts
     @Inject lateinit var wifiMonitor: org.sworrl.beaconfix.wifi.CurrentNetworkMonitor
+    @Inject lateinit var estimates: org.sworrl.beaconfix.estimate.EstimateRepository
 
     /** Lives as long as the process: pref mirrors, the help heads-up, launcher shortcuts. */
     private val appScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -54,6 +56,11 @@ class BeaconFixApp : Application(), Configuration.Provider {
         helpAlerts.ensureChannel(this); helpAlerts.start(appScope)
         org.sworrl.beaconfix.quick.Shortcuts.install(this, help, appScope)
         wifiMonitor.start()
+        // a new estimator generation (1.5: graded fits) recomputes every stored estimate once, in the background
+        appScope.launch {
+            if (prefs.estimatorVersion.first() < org.sworrl.beaconfix.estimate.Estimator.VERSION)
+                runCatching { estimates.refitAll(announce = false) }.onSuccess { prefs.setEstimatorVersion(org.sworrl.beaconfix.estimate.Estimator.VERSION) }
+        }
     }
 
     companion object { const val CHANNEL_COLLECTOR = "collector" }

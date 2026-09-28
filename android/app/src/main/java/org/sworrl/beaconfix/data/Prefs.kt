@@ -46,6 +46,8 @@ class Prefs @Inject constructor(@ApplicationContext private val ctx: Context) {
         val mapPoiFilter = stringPreferencesKey("map_poi_filter")
         val lastBackupAt = longPreferencesKey("last_backup_at")
         val helpAlertState = stringPreferencesKey("help_alert_state")
+        // 1.5
+        val estimatorVersion = intPreferencesKey("estimator_version")
     }
     val collectorOn: Flow<Boolean> = ctx.store.data.map { it[K.collectorOn] ?: false }
     val collectIntervalSec: Flow<Int> = ctx.store.data.map { it[K.collectInterval] ?: 60 }
@@ -79,6 +81,8 @@ class Prefs @Inject constructor(@ApplicationContext private val ctx: Context) {
     val lastBackupAt: Flow<Long> = ctx.store.data.map { it[K.lastBackupAt] ?: 0L }
     /** JSON {lat, lon, at} of the last nearest-help heads-up */
     val helpAlertState: Flow<String> = ctx.store.data.map { it[K.helpAlertState] ?: "" }
+    /** the estimator generation the stored AP estimates came from (estimate.Estimator.VERSION); older ones are recomputed once */
+    val estimatorVersion: Flow<Int> = ctx.store.data.map { it[K.estimatorVersion] ?: 0 }
 
     suspend fun setCollectorOn(v: Boolean) = ctx.store.edit { it[K.collectorOn] = v }
     suspend fun setCollectInterval(s: Int) = ctx.store.edit { it[K.collectInterval] = s.coerceIn(15, 900) }
@@ -103,6 +107,7 @@ class Prefs @Inject constructor(@ApplicationContext private val ctx: Context) {
     suspend fun setMapPoiFilter(v: String) = ctx.store.edit { it[K.mapPoiFilter] = v }
     suspend fun setLastBackupAt(ms: Long) = ctx.store.edit { it[K.lastBackupAt] = ms }
     suspend fun setHelpAlertState(json: String) = ctx.store.edit { it[K.helpAlertState] = json }
+    suspend fun setEstimatorVersion(v: Int) = ctx.store.edit { it[K.estimatorVersion] = v }
 
     companion object {
         val UNITS = setOf("auto", "metric", "imperial")

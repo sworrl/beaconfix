@@ -8,9 +8,7 @@ import dagger.hilt.InstallIn
 import dagger.hilt.android.qualifiers.ApplicationContext
 import dagger.hilt.components.SingletonComponent
 import org.sworrl.beaconfix.data.db.AppDatabase
-import org.sworrl.beaconfix.data.db.MIGRATION_1_2
-import org.sworrl.beaconfix.data.db.MIGRATION_2_3
-import org.sworrl.beaconfix.data.db.MIGRATION_3_4
+import org.sworrl.beaconfix.data.db.ALL_MIGRATIONS
 import javax.inject.Singleton
 
 @Module
@@ -19,5 +17,5 @@ object AppModule {
     /** Real migrations for every step (data/db/Migrations.kt) and no destructive fallback: an update never wipes the phone. */
     @Provides @Singleton
     fun database(@ApplicationContext ctx: Context): AppDatabase =
-        Room.databaseBuilder(ctx, AppDatabase::class.java, "beaconfix.db").addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4).build()
+        Room.databaseBuilder(ctx, AppDatabase::class.java, "beaconfix.db").addMigrations(*ALL_MIGRATIONS).build()
 }

@@ -211,4 +211,37 @@ object Mirror {
         ok -> v.copy(error = "", fetched = now, stale = true)
         else -> v.copy(error = error, stale = v.cached.isNotEmpty() || v.fetched > 0 || v.cachedAt > 0, cachedAt = if (v.cached.isEmpty() && v.fetched > 0) v.fetched else v.cachedAt)
     }
+
+    // ── the desktop's graded fit on a pulled AP row ─────────────────────────
+
+    /**
+     * [row] (whose position was just taken from the desktop) with the desktop's [fit] as its grade: every grading column
+     * set from the fit, or cleared when the desktop sent none (a grade from an earlier fit would no longer describe the
+     * position). Older desktops send only n … updated: then only vantage and the ellipse come across, with no grade.
+     */
+    /**
+     * [ap]'s `fit` when that fit is what placed the AP's position: its own lat/lon (graded desktops) within 5 m of the
+     * row's, or, from older desktops without them, a position of kind observed/region. A WiGLE or peer position has a
+     * fit of the desktop's own that describes a different point, so it gets none.
+     */
+    fun fitOfPosition(ap: org.sworrl.beaconfix.data.api.ApDto): org.sworrl.beaconfix.data.api.ApFitDto? {
+        val fit = ap.fit ?: return null
+        val lat = ap.lat ?: return null; val lon = ap.lon ?: return null
+        val fl = fit.lat; val fo = fit.lon
+        return if (fl != null && fo != null) fit.takeIf { Geo.distanceM(lat, lon, fl, fo) < 5.0 }
+        else fit.takeIf { ap.kind == "observed" || ap.kind == "region" }
+    }
+
+    fun withDesktopFit(row: org.sworrl.beaconfix.data.db.ApEntity, fit: org.sworrl.beaconfix.data.api.ApFitDto?, nowMs: Long): org.sworrl.beaconfix.data.db.ApEntity {
+        if (fit == null) return row.copy(fitKind = null, grade = null, score = null, r95 = null, cep50 = null, pWithin25 = null, cxx = null, cxy = null, cyy = null,
+            semiMajor = null, semiMinor = null, orient = null, vantage = null, devices = null, fitMetrics = null, gradedAt = null)
+        val metrics = org.sworrl.beaconfix.estimate.FitMetrics(source = "desktop", inHull = fit.inHull, ambiguous = fit.ambiguous, moved = fit.moved,
+            modes = fit.modes, sessions = fit.sessions, n = fit.n, rejected = fit.rejected, rms = fit.rms)
+        return row.copy(
+            fitKind = fit.kind, grade = fit.grade?.ifEmpty { null }, score = fit.score, r95 = fit.r95, cep50 = fit.cep50, pWithin25 = fit.pWithin25,
+            cxx = fit.cxx, cxy = fit.cxy, cyy = fit.cyy, semiMajor = fit.semiMajor, semiMinor = fit.semiMinor, orient = fit.orient,
+            vantage = fit.vantage, devices = fit.devices, fitMetrics = metrics.encode(), gradedAt = if (fit.graded) nowMs else null,
+            refDbm = fit.p0 ?: row.refDbm, pathExp = fit.pathloss ?: row.pathExp, residual = fit.rms ?: row.residual,
+        )
+    }
 }

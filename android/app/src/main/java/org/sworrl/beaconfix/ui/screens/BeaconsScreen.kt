@@ -31,6 +31,12 @@ import org.sworrl.beaconfix.collector.CollectorStatus
 import org.sworrl.beaconfix.data.db.ApEntity
 import org.sworrl.beaconfix.ui.Chip
 import org.sworrl.beaconfix.ui.EmptyState
+import org.sworrl.beaconfix.ui.FixGrade
+import org.sworrl.beaconfix.ui.metres
+import org.sworrl.beaconfix.R
+import org.sworrl.beaconfix.estimate.FitMetrics
+import androidx.compose.ui.res.stringResource
+import kotlin.math.roundToInt
 import org.sworrl.beaconfix.ui.SecurityText
 import org.sworrl.beaconfix.ui.ago
 import org.sworrl.beaconfix.ui.gradeColor
@@ -79,6 +85,10 @@ private fun BeaconRow(a: ApEntity, grade: String, dbm: Int?, expanded: Boolean, 
                     Text(a.ssid.ifEmpty { "(hidden)" }, fontWeight = FontWeight.Bold, color = if (a.home) Magenta else MaterialTheme.colorScheme.onSurface)
                     Text("${a.bssid} · ${a.band.ifEmpty { "?" }} GHz${if (a.ch > 0) " ch ${a.ch}" else ""}" + (dbm?.let { " · $it dBm" } ?: " · seen ${ago(a.lastSeen)}"), color = Slate, style = MaterialTheme.typography.bodySmall)
                 }
+                if (FixGrade.graded(a)) {
+                    val letter = a.grade ?: ""
+                    Chip(if (FixGrade.isMobile(a) || FixGrade.isRegion(a) || a.score == null) stringResource(R.string.fit_badge_letter, letter) else stringResource(R.string.fit_badge, letter, a.score.roundToInt()), FixGrade.color(letter))
+                }
                 Chip(secName(a.security), gradeColor(grade))
                 if (a.home) Chip("HOME", Magenta)
             }
@@ -90,9 +100,54 @@ private fun BeaconRow(a: ApEntity, grade: String, dbm: Int?, expanded: Boolean, 
                         Text("▸ ${i.title}", fontWeight = FontWeight.Bold, color = when (i.severity) { "critical" -> gradeColor("critical"); "weak" -> gradeColor("weak"); else -> MaterialTheme.colorScheme.onSurface }, style = MaterialTheme.typography.bodySmall)
                         Text(i.nerd, style = MaterialTheme.typography.bodySmall)
                     }
+                    if (FixGrade.graded(a)) FixGradeDetails(a)
                     if (a.travelling) Text("Travels with you (heard at places far apart) — never used for positioning.", color = Magenta, style = MaterialTheme.typography.bodySmall)
                     TextButton(onClick = onToggle) { Text("Less") }
                 }
+            }
+        }
+    }
+}
+
+/** The graded estimate (docs/GRADING.md): letter and score, P(error < 25 m), R95/CEP50, places, devices, score parts, flags. */
+@Composable
+private fun FixGradeDetails(a: ApEntity) {
+    val m = FitMetrics.parse(a.fitMetrics)
+    val col = FixGrade.color(a.grade)
+    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text(stringResource(R.string.fit_title), fontWeight = FontWeight.Bold, style = MaterialTheme.typography.bodySmall)
+            val letter = a.grade ?: ""
+            Chip(if (a.score != null && !FixGrade.isMobile(a) && !FixGrade.isRegion(a)) stringResource(R.string.fit_badge, letter, a.score.roundToInt()) else stringResource(R.string.fit_badge_letter, letter), col)
+            if (m?.source == "desktop") Text(stringResource(R.string.fit_by_desktop), color = Slate, style = MaterialTheme.typography.labelSmall)
+        }
+        when {
+            FixGrade.isMobile(a) -> Text(stringResource(R.string.fit_mobile), style = MaterialTheme.typography.bodySmall)
+            else -> {
+                if (FixGrade.isRegion(a) && a.r95 != null) Text(stringResource(R.string.fit_region, metres(a.r95)), style = MaterialTheme.typography.bodySmall)
+                a.pWithin25?.let { Text(stringResource(R.string.fit_within25, (it * 100).roundToInt()), color = col, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.bodySmall) }
+                if (a.r95 != null && a.cep50 != null) Text(stringResource(R.string.fit_r95_cep50, metres(a.r95), metres(a.cep50)), style = MaterialTheme.typography.bodySmall)
+            }
+        }
+        val places = a.vantage
+        if (places != null) Text(if (a.devices != null) stringResource(R.string.fit_places_devices, places, a.devices) else stringResource(R.string.fit_places, places), color = Slate, style = MaterialTheme.typography.bodySmall)
+        if (m != null) {
+            val parts = listOf("P" to m.cP, "G" to m.cG, "E" to m.cE, "F" to m.cF, "S" to m.cS, "T" to m.cT, "X" to m.cX)
+            if (parts.any { it.second != null }) {
+                Text(stringResource(R.string.fit_components) + "  " + parts.joinToString("  ") { (k, v) -> "$k " + (if (v == null || v < 0) "—" else String.format(java.util.Locale.ROOT, "%.2f", v)) },
+                    style = MaterialTheme.typography.bodySmall, fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace)
+                Text(stringResource(R.string.fit_components_legend), color = Slate, style = MaterialTheme.typography.labelSmall)
+            }
+            val fExt = stringResource(R.string.fit_flag_extrapolated); val fAmb = stringResource(R.string.fit_flag_ambiguous)
+            val fMoved = stringResource(R.string.fit_flag_moved); val fFragile = stringResource(R.string.fit_flag_fragile)
+            val flags = ArrayList<String>()
+            if (m.inHull == false) flags.add(fExt)
+            if (m.ambiguous == true) flags.add(fAmb)
+            if (m.moved == true) flags.add(fMoved)
+            if (m.fragile(a.semiMajor)) flags.add(fFragile)
+            if (flags.isNotEmpty()) {
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) { for (f in flags) Chip(f, FixGrade.color("E")) }
+                Text(stringResource(R.string.fit_flags_help), color = Slate, style = MaterialTheme.typography.labelSmall)
             }
         }
     }

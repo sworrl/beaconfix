@@ -4,8 +4,8 @@ import androidx.room.Database
 import androidx.room.RoomDatabase
 
 @Database(
-    entities = [ApEntity::class, ObservationEntity::class, FixEntity::class, PoiEntity::class, DesktopEntity::class, IdentityEntity::class, PendingLinkEntity::class, AnchorEntity::class, SnapshotEntity::class],
-    version = 4,
+    entities = [ApEntity::class, ObservationEntity::class, FixEntity::class, PoiEntity::class, DesktopEntity::class, IdentityEntity::class, PendingLinkEntity::class, AnchorEntity::class, SnapshotEntity::class, EstimateHistoryEntity::class],
+    version = 5,
     exportSchema = true,
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -17,4 +17,5 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun identity(): IdentityDao
     abstract fun anchors(): AnchorDao
     abstract fun snapshots(): SnapshotDao
+    abstract fun estimateHistory(): EstimateHistoryDao
 }

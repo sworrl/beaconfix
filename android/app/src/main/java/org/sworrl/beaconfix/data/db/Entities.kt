@@ -31,6 +31,49 @@ data class ApEntity(
     val security: String = "",
     val rsnFlags: Int = 0,
     val wpaFlags: Int = 0,
+    // ── v5 (1.5): the graded estimate (docs/GRADING.md); all null until the estimator (ours or the desktop's) graded it ──
+    /** fix | region | mobile | none */
+    val fitKind: String? = null,
+    /** A–F · R (region only) · M (travels with you) */
+    val grade: String? = null,
+    /** 0–100 */
+    val score: Double? = null,
+    /** radius holding 95 % / 50 % of the position probability (m) */
+    val r95: Double? = null,
+    val cep50: Double? = null,
+    /** P(error < 25 m) */
+    val pWithin25: Double? = null,
+    /** position covariance (m², x = east, y = north) */
+    val cxx: Double? = null,
+    val cxy: Double? = null,
+    val cyy: Double? = null,
+    /** 1-σ error ellipse (m) and its orientation as the estimator reports it (degrees) */
+    val semiMajor: Double? = null,
+    val semiMinor: Double? = null,
+    val orient: Double? = null,
+    /** distinct places the AP was heard from, and distinct devices that heard it */
+    val vantage: Int? = null,
+    val devices: Int? = null,
+    /** the remaining metrics as JSON (estimate.FitMetrics) */
+    val fitMetrics: String? = null,
+    /** when the grade was computed (ms) */
+    val gradedAt: Long? = null,
+)
+
+/** The last estimates of one AP (schema v5): at most 20 rows per BSSID (EstimateHistoryDao.append trims). */
+@Entity(tableName = "estimate_history", indices = [Index("bssid")])
+data class EstimateHistoryEntity(
+    @PrimaryKey(autoGenerate = true) val id: Long = 0,
+    val bssid: String,
+    /** ms */
+    val time: Long,
+    val lat: Double? = null,
+    val lon: Double? = null,
+    val cxx: Double? = null,
+    val cxy: Double? = null,
+    val cyy: Double? = null,
+    val score: Double? = null,
+    val grade: String? = null,
 )
 
 /** One RSSI sample of a BSSID taken at a known position. Mirrors the desktop `observations` table. */

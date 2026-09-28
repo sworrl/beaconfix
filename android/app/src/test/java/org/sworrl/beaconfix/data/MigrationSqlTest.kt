@@ -14,6 +14,8 @@ import org.sworrl.beaconfix.data.db.DEDUPE_DESKTOP_FIXES
 import org.sworrl.beaconfix.data.db.MIGRATION_1_2
 import org.sworrl.beaconfix.data.db.MIGRATION_2_3
 import org.sworrl.beaconfix.data.db.MIGRATION_3_4
+import org.sworrl.beaconfix.data.db.MIGRATION_4_5
+import org.sworrl.beaconfix.data.db.MigrationSql
 import java.io.File
 import java.lang.reflect.Proxy
 
@@ -66,9 +68,31 @@ class MigrationSqlTest {
         assertEquals(a.keys - "pois" + "pois" + "snapshots", b.keys)
     }
 
+    @Test fun fourToFiveOnlyAddsNullableApColumnsAndTheHistoryTable() {
+        val s = schema(5)
+        val sql = sqlOf(MIGRATION_4_5)
+        assertEquals(MigrationSql.ALTER_APS_V5 + s["estimate_history"]!!, sql)
+        assertTrue(sql.none { it.contains("DROP", ignoreCase = true) || it.contains("DELETE", ignoreCase = true) || it.contains("RENAME", ignoreCase = true) })
+        // every added column is in the exported v5 `aps`, nullable, and v4's `aps` is v5's minus exactly those columns
+        val apsV5 = s["aps"]!!.first()
+        var apsV4FromV5 = apsV5
+        for ((name, type) in MigrationSql.APS_V5_COLUMNS) {
+            val col = ", `$name` $type"
+            assertTrue("$name in the v5 aps table", apsV5.contains("$col,"))
+            apsV4FromV5 = apsV4FromV5.replace(col, "")
+        }
+        assertEquals(schema(4)["aps"]!!.first(), apsV4FromV5)
+    }
+
+    @Test fun protectedTablesAreUnchangedFromFourToFive() {
+        val a = schema(4); val b = schema(5)
+        for (t in listOf("observations", "fixes", "desktops", "identity", "pending_links", "anchors", "pois", "snapshots")) assertEquals(t, a[t], b[t])
+        assertEquals(a.keys + "estimate_history", b.keys)
+    }
+
     @Test fun migrationsChainToTheNewestSchema() {
         val versions = dir.listFiles()!!.mapNotNull { it.name.removeSuffix(".json").toIntOrNull() }.sorted()
-        assertTrue(versions.toString(), versions.containsAll(listOf(3, 4)))
+        assertTrue(versions.toString(), versions.containsAll(listOf(3, 4, 5)))
         assertEquals((1 until versions.last()).toList(), ALL_MIGRATIONS.map { it.startVersion })
         ALL_MIGRATIONS.forEach { assertEquals(it.startVersion + 1, it.endVersion) }
     }

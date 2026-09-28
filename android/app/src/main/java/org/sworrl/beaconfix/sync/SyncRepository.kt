@@ -112,16 +112,22 @@ class SyncRepository @Inject constructor(
                     for (a in list) {
                         if (a.bssid.length != 17) continue
                         val old = db.aps().get(a.bssid)
-                        val hasPos = a.lat != null && a.lon != null && a.kind != "ring" && a.kind != "none"
+                        val hasPos = a.lat != null && a.lon != null && a.kind != "ring" && a.kind != "none" && a.kind != "mobile"
                         val theirAcc = a.r ?: 100.0
-                        val takePos = hasPos && old?.posSource != "anchor" && (old?.lat == null || old.posSource != "observed" || (old.acc ?: 1e9) > theirAcc)
-                        db.aps().upsert((old ?: ApEntity(bssid = a.bssid, firstSeen = now)).copy(
+                        val fit = Mirror.fitOfPosition(a)       // the desktop's fit, when it is what placed this position
+                        // compare like with like: R95 where both sides have one (graded fits), else the accuracy radius
+                        val theirR95 = fit?.r95 ?: theirAcc * 2.45
+                        val ourR95 = old?.r95 ?: (old?.acc ?: 1e9) * 2.45
+                        val takePos = hasPos && old?.posSource != "anchor" && (old?.lat == null || old.posSource != "observed" || ourR95 > theirR95)
+                        val base = (old ?: ApEntity(bssid = a.bssid, firstSeen = now)).copy(
                             ssid = a.ssid.ifEmpty { old?.ssid ?: "" }, freq = if (a.freq > 0) a.freq else old?.freq ?: 0, band = a.band.ifEmpty { old?.band ?: "" }, ch = if (a.ch > 0) a.ch else old?.ch ?: 0,
                             lastSeen = maxOf(old?.lastSeen ?: 0, now),
                             lat = if (takePos) a.lat else old?.lat, lon = if (takePos) a.lon else old?.lon, acc = if (takePos) theirAcc else old?.acc,
                             posSource = if (takePos) (if (a.kind == "wigle" || a.kind == "observed") "placed" else "desktop") else old?.posSource ?: "",
                             home = a.home || (old?.home ?: false), travelling = a.status == "travelling" || (old?.travelling ?: false),
-                            security = a.security.ifEmpty { old?.security ?: "" }, rsnFlags = a.rsnFlags, wpaFlags = a.wpaFlags))
+                            security = a.security.ifEmpty { old?.security ?: "" }, rsnFlags = a.rsnFlags, wpaFlags = a.wpaFlags)
+                        // the desktop's fit becomes the row's grade along with its position (none sent: the old grade no longer applies)
+                        db.aps().upsert(if (takePos) Mirror.withDesktopFit(base, fit, now) else base)
                         pulledAps++
                     }
                 }
@@ -193,7 +199,7 @@ class SyncRepository @Inject constructor(
                 }
             }
             val touched = db.observations().touchedSince(0).take(400)   // refit what we have data for (bounded)
-            val refit = estimates.refit(touched)
+            val refit = estimates.refit(touched, force = true)
             runCatching { anchors.applyToAps() }
             desktops.upsert(d.copy(lastSync = System.currentTimeMillis(), lastError = "", pushedObs = d.pushedObs + pushed, pulledAps = d.pulledAps + pulledAps, hostname = hello.body()?.hostname ?: d.hostname, version = hello.body()?.version ?: d.version))
             return SyncReport(d.name, true, pushed, pulledAps, pulledObs, pulledFixes, refit)

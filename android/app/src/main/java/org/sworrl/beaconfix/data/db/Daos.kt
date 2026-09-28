@@ -20,6 +20,16 @@ interface ApDao {
     @Query("SELECT COUNT(*) FROM aps WHERE lat IS NOT NULL") fun positionedCount(): Flow<Int>
     @Query("UPDATE aps SET lat=:lat, lon=:lon, acc=:acc, posSource=:src, refDbm=:refDbm, pathExp=:pathExp, residual=:residual WHERE bssid=:bssid")
     suspend fun setPosition(bssid: String, lat: Double, lon: Double, acc: Double, src: String, refDbm: Double?, pathExp: Double?, residual: Double?)
+    /** Our own graded estimate (EstimateRepository): the position and every grading column at once. */
+    @Query("UPDATE aps SET lat=:lat, lon=:lon, acc=:acc, posSource=:src, refDbm=:refDbm, pathExp=:pathExp, residual=:residual, fitKind=:fitKind, grade=:grade, score=:score, " +
+        "r95=:r95, cep50=:cep50, pWithin25=:pWithin25, cxx=:cxx, cxy=:cxy, cyy=:cyy, semiMajor=:semiMajor, semiMinor=:semiMinor, orient=:orient, vantage=:vantage, devices=:devices, " +
+        "fitMetrics=:fitMetrics, gradedAt=:gradedAt WHERE bssid=:bssid")
+    suspend fun setEstimate(bssid: String, lat: Double, lon: Double, acc: Double, src: String, refDbm: Double?, pathExp: Double?, residual: Double?,
+                            fitKind: String?, grade: String?, score: Double?, r95: Double?, cep50: Double?, pWithin25: Double?, cxx: Double?, cxy: Double?, cyy: Double?,
+                            semiMajor: Double?, semiMinor: Double?, orient: Double?, vantage: Int?, devices: Int?, fitMetrics: String?, gradedAt: Long?)
+    /** A grade without a position change (kind mobile: "travels with you"). */
+    @Query("UPDATE aps SET fitKind=:fitKind, grade=:grade, score=:score, vantage=:vantage, devices=:devices, fitMetrics=:fitMetrics, gradedAt=:gradedAt WHERE bssid=:bssid")
+    suspend fun setGrade(bssid: String, fitKind: String?, grade: String?, score: Double?, vantage: Int?, devices: Int?, fitMetrics: String?, gradedAt: Long?)
     @Query("UPDATE aps SET home=:home WHERE bssid IN (:bssids)") suspend fun setHome(bssids: List<String>, home: Boolean)
     @Query("UPDATE aps SET home=0") suspend fun clearHome()
     @Query("SELECT bssid FROM aps") suspend fun allBssids(): List<String>
@@ -55,6 +65,24 @@ interface FixDao {
     /** Collapse desktop fixes pulled more than once (same timestamp) to the first copy; returns the rows removed. */
     @Query(DEDUPE_DESKTOP_FIXES) suspend fun dedupeDesktop(): Int
 }
+
+/** The last estimates per AP (schema v5), newest first; [append] keeps at most [ESTIMATE_HISTORY_KEEP] rows per BSSID. */
+@Dao
+interface EstimateHistoryDao {
+    @Insert suspend fun insert(row: EstimateHistoryEntity): Long
+    @Query("DELETE FROM estimate_history WHERE bssid = :bssid AND id NOT IN (SELECT id FROM estimate_history WHERE bssid = :bssid ORDER BY id DESC LIMIT :keep)")
+    suspend fun trim(bssid: String, keep: Int)
+    @Query("SELECT * FROM estimate_history WHERE bssid = :bssid ORDER BY id DESC") suspend fun forAp(bssid: String): List<EstimateHistoryEntity>
+    @Query("SELECT COUNT(*) FROM estimate_history") suspend fun count(): Int
+
+    @Transaction
+    suspend fun append(row: EstimateHistoryEntity) {
+        insert(row)
+        trim(row.bssid, ESTIMATE_HISTORY_KEEP)
+    }
+}
+
+const val ESTIMATE_HISTORY_KEEP = 20
 
 /** Shared with MIGRATION_3_4, which runs the same cleanup once. */
 const val DEDUPE_DESKTOP_FIXES = "DELETE FROM fixes WHERE source='desktop' AND id NOT IN (SELECT MIN(id) FROM fixes WHERE source='desktop' GROUP BY time)"

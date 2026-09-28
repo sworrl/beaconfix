@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- A13: graded AP positions (docs/GRADING.md): the map ellipse and the beacon detail. -->
+<resources>
+    <string name="fit_title">Position grade</string>
+    <string name="fit_badge">%1$s · %2$d</string>
+    <string name="fit_badge_letter">%1$s</string>
+    <string name="fit_within25">%1$d%% within 25 m</string>
+    <string name="fit_r95_cep50">R95 %1$s · CEP50 %2$s</string>
+    <string name="fit_places_devices">%1$d places · %2$d devices</string>
+    <string name="fit_places">%1$d places</string>
+    <string name="fit_components">Score parts</string>
+    <string name="fit_components_legend">P precision · G geometry · E evidence · F fit · S stability · T freshness · X agreement</string>
+    <string name="fit_region">Region only: somewhere within %1$s</string>
+    <string name="fit_mobile">Travels with you (grade M): never placed on the map or used for positioning</string>
+    <string name="fit_by_desktop">graded by the desktop</string>
+    <string name="fit_flag_extrapolated">extrapolated</string>
+    <string name="fit_flag_ambiguous">ambiguous</string>
+    <string name="fit_flag_moved">moved</string>
+    <string name="fit_flag_fragile">fragile</string>
+    <string name="fit_flags_help">extrapolated: outside the places it was heard from · ambiguous: a mirror position fits about as well · moved: only the recent samples count · fragile: one place decides it</string>
+    <string name="fit_map_snippet">grade %1$s %2$d · R95 %3$s · %4$d%% within 25 m</string>
+    <string name="fit_map_mobile">travels with you (M)</string>
+    <string name="fit_map_legend" formatted="false">ellipse = 95 %, coloured by grade A–F · dashed = extrapolated or ambiguous · faint disc = region only</string>
+</resources>
