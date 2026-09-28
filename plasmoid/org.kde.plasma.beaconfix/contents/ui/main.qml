@@ -143,7 +143,7 @@ PlasmoidItem {
                 for (var ri = 0; ri < (d.events || []).length; ri++) { var re = d.events[ri]; if (re && re.type === "ap_refit") deskRefit[re.bssid] = true }
                 var pf = {}, prevFit = root._prevFit
                 for (var fi = 0; fi < newAps.length; fi++) {
-                    var na = newAps[fi]; if (!na || !na.fit || na.lat === undefined) continue
+                    var na = newAps[fi]; if (!na || !na.fit || na.lat === undefined || na.kind === "mobile" || na.fit.kind === "mobile") continue   // a mobile one is only where it was last heard
                     var cur = {lat: na.lat, lon: na.lon, acc: na.fit.acc || na.r}
                     var prev = prevFit ? prevFit[na.bssid] : null
                     pf[na.bssid] = cur

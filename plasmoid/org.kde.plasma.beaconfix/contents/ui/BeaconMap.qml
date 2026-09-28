@@ -513,6 +513,49 @@ Item {
         return 2 * R * Math.asin(Math.sqrt(a))
     }
     function bandOf(ap) { return ap.band ? ap.band : ap.freq >= 5925 ? "6" : ap.freq >= 4900 ? "5" : ap.freq > 0 ? "2.4" : "" }
+
+    // ── graded estimates (desktop 3.9+): grade A–F for a fix, R region only, M mobile; absent: ungraded ──
+    // Okabe–Ito (colour-blind safe). Looked up per beacon on every paint: a constant table, no allocation.
+    readonly property var gradeColors: ({A: "#009E73", B: "#56B4E9", C: "#F0E442", D: "#E69F00", E: "#D55E00", F: "#CC79A7", R: "#8A93A6", M: "#0072B2"})
+    readonly property var gradeWords: [["A", "excellent"], ["B", "good"], ["C", "fair"], ["D", "weak"], ["E", "poor"], ["F", "unreliable"], ["R", "region only"], ["M", "mobile"]]
+    property bool showLegend: false
+    function gradeOf(a) {
+        if (!a) return ""
+        var g = a.grade || (a.fit && a.fit.grade) || ""
+        if (!g) { var k = a.fit && a.fit.kind; g = a.kind === "region" || k === "region" ? "R" : a.kind === "mobile" || k === "mobile" ? "M" : "" }
+        return g
+    }
+    function gradeColor(g) { return gradeColors[g] || "#e6edf7" }
+    function plural(n, w) { return n + " " + w + (n === 1 ? "" : "s") }
+    function hasFlag(f, name) { return !!(f && f.flags && f.flags.indexOf(name) >= 0) }
+    // "B · 72% within 25 m · 9 places · 3 devices" / "R · region ±140 m · 4 places" / "M · travels with you"
+    function gradeLine(a) {
+        var g = gradeOf(a), f = (a && a.fit) || {}
+        if (!g) return ""
+        if (g === "M") return "M · travels with you"
+        if (g === "R") return `R · region ±${Math.round(a.r95 || f.r95 || a.r || 0)} m · ${plural(f.vantage || 0, "place")}`
+        var parts = [g]
+        if (f.pWithin25 !== undefined) parts.push(Math.round(f.pWithin25 * 100) + "% within 25 m")
+        if (f.vantage !== undefined) parts.push(plural(f.vantage, "place"))
+        if (f.devices !== undefined) parts.push(plural(f.devices, "device"))
+        return parts.join(" · ")
+    }
+    // The "sample here next" target of the hovered (else the pinned) beacon, drawn by the fx layer
+    property var sugTarget: null                // {lat, lon, slat, slon, col} or null
+    function updateSuggest() {
+        var aps = src.aps || [], h = hover, a = null
+        if (h && h.kind === "beacon" && h.ids.length === 1) a = aps[h.ids[0]] || null
+        if (!(a && a.fit && a.fit.suggest) && selectedBeacon)
+            for (var i = 0; i < aps.length; i++) if (aps[i] && aps[i].bssid === selectedBeacon) { a = aps[i]; break }
+        var s = a && a.fit && a.fit.suggest && a.lat !== undefined && a.fit.suggest.lat !== undefined ? a.fit.suggest : null
+        var o = sugTarget
+        if (!s) { if (o) { sugTarget = null; fx.requestPaint() } return }
+        if (o && o.lat === a.lat && o.lon === a.lon && o.slat === s.lat && o.slon === s.lon) return
+        sugTarget = {lat: a.lat, lon: a.lon, slat: s.lat, slon: s.lon, col: gradeColor(gradeOf(a))}
+        fx.requestPaint()
+    }
+    onHoverChanged: updateSuggest()
+    onSelectedBeaconChanged: updateSuggest()
     function project(g) {                       // stored geometry → screen point (rings re-anchor on the fix they were heard from)
         var m = merc(g.lat, g.lon)
         if (g.kind === "ring") { var ang = (g.bearing - 90) * Math.PI / 180, rr = g.r / mpp(); return Qt.point(sx(m.x) + Math.cos(ang) * rr, sy(m.y) + Math.sin(ang) * rr) }
@@ -614,7 +657,7 @@ Item {
         if (fxActive()) fx.requestPaint()
     }
     function fxActive() {                       // anything for the fx layer to draw now (animations waiting for a glide do not count)
-        if (selectedBeacon) return true
+        if (selectedBeacon || sugTarget) return true
         var now = Date.now()
         for (var i = 0; i < anims.length; i++) if (anims[i].t0 <= now) return true
         return false
@@ -938,6 +981,24 @@ Item {
                 var aps = src.aps || [], pts = [], atMe = [], posBy = {}, last = map._lastAp
                 var selIdx = -1
                 map.selPos = null
+                // "region" beacons (grade R): one faint disc of radius R95 each, underneath everything else. There can
+                // be hundreds, so all of them go into one path, filled once and stroked once (overlaps do not stack up).
+                var nReg = 0
+                ctx.beginPath()
+                for (var rk = 0; rk < aps.length; rk++) {
+                    var ra = aps[rk]
+                    if (!ra || ra.kind !== "region" || ra.lat === undefined) continue
+                    var rpx = (ra.r95 || ra.r || 0) / mpp
+                    if (rpx < 2 || rpx > 20000) continue
+                    var rm = map.merc(ra.lat, ra.lon), rcx = map.sx(rm.x), rcy = map.sy(rm.y)
+                    ctx.moveTo(rcx + rpx, rcy); ctx.arc(rcx, rcy, rpx, 0, Math.PI * 2)
+                    nReg++
+                }
+                if (nReg) {
+                    ctx.globalAlpha = map.secFocus ? 0.03 : 0.07; ctx.fillStyle = map.gradeColors.R; ctx.fill()
+                    if (!lite) { ctx.globalAlpha = map.secFocus ? 0.08 : 0.22; ctx.strokeStyle = map.gradeColors.R; ctx.lineWidth = 0.8; ctx.stroke() }
+                    ctx.globalAlpha = 1
+                }
                 for (var k = 0; k < aps.length; k++) {
                     var ap = aps[k]
                     if (ap.kind === "none") continue
@@ -959,8 +1020,40 @@ Item {
                         last[ap.bssid] = {kind: "ring", lat: src.lat, lon: src.lon, r: ap.r, bearing: ap.bearing, ssid: ap.ssid, col: col, status: ap.status, dbm: ap.dbm}
                     } else {
                         var m2 = map.merc(ap.lat, ap.lon); px = map.sx(m2.x); py = map.sy(m2.y)
-                        var ur = ap.r / mpp
-                        if (ur > 6) { ctx.beginPath(); ctx.arc(px, py, ur, 0, Math.PI * 2); ctx.strokeStyle = "rgba(255,209,102,0.3)"; ctx.setLineDash([4, 4]); ctx.stroke(); ctx.setLineDash([]) }
+                        var ur = ap.r / mpp, apFit = ap.fit
+                        if (apFit && apFit.kind === "fix" && apFit.semiMajor > 0) {
+                            // 95 % error ellipse: 1-σ semi axes × 2.4477 (√χ²₂(0.95)), major axis along `orient`
+                            // (bearing, clockwise from north). Screen y points down: north is −y, so the major axis
+                            // is (sin θ, −cos θ) and the minor axis (cos θ, sin θ).
+                            var ea = Math.min(20000, apFit.semiMajor * 2.4477 / mpp), eb = Math.min(20000, (apFit.semiMinor > 0 ? apFit.semiMinor : apFit.semiMajor) * 2.4477 / mpp)
+                            var gcol = map.gradeColor(map.gradeOf(ap))
+                            var dashed = map.hasFlag(apFit, "extrapolated") || map.hasFlag(apFit, "ambiguous")
+                            if (ea > 3) {
+                                var th = (apFit.orient || 0) * Math.PI / 180, ux = Math.sin(th), uy = -Math.cos(th)
+                                ctx.beginPath()
+                                for (var es = 0; es <= 40; es++) {
+                                    var et = es * Math.PI / 20, ca = Math.cos(et) * ea, sb = Math.sin(et) * eb
+                                    var ex = px + ca * ux - sb * uy, ey = py + ca * uy + sb * ux
+                                    if (es === 0) ctx.moveTo(ex, ey); else ctx.lineTo(ex, ey)
+                                }
+                                ctx.closePath()
+                                ctx.globalAlpha = map.secFocus ? 0.04 : 0.12; ctx.fillStyle = gcol; ctx.fill()
+                                ctx.globalAlpha = map.secFocus ? 0.25 : 0.85; ctx.strokeStyle = gcol; ctx.lineWidth = 1.3
+                                if (dashed) ctx.setLineDash([5, 4])
+                                ctx.stroke(); ctx.setLineDash([])
+                                ctx.globalAlpha = 1
+                            }
+                            var mt = apFit.metrics
+                            if (map.hasFlag(apFit, "ambiguous") && mt && mt.altLat !== undefined && mt.altLon !== undefined) {
+                                // the other solution the data allows (mirror ambiguity): a hollow ghost, faintly tied to the estimate
+                                var am = map.merc(mt.altLat, mt.altLon), gx2 = map.sx(am.x), gy2 = map.sy(am.y)
+                                ctx.globalAlpha = 0.45; ctx.strokeStyle = gcol; ctx.lineWidth = 1; ctx.setLineDash([2, 3])
+                                ctx.beginPath(); ctx.moveTo(px, py); ctx.lineTo(gx2, gy2); ctx.stroke()
+                                ctx.globalAlpha = 0.9; ctx.setLineDash([2, 2]); ctx.lineWidth = 1.4
+                                ctx.beginPath(); ctx.arc(gx2, gy2, 4.5, 0, Math.PI * 2); ctx.stroke(); ctx.setLineDash([])
+                                ctx.globalAlpha = 1
+                            }
+                        } else if (ur > 6 && ap.kind !== "region" && ap.kind !== "mobile") { ctx.beginPath(); ctx.arc(px, py, ur, 0, Math.PI * 2); ctx.strokeStyle = "rgba(255,209,102,0.3)"; ctx.setLineDash([4, 4]); ctx.stroke(); ctx.setLineDash([]) }
                         last[ap.bssid] = {kind: ap.kind, lat: ap.lat, lon: ap.lon, r: ap.r, ssid: ap.ssid, col: col, status: ap.status, dbm: ap.dbm}
                     }
                     // A beacon just placed on the map is drawn where it now is: this canvas is not repainted by the
@@ -968,21 +1061,35 @@ Item {
                     // deferred batch, at the old orbit spot). The fx layer draws the glide in from that spot.
                     posBy[ap.bssid] = {x: px, y: py, col: col}
                     var sc = map.secOf(ap)
-                    var merged = false
-                    for (var q = 0; q < pts.length; q++)
-                        if (Math.abs(pts[q].x - px) < 9 && Math.abs(pts[q].y - py) < 9) {
+                    var merged = false, mob = ap.kind === "mobile"     // a mobile beacon keeps its own "M" marker
+                    for (var q = 0; q < pts.length && !mob; q++)
+                        if (!pts[q].mob && Math.abs(pts[q].x - px) < 9 && Math.abs(pts[q].y - py) < 9) {
                             pts[q].ids.push(k)
                             if (sc.rank > pts[q].secRank) { pts[q].secRank = sc.rank; pts[q].secCol = sc.color; pts[q].secGlyph = sc.glyph }
                             if (ap.dbm > pts[q].dbm) { pts[q].ssid = ap.ssid; pts[q].dbm = ap.dbm; pts[q].status = ap.status; pts[q].bssid = ap.bssid; pts[q].band = map.bandOf(ap); pts[q].col = col }
                             merged = true; break
                         }
-                    if (!merged) pts.push({x: px, y: py, ids: [k], col: col, wigle: ap.kind === "wigle", big: ap.status === "used" || ap.status === "active",
+                    if (!merged) pts.push({x: px, y: py, ids: [k], col: col, wigle: ap.kind === "wigle", mob: mob, big: ap.status === "used" || ap.status === "active",
                                            ssid: ap.ssid || "", dbm: ap.dbm, status: ap.status, bssid: ap.bssid, band: map.bandOf(ap),
                                            secRank: sc.rank, secCol: sc.color, secGlyph: sc.glyph})
                 }
                 for (var p = 0; p < pts.length; p++) {
                     var pt = pts[p], rad = pt.big ? 4.5 : 3
                     var insecure = pt.secRank >= 3
+                    if (pt.mob) {                       // mobile (grade M): a small "M" disc where it was last heard
+                        if (selIdx >= 0 && pt.ids.indexOf(selIdx) >= 0) map.selPos = {x: pt.x, y: pt.y}
+                        ctx.globalAlpha = map.secFocus && !insecure ? 0.25 : 1
+                        ctx.beginPath(); ctx.arc(pt.x, pt.y, 6.5, 0, Math.PI * 2); ctx.fillStyle = map.gradeColors.M; ctx.fill()
+                        ctx.strokeStyle = "rgba(255,255,255,0.85)"; ctx.lineWidth = 1; ctx.stroke()
+                        marks.push({x: pt.x, y: pt.y + 3.5, t: "M", c: "#ffffff", px: 9, b: 1, h: 1, v: 1, a: ctx.globalAlpha})
+                        if (insecure) {
+                            ctx.beginPath(); ctx.arc(pt.x, pt.y, 10.5, 0, Math.PI * 2)
+                            ctx.strokeStyle = pt.secCol; ctx.lineWidth = 1.6; ctx.setLineDash(pt.secRank >= 4 ? [] : [3, 2]); ctx.stroke(); ctx.setLineDash([])
+                            marks.push({x: pt.x - 11, y: pt.y - 8, t: pt.secGlyph, c: pt.secCol, px: 10, b: 1, h: 1, v: 1})
+                        }
+                        ctx.globalAlpha = 1
+                        continue
+                    }
                     ctx.globalAlpha = map.secFocus && !insecure ? 0.05 : 0.25; ctx.fillStyle = pt.col
                     ctx.beginPath(); ctx.arc(pt.x, pt.y, rad * 2.6, 0, Math.PI * 2); ctx.fill()
                     ctx.globalAlpha = 1
@@ -1117,6 +1224,22 @@ Item {
                 var sp = map.paintToView(map.selPos)
                 ctx.beginPath(); ctx.arc(sp.x, sp.y, 10 + 3 * Math.sin(now / 250), 0, Math.PI * 2)
                 ctx.strokeStyle = "#ffffff"; ctx.lineWidth = 2; ctx.stroke()
+            }
+            // "sample here next" for the hovered / pinned beacon: a dotted line from its estimate to a small target
+            var sg = map.sugTarget
+            if (sg) {
+                var sa0 = map.merc(sg.lat, sg.lon), sa1 = map.merc(sg.slat, sg.slon)
+                var sx0 = map.sx(sa0.x), sy0 = map.sy(sa0.y), sx1 = map.sx(sa1.x), sy1 = map.sy(sa1.y)
+                ctx.strokeStyle = sg.col; ctx.lineWidth = 1.5; ctx.globalAlpha = 0.8
+                ctx.setLineDash([1.5, 3.5]); ctx.beginPath(); ctx.moveTo(sx0, sy0); ctx.lineTo(sx1, sy1); ctx.stroke(); ctx.setLineDash([])
+                ctx.globalAlpha = 1; ctx.beginPath()
+                ctx.moveTo(sx1 + 8, sy1); ctx.arc(sx1, sy1, 8, 0, Math.PI * 2)
+                ctx.moveTo(sx1 + 3.5, sy1); ctx.arc(sx1, sy1, 3.5, 0, Math.PI * 2)
+                ctx.moveTo(sx1 - 12, sy1); ctx.lineTo(sx1 - 9, sy1); ctx.moveTo(sx1 + 9, sy1); ctx.lineTo(sx1 + 12, sy1)
+                ctx.moveTo(sx1, sy1 - 12); ctx.lineTo(sx1, sy1 - 9); ctx.moveTo(sx1, sy1 + 9); ctx.lineTo(sx1, sy1 + 12)
+                ctx.strokeStyle = "rgba(0,0,0,0.6)"; ctx.lineWidth = 3.5; ctx.stroke()
+                ctx.strokeStyle = sg.col; ctx.lineWidth = 1.6; ctx.stroke()
+                fxText.push({s: "t", x: sx1, y: sy1 + 25, t: "sample here", c: sg.col, h: 1})
             }
             // ── events as motion ──
             for (var ai = 0; ai < map.anims.length; ai++) {
@@ -1253,7 +1376,7 @@ Item {
         // Laid out once at load (never seen): the fonts and glyphs an animation needs are ready before its
         // first frame, instead of costing 70-120 ms of font set-up in the middle of it
         Repeater {
-            model: [{t: "▲ ▼ +-0123456789 dB ±m · samples", px: 11, b: true, i: false}, {t: "(hidden) gone", px: 10, b: false, i: true},
+            model: [{t: "▲ ▼ +-0123456789 dB ±m · samples here", px: 11, b: true, i: false}, {t: "(hidden) gone", px: 10, b: false, i: true},
                     {t: "🚩", px: 20, b: false, i: false}, {t: "📱💻🖥📍", px: 10, b: false, i: false}]
             delegate: Text {
                 required property var modelData
@@ -1269,7 +1392,7 @@ Item {
     Connections {
         target: map.src
         // data changes: one coalesced, guarded follow step per poll (lat and lon arrive separately)
-        function onApsChanged() { map.scheduleFollow(); overlay.requestPaint() }
+        function onApsChanged() { map.scheduleFollow(); overlay.requestPaint(); map.updateSuggest() }
         function onTrackChanged() { overlay.requestPaint() }
         function onPoisChanged() { map.selected = -1; map.cluster() }
         function onValidChanged() { map.scheduleFollow(); overlay.requestPaint() }
@@ -1623,6 +1746,13 @@ Item {
             onToggled: { map.secFocus = checked; map.secPanel = checked }
         }
         MapButton {
+            text: "A–F"; tip: "Position grades legend (how sure each beacon's place is)"; display: QQC2.AbstractButton.TextOnly
+            touches: false
+            checkable: true; checked: map.showLegend
+            contentItem: PC3.Label { text: "A–F"; color: "#e6edf7"; font.bold: true; font.pixelSize: 9; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
+            onToggled: map.showLegend = checked
+        }
+        MapButton {
             icon.name: "media-playback-start"; text: "Cinematic"; tip: "Cinematic mode: glide to significant events, now and then zoom out to show the city and state, and re-fit the zoom once you have moved somewhere new, never while parked (at most one automatic zoom every 10 minutes, none while Follow is off). Off: the map only pans to keep you in view"
             touches: false                          // switching it off mid-tour flies home (onCinematicChanged)
             checkable: true; checked: map.cinematic
@@ -1670,6 +1800,7 @@ Item {
                     return rows
                 }
                 delegate: Rectangle {
+                    id: secRow
                     required property var modelData
                     width: secList.width; radius: 6
                     color: Qt.rgba(1, 1, 1, 0.04); border.color: modelData.sec.color; border.width: modelData.sec.rank >= 3 ? 1 : 0
@@ -1681,6 +1812,16 @@ Item {
                         RowLayout {
                             Layout.fillWidth: true
                             PC3.Label { text: modelData.sec.glyph; color: modelData.sec.color; font.bold: true }
+                            Rectangle {                  // position grade badge (A–F, R, M)
+                                id: gradeBadge
+                                readonly property string g: map.gradeOf(secRow.modelData.ap)
+                                visible: g !== ""
+                                Layout.preferredWidth: 16; Layout.preferredHeight: 16; radius: 3
+                                color: "transparent"; border.color: map.gradeColor(g); border.width: 1
+                                PC3.Label { anchors.centerIn: parent; text: gradeBadge.g; color: map.gradeColor(gradeBadge.g); font.bold: true; font.pixelSize: 10 }
+                                QQC2.ToolTip.text: map.gradeLine(secRow.modelData.ap); QQC2.ToolTip.visible: gradeHover.hovered
+                                HoverHandler { id: gradeHover }
+                            }
                             PC3.Label { text: modelData.ap.ssid || "(hidden)"; font.bold: true; color: "#e6edf7"; elide: Text.ElideRight; Layout.fillWidth: true }
                             PC3.Label { text: Sec.secName(modelData.sec.security) + " · " + modelData.ap.dbm + " dBm" + (map.bandOf(modelData.ap) ? " · " + map.bandOf(modelData.ap) + " GHz" : ""); color: "#9fb0c8"; font.pixelSize: Kirigami.Theme.smallFont.pixelSize }
                         }
@@ -1709,6 +1850,38 @@ Item {
                     TapHandler { onTapped: { map.userTouched(); map.selectedBeacon = modelData.ap.bssid; overlay.requestPaint(); fx.requestPaint() } }
                 }
             }
+        }
+    }
+    Rectangle {                                 // position grades legend (toggled by the A–F button)
+        id: gradeLegend
+        visible: map.showLegend && !map.secPanel && map.editAnchor === null; z: 6
+        anchors { right: parent.right; top: parent.top; margins: Kirigami.Units.smallSpacing; rightMargin: 44 }
+        width: legendCol.implicitWidth + 16; height: legendCol.implicitHeight + 12
+        radius: 7; color: Qt.rgba(0.03, 0.05, 0.08, 0.9); border.color: Qt.rgba(0.21, 0.84, 1, 0.3); border.width: 1
+        Column {
+            id: legendCol
+            x: 8; y: 6; spacing: 2
+            PC3.Label { text: "Beacon position grade"; color: "#e6edf7"; font.bold: true; font.pixelSize: Kirigami.Theme.smallFont.pixelSize }
+            Repeater {
+                model: map.gradeWords
+                delegate: Row {
+                    id: lgRow
+                    required property var modelData
+                    readonly property string g: lgRow.modelData[0]
+                    spacing: 6
+                    Rectangle {
+                        anchors.verticalCenter: parent.verticalCenter
+                        width: 14; height: lgRow.g === "M" || lgRow.g === "R" ? 14 : 10; radius: height / 2
+                        color: Qt.alpha(map.gradeColor(lgRow.g), lgRow.g === "R" ? 0.25 : lgRow.g === "M" ? 1 : 0.2)
+                        border.color: map.gradeColor(lgRow.g); border.width: lgRow.g === "M" ? 0 : 1.3
+                        Text { visible: lgRow.g === "M"; anchors.centerIn: parent; text: "M"; color: "white"; font.bold: true; font.pixelSize: 8 }
+                    }
+                    PC3.Label { text: lgRow.g; color: map.gradeColor(lgRow.g); font.bold: true; font.pixelSize: Kirigami.Theme.smallFont.pixelSize; width: 14 }
+                    PC3.Label { text: lgRow.modelData[1]; color: "#c9d4e5"; font.pixelSize: Kirigami.Theme.smallFont.pixelSize }
+                }
+            }
+            PC3.Label { text: "- - dashed = extrapolated / ambiguous"; color: "#9fb0c8"; font.pixelSize: Kirigami.Theme.smallFont.pixelSize }
+            PC3.Label { text: "ellipse = 95 % area · ◎ = sample here next"; color: "#9fb0c8"; font.pixelSize: Kirigami.Theme.smallFont.pixelSize }
         }
     }
     Rectangle {                                 // antenna anchor editor
@@ -1994,7 +2167,7 @@ Item {
                 var ids = h.ids.slice().sort(function(a, b) { return aps[b].dbm - aps[a].dbm })
                 if (ids.length === 1) return map.beaconInfo(aps[ids[0]], false)
                 var ll = []
-                for (var j = 0; j < Math.min(8, ids.length); j++) { var b = aps[ids[j]]; ll.push(`${b.ssid || "(hidden)"}  ${b.dbm} dBm · ${b.status}`) }
+                for (var j = 0; j < Math.min(8, ids.length); j++) { var b = aps[ids[j]]; var bg = map.gradeOf(b); ll.push(`${b.ssid || "(hidden)"}  ${b.dbm} dBm · ${b.status}` + (bg ? " · " + bg : "")) }
                 if (ids.length > 8) ll.push("… and " + (ids.length - 8) + " more")
                 return {title: ids.length + " beacons here — click to pin the strongest", lines: ll, color: "#35d6ff", poi: null}
             }
@@ -2040,12 +2213,25 @@ Item {
     }
     function beaconInfo(a, pinned) {
         if (!a) return null
+        var f = a.fit || null
         var how = a.kind === "wigle" ? "mapped position (WiGLE / Apple)" : a.kind === "centroid" ? `multilaterated from ${a.vantage || 2} places, ±${map.distText(a.r)}`
+                : a.kind === "region" ? `somewhere in this region, ±${map.distText(a.r95 || a.r || 0)} (95 %)`
+                : a.kind === "mobile" ? "moves around — shown where it was last heard"
+                : f && f.kind === "fix" && a.kind !== "ring" ? `fitted from ${map.plural(f.vantage || f.n || 0, "place")}, ±${map.distText(a.r95 || f.r95 || a.r)} (95 %)`
                 : `~${map.distText(a.r)} away by signal — direction unknown`
         var band = map.bandOf(a) ? map.bandOf(a) + " GHz" : "", ch = a.ch ? ` ch ${a.ch}` : ""
         var st = a.status === "used" ? "used for the fix" : a.status === "active" ? "connected · travels with you"
                : a.status === "travelling" ? "travels with you" : a.status === "ignored" ? "ignored" : (a.status || "")
         var lines = [`${a.bssid}${band ? " · " + band + ch : ""} · ${a.dbm} dBm`, st, how]
+        var gl = map.gradeLine(a)
+        if (gl) lines.splice(1, 0, gl)
+        if (f && pinned) {                          // the fit's caveats and what would help, in full when pinned
+            var fl = (f.flags || []).map(function(x) { return x === "extrapolated" ? "outside the places it was heard from" : x === "ambiguous" ? "a second solution fits too (hollow ghost)"
+                                                           : x === "moved" ? "may have moved" : x === "fragile" ? "rests on a few samples" : x === "rangeScale" ? "range scale uncertain" : x })
+            if (fl.length) lines.push("⚠ " + fl.join(" · "))
+            if (f.pendingGrade && f.pendingGrade !== map.gradeOf(a)) lines.push("Grade moving towards " + f.pendingGrade)
+            if (f.suggest) lines.push("◎ Sampling at the target on the map would tighten it most")
+        }
         var sc = map.secOf(a)
         lines.push(`${sc.glyph} ${Sec.secName(sc.security)} · ${sc.label.toUpperCase()}`)
         var n = pinned ? sc.issues.length : Math.min(2, sc.issues.length)
