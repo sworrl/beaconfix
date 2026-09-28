@@ -337,7 +337,9 @@ void ellipse(double cxx, double cxy, double cyy, double *major, double *minor, d
     while (b < 0) b += 180.0;
     while (b >= 180.0) b -= 180.0;
     *orientDeg = b;
+    // axis-aligned or (numerically) circular: no real orientation, and the eigenvector is last-bit noise
     if (std::fabs(cxy) < 1e-12) *orientDeg = cxx >= cyy ? 90.0 : 0.0;   // x = east: major axis along east → 90° bearing
+    if (disc <= 1e-6 * std::fabs(tr)) *orientDeg = 0.0;                   // circular: bearing 0 by convention
 }
 
 // erfc with fractional error < 1.2e-7 (Numerical Recipes erfcc): identical in the Kotlin twin
