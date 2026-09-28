@@ -1,23 +1,32 @@
 #pragma once
-// Position estimation from signal-strength samples.
+// Position estimation from signal-strength samples, with a graded confidence (docs/GRADING.md).
 //
-// Model: RSSI = P0 − 10·n·log10(d)   (log-distance path loss)
-//   P0  reference level at 1 m (fitted per AP: radios differ by 20 dB)
-//   n   path-loss exponent (2.4 outdoors; fitted in [1.8, 4] once there are ≥ 8 samples)
-//   d   distance between the observer's fix and the AP
+// Model (per cluster k of samples taken within a few metres of each other):
+//   y_k = P0 + g_dev − 10·n·log10(d_k) + ε_k,   d_k = √(|p − q_k|² + h²)
+//   P0  level at 1 m (Gaussian prior per band), n the path-loss exponent (Gaussian prior),
+//   g_dev the hearing device's offset (calibrated across APs, this host = 0), h the AP height,
+//   ε  shadowing: σ² = σ0²·(ρ_in + (1 − ρ_in)/m_k) + (∂model/∂p)²·a_k²  (the observer's own
+//      fix error a_k enters as an errors-in-variables term, so near samples with poor fixes
+//      carry little information).
 //
-// Fit: iteratively reweighted nonlinear least squares over (x, y, P0[, n]) in a local
-// metric frame — Gauss–Newton with Levenberg damping, Huber weights on the dB residuals,
-// each sample also weighted by the observer's fix accuracy, its age and its status.
-// The seed is the signal-weighted centroid. The 1-σ error ellipse comes from
-// (JᵀWJ)⁻¹·σ²; the circular accuracy reported is its semi-major axis (conservative).
+// Pipeline (estimator.cpp):
+//   1. samples → clusters (radius max(15 m, median fix accuracy)); fixes worse than 100 m only
+//      when nothing better exists ("heard near");
+//   2. a grid posterior over the position with (P0, n) integrated out in closed form, plus the
+//      likelihood of NOT hearing the AP where we scanned (misses) and Wi-Fi RTT ranges → global
+//      optimum, number of modes, the 95 % highest-posterior region;
+//   3. Levenberg–Marquardt polish (robust IRLS: a Gaussian + uniform outlier mixture, EM weights, at the
+//      nominal and then a MAD-pooled scale) from the
+//      grid modes and the mirror image across the samples' principal axis;
+//   4. covariance: Laplace × max(1, τ²) × design effect of correlated shadowing (Gudmundson) +
+//      correlated fix error / sessions, floored by the Cramér–Rao bound, the leave-one-cluster-out
+//      jackknife and a cluster bootstrap, then scaled by the anchor calibration κ²;
+//   5. metrics (geometry, evidence, fit, stability, freshness, external agreement) → a 0–100
+//      score and a letter grade (A–F, R = region only, M = mobile) with hysteresis.
 //
-// Guard: distinct vantage points are counted on a 25 m grid. Fewer than three, or all
-// of them inside 1.5× the worst fix accuracy, and no position is claimed — the geometry
-// cannot separate "the AP is here" from "we were standing here".
-//
-// Everything here is pure (no Qt I/O, no state), so it is unit-testable and shared by
-// the AP fitter, the self-locator and the incremental update.
+// Everything here is pure (no Qt I/O, no state) and deterministic, so the Kotlin twin
+// (android/…/estimate/Estimator.kt) reproduces it exactly: tests/fixtures/estimator_golden.json.
+#include <QHash>
 #include <QList>
 #include <QString>
 #include <QtGlobal>
@@ -26,46 +35,130 @@
 
 namespace Estimator {
 
+inline constexpr int kVersion = 2;       // stored in kv 'estimator_version': estimates older than this are recomputed
+
 struct Obs {
     double lat = 0, lon = 0;          // where the observer was
-    double acc = 30;                  // its fix accuracy (m, 1-σ-ish)
+    double acc = 30;                  // its fix accuracy (m, 68 % radius as Android/GeoClue report it)
     int    dbm = -100;
     qint64 t = 0;                     // seconds since the epoch (0 = unknown)
     double weight = 1;                // extra factor: 0.3 for "travels with you" statuses etc.
     QString device;                   // who heard it ("" = this host)
+    double rangeM = -1, rangeSd = 0;  // optional Wi-Fi RTT (FTM) range to the AP and its 1-σ (m)
 };
 
+// Where we scanned without hearing the AP (docs/GRADING.md §1.7)
+struct Miss { double lat = 0, lon = 0; int count = 1; };
+
+// A position somebody else claims (WiGLE / Apple / BeaconDB / the AP's own LCI): only compared, never fitted
+struct External { bool has = false; double lat = 0, lon = 0, acc = 50; QString source; };
+
 struct Fit {
-    bool   valid = false;
+    bool   valid = false;             // a position is claimed (kind fix or region)
+    QString kind = QStringLiteral("none");   // fix | region | mobile | none
     double lat = 0, lon = 0;
-    double acc = 0;                   // circular 1-σ (m) — semi-major axis of the error ellipse
-    double semiMajor = 0, semiMinor = 0, orientDeg = 0;   // error ellipse
+    double acc = 0;                   // circular 1-σ (m): semi-major axis of the 1-σ ellipse (compat)
+    double semiMajor = 0, semiMinor = 0, orientDeg = 0;   // 1-σ error ellipse (orient: bearing of the major axis)
+    double cxx = 0, cxy = 0, cyy = 0; // position covariance (m², x = east, y = north)
+    double r95 = 0, cep50 = 0;        // radius holding 95 % / 50 % of the position probability
+    double pWithin25 = 0;             // P(|error| < 25 m)
     double rms = 0;                   // weighted residual RMS in dB
     double p0 = -40;                  // fitted reference level at 1 m
-    double pathloss = 2.4;            // path-loss exponent used / fitted
+    double pathloss = 2.4;            // path-loss exponent (fitted with a prior)
     bool   fittedN = false;
     int    n = 0;                     // samples used
-    int    vantage = 0;               // distinct vantage points (25 m cells)
-    int    rejected = 0;              // outliers down-weighted to ~0
-    QString quality;                  // good | fair | poor | none
+    int    vantage = 0;               // clusters (distinct places)
+    int    rejected = 0;              // samples in clusters the robust fit treats as outliers
+    QString quality = QStringLiteral("none");   // compat: good | fair | poor | none
     qint64 updated = 0;               // seconds since the epoch
+    // ── grading metrics (docs/GRADING.md §2) ──
+    double score = 0;                 // 0–100
+    QString grade;                    // A–F · R (region only) · M (mobile) · "" (none)
+    QString pendingGrade;             // hysteresis: a letter change waiting for confirmation
+    double rssDop = 0;                // √tr(M⁻¹) (m), geometry-only dilution of precision
+    double crlbR95 = 0;               // R95 the Cramér–Rao bound allows with σ0
+    double rbar = 1;                  // mean resultant length of the bearings AP → places (0 surrounded, 1 one side)
+    double maxGapDeg = 360;           // largest gap between those bearings
+    bool   inHull = false;            // estimate inside the convex hull of the places
+    double linRatio = 0;              // μ2/μ1 of the places' scatter (0 = a straight line)
+    double chi2nu = 0;                // reduced χ² of the inliers
+    double sigmaDb = 0;               // robust residual scale (dB)
+    double outlierFrac = 0;
+    double ess = 0;                   // Kish effective number of places
+    int    sessions = 0, devices = 0;
+    double spearman = 0;              // rank correlation of level and log-distance (should be < −0.5)
+    double p0RangeCorr = 0;           // |corr(P0, range)|: ~1 = no close sample, range scale unidentified
+    double dminRatio = 0;             // closest place / median place distance
+    bool   ambiguous = false;         // a mirror / second mode explains the data about as well
+    double altLat = 0, altLon = 0;    // that alternative (ghost marker)
+    int    modes = 0;                 // significant posterior modes
+    double driftD2 = 0;               // smoothed Mahalanobis² of the move between refits
+    double extD2 = -1;                // Mahalanobis² against the external position (−1 none)
+    double jackMax = 0;               // largest leave-one-place-out shift (m)
+    double nisEwma = 0;               // smoothed normalised innovation² of the incremental updates (0 = none yet)
+    double fadingDb = 0;              // mean within-place spread of the level (fast fading)
+    bool   moved = false;             // the AP moved: only the recent epoch is fitted
+    qint64 newest = 0;                // newest sample time
+    double suggestLat = 0, suggestLon = 0, suggestGain = 0;   // "sample here next" (gain in nats; 0 none)
+    double cP = 0, cG = 0, cE = 0, cF = 0, cFfit = 0, cS = 0, cT = 0, cX = -1;   // score components (cX −1: no external)
+    QString groupRef;                 // multi-BSSID group this fit was pooled over ("" none)
+    int    groupSize = 0;
 };
 
 struct Options {
-    double defaultN = 2.4;
-    int    minSamples = 3;
-    int    minVantage = 3;
-    int    fitNFrom = 8;              // fit the exponent from this many samples
-    double huberDb = 6.0;             // residuals beyond this many dB get linear (not quadratic) weight
-    double ageDays = 30;              // older samples fade
-    double geomFactor = 1.5;          // vantage spread must exceed this × worst fix accuracy
+    double defaultN = 2.4;            // prior mean of n
+    double nSd = 0.5;                 // prior σ of n
+    double p0Mean = -40, p0Sd = 8;    // prior of P0 (dBm at 1 m)
+    double sigmaDb = 6.0;             // σ0: shadowing
+    double outlierPrior = 0.1;        // robust fit: prior share of gross outliers (Gaussian + uniform mixture)
+    double outlierSpanDb = 80;        // … spread uniformly over this many dB
+    double heightM = 3.0;             // AP height above the observer
+    double clusterMinM = 15;          // minimum cluster radius
+    int    maxClusters = 120;
+    double ageTauDays = 180;          // sample age weight exp(−age/τ), floored at 0.15
+    double maxAcc = 300;              // coarser fixes are ignored
+    double geomAcc = 100;             // fixes coarser than this only when nothing better exists
+    double rhoIn = 0.6;               // shadowing correlation inside one cluster
+    double shadowCorrM = 30;          // Gudmundson decorrelation distance
+    double rangePriorM = 150;         // position prior exp(−distance to the nearest place / this)
+    double missFloor = 0.2;           // P(not heard) even when in range (scan misses)
+    double sensitivity = -92;         // detection floor (dBm)
+    int    gridN = 48;
+    double minHalfWidth = 120, maxHalfWidth = 600;
+    int    bootstrap = 24;            // cluster bootstrap replicates (needs ≥ 6 places; 0 = off)
+    int    jackMaxK = 60;             // jackknife up to this many places (0 = off)
     int    maxIter = 40;
+    double fixMaxR95 = 150;           // a "fix" needs R95 and the CRLB R95 below this
+    double maxR95 = 1500;             // beyond this nothing is claimed
+    double kappa = 1.0;               // covariance calibration (σ multiplier) from the anchors
+    quint64 seed = 0x5EEDBEAC0F1ULL;
+    // kept for callers of the previous engine
+    int    minSamples = 1;
+};
+
+struct Context {
+    QHash<QString, double> deviceOffset;   // dB the device hears louder than this host
+    QList<Miss> misses;
+    External external;
+    bool   hasPrev = false;
+    Fit    prev;                      // the previous fit (drift, hysteresis)
+    bool   mobile = false;            // the locator already knows it travels with us
+    bool   noEpochSplit = false;      // internal: no moved-AP check
 };
 
 // A known transmitter for self-location
-struct Known { double lat = 0, lon = 0, acc = 25; int dbm = -100; double p0 = -40, pathloss = 2.4; bool haveModel = false; QString bssid; };
+struct Known {
+    double lat = 0, lon = 0, acc = 25; int dbm = -100; double p0 = -40, pathloss = 2.4; bool haveModel = false; QString bssid;
+    double cxx = 0, cxy = 0, cyy = 0; // its position covariance (0 = use acc)
+    double weight = 1;                // by grade
+};
 
-struct SelfFix { bool valid = false; double lat = 0, lon = 0, acc = 0, rms = 0; int used = 0, rejected = 0; };
+struct SelfFix {
+    bool valid = false; double lat = 0, lon = 0, acc = 0, rms = 0; int used = 0, rejected = 0;
+    int excluded = 0;                 // APs removed by the integrity check
+    QString integrity;                // ok | repaired | failed | unverified
+    double r95 = 0;
+};
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 inline double distanceM(double lat1, double lon1, double lat2, double lon2)
@@ -90,294 +183,29 @@ struct Frame {
     double lon(double x) const { return lon0 + x / mx; }
 };
 
-// Distinct vantage points. Two samples are the same place when they are closer than
-// 25 m or than 1.5× the larger of their fix errors — jitter of the fix must not count as
-// having moved.
-inline int vantageCount(const QList<Obs> &obs, double cellM = 25.0)
-{
-    QList<Obs> cells;
-    for (const Obs &o : obs) {
-        bool found = false;
-        for (const Obs &c : cells) if (distanceM(c.lat, c.lon, o.lat, o.lon) < std::max(cellM, 1.5 * std::max(c.acc, o.acc))) { found = true; break; }
-        if (!found) cells.append(o);
-    }
-    return cells.size();
-}
+// Solve A·x = b (k ≤ 4) by Gaussian elimination with partial pivoting
+bool solve(double A[4][4], double b[4], int k, double out[4]);
+// 2×2 symmetric inverse [[a b][b d]] → [o0 o1; o1 o2]
+bool invert2(double a, double b, double d, double out[3]);
+// 1-σ ellipse of a 2×2 covariance
+void ellipse(double cxx, double cxy, double cyy, double *major, double *minor, double *orientDeg);
+// P(|X| < r) for X ~ N(0, diag(s1², s2²)), and the radius for probability p
+double probWithin(double s1, double s2, double r);
+double radiusFor(double s1, double s2, double p);
+double normCdf(double z);
+// Distinct places, as the fitter clusters them (for callers that want the count without fitting)
+int vantageCount(const QList<Obs> &obs, double clusterMinM = 15.0);
 
-inline double spreadM(const QList<Obs> &obs)
-{
-    double best = 0;
-    for (int i = 0; i < obs.size(); ++i)
-        for (int j = i + 1; j < obs.size(); ++j) best = std::max(best, distanceM(obs[i].lat, obs[i].lon, obs[j].lat, obs[j].lon));
-    return best;
-}
-
-// Solve the symmetric positive system A·dx = b (k ≤ 4) by Gaussian elimination with pivoting
-inline bool solve(double A[4][4], double b[4], int k, double out[4])
-{
-    double M[4][5];
-    for (int i = 0; i < k; ++i) { for (int j = 0; j < k; ++j) M[i][j] = A[i][j]; M[i][k] = b[i]; }
-    for (int c = 0; c < k; ++c) {
-        int piv = c;
-        for (int r = c + 1; r < k; ++r) if (std::fabs(M[r][c]) > std::fabs(M[piv][c])) piv = r;
-        if (std::fabs(M[piv][c]) < 1e-12) return false;
-        if (piv != c) for (int j = 0; j <= k; ++j) std::swap(M[c][j], M[piv][j]);
-        for (int r = 0; r < k; ++r) {
-            if (r == c) continue;
-            const double f = M[r][c] / M[c][c];
-            for (int j = c; j <= k; ++j) M[r][j] -= f * M[c][j];
-        }
-    }
-    for (int i = 0; i < k; ++i) out[i] = M[i][k] / M[i][i];
-    return true;
-}
-
-// 2×2 symmetric inverse
-inline bool invert2(double a, double b, double d, double out[3])   // [[a b][b d]] → [[o0 o1][o1 o2]]
-{
-    const double det = a * d - b * b;
-    if (std::fabs(det) < 1e-12) return false;
-    out[0] = d / det; out[1] = -b / det; out[2] = a / det;
-    return true;
-}
-
-inline void ellipse(double cxx, double cxy, double cyy, double *major, double *minor, double *orientDeg)
-{
-    const double tr = cxx + cyy, det = cxx * cyy - cxy * cxy;
-    const double disc = std::sqrt(std::max(0.0, tr * tr / 4 - det));
-    const double l1 = std::max(0.0, tr / 2 + disc), l2 = std::max(0.0, tr / 2 - disc);
-    *major = std::sqrt(l1); *minor = std::sqrt(l2);
-    *orientDeg = std::atan2(l1 - cxx, cxy) * 180.0 / M_PI;
-    if (std::fabs(cxy) < 1e-12) *orientDeg = cxx >= cyy ? 90.0 : 0.0;   // x = east: major axis along east → 90° bearing
-}
-
-// ── the AP fitter ────────────────────────────────────────────────────────────
-inline double tukeyWeight(double r, double c) { const double a = std::fabs(r); if (a >= c) return 0.0; const double q = 1 - (a / c) * (a / c); return q * q; }
-// ρ functions (the objective actually minimised): Huber grows linearly past k, Tukey saturates at c²/6 —
-// so a solution that "explains" nothing by rejecting every sample has the WORST cost, not zero.
-inline double huberRho(double r, double k) { const double a = std::fabs(r); return a <= k ? 0.5 * r * r : k * (a - 0.5 * k); }
-inline double tukeyRho(double r, double c) { const double a = std::fabs(r); if (a >= c) return c * c / 6.0; const double q = 1 - (a / c) * (a / c); return c * c / 6.0 * (1 - q * q * q); }
-
-namespace detail {
-struct S { double x, y, w; int dbm; };
-struct Solution { double x = 0, y = 0, p0 = -40, n = 2.4, cost = 1e300; int inliers = 0; bool ok = false; };
-
-// IRLS from one seed. Huber for the first half of the iterations, then the redescending
-// Tukey biweight (c = 2× the Huber scale) so gross outliers end up with zero weight.
-inline Solution irls(const QList<S> &s, double x, double y, double p0, double n, bool fitN, const Options &opt)
-{
-    const int k = fitN ? 4 : 3;
-    double lambda = 1e-2;
-    auto weightOf = [&](double r, int it) { return it < opt.maxIter / 2 ? huberWeight(r, opt.huberDb) : tukeyWeight(r, 2.0 * opt.huberDb); };
-    auto costOf = [&](double cx, double cy, double cp0, double cn, int it) {
-        double c = 0;
-        for (const S &q : s) { const double d = std::max(1.0, std::hypot(cx - q.x, cy - q.y)); const double r = q.dbm - modelDbm(cp0, cn, d); c += q.w * (it < opt.maxIter / 2 ? huberRho(r, opt.huberDb) : tukeyRho(r, 2.0 * opt.huberDb)); }
-        return c;
-    };
-    Solution sol; sol.x = x; sol.y = y; sol.p0 = p0; sol.n = n;
-    for (int it = 0; it < opt.maxIter; ++it) {
-        double A[4][4] = {{0}}, b[4] = {0};
-        for (const S &q : s) {
-            const double dx = x - q.x, dy = y - q.y, d = std::max(1.0, std::hypot(dx, dy));
-            const double r = q.dbm - modelDbm(p0, n, d);
-            const double w = q.w * weightOf(r, it);
-            const double g = 10.0 * n / std::log(10.0) / (d * d);
-            double J[4] = {g * dx, g * dy, -1.0, -10.0 * std::log10(d)};
-            for (int a = 0; a < k; ++a) { for (int c = 0; c < k; ++c) A[a][c] += w * J[a] * J[c]; b[a] -= w * J[a] * r; }
-        }
-        const double cost = costOf(x, y, p0, n, it);
-        for (int a = 0; a < k; ++a) A[a][a] *= (1.0 + lambda);
-        double dx[4];
-        if (!solve(A, b, k, dx)) break;
-        const double stepLen = std::hypot(dx[0], dx[1]);                // trust region: no leap further than 300 m per iteration
-        if (stepLen > 300.0) { dx[0] *= 300.0 / stepLen; dx[1] *= 300.0 / stepLen; }
-        const double nx = x + dx[0], ny = y + dx[1], np0 = std::clamp(p0 + dx[2], -90.0, 10.0);
-        const double nn = fitN ? std::clamp(n + dx[3], 1.8, 4.0) : n;
-        const double newCost = costOf(nx, ny, np0, nn, it);
-        if (newCost <= cost) {
-            const bool small = std::hypot(dx[0], dx[1]) < 0.2 && std::fabs(cost - newCost) < 1e-3 * std::max(1.0, cost);
-            x = nx; y = ny; p0 = np0; n = nn; lambda = std::max(1e-6, lambda / 3);
-            if (small && it >= opt.maxIter / 2) break;
-            if (small) it = opt.maxIter / 2 - 1;                      // converged under Huber: switch to Tukey now
-        } else { lambda *= 8; if (lambda > 1e6) { if (it < opt.maxIter / 2) it = opt.maxIter / 2 - 1; else break; lambda = 1e-2; } }
-    }
-    sol.x = x; sol.y = y; sol.p0 = p0; sol.n = n; sol.cost = costOf(x, y, p0, n, opt.maxIter);
-    for (const S &q : s) { const double d = std::max(1.0, std::hypot(x - q.x, y - q.y)); if (tukeyWeight(q.dbm - modelDbm(p0, n, d), 2.0 * opt.huberDb) >= 0.25) ++sol.inliers; }
-    sol.ok = std::isfinite(sol.cost) && std::isfinite(x) && std::isfinite(y) && sol.inliers >= std::max(opt.minSamples, int(s.size()) / 2);
-    return sol;
-}
-} // namespace detail
-
-inline Fit fitAp(const QList<Obs> &samples, qint64 now = 0, const Options &opt = Options())
-{
-    Fit f; f.n = samples.size(); f.pathloss = opt.defaultN; f.updated = now;
-    f.quality = QStringLiteral("none");
-    if (samples.size() < opt.minSamples) return f;
-    f.vantage = vantageCount(samples);
-    double worstAcc = 0; for (const Obs &o : samples) worstAcc = std::max(worstAcc, o.acc);
-    if (f.vantage < opt.minVantage) return f;
-    if (spreadM(samples) < opt.geomFactor * worstAcc) return f;      // we never really moved relative to the fix error
-
-    // Base weights: fix accuracy, age, status
-    const Frame fr(samples[0].lat, samples[0].lon);
-    QList<detail::S> s; s.reserve(samples.size());
-    double sw = 0, sx = 0, sy = 0, ux = 0, uy = 0;
-    for (const Obs &o : samples) {
-        double w = 1.0 / (1.0 + std::pow(o.acc / 25.0, 2));
-        if (now > 0 && o.t > 0) { const double days = double(now - o.t) / 86400.0; if (days > opt.ageDays) w *= std::max(0.15, opt.ageDays / days); }
-        w *= std::max(0.05, o.weight);
-        s.append({fr.x(o.lon), fr.y(o.lat), w, o.dbm});
-        const double cw = w * std::pow(10.0, o.dbm / 40.0);          // seed: louder pulls harder (gently)
-        sw += cw; sx += cw * s.last().x; sy += cw * s.last().y; ux += s.last().x; uy += s.last().y;
-    }
-    const bool fitN = samples.size() >= opt.fitNFrom;
-    // Seeds: weighted centroid, plain centroid, and the centroid of the loudest quartile.
-    // Gross outliers (a loud sample far away) capture one seed; the others escape it.
-    QList<QPair<double, double>> seeds{{sx / sw, sy / sw}, {ux / s.size(), uy / s.size()}};
-    {
-        QList<detail::S> loud = s; std::sort(loud.begin(), loud.end(), [](const detail::S &a, const detail::S &b) { return a.dbm > b.dbm; });
-        const int q = std::max(3, int(loud.size()) / 4); double lx = 0, ly = 0;
-        for (int i = 0; i < q && i < loud.size(); ++i) { lx += loud[i].x; ly += loud[i].y; }
-        seeds.append({lx / std::min(q, int(loud.size())), ly / std::min(q, int(loud.size()))});
-    }
-    detail::Solution best;
-    for (const auto &sd : seeds) {
-        QList<double> p; for (const detail::S &q : s) p << q.dbm + 10.0 * opt.defaultN * std::log10(std::max(1.0, std::hypot(sd.first - q.x, sd.second - q.y)));
-        std::sort(p.begin(), p.end());
-        const detail::Solution sol = detail::irls(s, sd.first, sd.second, p[p.size() / 2], opt.defaultN, fitN, opt);
-        if (sol.ok && (sol.inliers > best.inliers || (sol.inliers == best.inliers && sol.cost < best.cost))) best = sol;
-    }
-    if (!best.ok) return f;
-    const double x = best.x, y = best.y, p0 = best.p0, n = best.n;
-    const int k = fitN ? 4 : 3;
-    // Statistics at the solution (Tukey weights: outliers contribute nothing)
-    double A[4][4] = {{0}}, wsum = 0, wres = 0; int rejected = 0, kept = 0;
-    for (const detail::S &q : s) {
-        const double dx = x - q.x, dy = y - q.y, d = std::max(1.0, std::hypot(dx, dy));
-        const double r = q.dbm - modelDbm(p0, n, d), h = tukeyWeight(r, 2.0 * opt.huberDb), w = q.w * h;
-        if (h < 0.25) { ++rejected; continue; }
-        ++kept;
-        const double g = 10.0 * n / std::log(10.0) / (d * d);
-        double J[4] = {g * dx, g * dy, -1.0, -10.0 * std::log10(d)};
-        for (int a = 0; a < k; ++a) for (int c = 0; c < k; ++c) A[a][c] += w * J[a] * J[c];
-        wsum += w; wres += w * r * r;
-    }
-    if (kept < opt.minSamples) return f;
-    const int dof = std::max(1, kept - k);
-    const double sigma2 = std::max(4.0, wres / std::max(1e-9, wsum) * double(kept) / dof);   // dB², floor 2 dB
-    double cov[3] = {1e6, 0, 1e6};
-    {
-        double inv[4][4] = {{0}};
-        bool ok = true;
-        for (int col = 0; col < k && ok; ++col) {
-            double e[4] = {0}; e[col] = 1; double out[4];
-            double Acopy[4][4]; for (int i = 0; i < 4; ++i) for (int j = 0; j < 4; ++j) Acopy[i][j] = A[i][j];
-            if (!solve(Acopy, e, k, out)) { ok = false; break; }
-            for (int i = 0; i < k; ++i) inv[i][col] = out[i];
-        }
-        if (ok) { cov[0] = inv[0][0] * sigma2; cov[1] = inv[0][1] * sigma2; cov[2] = inv[1][1] * sigma2; }
-    }
-    ellipse(cov[0], cov[1], cov[2], &f.semiMajor, &f.semiMinor, &f.orientDeg);
-    // The observers' own error adds in quadrature (their median accuracy)
-    QList<double> accs; for (const Obs &o : samples) accs << o.acc; std::sort(accs.begin(), accs.end());
-    const double medAcc = accs[accs.size() / 2];
-    f.semiMajor = std::sqrt(f.semiMajor * f.semiMajor + medAcc * medAcc * 0.5);
-    f.semiMinor = std::sqrt(f.semiMinor * f.semiMinor + medAcc * medAcc * 0.5);
-    f.acc = std::max(8.0, f.semiMajor);
-    f.rms = std::sqrt(wres / std::max(1e-9, wsum));
-    f.lat = fr.lat(y); f.lon = fr.lon(x); f.p0 = p0; f.pathloss = n; f.fittedN = fitN; f.rejected = rejected;
-    f.valid = std::isfinite(f.lat) && std::isfinite(f.lon) && f.acc < 1500;
-    if (!f.valid) { f.quality = QStringLiteral("none"); return f; }
-    f.quality = (f.acc <= 40 && f.vantage >= 5 && f.rms <= 6) ? QStringLiteral("good") : (f.acc <= 120 && f.vantage >= 3) ? QStringLiteral("fair") : QStringLiteral("poor");
-    return f;
-}
-
-// ── incremental update (between batched refits) ──────────────────────────────
-// One new sample nudges an existing fit: the sample says "the AP is d metres from here"
-// (d from the AP's own P0/n). Linearised as a 2-D Kalman step along the radial direction
-// with σ_d from the dB noise, and no information tangentially.
-inline Fit update(const Fit &prev, const Obs &o, double sigmaDb = 6.0)
-{
-    if (!prev.valid) return prev;
-    Fit f = prev;
-    const Frame fr(prev.lat, prev.lon);                                 // the fit sits at the origin
-    const double ox = fr.x(o.lon), oy = fr.y(o.lat);                   // the observer
-    const double r = std::max(1.0, std::hypot(ox, oy));                 // predicted range: fit ↔ observer
-    const double d = modelDistance(prev.p0, prev.pathloss, o.dbm);      // measured range from the sample
-    const double ux = -ox / r, uy = -oy / r;                            // unit vector observer → fit
-    const double sigD = d * std::log(10.0) * sigmaDb / (10.0 * prev.pathloss);   // dB noise → metres at this range
-    const double R = sigD * sigD + o.acc * o.acc;
-    const double P = prev.acc * prev.acc;                               // isotropic prior
-    const double K = P / (P + R);
-    const double innov = d - r;                                         // > 0: the AP is further from the observer than the fit says
-    const double nx = K * innov * ux, ny = K * innov * uy;              // step along the radial, away from the observer
-    f.lat = fr.lat(ny); f.lon = fr.lon(nx);
-    f.acc = std::max(8.0, std::sqrt((1 - K) * P + R * K * K * 0.5));   // shrinks along the radial only: keep it conservative
-    f.n = prev.n + 1;
-    f.updated = std::max(prev.updated, o.t);
-    return f;
-}
-
-// ── self-location: where are WE, from beacons with known positions ───────────
-inline SelfFix selfLocate(const QList<Known> &known, const Options &opt = Options())
-{
-    SelfFix out;
-    if (known.size() < 2) return out;
-    const Frame fr(known[0].lat, known[0].lon);
-    struct S { double x, y, w, d, sig; };
-    QList<S> s; double sw = 0, sx = 0, sy = 0;
-    for (const Known &k : known) {
-        const double p0 = k.haveModel ? k.p0 : -40.0, n = k.haveModel ? k.pathloss : opt.defaultN;
-        const double d = std::clamp(modelDistance(p0, n, k.dbm), 1.0, 1500.0);
-        const double sigD = d * std::log(10.0) * 6.0 / (10.0 * n);      // 6 dB of shadowing → range σ
-        const double sig2 = sigD * sigD + k.acc * k.acc;
-        const double w = 1.0 / sig2;
-        s.append({fr.x(k.lon), fr.y(k.lat), w, d, std::sqrt(sig2)});
-        const double cw = std::pow(10.0, k.dbm / 20.0) / std::max(10.0, k.acc);
-        sw += cw; sx += cw * s.last().x; sy += cw * s.last().y;
-    }
-    double x = sx / sw, y = sy / sw;
-    if (known.size() >= 3) {
-        double lambda = 1e-2;
-        for (int it = 0; it < opt.maxIter; ++it) {
-            double A[4][4] = {{0}}, b[4] = {0}, cost = 0;
-            for (const S &q : s) {
-                const double dx = x - q.x, dy = y - q.y, r = std::max(1.0, std::hypot(dx, dy));
-                const double res = r - q.d, h = huberWeight(res / q.sig, 2.0), w = q.w * h;
-                const double jx = dx / r, jy = dy / r;
-                A[0][0] += w * jx * jx; A[0][1] += w * jx * jy; A[1][0] += w * jx * jy; A[1][1] += w * jy * jy;
-                b[0] -= w * jx * res; b[1] -= w * jy * res; cost += w * res * res;
-            }
-            A[0][0] *= 1 + lambda; A[1][1] *= 1 + lambda;
-            double dx[4]; if (!solve(A, b, 2, dx)) break;
-            const double nx = x + dx[0], ny = y + dx[1]; double newCost = 0;
-            for (const S &q : s) { const double res = std::max(1.0, std::hypot(nx - q.x, ny - q.y)) - q.d; newCost += q.w * huberWeight(res / q.sig, 2.0) * res * res; }
-            if (newCost <= cost) { x = nx; y = ny; lambda = std::max(1e-6, lambda / 3); if (std::hypot(dx[0], dx[1]) < 0.2) break; }
-            else { lambda *= 8; if (lambda > 1e6) break; }
-        }
-    }
-    double A[3] = {0, 0, 0}, wsum = 0, wres = 0; int rejected = 0;
-    for (const S &q : s) {
-        const double dx = x - q.x, dy = y - q.y, r = std::max(1.0, std::hypot(dx, dy));
-        const double res = r - q.d, h = huberWeight(res / q.sig, 2.0), w = q.w * h;
-        if (h < 0.5) ++rejected;
-        const double jx = dx / r, jy = dy / r;
-        A[0] += w * jx * jx; A[1] += w * jx * jy; A[2] += w * jy * jy;
-        wsum += w; wres += w * res * res;
-    }
-    const double chi = wres / std::max(1, int(s.size()) - 2);          // unit-variance residual scaling
-    double inv[3];
-    double acc;
-    if (known.size() >= 3 && invert2(A[0], A[1], A[2], inv)) { double maj, mn, o; ellipse(inv[0] * std::max(1.0, chi), inv[1] * std::max(1.0, chi), inv[2] * std::max(1.0, chi), &maj, &mn, &o); acc = maj; }
-    else { acc = 0; for (const S &q : s) acc = std::max(acc, q.sig); }
-    // and the spread of the ranges around the solution, honestly
-    double spread = 0; for (const S &q : s) { const double res = std::max(1.0, std::hypot(x - q.x, y - q.y)) - q.d; spread += q.w * res * res; }
-    spread = std::sqrt(spread / std::max(1e-9, wsum));
-    out.valid = true; out.lat = fr.lat(y); out.lon = fr.lon(x);
-    out.acc = std::max(15.0, std::max(acc, spread * 0.7));
-    out.rms = std::sqrt(wres / std::max(1e-9, wsum));
-    out.used = s.size() - rejected; out.rejected = rejected;
-    return out;
-}
+// The AP fitter
+Fit fitAp(const QList<Obs> &samples, qint64 now = 0, const Options &opt = Options(), const Context &ctx = Context());
+// Score and letter from the metrics already in f (with hysteresis against prev)
+void grade(Fit &f, const Fit *prev);
+// Incremental update between refits: a 2-D Kalman step along the radial direction
+Fit update(const Fit &prev, const Obs &o, const Options &opt = Options());
+// Self-location from beacons with known positions (with an integrity check)
+SelfFix selfLocate(const QList<Known> &known, const Options &opt = Options());
+// Letter for a score (no hysteresis)
+QString letterFor(double score);
+QString qualityFor(const QString &grade);
 
 } // namespace Estimator
