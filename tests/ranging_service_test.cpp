@@ -73,6 +73,39 @@ int main(int argc, char **argv)
     CHECK(!RangingService::rttOffsetStale(loose, 0.5), "−1.2 m with σ_offset 0.5 m is within 3σ");
     CHECK(RangingService::rttOffsetStale(loose, 0.1), "−1.2 m with σ_offset 0.1 m is not");
 
+    // A stale offset: the BLE models learnt under it go back to the calibration's, and the interval stays wide
+    {
+        // the 0.6 m calibration: down −78.8 dBm, up −93.9 dBm
+        Rls2 down(priorP0Ble(7), kNBle), up(priorP0Ble(-7), kNBle);
+        down.update(std::log10(0.6), -78.8, 1.0); up.update(std::log10(0.6), -93.9, 1.0);
+        const Rls2 downCal = down, upCal = up;
+        // then learnt while a drifted RTT offset held the range at 0.15–0.3 m and the levels read −60 / −75 dBm
+        for (int i = 0; i < 300; ++i) {
+            const double u = std::log10(i % 2 ? 0.15 : 0.3);
+            down.update(u, -60.0, 4.0); up.update(u, -75.0, 4.0);
+        }
+        CHECK(std::fabs(down.p0 - downCal.p0) > 3.0 && std::fabs(up.p0 - upCal.p0) > 3.0, "the biased learning moved both P0s (%.1f → %.1f, %.1f → %.1f dBm)",
+              downCal.p0, down.p0, upCal.p0, up.p0);
+        auto tenMinutes = [&](RangeFilter &f) { for (int i = 0; i < 60; ++i) { f.predict(10, false); f.updateRssi(0, -70.0, 2.0, down.p0, down.n); f.updateRssi(1, -85.0, 2.0, up.p0, up.n); } };
+        // before: only P_uu was floored, the offsets stayed as tight as the learning had made them
+        RangeFilter before(2, std::log10(0.2), 1e-4, 2.0 * kFrozenFadeVar, 4.0);
+        before.P[0][0] = std::max(before.P[0][0], 0.25);
+        tenMinutes(before);
+        RangeFilter f(2, std::log10(0.2), 1e-4, 2.0 * kFrozenFadeVar, 4.0);
+        RangingService::forgetSuspectLearning(f, down, up, &downCal, &upCal);
+        CHECK(down.p0 == downCal.p0 && down.n == downCal.n && up.p0 == upCal.p0 && up.n == upCal.n
+              && down.S[0][0] == downCal.S[0][0] && up.S[1][1] == upCal.S[1][1], "stale → both models back to the calibration's (P0 %.1f / %.1f dBm)", down.p0, up.p0);
+        CHECK(f.offsetVar(0) == kOffsetVar0 && f.offsetVar(1) == kOffsetVar0 && f.puu() >= 0.25, "stale → BLE offsets at the prior (σ %.1f dB), P_uu ≥ 0.25", std::sqrt(kOffsetVar0));
+        tenMinutes(f);
+        CHECK(std::sqrt(f.puu()) > 0.25 && std::sqrt(f.puu()) > 1.5 * std::sqrt(before.puu()),
+              "10 min of BLE later the range is still ×/÷ %.2f (only the P_uu floor: ×/÷ %.2f)", std::pow(10.0, std::sqrt(f.puu())), std::pow(10.0, std::sqrt(before.puu())));
+        // a ranging.json from before the snapshot: the models cannot be restored, the widening still applies
+        Rls2 d2 = down, u2 = up; d2.p0 = -60;
+        RangeFilter g(2, std::log10(0.2), 1e-4, 2.0 * kFrozenFadeVar, 4.0);
+        RangingService::forgetSuspectLearning(g, d2, u2, nullptr, nullptr);
+        CHECK(d2.p0 == -60 && g.offsetVar(0) == kOffsetVar0 && g.offsetVar(1) == kOffsetVar0, "no snapshot → models kept, offsets widened");
+    }
+
     // BLE advert registration errors: only a wrong shape drops the TX-power AD / TxPower; the rest retry
     CHECK(BleLink::shapeError(QStringLiteral("org.bluez.Error.InvalidLength"), QStringLiteral("Advertising data too long")), "too long → shape");
     CHECK(BleLink::shapeError(QStringLiteral("org.bluez.Error.Failed"), QStringLiteral("Failed to parse advertisement.")), "cannot parse (TxPower refused) → shape");

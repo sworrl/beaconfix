@@ -53,6 +53,10 @@ private:
         QString device, kind;
         RangeMath::RangeFilter f{2, 1.0, 1.0, RangeMath::kOffsetVar0, kUncalRttOffsetVar};   // link 0: the peer hears our advert · link 1: we hear the peer's
         RangeMath::Rls2 rlsDown{-59, 2.0}, rlsUp{-59, 2.0};
+        // Both links' models as the last successful manual calibration left them (ranging.json rlsDownCal / rlsUpCal):
+        // an RTT offset found stale puts them back (forgetSuspectLearning)
+        RangeMath::Rls2 rlsDownCal{-59, 2.0}, rlsUpCal{-59, 2.0};
+        bool haveCalModels = false;
         bool haveUpPrior = false;
         int upTx = 127;                                      // the TX power the peer's advert carries
         int downTx = 127;                                    // our TX power as the peer reports it (its fallback when our byte 8 says 127)
@@ -121,6 +125,12 @@ public:
     // median range (burst − offset) is below −max(1 m, 3·σ_offset) — a distance cannot be negative. *median = that median.
     static constexpr int kStaleWindow = 20, kStaleMinBursts = 10;
     static bool rttOffsetStale(const std::vector<double> &implied, double offsetSigmaM, double *median = nullptr);
+    // The RTT offset was found stale: everything the BLE links learnt since the last calibration was supervised by it.
+    // Put both models back to that calibration's (downCal / upCal; null = not known, e.g. a ranging.json from before
+    // 3.8's snapshot) and widen both BLE offsets to the prior (kOffsetVar0) and P_uu to at least 0.25, so the interval
+    // shows the doubt until a recalibration instead of BLE updates from the suspect models narrowing it again.
+    static void forgetSuspectLearning(RangeMath::RangeFilter &f, RangeMath::Rls2 &down, RangeMath::Rls2 &up,
+                                      const RangeMath::Rls2 *downCal, const RangeMath::Rls2 *upCal);
 private:
     void applyOurTx(int tx);                                 // our advert's TX power changed: re-prior uncalibrated down links
     static QString agentBeaconId(const QString &desktopId, const QString &device);

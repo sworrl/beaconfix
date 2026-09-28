@@ -579,9 +579,15 @@ fusion (and out of `method`) until the next calibration. `/ranging/info` `ble.sc
   [0.012, 0.055] for a true ~0.6 m. The service now keeps each calibrated peer's last 20
   `burst − c`; when at least 10 have a median below `−max(1 m, 3·σ_c)` — a distance cannot be
   negative — the offset is marked stale: `rttCalibrated` goes false (no more BLE learning),
-  `e_c` goes back to the uncalibrated `N(0, 2²)`, `P_uu` is raised to at least 0.25 (the interval
-  widens honestly), RTT bursts stay out of the filter and out of `method`, and the event log and
-  the phone's range card say to calibrate again. A calibration whose bursts agree clears it.
+  `e_c` goes back to the uncalibrated `N(0, 2²)`, both BLE models go back to what the last manual
+  calibration left them at (`rlsDownCal` / `rlsUpCal` in `ranging.json`: what they learnt since was
+  supervised by the drifting offset), both BLE offsets go back to their prior (`kOffsetVar0`, σ 9 dB)
+  and `P_uu` is raised to at least 0.25, so the interval widens honestly and stays wide (×/÷ 2 after
+  ten minutes of BLE, where the `P_uu` floor alone was undone within minutes: 0.21–0.33 m ± 0.1 m
+  55 minutes into a stale state). RTT bursts stay out of the filter and out of `method`, and the
+  event log and the phone's range card say to calibrate again. A calibration whose bursts agree
+  clears it. A `ranging.json` written before the calibration snapshot existed has no models to go
+  back to; a stale offset then only widens.
 * **The first calibration point.** On 2026-09-27 the Pixel lay 0.61 m (2 ft) from the desktop.
   That distance is the seed for `c_pair` and the BLE `P0`s (§10).
 

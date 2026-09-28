@@ -241,7 +241,11 @@ void RangingService::noteRtt(Peer &p, double impliedM, qint64 now)
     p.rttStaleAt = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
     p.rttOffsetVar = kUncalRttOffsetVar;                    // back to the uncalibrated prior …
     p.f.resetRttOffset(0, kUncalRttOffsetVar);
-    p.f.P[0][0] = std::max(p.f.P[0][0], 0.25);              // … and the range forgets what the biased bursts taught it (σ ×/÷ 3)
+    // … the BLE models back to the calibration (what they learnt since was supervised by the drifting offset), both BLE
+    // offsets and the range as uncertain as that makes them (σ ×/÷ 3 at least). Before, only P_uu was floored once and
+    // BLE updates through the suspect models (P0 −68 for −79, n at the 1.5 clamp) had it at 0.2–0.3 m ±0.1 m within
+    // minutes, 55 minutes into the stale state.
+    forgetSuspectLearning(p.f, p.rlsDown, p.rlsUp, p.haveCalModels ? &p.rlsDownCal : nullptr, p.haveCalModels ? &p.rlsUpCal : nullptr);
     p.rttImplied.clear();
     const QString text = QStringLiteral("Wi-Fi RTT with %1: the calibrated offset moved by about %2 m (bursts now read below zero); "
                                         "RTT is left out until you calibrate again at a known distance").arg(p.device).arg(p.rttStaleByM, 0, 'f', 1);
@@ -253,6 +257,14 @@ void RangingService::noteRtt(Peer &p, double impliedM, qint64 now)
     m_dirty = true;
     save();
     Q_UNUSED(now);
+}
+
+void RangingService::forgetSuspectLearning(RangeFilter &f, Rls2 &down, Rls2 &up, const Rls2 *downCal, const Rls2 *upCal)
+{
+    if (downCal) down = *downCal;
+    if (upCal) up = *upCal;
+    for (int k = 0; k < 2; ++k) f.resetOffset(k, 0, kOffsetVar0);
+    f.P[0][0] = std::max(f.P[0][0], 0.25);
 }
 
 RangeMath::Level RangingService::freshLevel(const std::vector<double> &rssi, int fresh, double spanS, bool moving)
@@ -522,6 +534,7 @@ void RangingService::finishCalibration(Peer &p)
         if (lb.valid) { p.rlsUp = Rls2(priorP0Ble(p.upTx), kNBle); p.rlsUp.update(std::log10(D), lb.dbm, lb.sigma * lb.sigma); p.f.resetOffset(1, 0, std::max(lb.sigma * lb.sigma, kFrozenFadeVar) + kFrozenFadeVar); }
         p.f.updateLogRange(std::log10(D), 0.01);               // they were D apart when the window closed
         p.calibrated = true; p.calibratedAt = at; p.calDistM = D;
+        p.rlsDownCal = p.rlsDown; p.rlsUpCal = p.rlsUp; p.haveCalModels = true;   // what a stale offset returns to
         text = QStringLiteral("Ranging calibrated with %1 at %2 m (%3; %4 + %5 BLE samples)").arg(p.device).arg(D, 0, 'f', 2)
             .arg(rttOk ? QStringLiteral("%1 of %2 RTT bursts agreed, offset %3 m ± %4").arg(nRtt).arg(nBursts).arg(p.rttOffset, 0, 'f', 2).arg(std::sqrt(p.rttOffsetVar), 0, 'f', 2)
                        : QStringLiteral("%1 RTT burst%2: offset not changed").arg(nBursts).arg(nBursts == 1 ? "" : "s"))
@@ -676,6 +689,8 @@ void RangingService::save() const
                                       {"rttCalibrated", p.rttCal}, {"lastCal", p.lastCal},
                                       {"rttStale", p.rttStale}, {"rttStaleByM", p.rttStaleByM}, {"rttStaleAt", p.rttStaleAt},
                                       {"calibratedAt", p.calibratedAt}, {"calDistM", p.calDistM}, {"rlsDown", rls(p.rlsDown)}, {"rlsUp", rls(p.rlsUp)},
+                                      {"rlsDownCal", p.haveCalModels ? QJsonValue(rls(p.rlsDownCal)) : QJsonValue()},
+                                      {"rlsUpCal", p.haveCalModels ? QJsonValue(rls(p.rlsUpCal)) : QJsonValue()},
                                       {"offsetVar", QJsonArray{p.f.offsetVar(0), p.f.offsetVar(1)}},
                                       {"totals", QJsonObject{{"rtt", double(tRtt)}, {"bleDown", double(tDown)}, {"bleUp", double(tUp)},
                                                              {"lastRttMs", double(std::max(p.lastRttMs, p.prevLastRttMs))}}}};
@@ -711,6 +726,15 @@ void RangingService::load()
         if (!p.calibrated) continue;
         rls(o["rlsDown"].toObject(), p.rlsDown); rls(o["rlsUp"].toObject(), p.rlsUp);
         p.haveUpPrior = true;
+        // The calibration's own models. A file from before them: the saved models, unless the offset is already stale
+        // (then what they learnt is suspect and the calibration's values are not known; only the widening below applies)
+        if (o["rlsDownCal"].isObject() && o["rlsUpCal"].isObject()) {
+            p.rlsDownCal = p.rlsDown; p.rlsUpCal = p.rlsUp;
+            rls(o["rlsDownCal"].toObject(), p.rlsDownCal); rls(o["rlsUpCal"].toObject(), p.rlsUpCal);
+            p.haveCalModels = true;
+        } else if (!o["rttStale"].toBool()) {
+            p.rlsDownCal = p.rlsDown; p.rlsUpCal = p.rlsUp; p.haveCalModels = true;
+        }
         p.rttOffset = o["rttOffset"].toDouble(); p.rttOffsetVar = o["rttOffsetVar"].toDouble(kUncalRttOffsetVar);
         // Files before 3.8 have no flag: an RTT-measured offset is the one whose variance is not a prior (0.25, then 4)
         p.rttCal = o.contains(QStringLiteral("rttCalibrated")) ? o["rttCalibrated"].toBool() : p.rttOffsetVar < 0.2499;
@@ -719,5 +743,7 @@ void RangingService::load()
         p.f.resetRttOffset(0, p.rttOffsetVar);
         const QJsonArray ov = o["offsetVar"].toArray();
         for (int k = 0; k < 2 && k < ov.size(); ++k) p.f.resetOffset(k, 0, std::max(ov[k].toDouble(kOffsetVar0), 2.0 * kFrozenFadeVar));
+        // still stale: the calibration's models and the wide offsets (a file written before this was learnt narrow)
+        if (p.rttStale) forgetSuspectLearning(p.f, p.rlsDown, p.rlsUp, p.haveCalModels ? &p.rlsDownCal : nullptr, p.haveCalModels ? &p.rlsUpCal : nullptr);
     }
 }
