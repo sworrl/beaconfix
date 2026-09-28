@@ -140,8 +140,10 @@ export. LAN-only, token-only, rate limited, optional TLS. [docs/API.md](docs/API
 
 **Internal map database**: SQLite, encrypted at rest with AES-256-GCM, key in KWallet or a key
 file. [docs/DATABASE.md](docs/DATABASE.md). Every beacon's position is refined as samples
-accumulate (robust weighted least squares on a path-loss model — [docs/ESTIMATION.md](docs/ESTIMATION.md)),
-and two BeaconFix installs, or the Android app, keep each other in step through the sync API.
+accumulate (a grid posterior and robust least squares on a path-loss model — [docs/ESTIMATION.md](docs/ESTIMATION.md)),
+and graded: a 95 % region, the chance of being within 25 m, a 0–100 score and a letter A–F (R for
+an area only, M for one that travels), drawn as grade-coloured ellipses on every map
+([docs/GRADING.md](docs/GRADING.md)). Two BeaconFix installs, or the Android app, keep each other in step through the sync API.
 
 **Identity**: one Ed25519 identity across the desktop, the laptop and the phone; moved between
 devices as an encrypted bundle (QR, text, file, or a 6-digit code on the LAN); independently

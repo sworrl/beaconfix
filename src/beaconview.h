@@ -39,6 +39,11 @@ public:
     void setShowDevices(bool on);
     void setShowImported(bool on);           // the imported history track (Timeline / WiGLE / GPX / KML)
     void replayLastRefit();
+    bool showLegend() const { return m_showLegend; }
+    void setShowLegend(bool on);             // the grade legend (bottom right)
+    // Grade colours (Okabe–Ito, colour-blind safe): A–F, R (region only), M (mobile); grey otherwise
+    static QColor gradeColor(const QString &grade);
+    static QColor gradeTextColor(const QString &grade);   // black or white, whichever reads on gradeColor()
 
 protected:
     void paintEvent(QPaintEvent *) override;
@@ -88,6 +93,8 @@ private:
     void    drawCard(QPainter &p);
     void    drawScale(QPainter &p);
     void    drawAttribution(QPainter &p);
+    void    drawLegend(QPainter &p);
+    void    drawSuggestion(QPainter &p, int apIndex, const QPointF &from);   // "sample here next" crosshair
 
     void    zoomAt(double delta, const QPointF &anchor, bool animate = true);
     void    applyZoom(double z, const QPointF &anchor);
@@ -136,6 +143,7 @@ private:
     Anim    m_lastRefit; bool m_haveRefit = false;              // "Replay last refit"
     bool    m_showDevices = true;
     bool    m_showImported = true;
+    bool    m_showLegend = false;
     void    drawDevices(QPainter &p);
     void    drawAnchors(QPainter &p);
     void    drawRangeInset(QPainter &p, const QList<QJsonObject> &close);   // sub-pixel gaps: a to-scale inset next to us

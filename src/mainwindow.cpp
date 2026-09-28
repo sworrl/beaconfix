@@ -9,6 +9,7 @@
 #include "pairing.h"
 #include <QComboBox>
 #include "mapdb.h"
+#include "fitjson.h"
 #include "identity.h"
 #include "osintegration.h"
 #include <QProcess>
@@ -196,14 +197,18 @@ MainWindow::MainWindow(Locator *loc, TileSource *tiles, QWidget *parent) : QMain
     nl->addWidget(m_pois, 1);
     tabs->addTab(nearby, QIcon::fromTheme(QStringLiteral("find-location")), QStringLiteral("Nearby"));
 
-    m_aps = new QTableWidget(0, 7);
-    m_aps->setHorizontalHeaderLabels({QStringLiteral("SSID"), QStringLiteral("BSSID"), QStringLiteral("dBm"), QStringLiteral("MHz"), QStringLiteral("Security"), QStringLiteral("Status"), QStringLiteral("Where")});
+    m_aps = new QTableWidget(0, 8);
+    m_aps->setHorizontalHeaderLabels({QStringLiteral("SSID"), QStringLiteral("BSSID"), QStringLiteral("dBm"), QStringLiteral("MHz"), QStringLiteral("Security"), QStringLiteral("Status"), QStringLiteral("Grade"), QStringLiteral("Where")});
+    m_aps->horizontalHeaderItem(6)->setToolTip(QStringLiteral("How well our own samples pin the AP down (docs/GRADING.md): A–F by score, R = only a region, M = travels with you. Sorts by score."));
+    m_aps->horizontalHeader()->setSectionResizeMode(6, QHeaderView::ResizeToContents);
+    m_aps->setSortingEnabled(true);
     m_aps->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
     m_aps->setEditTriggers(QAbstractItemView::NoEditTriggers);
     m_aps->setSelectionBehavior(QAbstractItemView::SelectRows);
     m_aps->setContextMenuPolicy(Qt::CustomContextMenu);
     m_aps->verticalHeader()->hide();
     connect(m_aps, &QTableWidget::customContextMenuRequested, this, &MainWindow::apContextMenu);
+    connect(m_aps, &QTableWidget::cellDoubleClicked, this, [this](int row, int) { if (QTableWidgetItem *it = m_aps->item(row, 0)) showApDetails(it->data(Qt::UserRole).toString()); });
     tabs->addTab(m_aps, QIcon::fromTheme(QStringLiteral("network-wireless")), QStringLiteral("Access points"));
 
     m_history = new QTableWidget(0, 6);
@@ -463,12 +468,36 @@ QWidget *MainWindow::buildSettings()
         auto *refit = new QPushButton(QIcon::fromTheme(QStringLiteral("view-refresh")), QStringLiteral("Refit all beacons"));
         refit->setToolTip(QStringLiteral("Re-estimate every beacon's position from all its samples with the least-squares fit (a log-distance path-loss model, robust weights). Beacons with new samples are refit automatically ten seconds after a scan."));
         row->addWidget(refit); row->addStretch();
-        v->addWidget(info); v->addLayout(row);
-        auto refreshInfo = [this, info] {
+        auto *grades = new QLabel; grades->setTextFormat(Qt::RichText); grades->setWordWrap(true);
+        grades->setToolTip(QStringLiteral("Grades of every AP we have samples of (docs/GRADING.md): A–F for a fix by score, R = only a region, M = travels with you."));
+        v->addWidget(info); v->addWidget(grades); v->addLayout(row);
+        auto refreshInfo = [this, info, grades] {
             int fitted = m_loc->refitCount(), withSamples = 0, samples = 0;
             for (const AccessPoint &ap : m_loc->accessPoints()) if (const ApRecord *r = m_loc->record(ap.bssid)) { if (r->obs.size() >= 3) ++withSamples; samples += r->obs.size(); }
             info->setText(QStringLiteral("%1 beacons positioned from your own samples · %2 in range with enough samples to fit · %3 samples on the beacons in range\nEvery scan taken while the fix is fresh and tight (GPS, or Wi-Fi within two minutes) adds a sample; walk or drive around and the positions tighten. Samples from paired devices and synced peers count too.")
                           .arg(fitted).arg(withSamples).arg(samples));
+            // Grade counts and the anchor calibration (Locator::estimatorJson)
+            const QJsonObject est = m_loc->estimatorJson();
+            const QJsonObject gr = est["grades"].toObject();
+            QStringList chips;
+            for (const QString &g : {QStringLiteral("A"), QStringLiteral("B"), QStringLiteral("C"), QStringLiteral("D"), QStringLiteral("E"), QStringLiteral("F"), QStringLiteral("R"), QStringLiteral("M")}) {
+                const int n = gr[g].toInt();
+                if (!n) continue;
+                chips << QStringLiteral("<span style=\"background:%1; color:%2; font-weight:bold\">&nbsp;%3&nbsp;</span>&nbsp;%4")
+                             .arg(BeaconView::gradeColor(g).name(), BeaconView::gradeTextColor(g).name(), g).arg(n);
+            }
+            QString html = chips.isEmpty() ? QStringLiteral("No graded positions yet.") : QStringLiteral("Grades: ") + chips.join(QStringLiteral("&nbsp;&nbsp; "));
+            if (const int none = gr["none"].toInt()) html += QStringLiteral(" &nbsp;· %1 without a position").arg(none);
+            const QJsonObject cal = est["calibration"].toObject();
+            if (!cal.isEmpty() && cal["fixes"].toInt() + cal["regions"].toInt() > 0) {
+                html += QStringLiteral("<br>Anchor calibration: κ = %1").arg(est["kappa"].toDouble(cal["kappa"].toDouble(1)), 0, 'f', 2);
+                if (cal["coverage95"].isDouble())
+                    html += QStringLiteral(" · %1% of %2 anchored fixes inside their R95 (95% expected)").arg(qRound(cal["coverage95"].toDouble() * 100)).arg(cal["fixes"].toInt());
+                if (cal["regionCoverage95"].isDouble())
+                    html += QStringLiteral(" · regions %1% of %2").arg(qRound(cal["regionCoverage95"].toDouble() * 100)).arg(cal["regions"].toInt());
+                if (cal["meanNees"].isDouble()) html += QStringLiteral(" · mean NEES %1 (2 ideal)").arg(cal["meanNees"].toDouble(), 0, 'f', 2);
+            }
+            grades->setText(html);
         };
         connect(refit, &QPushButton::clicked, this, [this, refit] { refit->setEnabled(false); const int n = m_loc->Refit(); statusBar()->showMessage(QStringLiteral("Refit done: %1 beacons positioned").arg(n), 5000); refit->setEnabled(true); });
         connect(m_loc, &Locator::refitDone, this, refreshInfo);
@@ -782,6 +811,7 @@ void MainWindow::refreshPois()
 void MainWindow::refreshAps()
 {
     const auto &aps = m_loc->accessPoints();
+    m_aps->setSortingEnabled(false);                       // rows are filled by index; re-sorted at the end
     m_aps->setRowCount(aps.size());
     for (int i = 0; i < aps.size(); ++i) {
         const AccessPoint &ap = aps[i];
@@ -790,9 +820,9 @@ void MainWindow::refreshAps()
         c0->setData(Qt::UserRole, ap.bssid);
         m_aps->setItem(i, 0, c0);
         m_aps->setItem(i, 1, new QTableWidgetItem(ap.bssid));
-        auto *c2 = new QTableWidgetItem(QString::number(ap.dbm)); c2->setTextAlignment(Qt::AlignRight | Qt::AlignVCenter);
+        auto *c2 = new NumericItem(QString::number(ap.dbm)); c2->setTextAlignment(Qt::AlignRight | Qt::AlignVCenter); c2->setData(Qt::UserRole, ap.dbm);
         m_aps->setItem(i, 2, c2);
-        auto *c3 = new QTableWidgetItem(QString::number(ap.frequency)); c3->setTextAlignment(Qt::AlignRight | Qt::AlignVCenter);
+        auto *c3 = new NumericItem(QString::number(ap.frequency)); c3->setTextAlignment(Qt::AlignRight | Qt::AlignVCenter); c3->setData(Qt::UserRole, ap.frequency);
         m_aps->setItem(i, 3, c3);
         const QString label = st == QLatin1String("used") ? QStringLiteral("used")
                             : st == QLatin1String("home") ? QStringLiteral("home network (the RV)")
@@ -808,14 +838,35 @@ void MainWindow::refreshAps()
         m_aps->setItem(i, 5, c4);
         const ApEstimate e = m_loc->estimateFor(ap);
         const ApRecord *r = m_loc->record(ap.bssid);
+        const Estimator::Fit &f = e.fit;
+        const bool graded = e.kind == ApEstimate::Trilat && f.kind == QLatin1String("fix") && !f.grade.isEmpty();
+        auto places = [](int n) { return n == 1 ? QStringLiteral("1 place") : QStringLiteral("%1 places").arg(n); };
+        // Grade: the letter on its colour, sorted by score (fixes above regions above mobile above nothing)
+        const QString g = graded ? f.grade : e.kind == ApEstimate::Region ? QStringLiteral("R") : e.kind == ApEstimate::Mobile ? QStringLiteral("M") : QString();
+        auto *cg = new NumericItem(g);
+        cg->setTextAlignment(Qt::AlignCenter);
+        cg->setData(Qt::UserRole, graded ? f.score : e.kind == ApEstimate::Region ? -100 + f.score : e.kind == ApEstimate::Mobile ? -200.0 : -300.0);
+        if (!g.isEmpty()) {
+            cg->setBackground(BeaconView::gradeColor(g)); cg->setForeground(BeaconView::gradeTextColor(g));
+            QFont bf = cg->font(); bf.setBold(true); cg->setFont(bf);
+            cg->setToolTip(graded ? QStringLiteral("Score %1 / 100 · %2% within 25 m · ±%3 m (95 %)\nDouble-click for the details").arg(f.score, 0, 'f', 0).arg(qRound(f.pWithin25 * 100)).arg(qRound(f.r95))
+                         : e.kind == ApEstimate::Region ? QStringLiteral("Region only: somewhere within %1 m\nDouble-click for the details").arg(qRound(f.r95))
+                                                        : QStringLiteral("Travels with you: heard in too many places to pin down"));
+        }
+        m_aps->setItem(i, 6, cg);
         const QString where = e.kind == ApEstimate::Wigle ? QStringLiteral("WiGLE %1, %2").arg(e.lat, 0, 'f', 5).arg(e.lon, 0, 'f', 5)
+                            : graded ? QStringLiteral("fit %1, %2 ±%3 m · %4% within 25 m (%5 samples from %6%7)").arg(e.lat, 0, 'f', 5).arg(e.lon, 0, 'f', 5).arg(qRound(f.r95))
+                                           .arg(qRound(f.pWithin25 * 100)).arg(f.n).arg(places(f.vantage), f.devices > 1 ? QStringLiteral(", %1 devices").arg(f.devices) : QString())
+                            : e.kind == ApEstimate::Region ? QStringLiteral("region %1, %2 ±%3 m (%4 samples from %5)").arg(e.lat, 0, 'f', 5).arg(e.lon, 0, 'f', 5).arg(qRound(f.r95)).arg(f.n).arg(places(f.vantage))
+                            : e.kind == ApEstimate::Mobile ? QStringLiteral("travels with you — last heard %1, %2").arg(e.lat, 0, 'f', 5).arg(e.lon, 0, 'f', 5)
                             : e.kind == ApEstimate::Trilat ? QStringLiteral("fit %1, %2 ±%3 m (%4 samples from %5 places, %6)").arg(e.lat, 0, 'f', 5).arg(e.lon, 0, 'f', 5).arg(qRound(e.radiusM)).arg(e.fit.n).arg(e.fit.vantage).arg(e.fit.quality)
                             : e.kind == ApEstimate::Peer ? QStringLiteral("from %1: %2, %3 ±%4 m").arg(r ? r->peerFrom : QString()).arg(e.lat, 0, 'f', 5).arg(e.lon, 0, 'f', 5).arg(qRound(e.radiusM))
                             : e.kind == ApEstimate::Centroid ? QStringLiteral("est. %1, %2 ±%3 m (%4 obs)").arg(e.lat, 0, 'f', 5).arg(e.lon, 0, 'f', 5).arg(qRound(e.radiusM)).arg(r ? r->obs.size() : 0)
                             : e.kind == ApEstimate::Observed ? QStringLiteral("heard here before %1, %2 ±%3 m").arg(e.lat, 0, 'f', 5).arg(e.lon, 0, 'f', 5).arg(qRound(e.radiusM))
                             : e.kind == ApEstimate::Ring ? QStringLiteral("~%1 m away, bearing unknown").arg(qRound(e.radiusM)) : QString();
-        m_aps->setItem(i, 6, new QTableWidgetItem(where));
+        m_aps->setItem(i, 7, new QTableWidgetItem(where));
     }
+    m_aps->setSortingEnabled(true);
 }
 
 void MainWindow::apContextMenu(const QPoint &pos)
@@ -832,7 +883,12 @@ void MainWindow::apContextMenu(const QPoint &pos)
     trav->setCheckable(true); trav->setChecked(m_loc->isTravelling(bssid));
     QAction *ign = menu.addAction(QStringLiteral("Always ignore SSID \"%1\"").arg(ssid));
     QAction *cp = menu.addAction(QStringLiteral("Copy BSSID"));
+    menu.addSeparator();
+    QAction *det = menu.addAction(QIcon::fromTheme(QStringLiteral("documentinfo")), QStringLiteral("Position details…"));
+    const ApRecord *rec = m_loc->record(bssid);
+    det->setEnabled(rec && (rec->fit.valid || rec->fit.kind == QLatin1String("mobile")));
     QAction *chosen = menu.exec(m_aps->viewport()->mapToGlobal(pos));
+    if (chosen == det) { showApDetails(bssid); return; }
     if (chosen == hm) {
         if (home) { for (const QString &p : m_loc->homeNetworks()) { const QRegularExpression re(QRegularExpression::wildcardToRegularExpression(p), QRegularExpression::CaseInsensitiveOption); if (re.match(bssid).hasMatch() || re.match(apx.ssid).hasMatch()) m_loc->removeHomeNetwork(p); } }
         else m_loc->addHomeNetwork(apx.ssid.isEmpty() ? bssid : apx.ssid);
@@ -841,6 +897,110 @@ void MainWindow::apContextMenu(const QPoint &pos)
     else if (chosen == trav) m_loc->setTravelling(bssid, trav->isChecked());
     else if (chosen == ign) m_loc->addIgnorePattern(ssid), m_ignore->setPlainText(m_loc->ignorePatterns().join('\n'));
     else if (chosen == cp) QApplication::clipboard()->setText(bssid);
+}
+
+// One AP's graded estimate (docs/GRADING.md): what the letter rests on
+void MainWindow::showApDetails(const QString &bssid)
+{
+    const ApRecord *r = m_loc->record(bssid);
+    if (!r) return;
+    const Estimator::Fit f = r->fit;
+    AccessPoint apx; apx.bssid = bssid; apx.ssid = r->ssid;
+    for (const AccessPoint &ap : m_loc->accessPoints()) if (ap.bssid == bssid) { apx = ap; break; }
+    const ApEstimate e = m_loc->estimateFor(apx);
+    const bool mobile = f.kind == QLatin1String("mobile"), region = f.kind == QLatin1String("region");
+    const QString g = !f.grade.isEmpty() ? f.grade : mobile ? QStringLiteral("M") : region ? QStringLiteral("R") : QString();
+    auto m = [](double v) { return v >= 100 ? QStringLiteral("%1 m").arg(qRound(v)) : QStringLiteral("%1 m").arg(v, 0, 'f', 1); };
+    auto plural = [](int n, const char *one, const char *many) { return QStringLiteral("%1 %2").arg(n).arg(QString::fromLatin1(n == 1 ? one : many)); };
+
+    QDialog dlg(this);
+    dlg.setWindowTitle(QStringLiteral("Position of %1").arg(apx.ssid.isEmpty() ? bssid : apx.ssid));
+    auto *v = new QVBoxLayout(&dlg);
+    auto *head = new QLabel;
+    head->setTextFormat(Qt::RichText);
+    const QString lead = mobile ? QStringLiteral("travels with you")
+                       : region ? QStringLiteral("region ±%1 m · %2").arg(qRound(f.r95)).arg(plural(f.vantage, "place", "places"))
+                       : f.valid ? QStringLiteral("%1% within 25 m · %2%3").arg(qRound(f.pWithin25 * 100)).arg(plural(f.vantage, "place", "places"),
+                                                                                 f.devices > 0 ? QStringLiteral(" · ") + plural(f.devices, "device", "devices") : QString())
+                                 : QStringLiteral("no position of our own yet");
+    const QColor gc = BeaconView::gradeColor(g), tc = BeaconView::gradeTextColor(g);
+    head->setText(QStringLiteral("<span style=\"font-size:x-large; font-weight:bold; background:%1; color:%2\">&nbsp;%3&nbsp;</span>&nbsp;&nbsp;"
+                                 "<span style=\"font-size:large\">%4</span><br><span>%5 · %6</span>")
+                      .arg(gc.name(), tc.name(), g.isEmpty() ? QStringLiteral("–") : g, lead.toHtmlEscaped(), apx.ssid.isEmpty() ? QStringLiteral("(hidden)") : apx.ssid.toHtmlEscaped(), bssid));
+    v->addWidget(head);
+
+    auto *form = new QFormLayout;
+    auto add = [form](const QString &k, const QString &val) { auto *l = new QLabel(val); l->setTextInteractionFlags(Qt::TextSelectableByMouse); l->setWordWrap(true); form->addRow(k, l); };
+    add(QStringLiteral("Kind:"), QStringLiteral("%1 · shown on the map as %2").arg(f.kind, QString::fromLatin1(ApEstimate::kindName(e.kind))));
+    if (!mobile && f.valid) {
+        add(QStringLiteral("Score:"), QStringLiteral("%1 / 100%2").arg(f.score, 0, 'f', 1)
+                                          .arg(f.pendingGrade.isEmpty() ? QString() : QStringLiteral(" · heading for %1 (confirmed on the next refit)").arg(f.pendingGrade)));
+        add(QStringLiteral("Position:"), QStringLiteral("%1, %2").arg(f.lat, 0, 'f', 6).arg(f.lon, 0, 'f', 6));
+        add(QStringLiteral("Error:"), QStringLiteral("R95 %1 · CEP50 %2 · %3% within 25 m\n1-σ ellipse %4 × %5, major axis toward %6°")
+                                          .arg(m(f.r95), m(f.cep50)).arg(qRound(f.pWithin25 * 100)).arg(m(f.semiMajor), m(f.semiMinor)).arg(qRound(f.orientDeg)));
+    }
+    add(QStringLiteral("Evidence:"), QStringLiteral("%1 from %2 · %3 · %4%5")
+                                         .arg(plural(f.n, "sample", "samples"), plural(f.vantage, "place", "places"), plural(f.devices, "device", "devices"), plural(f.sessions, "session", "sessions"))
+                                         .arg(f.rejected > 0 ? QStringLiteral(" · %1 set aside as outliers").arg(f.rejected) : QString()));
+    if (!mobile && f.valid) {
+        // Score components (all in [0, 1]); X only when an outside placement exists
+        auto *grid = new QGridLayout; grid->setHorizontalSpacing(8); grid->setVerticalSpacing(2);
+        struct C { const char *key, *name, *tip; double val; };
+        const C comps[] = {{"P", "precision", "How small R95 is: 10 m → 1, 300 m → 0", f.cP},
+                           {"G", "geometry", "Places heard from surround the AP (inside their hull, not all on one line)", f.cG},
+                           {"E", "evidence", "Effective number of independent places", f.cE},
+                           {"F", "fit", "Residuals match the model (χ², outliers, consistency of later samples)", f.cF},
+                           {"S", "stability", "No drift between refits, no single place it rests on, no mirror", f.cS},
+                           {"T", "freshness", "Age of the newest sample (half-life 180 days)", f.cT},
+                           {"X", "external", "Agreement with a WiGLE / Apple / BeaconDB placement", f.cX}};
+        int row = 0;
+        for (const C &c : comps) {
+            auto *k = new QLabel(QStringLiteral("<b>%1</b> %2").arg(QString::fromLatin1(c.key), QString::fromLatin1(c.name)));
+            k->setToolTip(QString::fromUtf8(c.tip));
+            grid->addWidget(k, row, 0);
+            if (c.val < 0) { auto *na = new QLabel(QStringLiteral("— no outside placement")); na->setEnabled(false); grid->addWidget(na, row, 1); }
+            else {
+                auto *bar = new QProgressBar; bar->setRange(0, 100); bar->setValue(qRound(qBound(0.0, c.val, 1.0) * 100));
+                bar->setFormat(QStringLiteral("%1").arg(c.val, 0, 'f', 2)); bar->setMaximumHeight(16); bar->setToolTip(QString::fromUtf8(c.tip));
+                grid->addWidget(bar, row, 1);
+            }
+            ++row;
+        }
+        auto *cw = new QWidget; cw->setLayout(grid); grid->setContentsMargins(0, 0, 0, 0);
+        form->addRow(QStringLiteral("Components:"), cw);
+    }
+    QStringList fl;
+    for (const QJsonValue &x : Estimator::flags(f)) {
+        const QString k = x.toString();
+        fl << (k == QLatin1String("extrapolated") ? QStringLiteral("extrapolated — outside the places heard from")
+               : k == QLatin1String("ambiguous") ? QStringLiteral("ambiguous — a mirror position (%1, %2) fits about as well").arg(f.altLat, 0, 'f', 5).arg(f.altLon, 0, 'f', 5)
+               : k == QLatin1String("moved") ? QStringLiteral("moved — only the recent samples are fitted")
+               : k == QLatin1String("fragile") ? QStringLiteral("fragile — dropping one place shifts it %1").arg(m(f.jackMax))
+               : k == QLatin1String("rangeScale") ? QStringLiteral("range scale — no close sample, the distance scale is uncertain") : k);
+    }
+    if (!mobile) add(QStringLiteral("Flags:"), fl.isEmpty() ? QStringLiteral("none") : fl.join('\n'));
+    if (!mobile && f.valid)
+        add(QStringLiteral("Model:"), QStringLiteral("P0 %1 dBm at 1 m · path-loss n %2%3 · residual %4 dB rms · %5 posterior mode%6")
+                                          .arg(f.p0, 0, 'f', 1).arg(f.pathloss, 0, 'f', 2).arg(f.fittedN ? QStringLiteral(" (fitted)") : QString()).arg(f.rms, 0, 'f', 1)
+                                          .arg(f.modes).arg(f.modes == 1 ? QString() : QStringLiteral("s")));
+    add(QStringLiteral("Group:"), f.groupRef.isEmpty() ? QStringLiteral("none — fitted on its own")
+                                                       : QStringLiteral("pooled with %1 BSSIDs of one radio (reference %2)").arg(f.groupSize).arg(f.groupRef));
+    if (f.suggestGain > 0 && !mobile) {
+        const Fix &fx = m_loc->fix();
+        add(QStringLiteral("Sample next:"), QStringLiteral("%1, %2 (expected gain %3 nats%4)").arg(f.suggestLat, 0, 'f', 5).arg(f.suggestLon, 0, 'f', 5).arg(f.suggestGain, 0, 'f', 2)
+                                                .arg(fx.valid ? QStringLiteral(", %1 from you").arg(m(Locator::distanceM(fx.lat, fx.lon, f.suggestLat, f.suggestLon))) : QString()));
+    }
+    if (f.updated > 0) add(QStringLiteral("Updated:"), QDateTime::fromSecsSinceEpoch(f.updated).toString(QStringLiteral("yyyy-MM-dd HH:mm")));
+    v->addLayout(form);
+
+    auto *bb = new QDialogButtonBox(QDialogButtonBox::Close);
+    QPushButton *show = bb->addButton(QStringLiteral("Show on map"), QDialogButtonBox::ActionRole);
+    show->setEnabled(e.kind != ApEstimate::None && e.kind != ApEstimate::Ring);
+    connect(show, &QPushButton::clicked, &dlg, [this, &dlg, e] { m_tabs->setCurrentWidget(m_map); m_map->focusOn(e.lat, e.lon, 17); dlg.accept(); });
+    connect(bb, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    v->addWidget(bb);
+    dlg.resize(520, dlg.sizeHint().height());
+    dlg.exec();
 }
 
 void MainWindow::refreshHistory()

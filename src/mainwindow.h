@@ -31,6 +31,7 @@ private:
     void refreshPois();
     void refreshTrip();
     void apContextMenu(const QPoint &pos);
+    void showApDetails(const QString &bssid);   // the graded estimate of one AP: score components, flags, R95 …
     QWidget *buildTrip();
     QWidget *buildDevices();
     void refreshDevices();

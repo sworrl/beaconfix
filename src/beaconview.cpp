@@ -3,6 +3,7 @@
 #include "tilesource.h"
 #include "anchordialog.h"
 #include "ranging/rangingservice.h"
+#include "fitjson.h"
 #include <QMessageBox>
 #include <QFontMetrics>
 #include <QActionGroup>
@@ -41,6 +42,44 @@ static const QColor C_DIM(0x9f, 0xb0, 0xc8);
 
 enum { BtnZoomIn, BtnZoomOut, BtnLocate, BtnLayers, BtnPlaces, BtnCount };
 
+// ── Grades (docs/GRADING.md): the shared Okabe–Ito palette ─────────────────────
+QColor BeaconView::gradeColor(const QString &g)
+{
+    if (g == QLatin1String("A")) return QColor(0x00, 0x9E, 0x73);
+    if (g == QLatin1String("B")) return QColor(0x56, 0xB4, 0xE9);
+    if (g == QLatin1String("C")) return QColor(0xF0, 0xE4, 0x42);
+    if (g == QLatin1String("D")) return QColor(0xE6, 0x9F, 0x00);
+    if (g == QLatin1String("E")) return QColor(0xD5, 0x5E, 0x00);
+    if (g == QLatin1String("F")) return QColor(0xCC, 0x79, 0xA7);
+    if (g == QLatin1String("M")) return QColor(0x00, 0x72, 0xB2);
+    return QColor(0x8A, 0x93, 0xA6);                     // R, and anything ungraded
+}
+
+QColor BeaconView::gradeTextColor(const QString &g)
+{
+    const QColor c = gradeColor(g);
+    return (0.299 * c.red() + 0.587 * c.green() + 0.114 * c.blue()) / 255.0 > 0.55 ? QColor(0x10, 0x14, 0x1c) : QColor(Qt::white);
+}
+
+static bool gradedFix(const Estimator::Fit &f) { return f.kind == QLatin1String("fix") && f.grade.size() == 1 && f.grade[0] >= QLatin1Char('A') && f.grade[0] <= QLatin1Char('F'); }
+
+static QString plural(int n, const char *one, const char *many) { return QStringLiteral("%1 %2").arg(n).arg(QString::fromLatin1(n == 1 ? one : many)); }
+
+// The lead line of a beacon card / list row: "B · 72% within 25 m · 9 places · 3 devices"
+static QString gradeLead(const ApEstimate &e)
+{
+    const Estimator::Fit &f = e.fit;
+    if (e.kind == ApEstimate::Mobile) return QStringLiteral("M · travels with you");
+    if (e.kind == ApEstimate::Region)
+        return QStringLiteral("R · region ±%1 m · %2").arg(qRound(f.r95)).arg(plural(f.vantage, "place", "places"));
+    if (e.kind == ApEstimate::Trilat && gradedFix(f)) {
+        QString s = QStringLiteral("%1 · %2% within 25 m · %3").arg(f.grade).arg(qRound(f.pWithin25 * 100)).arg(plural(f.vantage, "place", "places"));
+        if (f.devices > 0) s += QStringLiteral(" · ") + plural(f.devices, "device", "devices");
+        return s;
+    }
+    return QString();
+}
+
 BeaconView::BeaconView(Locator *loc, TileSource *tiles, QWidget *parent) : QWidget(parent), m_loc(loc), m_src(tiles)
 {
     m_tiles.setMaxCost(700);
@@ -63,6 +102,7 @@ BeaconView::BeaconView(Locator *loc, TileSource *tiles, QWidget *parent) : QWidg
     m_showNames = s.value("map/showNames", true).toBool();
     m_showDevices = s.value("map/showDevices", true).toBool();
     m_showImported = s.value("map/showImported", true).toBool();
+    m_showLegend = s.value("map/showLegend", false).toBool();
 
     m_anim.setInterval(33);
     connect(&m_anim, &QTimer::timeout, this, [this] {
@@ -371,6 +411,7 @@ void BeaconView::paintEvent(QPaintEvent *)
     drawScale(p);
     drawTicker(p);
     drawAttribution(p);
+    if (m_showLegend) drawLegend(p);
     drawCard(p);
 }
 
@@ -535,8 +576,48 @@ void BeaconView::drawBeacons(QPainter &p)
         p.setPen(QPen(c, 1, Qt::DotLine)); p.setBrush(Qt::NoBrush);
         p.drawEllipse(me, it.e.radiusM / mpp, it.e.radiusM / mpp);
     }
+    const QRectF view = QRectF(rect()).adjusted(-40, -40, 40, 40);
+    // Regions first (grade R: only an area is known): faint discs of radius R95, cheap enough for hundreds
+    {
+        QColor rc = gradeColor(QStringLiteral("R")), rf = rc;
+        rc.setAlpha(70); rf.setAlpha(18);
+        p.setPen(QPen(rc, 1)); p.setBrush(rf);
+        for (const Item &it : items) {
+            if (it.e.kind != ApEstimate::Region) continue;
+            const double r = it.e.radiusM / mpp;
+            if (r < 4 || !view.intersects(QRectF(it.pos.x() - r, it.pos.y() - r, 2 * r, 2 * r))) continue;
+            p.drawEllipse(it.pos, r, r);
+        }
+    }
     for (const Item &it : items) {
-        if (it.e.kind == ApEstimate::Ring) continue;
+        if (it.e.kind == ApEstimate::Ring || it.e.kind == ApEstimate::Region || it.e.kind == ApEstimate::Mobile) continue;
+        const Estimator::Fit &f = it.e.fit;
+        if (it.e.kind == ApEstimate::Trilat && gradedFix(f) && f.semiMajor > 0) {
+            // The 95 % error ellipse: semi-axes × √χ²₂(0.95) = 2.4477, major axis along the bearing orientDeg.
+            // Screen y points south, so rotating by +bearing (clockwise on screen) turns "up" (north) onto it.
+            const double fm = metersPerPixel(it.e.lat);
+            const double a = f.semiMajor * 2.4477 / fm, b = qMax(f.semiMinor, 0.0) * 2.4477 / fm;
+            if (!view.intersects(QRectF(it.pos.x() - a, it.pos.y() - a, 2 * a, 2 * a))) continue;
+            const bool doubtful = !f.inHull || f.ambiguous || f.modes >= 2;   // Estimator::flags(): extrapolated / ambiguous
+            const QColor gc = gradeColor(f.grade);
+            if (a >= 3) {
+                QColor fill = gc; fill.setAlpha(34);
+                QPen pen(gc, 1.4, doubtful ? Qt::DashLine : Qt::SolidLine);
+                p.save();
+                p.translate(it.pos); p.rotate(f.orientDeg);
+                p.setPen(pen); p.setBrush(fill);
+                p.drawEllipse(QRectF(-qMax(b, 1.0), -a, 2 * qMax(b, 1.0), 2 * a));
+                p.restore();
+            }
+            if ((f.ambiguous || f.modes >= 2) && (f.altLat != 0 || f.altLon != 0)) {   // the mirror / second mode: a hollow ghost
+                const QPointF ghost = toScreen(f.altLat, f.altLon);
+                QColor lc = gc; lc.setAlpha(110);
+                p.setPen(QPen(lc, 1, Qt::DotLine)); p.setBrush(Qt::NoBrush);
+                p.drawLine(it.pos, ghost);
+                p.setPen(QPen(gc, 1.6, Qt::DashLine)); p.drawEllipse(ghost, 5.5, 5.5);
+            }
+            continue;
+        }
         const double r = it.e.radiusM / mpp;
         if (r < 6) continue;
         QColor c = it.col; c.setAlpha(55);
@@ -551,8 +632,10 @@ void BeaconView::drawBeacons(QPainter &p)
             if (QLineF(items[g.first()].pos, items[k].pos).length() < 9) { g << k; placed = true; break; }
         if (!placed) groups.append(QList<int>{k});
     }
+    int focus = -1;                                            // the hovered / selected single beacon (index into items)
     for (const QList<int> &g : groups) {
-        const Item &it = items[g.first()];
+        const int k0 = g.first();
+        const Item &it = items[k0];
         const int hitIdx = m_hits.size();
         const bool hot = m_hover == hitIdx || (m_selKind == HitBeacon && g.size() == 1 && m_selItem == it.i);
         const double dot = it.st == QLatin1String("used") || it.st == QLatin1String("active") ? 5.0 : 3.5;
@@ -567,15 +650,53 @@ void BeaconView::drawBeacons(QPainter &p)
             path.lineTo(it.pos.x(), it.pos.y() + d); path.lineTo(it.pos.x() - d, it.pos.y()); path.closeSubpath();
             glowDot(p, it.pos, 1, it.col, 12);
             p.setBrush(it.col); p.setPen(QPen(Qt::white, 1.2)); p.drawPath(path);
+        } else if (it.e.kind == ApEstimate::Mobile) {         // travels with us: a small "M" chip at the last place heard
+            const double r = hot ? 8.5 : 7;
+            p.setPen(QPen(QColor(255, 255, 255, 210), 1.2)); p.setBrush(gradeColor(QStringLiteral("M"))); p.drawEllipse(it.pos, r, r);
+            QFont f = p.font(); const QFont keep = f; f.setBold(true); f.setPixelSize(int(r * 1.3)); p.setFont(f);
+            p.setPen(Qt::white); p.drawText(QRectF(it.pos.x() - r, it.pos.y() - r, 2 * r, 2 * r), Qt::AlignCenter, QStringLiteral("M"));
+            p.setFont(keep);
         } else {
             glowDot(p, it.pos, hot ? dot + 2 : dot, it.col, it.st == QLatin1String("used") ? 3.2 : 2.2);
         }
+        if (hot && g.size() == 1) focus = k0;
         QList<int> apIdx;
         for (int k : g) { apIdx << items[k].i; m_beaconPos[items[k].i] = it.pos; }
         if (g.size() > 1) badge(p, it.pos + QPointF(9, -9), QString::number(g.size()), it.col);
         m_hits.append({HitBeacon, it.pos, 9, apIdx});
     }
+    if (focus >= 0) drawSuggestion(p, items[focus].i, items[focus].pos);
     if (!atMe.isEmpty()) m_hits.append({HitBeacon, me, 12, atMe});
+}
+
+// Where one more sample would tighten this AP the most (Fit::suggest*): a small crosshair, dotted from the estimate
+void BeaconView::drawSuggestion(QPainter &p, int apIndex, const QPointF &from)
+{
+    const auto &aps = m_loc->accessPoints();
+    if (apIndex < 0 || apIndex >= aps.size()) return;
+    const ApEstimate e = m_loc->estimateFor(aps[apIndex]);
+    const Estimator::Fit &f = e.fit;
+    if (!(f.suggestGain > 0) || e.kind == ApEstimate::Mobile) return;
+    const QPointF at = toScreen(f.suggestLat, f.suggestLon);
+    if (QLineF(from, at).length() < 4) return;
+    const QColor gc = e.kind == ApEstimate::Trilat || e.kind == ApEstimate::Region ? gradeColor(f.grade) : C_TEXT;
+    QColor lc = gc; lc.setAlpha(170);
+    p.setPen(QPen(lc, 1.2, Qt::DotLine)); p.setBrush(Qt::NoBrush);
+    p.drawLine(from, at);
+    QPen pen(QColor(8, 12, 20, 200), 3.2); p.setPen(pen);           // dark under-stroke so it reads on any basemap
+    p.drawEllipse(at, 6, 6);
+    p.drawLine(at + QPointF(-11, 0), at + QPointF(-3, 0)); p.drawLine(at + QPointF(3, 0), at + QPointF(11, 0));
+    p.drawLine(at + QPointF(0, -11), at + QPointF(0, -3)); p.drawLine(at + QPointF(0, 3), at + QPointF(0, 11));
+    pen.setColor(gc); pen.setWidthF(1.5); p.setPen(pen);
+    p.drawEllipse(at, 6, 6);
+    p.drawLine(at + QPointF(-11, 0), at + QPointF(-3, 0)); p.drawLine(at + QPointF(3, 0), at + QPointF(11, 0));
+    p.drawLine(at + QPointF(0, -11), at + QPointF(0, -3)); p.drawLine(at + QPointF(0, 3), at + QPointF(0, 11));
+    QFont sf = font(); sf.setPointSizeF(sf.pointSizeF() * 0.8); p.setFont(sf);
+    const QString t = QStringLiteral("sample here");
+    const QRectF tr(at.x() + 13, at.y() - 9, p.fontMetrics().horizontalAdvance(t) + 10, 18);
+    p.setPen(Qt::NoPen); p.setBrush(QColor(8, 12, 20, 200)); p.drawRoundedRect(tr, 4, 4);
+    p.setPen(C_TEXT); p.drawText(tr, Qt::AlignCenter, t);
+    p.setFont(font());
 }
 
 void BeaconView::drawMe(QPainter &p)
@@ -1071,14 +1192,32 @@ QString BeaconView::beaconCard(int i) const
                                                           .arg(distText(Locator::distanceM(fix.lat, fix.lon, e.lat, e.lon)), compass(Locator::bearingDeg(fix.lat, fix.lon, e.lat, e.lon)))
                       : e.kind == ApEstimate::Observed ? QStringLiteral("Heard here before (internal map), ±%1 · %2 %3 from you").arg(distText(e.radiusM))
                                                           .arg(distText(Locator::distanceM(fix.lat, fix.lon, e.lat, e.lon)), compass(Locator::bearingDeg(fix.lat, fix.lon, e.lat, e.lon)))
+                      : e.kind == ApEstimate::Region ? QStringLiteral("Only an area so far: within %1 of this centre (%2 samples) · %3 %4 from you").arg(distText(e.radiusM)).arg(e.fit.n)
+                                                          .arg(distText(Locator::distanceM(fix.lat, fix.lon, e.lat, e.lon)), compass(Locator::bearingDeg(fix.lat, fix.lon, e.lat, e.lon)))
+                      : e.kind == ApEstimate::Mobile ? QStringLiteral("Heard in too many places to pin down · shown where it was last heard")
                       : QStringLiteral("~%1 away by signal — direction unknown").arg(distText(e.radiusM));
+    // The graded lead ("B · 72% within 25 m · 9 places · 3 devices") and what the grade is wary of
+    QString lead = gradeLead(e);
+    if (!lead.isEmpty() && e.kind == ApEstimate::Trilat)
+        lead += QStringLiteral(" · ±%1 (95 %)").arg(distText(e.fit.r95));
+    QStringList fl;
+    for (const QJsonValue &v : Estimator::flags(e.fit)) {
+        const QString k = v.toString();
+        fl << (k == QLatin1String("extrapolated") ? QStringLiteral("outside the places heard from")
+               : k == QLatin1String("ambiguous") ? QStringLiteral("a mirror position fits about as well")
+               : k == QLatin1String("moved") ? QStringLiteral("moved — only recent samples used")
+               : k == QLatin1String("fragile") ? QStringLiteral("rests on one or two places")
+               : k == QLatin1String("rangeScale") ? QStringLiteral("no close sample, distance scale uncertain") : k);
+    }
+    if (!lead.isEmpty() && !fl.isEmpty() && e.kind != ApEstimate::Mobile) lead += QStringLiteral("\n⚠ ") + fl.join(QStringLiteral(" · "));
+    if (!lead.isEmpty() && e.fit.suggestGain > 0 && e.kind != ApEstimate::Mobile) lead += QStringLiteral("\n⌖ One more sample at the crosshair would help most");
     const QString stText = st == QLatin1String("used") ? QStringLiteral("used for the fix") : st == QLatin1String("home") ? QStringLiteral("home network · the RV") : st == QLatin1String("active") ? QStringLiteral("connected · travels with you")
                          : st == QLatin1String("travelling") ? QStringLiteral("travels with you") : st == QLatin1String("nomap") ? QStringLiteral("opted out (_nomap)") : QStringLiteral("ignored");
     const QString sec = ap.security.isEmpty() ? QString()
                       : QStringLiteral("\n🔒 %1%2%3").arg(ap.security.toUpper(), ap.adhoc ? QStringLiteral(" · ad-hoc") : QString(),
                                                     AccessPoint::insecure(ap.security) ? QStringLiteral("  ⚠ insecure — traffic can be read or the network joined by anyone nearby") : QString());
-    return QStringLiteral("📶 %1\n%2 · %3 dBm · %4 (%5 MHz)%8\n%6\n%7")
-        .arg(ap.ssid.isEmpty() ? QStringLiteral("(hidden network)") : ap.ssid, ap.bssid).arg(ap.dbm).arg(band).arg(ap.frequency).arg(stText, how, sec);
+    return QStringLiteral("📶 %1\n%9%2 · %3 dBm · %4 (%5 MHz)%8\n%6\n%7")
+        .arg(ap.ssid.isEmpty() ? QStringLiteral("(hidden network)") : ap.ssid, ap.bssid).arg(ap.dbm).arg(band).arg(ap.frequency).arg(stText, how, sec, lead.isEmpty() ? QString() : lead + QStringLiteral("\n"));
 }
 
 QString BeaconView::poiCard(int i) const
@@ -1105,7 +1244,15 @@ QString BeaconView::poiCard(int i) const
 
 void BeaconView::drawCard(QPainter &p)
 {
-    QString text; QPointF anchor; QColor accent = C_ME;
+    QString text; QPointF anchor; QColor accent = C_ME, leadCol;
+    auto beaconAccent = [this, &accent, &leadCol](int i) {
+        accent = C_LOCATED;
+        const ApEstimate e = m_loc->estimateFor(m_loc->accessPoints()[i]);
+        if (!gradeLead(e).isEmpty()) {
+            accent = leadCol = gradeColor(e.fit.grade.isEmpty() ? QStringLiteral("M") : e.fit.grade);
+            if (leadCol.lightnessF() < 0.45) leadCol = leadCol.lighter(160);   // M blue: readable on the dark card
+        }
+    };
     const Hit *h = m_hover >= 0 && m_hover < m_hits.size() ? &m_hits[m_hover] : nullptr;
     if (h && h->kind == HitButton) {
         static const char *tips[] = {"Zoom in (+)", "Zoom out (−)", "Follow my position (0)", "Map style", "Places to show"};
@@ -1114,7 +1261,7 @@ void BeaconView::drawCard(QPainter &p)
         text = poiCard(h->items.first()); anchor = h->pos;
         if (const PoiCategory *c = Locator::poiCategory(m_loc->pois()[h->items.first()].cat)) accent = c->color;
     } else if (h && h->kind == HitBeacon && h->items.size() == 1) {
-        text = beaconCard(h->items.first()); anchor = h->pos; accent = C_LOCATED;
+        text = beaconCard(h->items.first()); anchor = h->pos; beaconAccent(h->items.first());
     } else if (h && (h->kind == HitCluster || h->kind == HitBeacon)) {
         QStringList l;
         const bool poi = h->kind == HitCluster;
@@ -1137,7 +1284,7 @@ void BeaconView::drawCard(QPainter &p)
         text = poiCard(m_selItem); anchor = m_poiPos[m_selItem];
         if (const PoiCategory *c = Locator::poiCategory(m_loc->pois()[m_selItem].cat)) accent = c->color;
     } else if (m_selKind == HitBeacon && m_selItem >= 0 && m_selItem < m_beaconPos.size() && !m_beaconPos[m_selItem].isNull()) {
-        text = beaconCard(m_selItem); anchor = m_beaconPos[m_selItem]; accent = C_LOCATED;
+        text = beaconCard(m_selItem); anchor = m_beaconPos[m_selItem]; beaconAccent(m_selItem);
     }
     if (text.isEmpty()) return;
 
@@ -1163,7 +1310,7 @@ void BeaconView::drawCard(QPainter &p)
     y += tf.height();
     p.setFont(small);
     for (int i = 1; i < lines.size(); ++i) {
-        p.setPen(i == lines.size() - 1 && lines[i].startsWith(QLatin1String("Right-click")) ? C_DIM : C_TEXT);
+        p.setPen(i == 1 && leadCol.isValid() ? leadCol : i == lines.size() - 1 && lines[i].startsWith(QLatin1String("Right-click")) ? C_DIM : C_TEXT);
         p.drawText(QRectF(box.left() + 12, y, w - 20, sf.height()), Qt::AlignLeft | Qt::AlignVCenter, sf.elidedText(lines[i], Qt::ElideRight, int(w - 20)));
         y += sf.height();
     }
@@ -1210,6 +1357,60 @@ void BeaconView::keyPressEvent(QKeyEvent *e)
 void BeaconView::setShowDevices(bool on)
 {
     m_showDevices = on; QSettings().setValue("map/showDevices", on); update();
+}
+
+void BeaconView::setShowLegend(bool on)
+{
+    m_showLegend = on; QSettings().setValue("map/showLegend", on); update();
+}
+
+// Bottom right, above the attribution: what the ellipse colours and strokes mean
+void BeaconView::drawLegend(QPainter &p)
+{
+    QFont small = font(); small.setPointSizeF(font().pointSizeF() * 0.78);
+    QFont bold = small; bold.setBold(true);
+    const QFontMetricsF fm(small);
+    const double lh = fm.height() + 5, chip = fm.height() + 2;
+    const QStringList notes{QStringLiteral("R  region only (disc = R95)"), QStringLiteral("M  travels with you"),
+                            QStringLiteral("ellipse: 95 % of the position"), QStringLiteral("dashed: extrapolated / ambiguous"),
+                            QStringLiteral("○ ghost: the mirror position"), QStringLiteral("⌖ sample here next")};
+    double w = 6 * (chip + 3) + 16;
+    for (const QString &n : notes) w = qMax(w, fm.horizontalAdvance(n) + chip + 24);
+    const double h = 10 + lh + notes.size() * lh + 4;
+    const double attrH = fm.height() + 12;
+    const QRectF box(width() - 12 - w, height() - attrH - 12 - h, w, h);
+    p.setPen(QPen(QColor(C_ME.red(), C_ME.green(), C_ME.blue(), 60), 1)); p.setBrush(QColor(8, 12, 20, 215)); p.drawRoundedRect(box, 8, 8);
+    double x = box.left() + 8, y = box.top() + 6;
+    p.setFont(bold);
+    for (const QString &g : {QStringLiteral("A"), QStringLiteral("B"), QStringLiteral("C"), QStringLiteral("D"), QStringLiteral("E"), QStringLiteral("F")}) {
+        const QRectF c(x, y + (lh - chip) / 2, chip, chip);
+        p.setPen(Qt::NoPen); p.setBrush(gradeColor(g)); p.drawRoundedRect(c, 3, 3);
+        p.setPen(gradeTextColor(g)); p.drawText(c, Qt::AlignCenter, g);
+        x += chip + 3;
+    }
+    p.setFont(small); p.setPen(C_DIM);
+    p.drawText(QRectF(x + 4, y, box.right() - x - 8, lh), Qt::AlignLeft | Qt::AlignVCenter, QStringLiteral("best → worst"));
+    y += lh;
+    for (int i = 0; i < notes.size(); ++i) {
+        const QRectF c(box.left() + 8, y + (lh - chip) / 2, chip, chip);
+        const QString g = i == 0 ? QStringLiteral("R") : i == 1 ? QStringLiteral("M") : QString();
+        QString t = notes[i];
+        if (!g.isEmpty()) {
+            p.setPen(Qt::NoPen); p.setBrush(gradeColor(g)); p.drawRoundedRect(c, 3, 3);
+            p.setFont(bold); p.setPen(gradeTextColor(g)); p.drawText(c, Qt::AlignCenter, g); p.setFont(small);
+            t = t.mid(3);
+        } else if (i == 2 || i == 3) {
+            const QColor gc = gradeColor(QStringLiteral("B"));
+            p.setPen(QPen(gc, 1.3, i == 3 ? Qt::DashLine : Qt::SolidLine)); QColor f = gc; f.setAlpha(34); p.setBrush(f);
+            p.drawEllipse(c.center(), chip / 2 - 1, chip / 2 - 4);
+        } else {
+            p.setPen(C_TEXT); p.drawText(c, Qt::AlignCenter, t.left(1)); t = t.mid(2);
+        }
+        p.setPen(C_TEXT);
+        p.drawText(QRectF(c.right() + 6, y, box.right() - c.right() - 10, lh), Qt::AlignLeft | Qt::AlignVCenter, t);
+        y += lh;
+    }
+    p.setFont(font());
 }
 
 void BeaconView::setShowImported(bool on)
@@ -1543,6 +1744,9 @@ void BeaconView::contextMenuEvent(QContextMenuEvent *e)
         imp->setCheckable(true); imp->setChecked(m_showImported);
         connect(imp, &QAction::toggled, this, &BeaconView::setShowImported);
     }
+    QAction *legend = menu.addAction(QStringLiteral("Show grade legend"));
+    legend->setCheckable(true); legend->setChecked(m_showLegend);
+    connect(legend, &QAction::toggled, this, &BeaconView::setShowLegend);
     QAction *replay = menu.addAction(QIcon::fromTheme(QStringLiteral("media-playback-start")), QStringLiteral("Replay last refit"));
     replay->setEnabled(m_haveRefit);
     connect(replay, &QAction::triggered, this, &BeaconView::replayLastRefit);
