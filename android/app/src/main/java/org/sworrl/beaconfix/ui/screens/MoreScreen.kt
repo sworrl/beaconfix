@@ -26,6 +26,7 @@ val MORE = listOf(
     MoreItem("events", "📻", "Events", "What the desktop hears, live"),
     MoreItem("sightings", "📷", "Sightings", "ALPR cameras your routes passed (your plate was likely read) and searches for your plate in released Flock audit logs"),
     MoreItem("detector", "📡", "ALPR Detector", "Radar sweep, proximity geiger alerts, and audio/haptic customization for surveillance cameras"),
+    MoreItem("alpr", "📹", "ALPR Dash Cam", "Local plate reader using your phone camera: offline alert matching, dash cam capture, and pass recording"),
     MoreItem("survey", "◎", "Survey", "Scan continuously and watch signal strengths"),
     MoreItem("sync", "⇅", "Sync", "Push your samples, pull the desktop's map"),
     MoreItem("hub", "🛰", "Hub", "Your BeaconFix hub over WireGuard: sync to the master database, every node's live position"),

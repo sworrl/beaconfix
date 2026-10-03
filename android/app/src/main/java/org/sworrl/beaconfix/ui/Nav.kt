@@ -147,7 +147,7 @@ private fun Graph(nav: NavHostController, idVm: IdentityViewModel, modifier: Mod
         composable("link") { LinkScreen(onBack = { nav.popBackStack() }) }
         composable("alpr") { org.sworrl.beaconfix.alpr.ui.AlprScreen(onBack = { nav.popBackStack() }) }
         composable("detector") { org.sworrl.beaconfix.ui.screens.DetectorScreen(onAlpr = { nav.navigate("alpr") }) }
-        composable("settings") { SettingsScreen(onPair = { nav.navigate("link") }, onIdentity = { nav.navigate("identity") }, onWidgets = { nav.navigate("widgets") }, onImport = { nav.navigate("import") }, onLicenses = { nav.navigate("licenses") }) }
+        composable("settings") { SettingsScreen(onPair = { nav.navigate("link") }, onIdentity = { nav.navigate("identity") }, onWidgets = { nav.navigate("widgets") }, onImport = { nav.navigate("import") }, onLicenses = { nav.navigate("licenses") }, onAlpr = { nav.navigate("alpr") }, onTrip = { nav.navigate("trip") }, onMap = { nav.navigate("map") }) }
         composable("licenses") { org.sworrl.beaconfix.ui.screens.LicensesScreen(onBack = { nav.popBackStack() }) }
         composable("sightings") { org.sworrl.beaconfix.sightings.ui.SightingsScreen(onOpen = { nav.navigate("sighting/" + android.net.Uri.encode(it)) }, onBack = { nav.popBackStack() }) }
         composable("sighting/{uid}") { e ->

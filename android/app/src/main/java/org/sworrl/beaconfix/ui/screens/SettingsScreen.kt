@@ -31,7 +31,17 @@ import org.sworrl.beaconfix.ui.theme.Slate
 import org.sworrl.beaconfix.ui.vm.SettingsViewModel
 
 @Composable
-fun SettingsScreen(onPair: () -> Unit, onIdentity: () -> Unit = {}, onWidgets: () -> Unit = {}, onImport: () -> Unit = {}, onLicenses: () -> Unit = {}, vm: SettingsViewModel = hiltViewModel()) {
+fun SettingsScreen(
+    onPair: () -> Unit,
+    onIdentity: () -> Unit = {},
+    onWidgets: () -> Unit = {},
+    onImport: () -> Unit = {},
+    onLicenses: () -> Unit = {},
+    onAlpr: () -> Unit = {},
+    onTrip: () -> Unit = {},
+    onMap: () -> Unit = {},
+    vm: SettingsViewModel = hiltViewModel()
+) {
     val ctx = androidx.compose.ui.platform.LocalContext.current
     val ui by vm.ui.collectAsState()
     val placesVm: SettingsPlacesViewModel = hiltViewModel()
@@ -82,6 +92,17 @@ fun SettingsScreen(onPair: () -> Unit, onIdentity: () -> Unit = {}, onWidgets: (
                     onClick = { vm.setRoutingProvider("graphhopper") },
                     enabled = ui.routingProvider != "graphhopper"
                 ) { Text("GraphHopper") }
+            }
+        }
+        InfoCard("ALPR Dash Cam (Phone Camera)") {
+            Text("Run the camera as a local plate reader while driving. Detects plates, matches alerts offline, and captures pass evidence.", color = Slate, style = MaterialTheme.typography.bodySmall)
+            OutlinedButton(onClick = onAlpr) { Text("Open ALPR Dash Cam") }
+        }
+        InfoCard("Route Tracking & Trip Log") {
+            Text("Your driving and walking routes are tracked locally and road-snapped on the Map. Daily mileage, moving time, and stops are logged in Trip.", color = Slate, style = MaterialTheme.typography.bodySmall)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(onClick = onTrip) { Text("View Trip Log") }
+                OutlinedButton(onClick = onMap) { Text("Open Map") }
             }
         }
         InfoCard("Status in the shade") {
