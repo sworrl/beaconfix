@@ -19,7 +19,18 @@ from the app's Settings and Devices tabs; all can be edited by hand while the tr
 | `ignorePatterns` | (empty) | globs of SSIDs/BSSIDs never used for positioning |
 | `homeNetworks` | (seeded) | globs of the networks that travel with you (see below) |
 | `homeFix` | (state) | last precise fix taken while a home network was heard |
-| `wigleToken` | (empty) | optional WiGLE API token for real beacon positions |
+| `wigleToken` | (empty) | optional WiGLE API token for real beacon positions ([wigle.net/account](https://wigle.net/account), "Encoded for use") |
+| `mapillaryToken` | (empty) | optional Mapillary client token (`MLY\|…`, [developers dashboard](https://www.mapillary.com/dashboard/developers), READ scope) for street photos of cameras |
+| `routing/orsKey` | (empty) | optional [OpenRouteService](https://openrouteservice.org/dev/#/signup) key for camera-avoiding routes |
+| `routing/graphhopperKey` | (empty) | optional [GraphHopper](https://www.graphhopper.com/dashboard/signup) key (the alternative provider) |
+| `telegram/token` | (empty) | optional token of your own Telegram bot ([@BotFather](https://t.me/BotFather)) for alerts |
+
+BeaconFix ships with **no API keys**. Every key is your own, entered in the app's Settings tab (which links to each
+sign-up page) and stored only in this file on your computer; none is ever synced, uploaded or sent anywhere but
+the service it belongs to.
+
+| key (cont.) | default | meaning |
+|---|---|---|
 | `poiRadiusKm` | 6 | radius for places of interest (1–30) |
 | `prefetchTiles` | true | warm the tile cache around each new stop |
 | `prefetchedTiles` | 0 | counter (state) |

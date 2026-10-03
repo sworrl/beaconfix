@@ -93,6 +93,7 @@ private:
     void photoCandidates(const QString &camId, const QJsonObject &tags, double lat, double lon);
     void fetchPhoto(const QString &camId, QList<QJsonObject> cands, int found);
     void panoramaxNear(const QString &camId, double lat, double lon, int host, std::function<void(QList<QJsonObject>)> done);
+    void mapillaryNear(const QString &camId, double lat, double lon, std::function<void(QList<QJsonObject>)> done);   // needs mapillaryToken
     void photoDone(const QString &camId, int found);
     // HIBF
     void hibfTick();

@@ -697,7 +697,52 @@ void PlateWatch::photoCandidates(const QString &camId, const QJsonObject &tags, 
         for (const QString &p : tags.value(QLatin1String("mapillary")).toString().split(QLatin1Char(';'), Qt::SkipEmptyParts))
             if (!p.trimmed().isEmpty()) cands.append({{"type", "mapillary"}, {"id", p.trimmed()}});
     if (!cands.isEmpty()) { fetchPhoto(camId, cands, 0); return; }
-    panoramaxNear(camId, lat, lon, 0, [this, camId](QList<QJsonObject> near) { fetchPhoto(camId, near, 0); });
+    panoramaxNear(camId, lat, lon, 0, [this, camId, lat, lon](QList<QJsonObject> near) {
+        if (!near.isEmpty() || QSettings().value(QStringLiteral("mapillaryToken")).toString().isEmpty()) { fetchPhoto(camId, near, 0); return; }
+        mapillaryNear(camId, lat, lon, [this, camId](QList<QJsonObject> m) { fetchPhoto(camId, m, 0); });   // docs/SIGHTINGS.md §3.2
+    });
+}
+
+// The nearest Mapillary pictures within 25 m that look towards the camera (Graph API, the user's client token): images
+// whose compass angle points within 60° of the camera are preferred; two at most (CC BY-SA 4.0, attribution kept).
+void PlateWatch::mapillaryNear(const QString &camId, double lat, double lon, std::function<void(QList<QJsonObject>)> done)
+{
+    const double dLat = 30.0 / 111320.0, dLon = 30.0 / (111320.0 * std::cos(lat * M_PI / 180.0));
+    QUrl u(QStringLiteral("https://graph.mapillary.com/images"));
+    QUrlQuery q;
+    q.addQueryItem(QStringLiteral("access_token"), QSettings().value(QStringLiteral("mapillaryToken")).toString());
+    q.addQueryItem(QStringLiteral("fields"), QStringLiteral("id,computed_geometry,geometry,computed_compass_angle,compass_angle,captured_at"));
+    q.addQueryItem(QStringLiteral("bbox"), QStringLiteral("%1,%2,%3,%4").arg(lon - dLon, 0, 'f', 6).arg(lat - dLat, 0, 'f', 6).arg(lon + dLon, 0, 'f', 6).arg(lat + dLat, 0, 'f', 6));
+    q.addQueryItem(QStringLiteral("limit"), QStringLiteral("50"));
+    u.setQuery(q);
+    QNetworkReply *r = get(u);
+    connect(r, &QNetworkReply::finished, this, [r, lat, lon, done] {
+        r->deleteLater();
+        struct C { double score; QString id; };
+        QList<C> best;
+        const QJsonArray arr = QJsonDocument::fromJson(r->readAll()).object().value(QLatin1String("data")).toArray();
+        for (const QJsonValue &v : arr) {
+            const QJsonObject o = v.toObject();
+            QJsonArray c = o.value(QLatin1String("computed_geometry")).toObject().value(QLatin1String("coordinates")).toArray();
+            if (c.size() < 2) c = o.value(QLatin1String("geometry")).toObject().value(QLatin1String("coordinates")).toArray();
+            if (c.size() < 2) continue;
+            const double ilon = c[0].toDouble(), ilat = c[1].toDouble();
+            const double dx = (lon - ilon) * 111320.0 * std::cos(lat * M_PI / 180.0), dy = (lat - ilat) * 111320.0, d = std::hypot(dx, dy);
+            if (d > 25.0) continue;
+            double score = d;
+            const QJsonValue ca = o.contains(QLatin1String("computed_compass_angle")) ? o.value(QLatin1String("computed_compass_angle")) : o.value(QLatin1String("compass_angle"));
+            if (ca.isDouble() && d > 2.0) {                          // facing the camera: bearing image → camera vs the image's heading
+                const double bearing = std::fmod(std::atan2(dx, dy) * 180.0 / M_PI + 360.0, 360.0);
+                double diff = std::fabs(std::fmod(bearing - ca.toDouble() + 540.0, 360.0) - 180.0);
+                if (diff > 60.0) score += 30.0;
+            }
+            best.append({score, o.value(QLatin1String("id")).toString()});
+        }
+        std::sort(best.begin(), best.end(), [](const C &a, const C &b) { return a.score < b.score; });
+        QList<QJsonObject> out;
+        for (int i = 0; i < best.size() && i < 2; ++i) out.append(QJsonObject{{"type", "mapillary"}, {"id", best[i].id}});
+        done(out);
+    });
 }
 
 // The nearest Panoramax picture within 25 m (STAC search). The meta-catalogue first, then the big instances.

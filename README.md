@@ -193,7 +193,8 @@ and to whom:
 | the phone snaps a track to roads | OSRM demo server | the track's coordinates |
 | opt-in: camera-avoiding route | OpenRouteService or GraphHopper (your key) | start, destination and the avoided areas |
 | opt-in: traffic-webcam still | the state 511 operator | the camera id |
-| opt-in, with a token | WiGLE; Telegram (your own bot) | BSSIDs one at a time; the alerts you chose |
+| opt-in, with your key | Mapillary | positions of the cameras you passed (for nearby street photos) |
+| opt-in, with your token | WiGLE; Telegram (your own bot) | BSSIDs one at a time; the alerts you chose |
 
 The LAN API answers only private addresses, only with a token, only from linked devices. The hub, if you
 run one, is yours, behind your VPN, with an end-to-end encrypted API.

@@ -1,4 +1,6 @@
 #include "mainwindow.h"
+#include "telegrambot.h"
+#include <QSettings>
 #include "anchordialog.h"
 #include <QTreeWidget>
 #include "locator.h"
@@ -442,6 +444,38 @@ QWidget *MainWindow::buildSettings()
                                       "Your start, destination and the camera polygons are sent to graphhopper.com under its terms."));
         connect(gh, &QLineEdit::editingFinished, this, [gh] { RoutePlanner::storeKey(AvoidRoute::Provider::GraphHopper, gh->text()); });
         form->addRow(QStringLiteral("GraphHopper key:"), gh);
+    }
+    {   // Your own keys for the optional services (never shipped with BeaconFix): stored only in ~/.config/sworrl/beaconfix.conf
+        auto *mly = new QLineEdit(QSettings().value(QStringLiteral("mapillaryToken")).toString());
+        mly->setEchoMode(QLineEdit::Password);
+        mly->setPlaceholderText(QStringLiteral("optional — client token (MLY|…) from mapillary.com/dashboard/developers"));
+        mly->setToolTip(QStringLiteral("Street-level photos of the cameras you pass (docs/SIGHTINGS.md §3.2): the nearest Mapillary image within 25 m\n"
+                                       "facing the camera, CC BY-SA 4.0. The camera's position goes to graph.mapillary.com under its terms."));
+        connect(mly, &QLineEdit::editingFinished, this, [mly] {
+            const QString t = mly->text().trimmed();
+            if (t.isEmpty()) QSettings().remove(QStringLiteral("mapillaryToken")); else QSettings().setValue(QStringLiteral("mapillaryToken"), t);
+        });
+        form->addRow(QStringLiteral("Mapillary token:"), mly);
+        auto *tg = new QLineEdit(QSettings().value(QStringLiteral("telegram/token")).toString());
+        tg->setEchoMode(QLineEdit::Password);
+        tg->setPlaceholderText(QStringLiteral("optional — your own bot's token from @BotFather (/newbot)"));
+        tg->setToolTip(QStringLiteral("Camera and plate alerts in a Telegram chat with your own bot. After saving, send /start to the bot\n"
+                                      "and pair the chat with the code it asks for."));
+        connect(tg, &QLineEdit::editingFinished, this, [this, tg] {
+            QObject *botObj = m_loc->apiServer() ? m_loc->apiServer()->property("telegramBot").value<QObject *>() : nullptr;
+            if (auto *bot = qobject_cast<TelegramBot *>(botObj)) bot->setToken(tg->text().trimmed());     // saves it and restarts the bot
+            else if (tg->text().trimmed().isEmpty()) QSettings().remove(QStringLiteral("telegram/token"));
+            else QSettings().setValue(QStringLiteral("telegram/token"), tg->text().trimmed());
+        });
+        form->addRow(QStringLiteral("Telegram bot token:"), tg);
+        auto *links = new QLabel(QStringLiteral("Free keys: <a href=\"https://wigle.net/account\">WiGLE</a> · "
+            "<a href=\"https://openrouteservice.org/dev/#/signup\">OpenRouteService</a> · "
+            "<a href=\"https://www.graphhopper.com/dashboard/signup\">GraphHopper</a> · "
+            "<a href=\"https://www.mapillary.com/dashboard/developers\">Mapillary</a> · "
+            "<a href=\"https://t.me/BotFather\">Telegram BotFather</a> — every key is yours, stored only on this computer."));
+        links->setOpenExternalLinks(true);
+        links->setWordWrap(true);
+        form->addRow(QString(), links);
     }
 
     m_notifyStops = new QCheckBox(QStringLiteral("Notify when a new stop is logged"));

@@ -266,6 +266,9 @@ For cameras with a pass (backfill and live), once per camera (kv `camera_photo_c
    Commons `imageinfo` for the original URL, MIME, size, author and licence), `panoramax` (picture id → the
    Panoramax API's HD asset), `mapillary` (only with a Mapillary token configured).
 2. Else the nearest **Panoramax** picture within 25 m of the camera (STAC search).
+3. Else, with a Mapillary token, the nearest **Mapillary** images within 25 m (Graph API `images?bbox=…`), those whose
+   compass angle points within 60° of the camera first; two at most (CC BY-SA 4.0). Mapillary's US coverage is far
+   better than Panoramax's: 8 of 9 test cameras got photos, often 360° panoramas of the camera's surroundings.
 Attribution and licence are stored and shown with the image.
 
 ### 3.3 Dash-cam frames (phone)
