@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 #include "plateevents.h"
+#include "roadsnap.h"
 #include <QByteArray>
 #include <QJsonObject>
 #include <QList>
@@ -62,9 +63,9 @@ struct Plan {
 };
 Plan plan(const QList<Cam> &cams, LatLon a, LatLon b, Provider p);
 
-QUrl requestUrl(Provider p, const QString &key);
+QUrl requestUrl(Provider p, const QString &key, const QString &profile = QStringLiteral("car"));
 QList<QPair<QByteArray, QByteArray>> requestHeaders(Provider p, const QString &key);
-QByteArray requestBody(Provider p, LatLon a, LatLon b, const QList<Area> &areas);
+QByteArray requestBody(Provider p, LatLon a, LatLon b, const QList<Area> &areas, const QString &profile = QStringLiteral("car"));
 
 struct Route {
     bool ok = false;
@@ -79,4 +80,56 @@ struct Passed { Cam cam; double distanceM = 0; double alongM = 0; bool inCone = 
 QList<Passed> camerasPassed(const QList<LatLon> &route, const QList<Cam> &cams);
 QJsonObject toJson(const Route &r, const Plan &plan, const QList<Passed> &passed, Provider p);
 
+// ── Inspect a camera unseen (docs/SIGHTINGS.md §9) ──
+struct Vantage {
+    LatLon pt;
+    double distanceM = 0;
+    double bearingToCamera = 0;              // deg (0…360): which way to look (candidate → camera)
+    QString side;                            // "behind" | "beside" | "front" | "any"
+    QString reason;                          // e.g. "Behind camera, outside field of view (32 m on sidewalk)"
+    double score = 0;
+};
+
+struct Exposure {
+    QString cameraId;
+    QString operatorName;
+    QString model;
+    LatLon entry;
+    LatLon exit;
+    double meters = 0;
+};
+
+struct InspectPlan {
+    Cam camera;
+    QList<Vantage> vantages;
+    Route toVantage;
+    Route away;
+    QList<Exposure> exposures;
+    QList<Area> avoidRegions;
+    Limits limits;
+    Provider provider = Provider::Ors;
+    bool safe = true;
+    QString note;
+};
+
+// §9.1: Avoid regions for inspection: half-angle + 15°, range × 1.5 + 10 m, 15 m disc around pole;
+// direction unknown or non-ALPR -> 60 m (or range × 1.5 + 10 m) disc.
+QList<Area> inspectAvoidRegions(const QList<Cam> &cams);
+
+// §9.2: Vantage points: 20-60 m from camera along OSM ways, outside every avoid region.
+QList<Vantage> findVantages(const Cam &target, const QList<RoadSnap::Way> &ways,
+                            const QList<Area> &avoidAreas,
+                            const QString &profile = QStringLiteral("car"),
+                            double minM = 20.0, double maxM = 60.0);
+
+// §9.3: Exposure check: tests densified route (every 5 m) against nominal camera cones/ranges
+QList<Exposure> checkExposures(const QList<LatLon> &route, const QList<Cam> &allCams);
+
+// GPX export for inspection plan
+QString toGpx(const QList<LatLon> &toVantage, const QList<LatLon> &away, const Vantage &vantage, const Cam &cam);
+
+// JSON representation for API / UI
+QJsonObject inspectToJson(const InspectPlan &ip, const QString &limitsText, const QJsonArray &photos = QJsonArray());
+
 } // namespace AvoidRoute
+

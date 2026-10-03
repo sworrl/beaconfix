@@ -112,3 +112,113 @@ void RoutePlanner::route(LatLon from, LatLon to, const QString &providerIn, Done
         done(200, toJson(r, pl, camerasPassed(r.points, cams), p));
     });
 }
+
+void RoutePlanner::inspect(const AvoidRoute::Cam &target, AvoidRoute::LatLon from, std::optional<AvoidRoute::LatLon> toIn,
+                           const QString &profile, double minM, double maxM, const QString &providerIn,
+                           const QList<RoadSnap::Way> &ways, const QJsonArray &photos, Done done)
+{
+    const LatLon to = toIn.value_or(from);
+    auto bad = [](double lat, double lon) { return !std::isfinite(lat) || !std::isfinite(lon) || std::fabs(lat) > 90 || std::fabs(lon) > 180 || (lat == 0 && lon == 0); };
+    if (bad(target.lat, target.lon)) { done(400, QJsonObject{{"error", "invalid camera coordinates"}}); return; }
+    if (bad(from.lat, from.lon) || bad(to.lat, to.lon)) { done(400, QJsonObject{{"error", "from and to need a valid lat / lon"}}); return; }
+
+    const double corr = 1500.0;
+    const double minLat = std::min({from.lat, to.lat, target.lat});
+    const double maxLat = std::max({from.lat, to.lat, target.lat});
+    const double minLon = std::min({from.lon, to.lon, target.lon});
+    const double maxLon = std::max({from.lon, to.lon, target.lon});
+    const double dLat = corr / 111194.93;
+    const double midLat = (minLat + maxLat) / 2.0;
+    const double dLon = corr / (111194.93 * std::max(0.05, std::cos(midLat * M_PI / 180.0)));
+
+    QList<Cam> allCams = m_cameras ? m_cameras(minLat - dLat, maxLat + dLat, minLon - dLon, maxLon + dLon) : QList<Cam>();
+    bool foundTarget = false;
+    for (const Cam &c : allCams) {
+        if (c.id == target.id) { foundTarget = true; break; }
+    }
+    if (!foundTarget) allCams.prepend(target);
+
+    const QList<Area> avoidAreas = inspectAvoidRegions(allCams);
+    const QList<Vantage> vantages = findVantages(target, ways, avoidAreas, profile, minM, maxM);
+
+    const QString limitsText = QStringLiteral("Only mapped cameras with their mapped directions are avoided. "
+        "Unmapped cameras, PTZ / 360° domes, private CCTV, police-car ALPRs and phone/cell tracking are not. "
+        "Fields of view come from datasheets (§2.3) and mapped directions can be wrong.");
+
+    InspectPlan plan;
+    plan.camera = target;
+    plan.vantages = vantages;
+    plan.avoidRegions = avoidAreas;
+
+    if (vantages.isEmpty()) {
+        plan.safe = false;
+        plan.note = QStringLiteral("No safe vantage points found outside camera avoid regions within %1–%2 m").arg(qRound(minM)).arg(qRound(maxM));
+        done(200, inspectToJson(plan, limitsText, photos));
+        return;
+    }
+
+    Provider p = Provider::Ors;
+    if (!providerIn.isEmpty()) {
+        if (!providerFromId(providerIn, &p)) { done(400, QJsonObject{{"error", "provider: ors | graphhopper"}}); return; }
+    } else {
+        Provider def = Provider::Ors;
+        providerFromId(m_keys ? QStringLiteral("ors") : defaultProvider(), &def);
+        const Provider other = def == Provider::Ors ? Provider::GraphHopper : Provider::Ors;
+        if (!keyFor(def).isEmpty()) p = def;
+        else if (!keyFor(other).isEmpty()) p = other;
+        else p = def;
+    }
+    plan.provider = p;
+    plan.limits = limits(p);
+
+    const QString key = keyFor(p);
+    if (key.isEmpty()) {
+        plan.safe = true;
+        plan.note = QStringLiteral("Vantage points and camera blind spots computed. Add an OpenRouteService or GraphHopper key in Settings → Routing to calculate turn-by-turn navigation legs.");
+        done(200, inspectToJson(plan, limitsText, photos));
+        return;
+    }
+
+    const Vantage v = vantages.first();
+    const QList<Area> cappedAreas = avoidAreas.mid(0, std::min<int>(avoidAreas.size(), plan.limits.maxAreas));
+
+    QPointer<RoutePlanner> self(this);
+    const QUrl u1 = requestUrl(p, key, profile);
+    const auto h1 = requestHeaders(p, key);
+    const QByteArray b1 = requestBody(p, from, v.pt, cappedAreas, profile);
+
+    send(u1, h1, b1, [self, plan, allCams, p, key, profile, from, to, v, cappedAreas, limitsText, photos, done](int http1, const QByteArray &body1, const QString &netErr1) mutable {
+        if (!netErr1.isEmpty()) {
+            plan.safe = false;
+            plan.note = QStringLiteral("%1 unreachable for approach leg: %2").arg(providerName(p), netErr1);
+            done(200, inspectToJson(plan, limitsText, photos));
+            return;
+        }
+        plan.toVantage = parseResponse(p, http1, body1);
+
+        const QUrl u2 = requestUrl(p, key, profile);
+        const auto h2 = requestHeaders(p, key);
+        const QByteArray b2 = requestBody(p, v.pt, to, cappedAreas, profile);
+
+        if (!self) return;
+        self->send(u2, h2, b2, [plan, allCams, limitsText, photos, done](int http2, const QByteArray &body2, const QString &netErr2) mutable {
+            if (!netErr2.isEmpty()) {
+                plan.safe = false;
+                plan.note = QStringLiteral("Departure leg unreachable: %1").arg(netErr2);
+                done(200, inspectToJson(plan, limitsText, photos));
+                return;
+            }
+            plan.away = parseResponse(plan.provider, http2, body2);
+
+            QList<LatLon> allPts = plan.toVantage.points;
+            allPts += plan.away.points;
+            plan.exposures = checkExposures(allPts, allCams);
+            plan.safe = plan.exposures.isEmpty() && plan.toVantage.ok && plan.away.ok;
+            if (!plan.safe && !plan.exposures.isEmpty()) {
+                plan.note = QStringLiteral("Route enters field of view of %1 camera(s)").arg(plan.exposures.size());
+            }
+            done(200, inspectToJson(plan, limitsText, photos));
+        });
+    });
+}
+

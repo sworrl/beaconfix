@@ -244,6 +244,14 @@ fun SightingDetailScreen(uid: String, onBack: () -> Unit, onMap: () -> Unit, vm:
                 e.sourceUrl?.takeIf { it.startsWith("http") }?.let { url -> OutlinedButton(onClick = { openUrl(ctx, url) }) { Text("View source") } }
                 val lat = e.lat ?: e.cameraLat; val lon = e.lon ?: e.cameraLon
                 if (lat != null && lon != null) OutlinedButton(onClick = { MapFocus.target.value = MapFocus.Target(e.cameraLat ?: lat, e.cameraLon ?: lon, 18.0, label = who(e)); onMap() }) { Text("Show on map") }
+                e.cameraId?.takeIf { it.isNotBlank() }?.let { camId ->
+                    OutlinedButton(onClick = {
+                        val cLat = e.cameraLat ?: e.lat ?: 0.0
+                        val cLon = e.cameraLon ?: e.lon ?: 0.0
+                        MapFocus.target.value = MapFocus.Target(cLat, cLon, 18.0, label = who(e), inspectCamId = camId)
+                        onMap()
+                    }) { Text("Inspect unseen") }
+                }
             }
         }
         if (media.isNotEmpty()) InfoCard("Images") {

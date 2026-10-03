@@ -78,6 +78,8 @@ class DashCamService : LifecycleService() {
     @Inject lateinit var locations: LocationSource
     @Inject lateinit var livePasses: org.sworrl.beaconfix.sightings.LivePassTracker
     @Inject lateinit var passFrames: org.sworrl.beaconfix.sightings.DashFrameBuffer
+    @Inject lateinit var prefs: org.sworrl.beaconfix.data.Prefs
+    @Volatile private var privateInspection = false
 
     private val main = Handler(Looper.getMainLooper())
     private lateinit var executor: ExecutorService
@@ -128,6 +130,12 @@ class DashCamService : LifecycleService() {
         }
         wake = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "beaconfix:alpr").apply { setReferenceCounted(false) }
         gyro = GyroMotion(this)
+        lifecycleScope.launch {
+            prefs.privateInspectionActive.collect { active ->
+                privateInspection = active
+                reconcile()
+            }
+        }
         if (Build.VERSION.SDK_INT >= 30) lifecycleScope.launch {
             // headroom is rate-limited by the system (≥ 1 s between calls); every 5 s is plenty for a slow quantity
             while (true) {
@@ -257,6 +265,7 @@ class DashCamService : LifecycleService() {
         val blocked = hotlist.hotlist.value.blockedRegions.toSet()
         val geo = loc?.let { Geofence.check(blocked, it.latitude, it.longitude, freshState()) }
         val reason = when {
+            privateInspection -> "Paused: Private camera inspection active"
             !hasPerm(Manifest.permission.CAMERA) -> "No camera permission"
             status.state.value.modelError.isNotEmpty() -> "Models unavailable: ${status.state.value.modelError}"
             Build.VERSION.SDK_INT >= 29 && thermal >= PowerManager.THERMAL_STATUS_SEVERE -> "Paused: phone too hot (${thermalName(thermal)})"

@@ -109,19 +109,42 @@ class SyncViewModel @Inject constructor(private val store: DesktopStore, db: App
     fun forget(d: DesktopEntity) = viewModelScope.launch { store.remove(d.id) }
 }
 
-data class SettingsUi(val collectorOn: Boolean = false, val interval: Int = 60, val maxAcc: Int = 60, val home: Set<String> = emptySet())
+data class SettingsUi(
+    val collectorOn: Boolean = false,
+    val interval: Int = 60,
+    val maxAcc: Int = 60,
+    val home: Set<String> = emptySet(),
+    val routingOrsKey: String = "",
+    val routingGraphhopperKey: String = "",
+    val routingProvider: String = "ors"
+)
 
 @HiltViewModel
 class SettingsViewModel @Inject constructor(private val prefs: Prefs, @ApplicationContext private val ctx: Context, private val widgets: org.sworrl.beaconfix.widget.WidgetUpdater, private val notifier: org.sworrl.beaconfix.widget.StatusNotifier) : ViewModel() {
     val statusNotification: StateFlow<Boolean> = prefs.statusNotification.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), true)
     /** show = the presence service comes up (and its permanent card); hide = the service stops and the card goes. */
     fun setStatusNotification(v: Boolean) = viewModelScope.launch { prefs.setStatusNotification(v); if (v) runCatching { CollectorService.start(ctx) } else { CollectorService.stop(ctx); notifier.clear() }; widgets.refresh(renderMap = false) }
-    val ui: StateFlow<SettingsUi> = combine(prefs.collectorOn, prefs.collectIntervalSec, prefs.maxFixAccM, prefs.homePatterns) { a, b, c, d -> SettingsUi(a, b, c, d) }
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), SettingsUi())
+    val ui: StateFlow<SettingsUi> = combine<Any, SettingsUi>(
+        prefs.collectorOn, prefs.collectIntervalSec, prefs.maxFixAccM, prefs.homePatterns,
+        prefs.routingOrsKey, prefs.routingGraphhopperKey, prefs.routingProvider
+    ) { a ->
+        SettingsUi(
+            a[0] as Boolean,
+            a[1] as Int,
+            a[2] as Int,
+            @Suppress("UNCHECKED_CAST") (a[3] as Set<String>),
+            a[4] as String,
+            a[5] as String,
+            a[6] as String
+        )
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), SettingsUi())
     fun setCollector(on: Boolean) = viewModelScope.launch { prefs.setCollectorOn(on); CollectorService.ensure(ctx, prefs) }
     fun setInterval(s: Int) = viewModelScope.launch { prefs.setCollectInterval(s) }
     fun setMaxAcc(m: Int) = viewModelScope.launch { prefs.setMaxFixAcc(m) }
     fun setHome(text: String) = viewModelScope.launch { prefs.setHomePatterns(text.lines().map { it.trim() }.filter { it.isNotEmpty() }.toSet()) }
+    fun setRoutingOrsKey(key: String) = viewModelScope.launch { prefs.setRoutingOrsKey(key.trim()) }
+    fun setRoutingGraphhopperKey(key: String) = viewModelScope.launch { prefs.setRoutingGraphhopperKey(key.trim()) }
+    fun setRoutingProvider(provider: String) = viewModelScope.launch { prefs.setRoutingProvider(provider) }
 }
 
 @HiltViewModel

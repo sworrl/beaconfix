@@ -7,6 +7,7 @@
 #include "fitjson.h"
 #include "platewatch.h"
 #include "routeplanner.h"
+#include "inspectdialog.h"
 #include <QDialogButtonBox>
 #include <QPushButton>
 #include <QHeaderView>
@@ -514,6 +515,7 @@ void BeaconView::paintEvent(QPaintEvent *e)
         prof.lap("beacons");
         if (m_showFlockCameras) drawFlockCameras(p);
         drawAvoidRoute(p);
+        drawInspectPlan(p);
         drawAnchors(p);
         prof.lap("cams");
         drawMe(p);
@@ -526,6 +528,7 @@ void BeaconView::paintEvent(QPaintEvent *e)
     } else {
         if (m_showFlockCameras) drawFlockCameras(p);
         drawAvoidRoute(p);
+        drawInspectPlan(p);
         p.setPen(C_TEXT);
         QFont f = p.font(); f.setPointSizeF(f.pointSizeF() * 1.4); p.setFont(f);
         p.drawText(rect(), Qt::AlignCenter, QStringLiteral("Listening for beacons…"));
@@ -2386,6 +2389,9 @@ void BeaconView::contextMenuEvent(QContextMenuEvent *e)
         QAction *clr = route->addAction(QStringLiteral("Clear the route"), this, &BeaconView::clearAvoidRoute);
         clr->setEnabled(!m_avoidRoute.isEmpty() || m_haveRouteStart);
     }
+    if (!m_inspectPlan.isEmpty()) {
+        menu.addAction(QIcon::fromTheme(QStringLiteral("edit-clear")), QStringLiteral("Clear inspection plan"), this, &BeaconView::clearInspectPlan);
+    }
     QAction *names = menu.addAction(QStringLiteral("Show Wi-Fi names"));
     names->setCheckable(true); names->setChecked(m_showNames);
     connect(names, &QAction::toggled, this, &BeaconView::setShowNames);
@@ -2439,6 +2445,7 @@ void BeaconView::showItemMenu(const Hit &h, const QPoint &globalPos)
         const FlockCamera c = m_flockCameras[idx];
         const QString coords = QStringLiteral("%1, %2").arg(c.lat, 0, 'f', 6).arg(c.lon, 0, 'f', 6);
         menu.addSection(c.model.isEmpty() ? QStringLiteral("Flock Camera") : c.model);
+        menu.addAction(QIcon::fromTheme(QStringLiteral("security-high")), QStringLiteral("Inspect unseen…"), this, [this, c] { inspectCamera(c.id); });
         menu.addAction(QIcon::fromTheme(QStringLiteral("edit-copy")), QStringLiteral("Copy %1").arg(coords), this, [coords] { QApplication::clipboard()->setText(coords); });
         if (c.source == QLatin1String("osm") && c.id.startsWith(QLatin1String("osm:"))) {
             const QString osmPath = c.id.mid(4);
@@ -2750,4 +2757,186 @@ void BeaconView::showRouteResult(const QJsonObject &o)
     v->addWidget(bb);
     m_routeDialog = d;
     d->show();
+}
+
+void BeaconView::inspectCamera(const QString &cameraId)
+{
+    auto *d = new InspectDialog(m_loc, cameraId, this);
+    d->setAttribute(Qt::WA_DeleteOnClose);
+    connect(d, &InspectDialog::showPlanOnMap, this, &BeaconView::showInspectPlan);
+    d->show();
+    d->raise();
+    d->activateWindow();
+}
+
+void BeaconView::showInspectPlan(const QJsonObject &plan)
+{
+    m_inspectPlan = plan;
+    const QJsonObject cam = plan.value(QLatin1String("camera")).toObject();
+    if (cam.contains(QLatin1String("lat")) && cam.contains(QLatin1String("lon"))) {
+        focusOn(cam.value(QLatin1String("lat")).toDouble(), cam.value(QLatin1String("lon")).toDouble(), 18);
+    }
+    update();
+}
+
+void BeaconView::clearInspectPlan()
+{
+    m_inspectPlan = QJsonObject();
+    update();
+}
+
+void BeaconView::drawInspectPlan(QPainter &p)
+{
+    if (m_inspectPlan.isEmpty()) return;
+    p.save();
+    p.setRenderHint(QPainter::Antialiasing);
+
+    // 1. Draw avoid regions (semi-transparent red polygons and discs)
+    const QJsonArray avoidArr = m_inspectPlan.value(QLatin1String("avoidRegions")).toArray();
+    for (const QJsonValue &v : avoidArr) {
+        const QJsonObject a = v.toObject();
+        const QJsonArray coords = a.value(QLatin1String("coordinates")).toArray();
+        if (coords.size() < 3) continue;
+        QPolygonF poly;
+        for (const QJsonValue &ptVal : coords) {
+            const QJsonArray pt = ptVal.toArray();
+            if (pt.size() >= 2) {
+                // coordinates in GeoJSON ring are [lon, lat]
+                poly << toScreen(pt[1].toDouble(), pt[0].toDouble());
+            }
+        }
+        if (!poly.isEmpty()) {
+            p.setBrush(QColor(230, 40, 40, 45));
+            p.setPen(QPen(QColor(230, 40, 40, 160), 1.5, Qt::DashLine));
+            p.drawPolygon(poly);
+        }
+    }
+
+    // 2. Draw route legs: toVantage (approach) and away (departure)
+    const QJsonObject legs = m_inspectPlan.value(QLatin1String("legs")).toObject();
+    auto drawLeg = [this, &p](const QJsonObject &legObj, const QColor &lineCol) {
+        if (!legObj.value(QLatin1String("ok")).toBool()) return;
+        const QJsonArray coords = legObj.value(QLatin1String("route")).toObject().value(QLatin1String("coordinates")).toArray();
+        if (coords.size() < 2) return;
+        QPolygonF line;
+        for (const QJsonValue &ptVal : coords) {
+            const QJsonArray pt = ptVal.toArray();
+            if (pt.size() >= 2) line << toScreen(pt[1].toDouble(), pt[0].toDouble());
+        }
+        if (line.size() >= 2) {
+            p.setBrush(Qt::NoBrush);
+            p.setPen(QPen(QColor(20, 20, 30, 200), 7, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+            p.drawPolyline(line);
+            p.setPen(QPen(lineCol, 3.5, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+            p.drawPolyline(line);
+        }
+    };
+
+    // Approach leg: Vibrant green
+    drawLeg(legs.value(QLatin1String("toVantage")).toObject(), QColor(50, 215, 95));
+    // Departure leg: Vibrant cyan
+    drawLeg(legs.value(QLatin1String("away")).toObject(), QColor(50, 190, 255));
+
+    // 3. Highlight exposures in bright red
+    const QJsonArray exposures = m_inspectPlan.value(QLatin1String("exposures")).toArray();
+    for (const QJsonValue &eVal : exposures) {
+        const QJsonObject exp = eVal.toObject();
+        const QJsonArray entry = exp.value(QLatin1String("entry")).toArray();
+        const QJsonArray exit = exp.value(QLatin1String("exit")).toArray();
+        if (entry.size() >= 2 && exit.size() >= 2) {
+            QPointF p1 = toScreen(entry[0].toDouble(), entry[1].toDouble());
+            QPointF p2 = toScreen(exit[0].toDouble(), exit[1].toDouble());
+            p.setPen(QPen(QColor(255, 30, 30), 6, Qt::SolidLine, Qt::RoundCap));
+            p.drawLine(p1, p2);
+            p.setBrush(QColor(255, 30, 30));
+            p.setPen(QPen(Qt::white, 1.5));
+            p.drawEllipse(p1, 5, 5);
+            p.drawEllipse(p2, 5, 5);
+        }
+    }
+
+    // 4. Draw Vantage points with look-direction arrows pointing at target camera
+    const QJsonArray vantages = m_inspectPlan.value(QLatin1String("vantages")).toArray();
+    for (int i = 0; i < vantages.size(); ++i) {
+        const QJsonObject v = vantages[i].toObject();
+        const double vLat = v.value(QLatin1String("lat")).toDouble();
+        const double vLon = v.value(QLatin1String("lon")).toDouble();
+        const double bearing = v.value(QLatin1String("bearingToCamera")).toDouble();
+        const QPointF sc = toScreen(vLat, vLon);
+
+        // Draw arrow pointing along bearing to camera (0 deg = North)
+        const double rad = qDegreesToRadians(bearing);
+        const double arrowLen = 26.0;
+        const double dx = std::sin(rad) * arrowLen;
+        const double dy = -std::cos(rad) * arrowLen;
+        const QPointF tip = sc + QPointF(dx, dy);
+
+        // Arrow line
+        p.setPen(QPen(QColor(20, 20, 30, 220), 4, Qt::SolidLine, Qt::RoundCap));
+        p.drawLine(sc, tip);
+        p.setPen(QPen(QColor(255, 215, 0), 2.5, Qt::SolidLine, Qt::RoundCap));
+        p.drawLine(sc, tip);
+
+        // Arrowhead
+        const double b1 = qDegreesToRadians(bearing + 150.0);
+        const double b2 = qDegreesToRadians(bearing - 150.0);
+        const QPointF a1 = tip + QPointF(std::sin(b1) * 8.0, -std::cos(b1) * 8.0);
+        const QPointF a2 = tip + QPointF(std::sin(b2) * 8.0, -std::cos(b2) * 8.0);
+        QPolygonF headPoly;
+        headPoly << tip << a1 << a2;
+        p.setBrush(QColor(255, 215, 0));
+        p.setPen(QPen(QColor(20, 20, 30), 1.0));
+        p.drawPolygon(headPoly);
+
+        // Vantage station circle
+        const bool isPrimary = (i == 0);
+        const double r = isPrimary ? 8.0 : 6.0;
+        p.setBrush(isPrimary ? QColor(255, 215, 0) : QColor(200, 200, 200));
+        p.setPen(QPen(QColor(20, 20, 30), 2.0));
+        p.drawEllipse(sc, r, r);
+
+        // Number 1, 2, 3
+        p.setPen(QColor(20, 20, 30));
+        QFont f = p.font();
+        f.setPixelSize(isPrimary ? 11 : 9);
+        f.setBold(true);
+        p.setFont(f);
+        p.drawText(QRectF(sc.x() - r, sc.y() - r, 2 * r, 2 * r), Qt::AlignCenter, QString::number(i + 1));
+    }
+
+    // 5. Target Camera highlight ring
+    const QJsonObject cam = m_inspectPlan.value(QLatin1String("camera")).toObject();
+    if (cam.contains(QLatin1String("lat")) && cam.contains(QLatin1String("lon"))) {
+        const QPointF camSc = toScreen(cam.value(QLatin1String("lat")).toDouble(), cam.value(QLatin1String("lon")).toDouble());
+        p.setBrush(Qt::NoBrush);
+        p.setPen(QPen(QColor(255, 60, 60, 220), 2.5, Qt::DashLine));
+        p.drawEllipse(camSc, 18, 18);
+        p.setPen(QPen(QColor(255, 215, 0, 180), 1.5));
+        p.drawEllipse(camSc, 23, 23);
+    }
+
+    // 6. Floating Status Card at the top-center
+    const bool safe = m_inspectPlan.value(QLatin1String("safe")).toBool();
+    const int expCount = exposures.size();
+    QString bannerText = safe ? QStringLiteral("INSPECT UNSEEN · CLEAN / SAFE")
+                              : QStringLiteral("INSPECT UNSEEN · %1 EXPOSURE(S)").arg(expCount);
+    const QColor bgCol = safe ? QColor(20, 70, 35, 220) : QColor(100, 20, 20, 230);
+    const QColor borderCol = safe ? QColor(60, 220, 100) : QColor(255, 80, 80);
+
+    QFont bannerFont = p.font();
+    bannerFont.setPixelSize(12);
+    bannerFont.setBold(true);
+    p.setFont(bannerFont);
+    QFontMetrics fm(bannerFont);
+    int textW = fm.horizontalAdvance(bannerText);
+    QRectF cardRect((width() - textW - 40) / 2.0, 10, textW + 40, 28);
+
+    p.setBrush(bgCol);
+    p.setPen(QPen(borderCol, 1.5));
+    p.drawRoundedRect(cardRect, 5, 5);
+
+    p.setPen(Qt::white);
+    p.drawText(cardRect, Qt::AlignCenter, bannerText);
+
+    p.restore();
 }

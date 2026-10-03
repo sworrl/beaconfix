@@ -17,9 +17,11 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.SmallFloatingActionButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -84,13 +86,26 @@ import kotlinx.coroutines.withContext
  * redraws the one or two small layers it touches instead of clearing and re-creating every circle, marker and track.
  * Track splitting, road snapping and the beacons' ellipses are computed off the main thread.
  */
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun MapScreen(live: LiveViewModel = hiltViewModel(), anchorsVm: AnchorsViewModel = hiltViewModel(), placesVm: MapPlacesViewModel = hiltViewModel(), hubVm: org.sworrl.beaconfix.ui.vm.HubViewModel = hiltViewModel()) {
+fun MapScreen(
+    live: LiveViewModel = hiltViewModel(),
+    anchorsVm: AnchorsViewModel = hiltViewModel(),
+    placesVm: MapPlacesViewModel = hiltViewModel(),
+    hubVm: org.sworrl.beaconfix.ui.vm.HubViewModel = hiltViewModel(),
+    inspectVm: org.sworrl.beaconfix.sightings.ui.InspectionViewModel = hiltViewModel(),
+) {
+    val ctx = LocalContext.current
     val aps by live.mapAps.collectAsState(); val track by live.phoneTrack.collectAsState(); val desk by live.desktopTrack.collectAsState()
     val views by live.views.collectAsState(); val me by live.phone.collectAsState()
     val anchorsList by anchorsVm.anchors.collectAsState(); val editing by anchorsVm.editing.collectAsState()
     val ranges by live.ranges.collectAsState()
     val flockCameras by live.flockCameras.collectAsState()
+    val activePlan by inspectVm.activePlan.collectAsState()
+    val inspectedPlan by inspectVm.inspectedCameraPlan.collectAsState()
+    val isInspectLoading by inspectVm.loading.collectAsState()
+    val liveGuardAlert by inspectVm.liveGuardAlert.collectAsState()
+    val inspectionSheetState = androidx.compose.material3.rememberModalBottomSheetState(skipPartiallyExpanded = true)
     var anchorsLayer by remember { mutableStateOf(true) }
     var heatmapLayer by remember { mutableStateOf(true) }
     var camerasLayer by remember { mutableStateOf(true) }
@@ -147,9 +162,26 @@ fun MapScreen(live: LiveViewModel = hiltViewModel(), anchorsVm: AnchorsViewModel
         val m = mapRef ?: return@LaunchedEffect
         follow = false
         PlacesOverlay.centreOn(m, t.lat, t.lon, t.zoom)
-        val key = t.poiKey
-        if (key != null) sheet = placesVm.find(key) ?: PlaceSheetModel.synthetic(t, placeLabel)
-        else sharedPin = PlacesOverlay.Pin(t.lat, t.lon, t.label.ifBlank { sharedLabel })
+        val inspectId = t.inspectCamId
+        if (inspectId != null) {
+            val cam = flockCameras.firstOrNull { it.id == inspectId }
+            val myLat = latest?.lat ?: t.lat
+            val myLon = latest?.lon ?: t.lon
+            inspectVm.inspectCamera(
+                inspectId,
+                cam?.lat ?: t.lat,
+                cam?.lon ?: t.lon,
+                cam?.operatorName ?: "",
+                cam?.model ?: "",
+                cam?.direction ?: "",
+                myLat,
+                myLon
+            )
+        } else {
+            val key = t.poiKey
+            if (key != null) sheet = placesVm.find(key) ?: PlaceSheetModel.synthetic(t, placeLabel)
+            else sharedPin = PlacesOverlay.Pin(t.lat, t.lon, t.label.ifBlank { sharedLabel })
+        }
         MapFocus.target.value = null
     }
     val map = mapRef
@@ -377,7 +409,91 @@ fun MapScreen(live: LiveViewModel = hiltViewModel(), anchorsVm: AnchorsViewModel
                         setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
                         icon = labelIcon(m, cache, glyph, camLabel, AColor.parseColor(color), false, big = true)
                         title = "${cam.model} (${cam.operatorName.ifEmpty { "Flock Safety" }})"
-                        snippet = "Passes: ${cam.passCount}\nStatus: ${if (isVetted) "Field Vetted" else "Candidate Location"}\nDirection: ${cam.direction.ifEmpty { "Omni / Unspecified" }}\n${cam.notes}"
+                        snippet = "Passes: ${cam.passCount}\nStatus: ${if (isVetted) "Field Vetted" else "Candidate Location"}\nDirection: ${cam.direction.ifEmpty { "Omni / Unspecified" }}\n${cam.notes}\n[Tap to inspect unseen]"
+                        setOnMarkerClickListener { mk, _ ->
+                            val myLat = latest?.lat ?: cam.lat
+                            val myLon = latest?.lon ?: cam.lon
+                            inspectVm.inspectCamera(
+                                cam.id,
+                                cam.lat,
+                                cam.lon,
+                                cam.operatorName,
+                                cam.model,
+                                cam.direction,
+                                myLat,
+                                myLon
+                            )
+                            mk.showInfoWindow()
+                            true
+                        }
+                    })
+                }
+            }
+        }
+    }
+    // inspection unseen layer (docs/SIGHTINGS.md §9.5): avoid regions, route legs, safe vantages with look direction, exposures
+    val planToDraw = activePlan ?: inspectedPlan
+    LaunchedEffect(map, planToDraw) {
+        val m = map ?: return@LaunchedEffect
+        val p = planToDraw
+        m.refill(layers.inspection) { out ->
+            if (p != null) {
+                // 1. Avoid regions (semi-transparent red polygons and discs)
+                for (reg in p.avoidRegions) {
+                    if (reg.coordinates.size >= 3) {
+                        out.add(Polygon(m).apply {
+                            points = reg.coordinates.map { GeoPoint(it.first, it.second) }
+                            fillPaint.color = AColor.parseColor("#35FF2A4B")
+                            outlinePaint.color = AColor.parseColor("#CCFF2A4B")
+                            outlinePaint.strokeWidth = 2.5f
+                            outlinePaint.pathEffect = android.graphics.DashPathEffect(floatArrayOf(8f, 8f), 0f)
+                        })
+                    }
+                }
+
+                // 2. Approach Leg (vibrant green)
+                if (p.toVantageLeg.ok && p.toVantageLeg.coordinates.size >= 2) {
+                    out.add(Polyline(m).apply {
+                        setPoints(p.toVantageLeg.coordinates.map { GeoPoint(it.first, it.second) })
+                        outlinePaint.color = AColor.parseColor("#FF32D75F")
+                        outlinePaint.strokeWidth = 7f
+                    })
+                }
+
+                // 3. Departure Leg (vibrant cyan)
+                if (p.awayLeg.ok && p.awayLeg.coordinates.size >= 2) {
+                    out.add(Polyline(m).apply {
+                        setPoints(p.awayLeg.coordinates.map { GeoPoint(it.first, it.second) })
+                        outlinePaint.color = AColor.parseColor("#FF32BEFF")
+                        outlinePaint.strokeWidth = 7f
+                    })
+                }
+
+                // 4. Exposures (bright danger red)
+                for (exp in p.exposures) {
+                    out.add(Polyline(m).apply {
+                        setPoints(listOf(GeoPoint(exp.entry.first, exp.entry.second), GeoPoint(exp.exit.first, exp.exit.second)))
+                        outlinePaint.color = AColor.parseColor("#FFFF2020")
+                        outlinePaint.strokeWidth = 12f
+                    })
+                }
+
+                // 5. Vantage Point markers with look-arrows pointing at target camera
+                for ((idx, vp) in p.vantages.withIndex()) {
+                    val vGp = GeoPoint(vp.lat, vp.lon)
+                    val arrowPts = buildFovCone(vGp, vp.bearingToCamera, 22.0, 16.0)
+                    out.add(Polygon(m).apply {
+                        points = arrowPts
+                        fillPaint.color = AColor.parseColor("#FFFFD700")
+                        outlinePaint.color = AColor.BLACK
+                        outlinePaint.strokeWidth = 2f
+                    })
+                    out.add(Marker(m).apply {
+                        position = vGp
+                        setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
+                        icon = labelIcon(m, cache, "${idx + 1}", "Vantage (${vp.side})", AColor.parseColor("#FFD700"), false, big = true)
+                        title = "Safe Vantage #${idx + 1} (${vp.side})"
+                        snippet = "${vp.reason}\nDistance: ${vp.distanceM.toInt()} m\nLook: ${vp.bearingToCamera.toInt()}°"
                     })
                 }
             }
@@ -505,6 +621,41 @@ fun MapScreen(live: LiveViewModel = hiltViewModel(), anchorsVm: AnchorsViewModel
             SmallFloatingActionButton(onClick = { follow = !follow }, modifier = Modifier.padding(top = 8.dp), containerColor = if (follow) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant) { Text("◎") }
         }
         if (aps.isEmpty() && latest == null) Box(Modifier.align(Alignment.Center)) { EmptyState("🗺", "Nothing to show yet", "Turn the collector on for your own beacons, or pair a desktop to see its map.") }
+
+        if (inspectedPlan != null) {
+            org.sworrl.beaconfix.sightings.ui.InspectionSheet(
+                plan = inspectedPlan,
+                loading = isInspectLoading,
+                onDismiss = { inspectVm.closePlanSheet() },
+                onStartPrivateInspection = { plan -> inspectVm.startPrivateInspection(plan) },
+                onOpenGpx = { plan -> inspectVm.openInExternalNavigation(ctx, plan) },
+                onProfileChange = { prof ->
+                    val myLat = latest?.lat ?: inspectedPlan!!.cameraLat
+                    val myLon = latest?.lon ?: inspectedPlan!!.cameraLon
+                    inspectVm.inspectCamera(
+                        inspectedPlan!!.cameraId,
+                        inspectedPlan!!.cameraLat,
+                        inspectedPlan!!.cameraLon,
+                        inspectedPlan!!.operatorName,
+                        inspectedPlan!!.model,
+                        inspectedPlan!!.direction,
+                        myLat,
+                        myLon,
+                        prof
+                    )
+                },
+                sheetState = inspectionSheetState
+            )
+        }
+
+        if (activePlan != null) {
+            org.sworrl.beaconfix.sightings.ui.InspectionActiveHud(
+                plan = activePlan!!,
+                guardAlert = liveGuardAlert,
+                onDone = { inspectVm.stopInspection() },
+                modifier = Modifier.align(Alignment.TopCenter).padding(top = 8.dp)
+            )
+        }
     }
 }
 
@@ -536,8 +687,9 @@ private fun ProximityInset(rs: org.sworrl.beaconfix.ranging.RangeSession, b: org
 /** The map's overlays, one folder per layer in draw order (bottom first); each is refilled only when its own inputs change. */
 private class MapLayers {
     val tracks = FolderOverlay(); val aps = FolderOverlay(); val places = FolderOverlay(); val cameras = FolderOverlay()
+    val inspection = FolderOverlay()
     val devices = FolderOverlay(); val anchors = FolderOverlay(); val ranges = FolderOverlay(); val me = FolderOverlay()
-    val stack: List<Overlay> get() = listOf(tracks, aps, places, cameras, devices, anchors, ranges, me)
+    val stack: List<Overlay> get() = listOf(tracks, aps, places, cameras, inspection, devices, anchors, ranges, me)
     var attribution: MapAttribution? = null
 }
 

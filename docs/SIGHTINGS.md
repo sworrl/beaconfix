@@ -516,3 +516,53 @@ A route from A to B that avoids the plate readers' fields of view, through a rou
 - Unit tests (`tests/avoidroute_test.cpp`): cone / disc geometry, corridor and caps, both request bodies, mocked
   answers (success, quota, refused key, a DNS block), the cameras a detour still passes, and the planner's whole flow
   on a fake transport (no key → nothing sent). No real provider call was made: no key was available.
+
+## 9. Inspect a camera unseen
+
+Go and look at (and photograph) a camera and its surroundings, and leave again, **without entering the field of view
+of that camera or of any other known ALPR** — so none of them reads your plate, takes your picture, or records you
+entering or leaving the area — and, optionally, without BeaconFix itself recording the trip.
+
+**Limits, stated in the UI before every inspection:** only *mapped* cameras with their mapped directions are avoided.
+Unmapped cameras, PTZ / 360° domes, private CCTV, police-car ALPRs and phone/cell tracking are not. Fields of view come
+from datasheets (§2.3) and mapped directions can be wrong, hence the margins below. A camera with no direction is
+treated as seeing all round. Look at the stored photos (§3.2, often 360° panoramas) first: the answer may not need a trip.
+
+### 9.1 Avoid regions
+For every ALPR (any trust, stale included — safety first) within 1.5 km of the start, the vantage or the corridor
+between them, *including the target*: the §2.3 cone with **half-angle + 15°** and **range × 1.5 + 10 m**, plus a 15 m
+disc around the pole; no known direction → a disc of radius range × 1.5 + 10 m. Non-ALPR cameras (webcam, CCTV, PTZ)
+are avoided too, as discs of 60 m (they see people and cars, not plates).
+
+### 9.2 Vantage points
+Candidates every ~5 m along OSM ways near the target (cached `osm_ways`, extended with foot ways for the foot profile:
+`footway`, `sidewalk`, `path`, `pedestrian`, `steps`, plus `parking` areas for the car profile), at **20–60 m** from the
+camera (configurable), outside every avoid region. Score (lower is better): distance outside the preferred 25–45 m
+band, + 0 when **behind** the camera (bearing camera → point within ±90° of the opposite of its direction), + 10 beside,
++ 25 in front but outside the cone; + 10 on a service way, − 5 on a sidewalk / parking area (somewhere you can stop).
+Return the best three, each with `distanceM`, `bearingToCamera` (which way to look), `side` and the reason it is safe.
+
+### 9.3 Routes and the exposure check
+Two legs, start → vantage and vantage → destination (default: back to the start), through the user's routing provider
+(§8: OpenRouteService or GraphHopper, **the user's own key**), profile `car` or `foot`, with the avoid regions as
+avoid polygons (simplified to the provider's caps; the smaller regions nearest the corridor first). Every returned
+route is then **checked**: densified every 5 m and tested against the *nominal* §2.3 cones and ranges of every camera;
+any stretch inside one is an **exposure** (camera, entry/exit point, metres) shown in red. A route with an exposure is
+never presented as safe; the next vantage or the other profile is tried, and when nothing is clean the UI says so.
+
+### 9.4 Desktop
+Right-click a camera (map or Sightings) → **Inspect unseen…**: profile, distance band, destination; the result draws the
+avoid regions, the vantage points with their look direction, both legs and any exposure, lists the camera's facts and
+stored photos, and exports the plan as GPX. API: `POST /api/v1/route/inspect`
+`{cameraId, from:{lat,lon}, to?:{lat,lon}, profile:"car"|"foot", minM?, maxM?}` (read scope) →
+`{camera, vantages:[…], legs:{toVantage, away}, exposures:[…], avoidRegions:[…], limits, provider}`. Nothing about an
+inspection is logged as an event or synced.
+
+### 9.5 Phone
+Camera sheet → **Inspect unseen**: the same request, computed on the phone with the phone's own provider key (phone
+Settings → API keys) or through the desktop's route when it is reachable. In-app map with both legs, the vantage and
+its look direction, the photos, "Open in OsmAnd / Organic Maps" (GPX), and a **live guard**: while an inspection is
+active, any fix within 40 m of entering an avoid region warns (sound / vibration, the camera and the way out).
+**Private inspection** (default on): while it is active — until Done, or once you are > 2 km from the target after
+reaching the vantage — the phone records no fixes, observations or camera passes, the dash cam pauses, and nothing about
+it is synced to the desktop or the hub.

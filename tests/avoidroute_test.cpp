@@ -185,6 +185,54 @@ int main(int argc, char **argv)
         CHECK(code == 502 && res.value(QLatin1String("error")).toString().contains(QLatin1String("NextDNS")), "a blocked provider: 502, says so");
     }
 
+    // ── inspect unseen (docs/SIGHTINGS.md §9) ──
+    {
+        const Cam target = cam(QStringLiteral("osm:node/99"), 0, 0, {90}); // Facing East
+        const QList<Area> inspectAreas = inspectAvoidRegions({target});
+        CHECK(inspectAreas.size() == 2, "inspect avoid regions: cone + 15 m pole disc");
+        CHECK(pointInRing(inspectAreas[1].ring, at(-10, 0).lat, at(-10, 0).lon), "10 m behind camera is inside the 15 m pole disc");
+        CHECK(!pointInRing(inspectAreas[0].ring, at(-30, 0).lat, at(-30, 0).lon) &&
+              !pointInRing(inspectAreas[1].ring, at(-30, 0).lat, at(-30, 0).lon), "30 m behind camera is outside all avoid regions");
+
+        // Vantage points on ways
+        RoadSnap::Way behindWay;
+        behindWay.id = 1;
+        behindWay.highway = QStringLiteral("footway");
+        behindWay.pts = {{at(-30, -50).lat, at(-30, -50).lon}, {at(-30, 50).lat, at(-30, 50).lon}};
+
+        RoadSnap::Way fovWay;
+        fovWay.id = 2;
+        fovWay.highway = QStringLiteral("primary");
+        fovWay.pts = {{at(20, -50).lat, at(20, -50).lon}, {at(20, 50).lat, at(20, 50).lon}};
+
+        const QList<Vantage> vantages = findVantages(target, {behindWay, fovWay}, inspectAreas, QStringLiteral("foot"), 20.0, 60.0);
+        CHECK(!vantages.isEmpty(), "found vantage candidates on behind way");
+        CHECK(vantages.first().side == QLatin1String("behind"), "best vantage is behind camera (side: %s)", qPrintable(vantages.first().side));
+        CHECK(std::fabs(vantages.first().distanceM - 30.0) < 5.0, "vantage distance %.1f m ≈ 30 m", vantages.first().distanceM);
+        CHECK(std::fabs(vantages.first().bearingToCamera - 90.0) < 15.0, "looking towards camera at bearing ~90° (actual %.1f°)", vantages.first().bearingToCamera);
+
+        // Exposure check
+        QList<LatLon> cleanRoute{at(-30, -50), at(-30, 50)};
+        QList<Exposure> cleanExp = checkExposures(cleanRoute, {target});
+        CHECK(cleanExp.isEmpty(), "route 30 m behind camera has 0 exposures");
+
+        QList<LatLon> dirtyRoute{at(15, -50), at(15, 50)}; // passes through Falcon's 25 m cone
+        QList<Exposure> dirtyExp = checkExposures(dirtyRoute, {target});
+        CHECK(dirtyExp.size() == 1 && dirtyExp.first().cameraId == QLatin1String("osm:node/99"), "route through cone flagged as exposure");
+
+        // GPX export
+        const QString gpx = toGpx(cleanRoute, cleanRoute, vantages.first(), target);
+        CHECK(gpx.contains(QLatin1String("<gpx")) && gpx.contains(QLatin1String("ALPR: osm:node/99")) && gpx.contains(QLatin1String("Approach to Vantage")), "valid GPX output generated");
+
+        // RoutePlanner inspect flow
+        RoutePlanner rp([&](double, double, double, double) { return QList<Cam>{target}; });
+        int inspectCode = 0; QJsonObject inspectRes;
+        rp.inspect(target, at(-100, -100), std::nullopt, QStringLiteral("foot"), 20.0, 60.0, QString(), {behindWay}, QJsonArray(),
+                   [&](int c, const QJsonObject &o) { inspectCode = c; inspectRes = o; });
+        CHECK(inspectCode == 200 && inspectRes.value(QLatin1String("safe")).toBool() && !inspectRes.value(QLatin1String("vantages")).toArray().isEmpty(),
+              "inspect without API key returns 200 with safe vantages and note");
+    }
+
     std::printf("\n%s: %d failure(s)\n", fails ? "FAILED" : "PASSED", fails);
     return fails ? 1 : 0;
 }

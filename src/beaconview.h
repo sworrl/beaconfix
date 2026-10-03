@@ -62,6 +62,10 @@ public:
     void routeAvoidingAlprs(double toLat, double toLon);
     void setRouteStart(double lat, double lon);
     void clearAvoidRoute();
+    // docs/SIGHTINGS.md §9: inspect unseen
+    void inspectCamera(const QString &cameraId);
+    void showInspectPlan(const QJsonObject &plan);
+    void clearInspectPlan();
     // Grade colours (Okabe–Ito, colour-blind safe): A–F, R (region only), M (mobile); grey otherwise
     static QColor gradeColor(const QString &grade);
     static QColor gradeTextColor(const QString &grade);   // black or white, whichever reads on gradeColor()
@@ -237,6 +241,9 @@ private:
     // the ALPR-avoiding route (docs/SIGHTINGS.md §8)
     void    drawAvoidRoute(QPainter &p);
     void    showRouteResult(const QJsonObject &o);
+    // the inspection plan (docs/SIGHTINGS.md §9)
+    void    drawInspectPlan(QPainter &p);
+    QJsonObject m_inspectPlan;
     bool    m_haveRouteStart = false, m_routing = false;
     double  m_routeStartLat = 0, m_routeStartLon = 0;
     QList<QPointF> m_avoidRoute;                                // mercator

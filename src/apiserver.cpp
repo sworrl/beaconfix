@@ -1771,6 +1771,62 @@ void ApiServer::serve(QTcpSocket *s, const Request &r, Device *dev, const QStrin
         });
         return;
     }
+    // ── Inspect a camera unseen (docs/SIGHTINGS.md §9) ──
+    if (ep == QLatin1String("route/inspect")) {
+        PlateWatch *pw = m_loc->plateWatch();
+        RoutePlanner *rp = pw ? pw->routePlanner() : nullptr;
+        MapDb *db = m_loc->mapDb();
+        if (!rp || !db) { finish(503, QJsonObject{{"error", "routing or map database unavailable"}}); return; }
+        if (!post) { finish(405, QJsonObject{{"error", "method not allowed"}}, {"Allow: POST"}); return; }
+        const QJsonObject b = QJsonDocument::fromJson(r.body).object();
+        const QString camId = b.value(QLatin1String("cameraId")).toString().trimmed();
+        if (camId.isEmpty()) { finish(400, QJsonObject{{"error", "cameraId required"}}); return; }
+
+        bool found = false;
+        const FlockCamera fc = db->flockCamera(camId, &found);
+        if (!found) { finish(404, QJsonObject{{"error", QStringLiteral("camera %1 not found").arg(camId)}}); return; }
+
+        AvoidRoute::Cam targetCam;
+        targetCam.id = fc.id; targetCam.lat = fc.lat; targetCam.lon = fc.lon;
+        targetCam.operatorName = fc.operatorName; targetCam.model = fc.model;
+        targetCam.dirs = PlateEvents::parseDirections(fc.direction);
+        PlateEvents::Camera peCam; peCam.id = fc.id; peCam.model = fc.model; peCam.type = fc.cameraType;
+        targetCam.cone = PlateEvents::coneFor(peCam);
+        const MapDb::CameraExtra extra = db->cameraExtra(camId);
+        targetCam.trust = extra.hasTrust ? extra.trust : 1.0;
+
+        auto point = [](const QJsonValue &v, AvoidRoute::LatLon *out) {
+            if (v.isObject()) { const QJsonObject o = v.toObject(); if (!o["lat"].isDouble() || !o["lon"].isDouble()) return false; *out = {o["lat"].toDouble(), o["lon"].toDouble()}; return true; }
+            if (v.isArray() && v.toArray().size() >= 2) { *out = {v.toArray()[0].toDouble(), v.toArray()[1].toDouble()}; return true; }
+            return false;
+        };
+
+        AvoidRoute::LatLon from, to;
+        if (!point(b["from"], &from)) {
+            const Fix &f = m_loc->fix();
+            if (f.valid) from = {f.lat, f.lon};
+            else from = {fc.lat, fc.lon};
+        }
+        std::optional<AvoidRoute::LatLon> toOpt;
+        if (point(b["to"], &to)) toOpt = to;
+
+        const QString profile = b.value(QLatin1String("profile")).toString(QStringLiteral("car")).toLower();
+        const double minM = b.contains(QLatin1String("minM")) ? b["minM"].toDouble() : 20.0;
+        const double maxM = b.contains(QLatin1String("maxM")) ? b["maxM"].toDouble() : 60.0;
+        const QString provider = b.value(QLatin1String("provider")).toString();
+
+        const QList<RoadSnap::Way> ways = db->waysNear(fc.lat, fc.lon, maxM + 50.0);
+        const QJsonArray photos = db->plateEventMedia(QString(), fc.id);
+
+        QPointer<QTcpSocket> sock(s);
+        const QString method = r.method, path = r.path;
+        rp->inspect(targetCam, from, toOpt, profile, minM, maxM, provider, ways, photos, [this, sock, method, path](int code, const QJsonObject &o) {
+            if (!sock) return;
+            logAccess(sock, method, path, code);
+            reply(sock, code, o);
+        });
+        return;
+    }
     if (ep == QLatin1String("flock")) {
         if (!get) { finish(405, QJsonObject{{"error", "method not allowed"}}, {"Allow: GET"}); return; }
         if (QUrlQuery(r.query).queryItemValue(QStringLiteral("geojson")) == QLatin1String("1")) {
@@ -2175,7 +2231,7 @@ static QString v3Scope(const QString &method, const QString &ep)
     static const QStringList sync{QStringLiteral("db/sync"), QStringLiteral("db/observations"), QStringLiteral("db/fixes"), QStringLiteral("devices/position"),
                                   QStringLiteral("anchors"), QStringLiteral("ranging"), QStringLiteral("flock/sighting"), QStringLiteral("plate-events")};
     if (sync.contains(ep) || ep.startsWith(QLatin1String("anchors/"))) return QStringLiteral("sync");
-    if (ep == QLatin1String("route/avoid")) return QStringLiteral("read");   // computes, changes nothing (docs/SIGHTINGS.md §8)
+    if (ep == QLatin1String("route/avoid") || ep == QLatin1String("route/inspect")) return QStringLiteral("read");   // computes, changes nothing (docs/SIGHTINGS.md §8, §9)
     return QStringLiteral("control");
 }
 

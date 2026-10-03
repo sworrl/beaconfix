@@ -6,6 +6,7 @@
 #include "platewatch.h"
 #include "eyesonflock.h"
 #include <QCheckBox>
+#include <QMenu>
 #include <QMessageBox>
 #include <QComboBox>
 #include <QSettings>
@@ -93,6 +94,36 @@ SightingsView::SightingsView(Locator *loc, QWidget *parent) : QWidget(parent), m
     m_table->verticalHeader()->setVisible(false);
     m_table->horizontalHeader()->setStretchLastSection(true);
     m_table->setSortingEnabled(false);
+    m_table->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(m_table, &QTableWidget::customContextMenuRequested, this, [this](const QPoint &pos) {
+        auto *item = m_table->itemAt(pos);
+        if (!item) return;
+        const int row = item->row();
+        const QString uid = m_table->item(row, 0)->data(Qt::UserRole).toString();
+        MapDb *db = m_loc->mapDb();
+        if (!db) return;
+        const QJsonObject ev = db->plateEvent(uid, false, false);
+        const QString camId = ev.value(QLatin1String("camera_id")).toString();
+        QMenu menu(this);
+        menu.addAction(QIcon::fromTheme(QStringLiteral("view-list-details")), QStringLiteral("Open event…"), this, [this, uid] { openEvent(uid); });
+        if (!camId.isEmpty()) {
+            menu.addAction(QIcon::fromTheme(QStringLiteral("security-high")), QStringLiteral("Inspect unseen…"), this, [this, camId] {
+                emit inspectCamera(camId);
+            });
+        }
+        double lat = ev.value(QLatin1String("camera_lat")).toDouble();
+        double lon = ev.value(QLatin1String("camera_lon")).toDouble();
+        if (lat == 0.0 && lon == 0.0) {
+            lat = ev.value(QLatin1String("lat")).toDouble();
+            lon = ev.value(QLatin1String("lon")).toDouble();
+        }
+        if (lat != 0.0 || lon != 0.0) {
+            menu.addAction(QIcon::fromTheme(QStringLiteral("map-globe")), QStringLiteral("Show on map"), this, [this, lat, lon] {
+                emit showOnMap(lat, lon);
+            });
+        }
+        menu.exec(m_table->viewport()->mapToGlobal(pos));
+    });
     v->addWidget(m_table, 1);
     connect(m_table, &QTableWidget::cellDoubleClicked, this, [this](int row, int) { openEvent(m_table->item(row, 0)->data(Qt::UserRole).toString()); });
     connect(m_filter, &QComboBox::currentIndexChanged, this, [this] { refresh(); });
@@ -181,6 +212,7 @@ void SightingsView::openEvent(const QString &uid)
     auto *d = new PlateEventDialog(m_loc, ev, this);
     d->setAttribute(Qt::WA_DeleteOnClose);
     connect(d, &PlateEventDialog::showOnMap, this, &SightingsView::showOnMap);
+    connect(d, &PlateEventDialog::inspectCamera, this, &SightingsView::inspectCamera);
     d->show();
     d->raise();
     d->activateWindow();
@@ -380,6 +412,15 @@ PlateEventDialog::PlateEventDialog(Locator *loc, const QJsonObject &ev, QWidget 
         auto *map = buttons->addButton(QStringLiteral("Show on map"), QDialogButtonBox::ActionRole);
         map->setIcon(QIcon::fromTheme(QStringLiteral("map-globe")));
         connect(map, &QPushButton::clicked, this, [this, lat, lon] { emit showOnMap(lat, lon); });
+    }
+    const QString camId = pass ? ev.value(QLatin1String("camera_id")).toString() : QString();
+    if (!camId.isEmpty()) {
+        auto *insp = buttons->addButton(QStringLiteral("Inspect unseen…"), QDialogButtonBox::ActionRole);
+        insp->setIcon(QIcon::fromTheme(QStringLiteral("security-high")));
+        connect(insp, &QPushButton::clicked, this, [this, camId] {
+            emit inspectCamera(camId);
+            close();
+        });
     }
     connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::close);
     v->addWidget(buttons);

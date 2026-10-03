@@ -163,9 +163,13 @@ Plan plan(const QList<Cam> &cams, LatLon a, LatLon b, Provider p)
     return out;
 }
 
-QUrl requestUrl(Provider p, const QString &key)
+QUrl requestUrl(Provider p, const QString &key, const QString &profile)
 {
-    if (p == Provider::Ors) return QUrl(QStringLiteral("https://api.openrouteservice.org/v2/directions/driving-car/geojson"));
+    if (p == Provider::Ors) {
+        if (profile.toLower() == QLatin1String("foot"))
+            return QUrl(QStringLiteral("https://api.openrouteservice.org/v2/directions/foot-walking/geojson"));
+        return QUrl(QStringLiteral("https://api.openrouteservice.org/v2/directions/driving-car/geojson"));
+    }
     QUrl u(QStringLiteral("https://graphhopper.com/api/1/route"));
     QUrlQuery q; q.addQueryItem(QStringLiteral("key"), key);
     u.setQuery(q);
@@ -189,7 +193,7 @@ static QJsonArray ringJson(const Ring &r)
     return a;
 }
 
-QByteArray requestBody(Provider p, LatLon a, LatLon b, const QList<Area> &areas)
+QByteArray requestBody(Provider p, LatLon a, LatLon b, const QList<Area> &areas, const QString &profile)
 {
     const QJsonArray pts{QJsonArray{a.lon, a.lat}, QJsonArray{b.lon, b.lat}};
     QJsonObject body;
@@ -201,7 +205,8 @@ QByteArray requestBody(Provider p, LatLon a, LatLon b, const QList<Area> &areas)
             body["options"] = QJsonObject{{"avoid_polygons", QJsonObject{{"type", "MultiPolygon"}, {"coordinates", polys}}}};
         }
     } else {
-        body = QJsonObject{{"points", pts}, {"profile", "car"}, {"points_encoded", false}, {"instructions", false}, {"calc_points", true}, {"ch.disable", true}};
+        const QString ghProfile = profile.toLower() == QLatin1String("foot") ? QStringLiteral("foot") : QStringLiteral("car");
+        body = QJsonObject{{"points", pts}, {"profile", ghProfile}, {"points_encoded", false}, {"instructions", false}, {"calc_points", true}, {"ch.disable", true}};
         if (!areas.isEmpty()) {
             QJsonArray feats;
             QStringList cond;
@@ -309,6 +314,305 @@ QJsonObject toJson(const Route &r, const Plan &plan, const QList<Passed> &passed
                        {"avoided", QJsonObject{{"areas", int(plan.areas.size())}, {"cameras", int(avoided.size())}, {"corridorCameras", int(plan.corridor.size())},
                                                {"capped", plan.capped}, {"corridorM", std::round(plan.corridorM)}}},
                        {"passes", ps}, {"passesInCone", inCone}, {"attribution", attribution}};
+}
+
+// ── Inspect a camera unseen (docs/SIGHTINGS.md §9) ──
+
+QList<Area> inspectAvoidRegions(const QList<Cam> &cams)
+{
+    QList<Area> out;
+    for (const Cam &c : cams) {
+        const bool isAlpr = (c.cone.maxM > 0 && c.trust > 0);
+        if (!isAlpr) {
+            // Non-ALPR camera (webcam, CCTV, PTZ): disc of 60 m (§9.1)
+            Area a; a.cameraId = c.id; a.disc = true;
+            a.ring = discPolygon(c.lat, c.lon, 60.0);
+            a.areaM2 = ringAreaM2(a.ring);
+            out << a;
+            continue;
+        }
+        if (c.dirs.isEmpty()) {
+            // No known direction: a disc of radius range * 1.5 + 10 m (§9.1)
+            const double r = c.cone.maxM * 1.5 + 10.0;
+            Area a; a.cameraId = c.id; a.disc = true;
+            a.ring = discPolygon(c.lat, c.lon, r);
+            a.areaM2 = ringAreaM2(a.ring);
+            out << a;
+        } else {
+            // Each direction: cone with half-angle + 15° and range * 1.5 + 10 m
+            const double half = c.cone.halfDeg + 15.0;
+            const double r = c.cone.maxM * 1.5 + 10.0;
+            for (double d : c.dirs) {
+                Area a; a.cameraId = c.id; a.dirDeg = d;
+                a.ring = conePolygon(c.lat, c.lon, d, half, r);
+                a.areaM2 = ringAreaM2(a.ring);
+                out << a;
+            }
+            // Plus 15 m disc around the pole
+            Area pole; pole.cameraId = c.id; pole.disc = true;
+            pole.ring = discPolygon(c.lat, c.lon, 15.0);
+            pole.areaM2 = ringAreaM2(pole.ring);
+            out << pole;
+        }
+    }
+    return out;
+}
+
+QList<Vantage> findVantages(const Cam &target, const QList<RoadSnap::Way> &ways,
+                            const QList<Area> &avoidAreas,
+                            const QString &profile,
+                            double minM, double maxM)
+{
+    struct Cand {
+        LatLon pt;
+        double dist = 0;
+        double score = 0;
+        double bearingToCam = 0;
+        QString side;
+        QString highway;
+        QString name;
+    };
+    QList<Cand> cands;
+    const bool isFoot = (profile.toLower() == QLatin1String("foot") || profile.toLower() == QLatin1String("walk"));
+
+    auto isWayAccepted = [isFoot](const QString &hw) {
+        if (hw.isEmpty()) return true;
+        if (isFoot) {
+            return RoadSnap::isMotorRoad(hw) || hw == QLatin1String("footway") || hw == QLatin1String("sidewalk") ||
+                   hw == QLatin1String("path") || hw == QLatin1String("pedestrian") || hw == QLatin1String("steps") ||
+                   hw == QLatin1String("cycleway") || hw == QLatin1String("track");
+        }
+        if (hw == QLatin1String("steps") || hw == QLatin1String("pedestrian") || hw == QLatin1String("footway")) return false;
+        return RoadSnap::isMotorRoad(hw) || hw == QLatin1String("parking") || hw == QLatin1String("service");
+    };
+
+    auto evaluatePoint = [&](LatLon pt, const QString &hw, const QString &name) {
+        const double d = PlateEvents::distanceM(target.lat, target.lon, pt.lat, pt.lon);
+        if (d < minM || d > maxM) return;
+        for (const Area &a : avoidAreas) {
+            if (pointInRing(a.ring, pt.lat, pt.lon)) return;
+        }
+        double sc = 0;
+        // Distance score: preferred 25–45 m band
+        if (d < 25.0) sc += (25.0 - d);
+        else if (d > 45.0) sc += (d - 45.0);
+
+        // Bearing camera -> point
+        const double bCamToPt = PlateEvents::bearingDeg(target.lat, target.lon, pt.lat, pt.lon);
+        QString side = QStringLiteral("behind");
+        if (!target.dirs.isEmpty()) {
+            double bestAngleScore = 1000.0;
+            QString bestSide = QStringLiteral("front");
+            for (double dir : target.dirs) {
+                const double opp = std::fmod(dir + 180.0, 360.0);
+                const double diffOpp = PlateEvents::angleDiff(bCamToPt, opp);
+                const double diffDir = PlateEvents::angleDiff(bCamToPt, dir);
+                if (diffOpp <= 90.0) {
+                    const double s = diffOpp * 0.01;
+                    if (s < bestAngleScore) { bestAngleScore = s; bestSide = QStringLiteral("behind"); }
+                } else if (diffDir > 90.0) {
+                    const double s = 10.0 + (180.0 - diffDir) * 0.01;
+                    if (s < bestAngleScore) { bestAngleScore = s; bestSide = QStringLiteral("beside"); }
+                } else {
+                    const double s = 25.0 + diffDir * 0.01;
+                    if (s < bestAngleScore) { bestAngleScore = s; bestSide = QStringLiteral("front"); }
+                }
+            }
+            sc += bestAngleScore;
+            side = bestSide;
+        } else {
+            side = QStringLiteral("any");
+        }
+
+        if (hw == QLatin1String("service")) sc += 10.0;
+        if (hw == QLatin1String("sidewalk") || hw == QLatin1String("footway") || hw == QLatin1String("path") ||
+            hw == QLatin1String("pedestrian") || hw == QLatin1String("parking")) {
+            sc -= 5.0;
+        }
+        const double bToCam = PlateEvents::bearingDeg(pt.lat, pt.lon, target.lat, target.lon);
+        cands.append({pt, d, sc, bToCam, side, hw, name});
+    };
+
+    for (const RoadSnap::Way &w : ways) {
+        if (!isWayAccepted(w.highway)) continue;
+        for (int i = 0; i + 1 < w.pts.size(); ++i) {
+            const RoadSnap::Pt &p1 = w.pts[i], &p2 = w.pts[i + 1];
+            const double segLen = PlateEvents::distanceM(p1.lat, p1.lon, p2.lat, p2.lon);
+            const int n = std::max(1, int(std::ceil(segLen / 5.0)));
+            for (int s = 0; s <= n; ++s) {
+                const double u = double(s) / double(n);
+                evaluatePoint({p1.lat + u * (p2.lat - p1.lat), p1.lon + u * (p2.lon - p1.lon)}, w.highway, w.name);
+            }
+        }
+    }
+
+    if (cands.isEmpty()) {
+        const double radii[] = {30.0, 40.0, 50.0};
+        for (double r : radii) {
+            for (int deg = 0; deg < 360; deg += 15) {
+                const double b = deg * M_PI / 180.0;
+                const double dLat = (r * std::cos(b)) / 111194.93;
+                const double dLon = (r * std::sin(b)) / (111194.93 * std::cos(target.lat * M_PI / 180.0));
+                evaluatePoint({target.lat + dLat, target.lon + dLon}, QStringLiteral("ground"), QString());
+            }
+        }
+    }
+
+    std::sort(cands.begin(), cands.end(), [](const Cand &a, const Cand &b) {
+        if (std::fabs(a.score - b.score) > 0.001) return a.score < b.score;
+        return a.dist < b.dist;
+    });
+
+    QList<Vantage> out;
+    for (const Cand &c : cands) {
+        bool tooClose = false;
+        for (const Vantage &v : out) {
+            if (PlateEvents::distanceM(c.pt.lat, c.pt.lon, v.pt.lat, v.pt.lon) < 10.0) {
+                tooClose = true; break;
+            }
+        }
+        if (tooClose) continue;
+        QString spotDesc = c.name.isEmpty() ? (c.highway.isEmpty() ? QStringLiteral("way") : c.highway) : c.name;
+        QString sideCap = c.side;
+        if (!sideCap.isEmpty()) sideCap[0] = sideCap[0].toUpper();
+        QString reason = QStringLiteral("%1 camera, outside field of view (%2 m on %3)")
+            .arg(sideCap).arg(qRound(c.dist)).arg(spotDesc);
+        out.append({c.pt, c.dist, c.bearingToCam, c.side, reason, c.score});
+        if (out.size() >= 3) break;
+    }
+    return out;
+}
+
+QList<Exposure> checkExposures(const QList<LatLon> &route, const QList<Cam> &allCams)
+{
+    QList<Exposure> out;
+    if (route.size() < 2) return out;
+    QList<QPair<Cam, QList<Area>>> camAreas;
+    for (const Cam &c : allCams) camAreas.append({c, areasFor(c)});
+
+    struct SamplePoint { LatLon pt; double distAlong = 0; };
+    QList<SamplePoint> samples;
+    double totalD = 0;
+    samples.append({route.first(), 0});
+    for (int i = 0; i + 1 < route.size(); ++i) {
+        const double len = PlateEvents::distanceM(route[i].lat, route[i].lon, route[i + 1].lat, route[i + 1].lon);
+        const int n = std::max(1, int(std::ceil(len / 5.0)));
+        for (int s = 1; s <= n; ++s) {
+            const double u = double(s) / double(n);
+            const LatLon p{route[i].lat + u * (route[i + 1].lat - route[i].lat),
+                           route[i].lon + u * (route[i + 1].lon - route[i].lon)};
+            totalD += len / n;
+            samples.append({p, totalD});
+        }
+    }
+
+    for (const auto &pair : camAreas) {
+        const Cam &c = pair.first;
+        const QList<Area> &areas = pair.second;
+        bool inExposure = false;
+        LatLon entryPt;
+        double startD = 0;
+        for (int i = 0; i < samples.size(); ++i) {
+            bool in = false;
+            for (const Area &a : areas) {
+                if (pointInRing(a.ring, samples[i].pt.lat, samples[i].pt.lon)) {
+                    in = true; break;
+                }
+            }
+            if (in && !inExposure) {
+                inExposure = true;
+                entryPt = samples[i].pt;
+                startD = samples[i].distAlong;
+            } else if (!in && inExposure) {
+                inExposure = false;
+                const double expLen = samples[i].distAlong - startD;
+                out.append({c.id, c.operatorName, c.model, entryPt, samples[i].pt, expLen});
+            }
+        }
+        if (inExposure) {
+            const double expLen = samples.last().distAlong - startD;
+            out.append({c.id, c.operatorName, c.model, entryPt, samples.last().pt, expLen});
+        }
+    }
+    return out;
+}
+
+QString toGpx(const QList<LatLon> &toVantage, const QList<LatLon> &away, const Vantage &vantage, const Cam &cam)
+{
+    QString xml;
+    xml += QStringLiteral("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+    xml += QStringLiteral("<gpx version=\"1.1\" creator=\"BeaconFix\" xmlns=\"http://www.topografix.com/GPX/1/1\">\n");
+    xml += QStringLiteral("  <wpt lat=\"%1\" lon=\"%2\">\n    <name>ALPR: %3</name>\n    <desc>%4 (%5)</desc>\n  </wpt>\n")
+        .arg(cam.lat, 0, 'f', 6).arg(cam.lon, 0, 'f', 6)
+        .arg(cam.id.toHtmlEscaped(), cam.model.toHtmlEscaped(), cam.operatorName.toHtmlEscaped());
+    xml += QStringLiteral("  <wpt lat=\"%1\" lon=\"%2\">\n    <name>Vantage: %3</name>\n    <desc>%4 (look %5°)</desc>\n  </wpt>\n")
+        .arg(vantage.pt.lat, 0, 'f', 6).arg(vantage.pt.lon, 0, 'f', 6)
+        .arg(vantage.side.toHtmlEscaped(), vantage.reason.toHtmlEscaped())
+        .arg(qRound(vantage.bearingToCamera));
+    if (!toVantage.isEmpty()) {
+        xml += QStringLiteral("  <trk>\n    <name>Approach to Vantage</name>\n    <trkseg>\n");
+        for (const LatLon &p : toVantage) {
+            xml += QStringLiteral("      <trkpt lat=\"%1\" lon=\"%2\"/>\n").arg(p.lat, 0, 'f', 6).arg(p.lon, 0, 'f', 6);
+        }
+        xml += QStringLiteral("    </trkseg>\n  </trk>\n");
+    }
+    if (!away.isEmpty()) {
+        xml += QStringLiteral("  <trk>\n    <name>Departure from Vantage</name>\n    <trkseg>\n");
+        for (const LatLon &p : away) {
+            xml += QStringLiteral("      <trkpt lat=\"%1\" lon=\"%2\"/>\n").arg(p.lat, 0, 'f', 6).arg(p.lon, 0, 'f', 6);
+        }
+        xml += QStringLiteral("    </trkseg>\n  </trk>\n");
+    }
+    xml += QStringLiteral("</gpx>\n");
+    return xml;
+}
+
+QJsonObject inspectToJson(const InspectPlan &ip, const QString &limitsText, const QJsonArray &photos)
+{
+    QJsonObject camObj{{"id", ip.camera.id}, {"lat", ip.camera.lat}, {"lon", ip.camera.lon},
+                       {"operator", ip.camera.operatorName}, {"model", ip.camera.model},
+                       {"trust", std::round(ip.camera.trust * 1000) / 1000}};
+    QJsonArray dirs;
+    for (double d : ip.camera.dirs) dirs.append(d);
+    camObj["directions"] = dirs;
+
+    QJsonArray vArr;
+    for (const Vantage &v : ip.vantages) {
+        vArr.append(QJsonObject{{"lat", v.pt.lat}, {"lon", v.pt.lon},
+                                {"distanceM", std::round(v.distanceM * 10) / 10},
+                                {"bearingToCamera", std::round(v.bearingToCamera)},
+                                {"side", v.side}, {"reason", v.reason}, {"score", std::round(v.score * 10) / 10}});
+    }
+
+    auto routeJson = [](const Route &r) {
+        QJsonArray coords;
+        for (const LatLon &x : r.points) coords.append(QJsonArray{std::round(x.lon * 1e6) / 1e6, std::round(x.lat * 1e6) / 1e6});
+        return QJsonObject{{"route", QJsonObject{{"type", "LineString"}, {"coordinates", coords}}},
+                           {"distanceM", std::round(r.distanceM)}, {"durationS", std::round(r.durationS)},
+                           {"ok", r.ok}, {"error", r.error}};
+    };
+
+    QJsonArray expArr;
+    for (const Exposure &e : ip.exposures) {
+        expArr.append(QJsonObject{{"cameraId", e.cameraId}, {"operator", e.operatorName}, {"model", e.model},
+                                  {"entry", QJsonArray{e.entry.lat, e.entry.lon}},
+                                  {"exit", QJsonArray{e.exit.lat, e.exit.lon}},
+                                  {"meters", std::round(e.meters)}});
+    }
+
+    QJsonArray avoidArr;
+    for (const Area &a : ip.avoidRegions) {
+        avoidArr.append(QJsonObject{{"cameraId", a.cameraId}, {"disc", a.disc},
+                                    {"coordinates", ringJson(a.ring)},
+                                    {"areaM2", std::round(a.areaM2)}});
+    }
+
+    return QJsonObject{{"camera", camObj}, {"vantages", vArr},
+                       {"legs", QJsonObject{{"toVantage", routeJson(ip.toVantage)}, {"away", routeJson(ip.away)}}},
+                       {"exposures", expArr}, {"avoidRegions", avoidArr},
+                       {"safe", ip.safe}, {"limits", limitsText},
+                       {"provider", providerId(ip.provider)}, {"providerName", providerName(ip.provider)},
+                       {"photos", photos}, {"note", ip.note}};
 }
 
 } // namespace AvoidRoute

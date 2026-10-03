@@ -116,13 +116,16 @@ class ObservationRecorder @Inject constructor(
             return 0
         }
 
-        db.fixes().insert(fix)
-        reportPosition(fix, scan.size)
+        val privateMode = prefs.privateInspectionActive.first()
+        if (!privateMode) {
+            db.fixes().insert(fix)
+            reportPosition(fix, scan.size)
+        }
         FlockDetectorKotlin.ensureLoaded(appContext)
         for (s in scan) {
             val det = FlockDetectorKotlin.evaluateWifi(s.bssid, s.ssid)   // docs/DETECTION.md: the shared tiered rules
             if (det.isFlock) {
-                reportFlockSighting(s.bssid, s.ssid, fix.lat, fix.lon, det)
+                if (!privateMode) reportFlockSighting(s.bssid, s.ssid, fix.lat, fix.lon, det)
                 alertManager.triggerAlert(org.sworrl.beaconfix.detector.DetectionType.ALPR_FLOCK)
                 alertManager.updateLastDetectedCamera(det.model.ifEmpty { det.label }, 150, "Approaching")
             }
@@ -133,11 +136,13 @@ class ObservationRecorder @Inject constructor(
         val obsSource = if (filtered?.isStationaryClamped == true) "phone-stationary" else "phone-gps"
         val rows = scan.map { s -> val r = ranges[s.bssid]
             ObservationEntity(bssid = s.bssid, time = now, lat = fix.lat, lon = fix.lon, acc = fix.acc, dbm = s.dbm, freq = s.freq, source = obsSource, rangeM = r?.rangeM, rangeSd = r?.rangeSd) }
-        val ids = db.observations().insertAll(rows)
+        val ids = if (!privateMode) db.observations().insertAll(rows) else emptyList()
         val n = ids.count { it > 0 }
-        status.update { it.copy(recordedTotal = it.recordedTotal + n, lastFixAt = now, lastFixAcc = fix.acc, lastFixSource = "gps ±${fix.acc.toInt()} m") }
+        status.update { it.copy(recordedTotal = it.recordedTotal + n, lastFixAt = now, lastFixAcc = fix.acc, lastFixSource = if (privateMode) "private inspection (suppressed)" else "gps ±${fix.acc.toInt()} m") }
         // incremental re-fit of the APs we just heard (cheap: a few dozen small least-squares problems)
-        estimates.refit(scan.map { it.bssid }.filter { it != connected })
+        if (!privateMode) {
+            estimates.refit(scan.map { it.bssid }.filter { it != connected })
+        }
         return n
     }
 

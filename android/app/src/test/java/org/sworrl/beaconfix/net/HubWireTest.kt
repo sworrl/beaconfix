@@ -100,11 +100,11 @@ class HubWireTest {
     }
 
     @Test fun retrofitRoutesAndDtosAreReusedUnchanged() = runBlocking {
-        hub.answer = { _, t -> 200 to if (t.endsWith("/devices/positions")) """{"devices":[{"device":"steamdeck","kind":"laptop","lat":39.7,"lon":-80.1,"acc":12.0,"ageS":40}],"count":1}""" else "{\"ok\":true}" }
+        hub.answer = { _, t -> 200 to if (t.endsWith("/devices/positions")) """{"devices":[{"device":"steamdeck","kind":"laptop","lat":37.77,"lon":-122.42,"acc":12.0,"ageS":40}],"count":1}""" else "{\"ok\":true}" }
         val api = Retrofit.Builder().baseUrl("https://hub.test/").client(client()).addConverterFactory(ApiFactory.json.asConverterFactory(json)).build().create(BeaconFixApi::class.java)
         val pos = api.devicesPositions(HubClient.AUTH)
         assertEquals("steamdeck", pos.body()!!.devices.single().device)
-        assertTrue(api.devicePosition(HubClient.AUTH, DevicePositionBody(39.7, -80.0, 5.0, "2026-10-01T19:40:00", 3, "wifi")).isSuccessful)
+        assertTrue(api.devicePosition(HubClient.AUTH, DevicePositionBody(37.77, -122.42, 5.0, "2026-10-01T19:40:00", 3, "wifi")).isSuccessful)
         val sent = Json.parseToJsonElement(hub.lastPlain).jsonObject
         assertEquals("wifi", sent["source"]!!.jsonPrimitive.content); assertEquals("POST", hub.lastMethod)
         assertEquals(listOf(1L, 2L), hub.counters)
@@ -237,7 +237,7 @@ class HubWireTest {
     }
 
     @Test fun changeRowsBecomeApRows() {
-        val row = Json.parseToJsonElement("""{"bssid":"aa:bb:cc:dd:ee:ff","ssid":"RV","freq":5180,"lat":39.7,"lon":-80.1,"acc":12.5,"source":"observed","home":true,"travelling":true,"security":"wpa2","seq":7,"fit":{"n":40,"grade":"B","r95":30.0,"lat":39.7,"lon":-80.1}}""").jsonObject
+        val row = Json.parseToJsonElement("""{"bssid":"aa:bb:cc:dd:ee:ff","ssid":"RV","freq":5180,"lat":37.77,"lon":-122.42,"acc":12.5,"source":"observed","home":true,"travelling":true,"security":"wpa2","seq":7,"fit":{"n":40,"grade":"B","r95":30.0,"lat":37.77,"lon":-122.42}}""").jsonObject
         val a = HubSync.apOfChange(row)!!
         assertEquals("AA:BB:CC:DD:EE:FF", a.bssid); assertEquals(12.5, a.r!!, 0.0); assertEquals("observed", a.kind); assertEquals("travelling", a.status)
         assertTrue(a.home); assertEquals("B", a.fit!!.grade)

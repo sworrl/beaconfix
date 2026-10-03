@@ -231,6 +231,11 @@ MainWindow::MainWindow(Locator *loc, TileSource *tiles, QWidget *parent) : QMain
         m_map->focusOn(lat, lon, 18);
         show(); raise(); activateWindow();
     });
+    connect(m_sightings, &SightingsView::inspectCamera, this, [this](const QString &cameraId) {
+        m_tabs->setCurrentWidget(m_map);
+        m_map->inspectCamera(cameraId);
+        show(); raise(); activateWindow();
+    });
 
     tabs->addTab(buildSettings(), QIcon::fromTheme(QStringLiteral("configure")), QStringLiteral("Settings"));
     if (m_loc->apiServer()) tabs->addTab(buildDevices(), QIcon::fromTheme(QStringLiteral("network-connect")), QStringLiteral("Devices"));

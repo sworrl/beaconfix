@@ -49,6 +49,7 @@ add_executable(beaconfix
     src/imagestore.cpp
     src/platewatch.cpp
     src/sightingsview.cpp
+    src/inspectdialog.cpp
     src/roadsnap.cpp
     src/cameratrust.cpp
     src/eyesonflock.cpp
@@ -167,7 +168,7 @@ if(BEACONFIX_TESTS)
     add_executable(camerainfo_test tests/camerainfo_test.cpp src/cameratrust.cpp src/eyesonflock.cpp src/hibf.cpp src/plateevents.cpp)
     target_link_libraries(camerainfo_test PRIVATE Qt6::Core)
     add_test(NAME camerainfo COMMAND camerainfo_test)
-    add_executable(avoidroute_test tests/avoidroute_test.cpp src/avoidroute.cpp src/routeplanner.cpp src/plateevents.cpp)
+    add_executable(avoidroute_test tests/avoidroute_test.cpp src/avoidroute.cpp src/routeplanner.cpp src/plateevents.cpp src/roadsnap.cpp)
     target_link_libraries(avoidroute_test PRIVATE Qt6::Core Qt6::Network)
     add_test(NAME avoidroute COMMAND avoidroute_test)
     add_executable(imagestore_test tests/imagestore_test.cpp src/imagestore.cpp)

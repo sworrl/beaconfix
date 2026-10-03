@@ -94,6 +94,8 @@ interface BeaconFixApi {
     @POST("api/v1/plate-events/{uid}/media") suspend fun pushPlateMedia(@Header("Authorization") auth: String, @Path("uid") uid: String, @Body body: PlateMediaUpload): Response<PlateMediaUploaded>
     @Streaming @GET("api/v1/plate-events/media/{uid}") suspend fun plateMedia(@Header("Authorization") auth: String, @Path("uid") uid: String, @Query("as") asWhat: String = "display"): Response<ResponseBody>
     @GET("api/v1/plate-events/status") suspend fun plateEventsStatus(@Header("Authorization") auth: String): Response<PlateEventsStatus>
+    // routing & blind-spot inspection unseen (docs/SIGHTINGS.md §8, §9)
+    @POST("api/v1/route/inspect") suspend fun routeInspect(@Header("Authorization") auth: String, @Body body: JsonObject): Response<JsonObject>
     @POST("api/v1/db/import") suspend fun dbImport(@Header("Authorization") auth: String, @Query("name") name: String, @Body body: RequestBody): Response<JsonObject>
 }
 

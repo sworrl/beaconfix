@@ -36,6 +36,13 @@ public:
     // done(200, {provider, route, distanceM, durationS, avoided, passes, attribution}) or (412 no key | 400 | 502, {error, …})
     void route(AvoidRoute::LatLon from, AvoidRoute::LatLon to, const QString &provider, Done done);
 
+    // §9: Inspect unseen. from → vantage, vantage → to (default: to = from).
+    // Computes avoid regions, finds vantages, routes both legs, verifies 5 m exposure.
+    // If no routing key is configured, still returns vantages and avoid regions (200), noting that routing requires a key.
+    void inspect(const AvoidRoute::Cam &target, AvoidRoute::LatLon from, std::optional<AvoidRoute::LatLon> to,
+                 const QString &profile, double minM, double maxM, const QString &provider,
+                 const QList<RoadSnap::Way> &ways, const QJsonArray &photos, Done done);
+
 private:
     QString keyFor(AvoidRoute::Provider p) const { return m_keys ? m_keys(p) : storedKey(p); }
     void send(const QUrl &url, const QList<QPair<QByteArray, QByteArray>> &headers, const QByteArray &body, Reply reply);

@@ -60,6 +60,13 @@ class Prefs @Inject constructor(@ApplicationContext private val ctx: Context) {
         val registeredPlates = stringPreferencesKey("registered_plates")
         val hibfSources = stringPreferencesKey("hibf_sources")
         val webcamStills = booleanPreferencesKey("webcam_stills")
+        // inspection unseen (§9.5)
+        val privateInspectionActive = booleanPreferencesKey("private_inspection_active")
+        val activeInspectionTarget = stringPreferencesKey("active_inspection_target")
+        val activeInspectionVantageReached = booleanPreferencesKey("active_inspection_vantage_reached")
+        val routingOrsKey = stringPreferencesKey("routing_ors_key")
+        val routingGraphhopperKey = stringPreferencesKey("routing_graphhopper_key")
+        val routingProvider = stringPreferencesKey("routing_provider")
     }
     val collectorOn: Flow<Boolean> = ctx.store.data.map { it[K.collectorOn] ?: false }
     val collectIntervalSec: Flow<Int> = ctx.store.data.map { it[K.collectInterval] ?: 60 }
@@ -150,6 +157,30 @@ class Prefs @Inject constructor(@ApplicationContext private val ctx: Context) {
     /** Keep a public webcam's still with a live pass (docs/SIGHTINGS.md §2.0). Off by default: providers such as WV511 forbid storing their images; on, stills stay on this phone. */
     val webcamStills: Flow<Boolean> = ctx.store.data.map { it[K.webcamStills] ?: false }
     suspend fun setWebcamStills(v: Boolean) = ctx.store.edit { it[K.webcamStills] = v }
+
+    /** Private inspection mode (docs/SIGHTINGS.md §9.5): no fixes, observations or passes recorded; dashcam paused; no sync. */
+    val privateInspectionActive: Flow<Boolean> = ctx.store.data.map { it[K.privateInspectionActive] ?: false }
+    suspend fun setPrivateInspectionActive(v: Boolean) = ctx.store.edit { it[K.privateInspectionActive] = v }
+
+    /** JSON serialization of active inspection plan/target for tracking and live guard alerts. */
+    val activeInspectionTarget: Flow<String> = ctx.store.data.map { it[K.activeInspectionTarget] ?: "" }
+    suspend fun setActiveInspectionTarget(json: String) = ctx.store.edit { it[K.activeInspectionTarget] = json }
+
+    /** Whether the user reached the vantage point during current private inspection. */
+    val activeInspectionVantageReached: Flow<Boolean> = ctx.store.data.map { it[K.activeInspectionVantageReached] ?: false }
+    suspend fun setActiveInspectionVantageReached(v: Boolean) = ctx.store.edit { it[K.activeInspectionVantageReached] = v }
+
+    /** User's OpenRouteService API key for avoiding ALPRs. */
+    val routingOrsKey: Flow<String> = ctx.store.data.map { it[K.routingOrsKey] ?: "" }
+    suspend fun setRoutingOrsKey(k: String) = ctx.store.edit { it[K.routingOrsKey] = k }
+
+    /** User's GraphHopper API key for avoiding ALPRs. */
+    val routingGraphhopperKey: Flow<String> = ctx.store.data.map { it[K.routingGraphhopperKey] ?: "" }
+    suspend fun setRoutingGraphhopperKey(k: String) = ctx.store.edit { it[K.routingGraphhopperKey] = k }
+
+    /** Routing provider ("ors" or "graphhopper"). */
+    val routingProvider: Flow<String> = ctx.store.data.map { it[K.routingProvider] ?: "ors" }
+    suspend fun setRoutingProvider(p: String) = ctx.store.edit { it[K.routingProvider] = p }
 
     companion object {
         val UNITS = setOf("auto", "metric", "imperial")

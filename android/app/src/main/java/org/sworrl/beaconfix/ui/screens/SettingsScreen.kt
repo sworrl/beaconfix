@@ -54,6 +54,36 @@ fun SettingsScreen(onPair: () -> Unit, onIdentity: () -> Unit = {}, onWidgets: (
             // edited here = the phone's list is newer than the desktop's: the next sync pushes it (needs control access)
             OutlinedButton(onClick = { vm.setHome(home); placesVm.markHomeDirty() }) { Text("Save") }
         }
+        InfoCard("Avoid ALPRs routing") {
+            Text("Routes around camera detection zones using OpenRouteService or GraphHopper avoid polygons. API keys are free and kept only on this phone.", color = Slate, style = MaterialTheme.typography.bodySmall)
+            var orsKey by remember(ui.routingOrsKey) { mutableStateOf(ui.routingOrsKey) }
+            var ghKey by remember(ui.routingGraphhopperKey) { mutableStateOf(ui.routingGraphhopperKey) }
+            OutlinedTextField(
+                value = orsKey,
+                onValueChange = { orsKey = it; vm.setRoutingOrsKey(it) },
+                label = { Text("OpenRouteService API Key") },
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true
+            )
+            OutlinedTextField(
+                value = ghKey,
+                onValueChange = { ghKey = it; vm.setRoutingGraphhopperKey(it) },
+                label = { Text("GraphHopper API Key") },
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true
+            )
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                Text("Preferred provider: ${if (ui.routingProvider == "graphhopper") "GraphHopper" else "OpenRouteService"}", style = MaterialTheme.typography.bodyMedium)
+                OutlinedButton(
+                    onClick = { vm.setRoutingProvider("ors") },
+                    enabled = ui.routingProvider != "ors"
+                ) { Text("ORS") }
+                OutlinedButton(
+                    onClick = { vm.setRoutingProvider("graphhopper") },
+                    enabled = ui.routingProvider != "graphhopper"
+                ) { Text("GraphHopper") }
+            }
+        }
         InfoCard("Status in the shade") {
             val on by vm.statusNotification.collectAsState()
             Text("BeaconFix keeps one silent, permanent card in the shade while it runs: your fix, beacons in range, sync state and the range to your desktop, with Help / Scan / Pause buttons. The lock screen only shows “BeaconFix · running”. Swiping it away only puts it back.", color = Slate, style = MaterialTheme.typography.bodySmall)

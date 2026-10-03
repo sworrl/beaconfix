@@ -21,6 +21,7 @@ public:
 
 signals:
     void showOnMap(double lat, double lon);
+    void inspectCamera(const QString &cameraId);
 
 private:
     Locator *m_loc;
@@ -38,4 +39,5 @@ public:
 
 signals:
     void showOnMap(double lat, double lon);
+    void inspectCamera(const QString &cameraId);
 };

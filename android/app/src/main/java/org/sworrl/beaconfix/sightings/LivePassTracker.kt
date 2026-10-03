@@ -101,6 +101,7 @@ class LivePassTracker @Inject constructor(
     private val repo: PlateEventRepository,
     private val frames: DashFrameBuffer,
     private val prefs: Prefs,
+    private val inspectionManager: InspectionManager,
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val lock = Mutex()
@@ -123,6 +124,10 @@ class LivePassTracker @Inject constructor(
     }
 
     private suspend fun handle(fix: RouteFix) {
+        if (prefs.privateInspectionActive.first()) {
+            inspectionManager.onLocation(fix.lat, fix.lon)
+            return
+        }
         val p0 = prev
         if (p0 != null && fix.timeMs <= p0.timeMs) return
         prev = fix
