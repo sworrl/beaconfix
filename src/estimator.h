@@ -2,25 +2,29 @@
 // Position estimation from signal-strength samples, with a graded confidence (docs/GRADING.md).
 //
 // Model (per cluster k of samples taken within a few metres of each other):
-//   y_k = P0 + g_dev − 10·n·log10(d_k) + ε_k,   d_k = √(|p − q_k|² + h²)
+//   y_k = P0 + g_dev + δ_dev − 10·n·log10(d_k) + ε_k,   d_k = √(|p − q_k|² + h²)
 //   P0  level at 1 m (Gaussian prior per band), n the path-loss exponent (Gaussian prior),
-//   g_dev the hearing device's offset (calibrated across APs, this host = 0), h the AP height,
+//   g_dev the hearing device's offset (calibrated across APs, this host = 0), δ_dev its deviation for THIS AP
+//   (prior N(0, devOffsetSd²), σ 10 dB; the device with the most places is the reference, δ = 0), h the AP height,
 //   ε  shadowing: σ² = σ0²·(ρ_in + (1 − ρ_in)/m_k) + (∂model/∂p)²·a_k²  (the observer's own
 //      fix error a_k enters as an errors-in-variables term, so near samples with poor fixes
 //      carry little information).
 //
 // Pipeline (estimator.cpp):
-//   1. samples → clusters (radius max(15 m, median fix accuracy)); fixes worse than 100 m only
-//      when nothing better exists ("heard near");
+//   1. samples → places: a sample joins a seed within max(5 m, 1.5 × the better fix accuracy of the two), so a
+//      smoothed walk keeps its geometry and poor indoor fixes still merge; fixes worse than 100 m only when nothing
+//      better exists ("heard near");
 //   2. a grid posterior over the position with (P0, n) integrated out in closed form, plus the
 //      likelihood of NOT hearing the AP where we scanned (misses) and Wi-Fi RTT ranges → global
 //      optimum, number of modes, the 95 % highest-posterior region;
 //   3. Levenberg–Marquardt polish (robust IRLS: a Gaussian + uniform outlier mixture, EM weights, at the
 //      nominal and then a MAD-pooled scale) from the
 //      grid modes and the mirror image across the samples' principal axis;
-//   4. covariance: Laplace × max(1, τ²) × design effect of correlated shadowing (Gudmundson) +
-//      correlated fix error / sessions, floored by the Cramér–Rao bound, the leave-one-cluster-out
-//      jackknife and a cluster bootstrap, then scaled by the anchor calibration κ²;
+//   4. covariance: the noise scale σ² from a scaled-inverse-χ² posterior (prior σ0, ν0 = 6; data dof = the effectively
+//      independent places, not samples), a sandwich Laplace with the Gudmundson-correlated shadowing (d_c 8 m), widened
+//      to the R95 the local posterior shows (RSS ranging is log-normal: the far side is flat), + correlated fix error /
+//      sessions, floored by the leave-one-place-out jackknife and a cluster bootstrap, then scaled by the anchor
+//      calibration κ²;
 //   5. metrics (geometry, evidence, fit, stability, freshness, external agreement) → a 0–100
 //      score and a letter grade (A–F, R = region only, M = mobile) with hysteresis.
 //
@@ -35,7 +39,7 @@
 
 namespace Estimator {
 
-inline constexpr int kVersion = 2;       // stored in kv 'estimator_version': estimates older than this are recomputed
+inline constexpr int kVersion = 4;       // stored in kv 'estimator_version': estimates older than this are recomputed
 
 struct Obs {
     double lat = 0, lon = 0;          // where the observer was
@@ -113,13 +117,17 @@ struct Options {
     double outlierPrior = 0.1;        // robust fit: prior share of gross outliers (Gaussian + uniform mixture)
     double outlierSpanDb = 80;        // … spread uniformly over this many dB
     double heightM = 3.0;             // AP height above the observer
-    double clusterMinM = 15;          // minimum cluster radius
+    double clusterMinM = 5;           // place radius: max(clusterMinM, clusterAccK × the better fix accuracy of the pair)
+    double clusterAccK = 1.5;
     int    maxClusters = 120;
     double ageTauDays = 180;          // sample age weight exp(−age/τ), floored at 0.15
     double maxAcc = 300;              // coarser fixes are ignored
     double geomAcc = 100;             // fixes coarser than this only when nothing better exists
     double rhoIn = 0.6;               // shadowing correlation inside one cluster
-    double shadowCorrM = 30;          // Gudmundson decorrelation distance
+    double shadowCorrM = 8;           // Gudmundson decorrelation distance (measured: docs/GRADING.md §1.5)
+    double sigmaPriorDof = 6;         // ν0 of the scaled-inverse-χ² prior on σ² (centred: E[σ²] = σ0² without data)
+    double postWindow = 4;            // R95 from the posterior over ±this many σ of the major axis (0 = Laplace only)
+    double devOffsetSd = 10;          // σ (dB) of a device's per-AP deviation from its calibrated offset (antenna, body, where it sits: measured up to ~30 dB)
     double rangePriorM = 150;         // position prior exp(−distance to the nearest place / this)
     double missFloor = 0.2;           // P(not heard) even when in range (scan misses)
     double sensitivity = -92;         // detection floor (dBm)
@@ -194,14 +202,15 @@ double probWithin(double s1, double s2, double r);
 double radiusFor(double s1, double s2, double p);
 double normCdf(double z);
 // Distinct places, as the fitter clusters them (for callers that want the count without fitting)
-int vantageCount(const QList<Obs> &obs, double clusterMinM = 15.0);
+int vantageCount(const QList<Obs> &obs, double clusterMinM = 5.0, double clusterAccK = 1.5);
 
 // The AP fitter
 Fit fitAp(const QList<Obs> &samples, qint64 now = 0, const Options &opt = Options(), const Context &ctx = Context());
 // Score and letter from the metrics already in f (with hysteresis against prev)
 void grade(Fit &f, const Fit *prev);
-// Incremental update between refits: a 2-D Kalman step along the radial direction
-Fit update(const Fit &prev, const Obs &o, const Options &opt = Options());
+// Incremental update between refits: a 2-D Kalman step along the radial direction. deviceOffsetDb: how much louder
+// o.device hears than this host (Context::deviceOffset), removed from o.dbm as fitAp does
+Fit update(const Fit &prev, const Obs &o, const Options &opt = Options(), double deviceOffsetDb = 0);
 // Self-location from beacons with known positions (with an integrity check)
 SelfFix selfLocate(const QList<Known> &known, const Options &opt = Options());
 // Letter for a score (no hysteresis)

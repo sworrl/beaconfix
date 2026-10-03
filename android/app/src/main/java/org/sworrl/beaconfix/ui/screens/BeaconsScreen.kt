@@ -52,6 +52,7 @@ import org.sworrl.beaconfix.ui.vm.LiveViewModel
 fun BeaconsScreen(vm: BeaconsViewModel = hiltViewModel(), live: LiveViewModel = hiltViewModel()) {
     val aps by vm.aps.collectAsState(); val q by vm.query.collectAsState()
     val scan by live.status.state.collectAsState()
+    val ranges by vm.ranges.collectAsState()
     var filter by remember { mutableStateOf("all") }   // all | insecure | range | placed
     var open by remember { mutableStateOf<String?>(null) }
     val inRange = scan.scan.associateBy { it.bssid }
@@ -63,6 +64,7 @@ fun BeaconsScreen(vm: BeaconsViewModel = hiltViewModel(), live: LiveViewModel = 
         Column(Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
             Text("Beacons", style = MaterialTheme.typography.headlineSmall)
             Text("${aps.size} known · ${inRange.size} in range · $crit insecure · $weak weak · $strong WPA3", color = Slate, style = MaterialTheme.typography.bodySmall)
+            if (scan.rttHeard > 0) Text(rttLine(scan.rttHeard, scan.rttHeardAz, scan.rttAnswered, scan.rttState), color = Slate, style = MaterialTheme.typography.bodySmall)
             OutlinedTextField(q, { vm.query.value = it }, Modifier.fillMaxWidth(), label = { Text("Search name or BSSID") }, singleLine = true)
             Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 for ((k, l) in listOf("all" to "All", "insecure" to "Insecure", "range" to "In range", "placed" to "Placed")) FilterChip(selected = filter == k, onClick = { filter = k }, label = { Text(l) })
@@ -70,13 +72,13 @@ fun BeaconsScreen(vm: BeaconsViewModel = hiltViewModel(), live: LiveViewModel = 
         }
         if (aps.isEmpty()) EmptyState("📶", "No beacons yet", "Turn the collector on (Home) or sync with a desktop; every network you hear lands here with its security grade.")
         LazyColumn(Modifier.fillMaxSize(), contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 12.dp, vertical = 4.dp)) {
-            items(graded, key = { it.first.bssid }) { (a, g) -> BeaconRow(a, g, inRange[a.bssid]?.dbm, open == a.bssid) { open = if (open == a.bssid) null else a.bssid } }
+            items(graded, key = { it.first.bssid }) { (a, g) -> BeaconRow(a, g, inRange[a.bssid]?.dbm, open == a.bssid, ranges[a.bssid]) { open = if (open == a.bssid) null else a.bssid } }
         }
     }
 }
 
 @Composable
-private fun BeaconRow(a: ApEntity, grade: String, dbm: Int?, expanded: Boolean, onToggle: () -> Unit) {
+private fun BeaconRow(a: ApEntity, grade: String, dbm: Int?, expanded: Boolean, rtt: org.sworrl.beaconfix.ranging.ApRange?, onToggle: () -> Unit) {
     Card(Modifier.fillMaxWidth().padding(vertical = 3.dp).clickable { onToggle() }) {
         Column(Modifier.padding(12.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -94,6 +96,8 @@ private fun BeaconRow(a: ApEntity, grade: String, dbm: Int?, expanded: Boolean, 
             }
             val where = when { a.lat == null -> "no position yet — needs samples from two places"; a.posSource == "observed" -> "placed by your samples · ±${(a.acc ?: 0.0).toInt()} m" + (a.residual?.let { " · fit ${it.toInt()} m" } ?: ""); a.posSource == "placed" -> "mapped position (Apple / WiGLE) · ±${(a.acc ?: 0.0).toInt()} m"; else -> "position from the desktop · ±${(a.acc ?: 0.0).toInt()} m" }
             Text(where, color = Slate, style = MaterialTheme.typography.bodySmall)
+            // the AP answered Wi-Fi RTT (802.11mc / az): the newest measured range (offset-corrected), from where it was taken
+            if (rtt != null) Text(rtt.text + (if (rtt.az) " (802.11az)" else "") + " · ${ago(rtt.time)}", color = org.sworrl.beaconfix.ui.theme.Cyan, style = MaterialTheme.typography.bodySmall)
             AnimatedVisibility(expanded) {
                 Column(Modifier.padding(top = 6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                     for (i in SecurityText.forSecurity(a.security)) {

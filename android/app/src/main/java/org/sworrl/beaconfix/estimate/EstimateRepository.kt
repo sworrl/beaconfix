@@ -1,5 +1,9 @@
 package org.sworrl.beaconfix.estimate
 
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import org.sworrl.beaconfix.data.Prefs
 import org.sworrl.beaconfix.data.db.ApEntity
 import org.sworrl.beaconfix.data.db.AppDatabase
 import org.sworrl.beaconfix.data.db.EstimateHistoryEntity
@@ -13,9 +17,36 @@ data class PhoneFix(val lat: Double, val lon: Double, val acc: Double, val used:
 
 /** Keeps every AP's graded estimate current as observations accumulate, and locates the phone from known APs. */
 @Singleton
-class EstimateRepository @Inject constructor(private val db: AppDatabase, private val bus: RefitBus, private val anchors: org.sworrl.beaconfix.anchors.AnchorRepository) {
+class EstimateRepository @Inject constructor(private val db: AppDatabase, private val bus: RefitBus, private val anchors: org.sworrl.beaconfix.anchors.AnchorRepository,
+                                             private val prefs: Prefs) {
     /** When each BSSID was last refit (ms): the collector path refits an AP at most once per [MIN_REFIT_INTERVAL_MS]. */
     private val lastRefit = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    /** Where this phone scanned (the misses), read incrementally from its own observation rows; guarded by [scanLock]. */
+    private val scanCells = ScanCells()
+    private var scanRowId = 0L
+    private var scanLastTime = Long.MIN_VALUE
+    private val scanLock = Mutex()
+
+    /** Bring [scanCells] up to the newest own row: one scan per instant (the collector stamps a scan's rows alike). */
+    private suspend fun refreshScanCells() {
+        val top = db.observations().maxId() ?: 0L
+        if (top < scanRowId) { scanCells.clear(); scanRowId = 0L; scanLastTime = Long.MIN_VALUE }   // rows were deleted: start over
+        while (true) {
+            val rows = db.observations().ownScanRows(scanRowId, 5000)
+            if (rows.isEmpty()) break
+            for (r in rows) {
+                if (r.time != scanLastTime) { scanCells.note(r.lat, r.lon, r.acc, if (r.time > 0) r.time / 1000 else 0); scanLastTime = r.time }
+                scanRowId = r.id
+            }
+            if (rows.size < 5000) break
+        }
+    }
+
+    /** The desktop's missesFor on this phone's scans: [obs] as the fitter gets them (the desktop drops fixes outside (0, 300] m first). */
+    private suspend fun missesFor(obs: List<Obs>): List<Miss> = runCatching {
+        scanLock.withLock { refreshScanCells(); scanCells.missesFor(obs.filter { it.acc > 0 && it.acc <= 300 }) }
+    }.getOrDefault(emptyList())
 
     /**
      * Re-fit the given BSSIDs from all their observations (ours and the desktop's). [announce] = emit refit animations.
@@ -26,6 +57,7 @@ class EstimateRepository @Inject constructor(private val db: AppDatabase, privat
         var updated = 0
         val pinned = anchors.pinned()
         val nowMs = System.currentTimeMillis()
+        val cal = EstimatorCalibration.decode(runCatching { prefs.estimatorCalibration.first() }.getOrDefault(""))
         for (b in bssids.toSet()) {
             if (!force) { val last = lastRefit[b]; if (last != null && nowMs - last < MIN_REFIT_INTERVAL_MS) continue }
             lastRefit[b] = nowMs
@@ -33,7 +65,9 @@ class EstimateRepository @Inject constructor(private val db: AppDatabase, privat
             if (ap.home || ap.ignored || ap.posSource == "anchor" || b.uppercase() in pinned) continue
             val obs = db.observations().forAp(b)
             if (obs.isEmpty() && !ap.travelling) continue
-            val fit = runCatching { Estimator.fitAp(obs.map { obsOf(it) }, nowMs / 1000, optionsFor(ap), contextFor(ap)) }.getOrNull() ?: continue
+            val samples = obs.map { obsOf(it) }
+            val ctx = contextFor(ap, cal).also { it.misses = missesFor(samples) }
+            val fit = runCatching { Estimator.fitAp(samples, nowMs / 1000, optionsFor(ap, cal), ctx) }.getOrNull() ?: continue
             if (store(ap, fit, nowMs, obs, announce)) updated++
         }
         return updated
@@ -108,20 +142,23 @@ class EstimateRepository @Inject constructor(private val db: AppDatabase, privat
     companion object {
         const val MIN_REFIT_INTERVAL_MS = 120_000L
 
-        /** Seconds since the epoch; the desktop's rows are "desktop" so its sessions and devices count separately. */
-        fun obsOf(o: ObservationEntity): Obs = Obs(lat = o.lat, lon = o.lon, acc = o.acc, dbm = o.dbm, t = if (o.time > 0) o.time / 1000 else 0, device = if (o.remote) "desktop" else "")
+        /** Seconds since the epoch; the desktop's rows are "desktop" so its sessions and devices count separately. A Wi-Fi RTT range (v6) becomes Obs.rangeM / rangeSd. */
+        fun obsOf(o: ObservationEntity): Obs = Obs(lat = o.lat, lon = o.lon, acc = o.acc, dbm = o.dbm, t = if (o.time > 0) o.time / 1000 else 0, device = if (o.remote) EstimatorCalibration.DESKTOP else "",
+            rangeM = o.rangeM?.takeIf { it > 0 && it.isFinite() } ?: -1.0, rangeSd = o.rangeSd?.takeIf { it.isFinite() && it >= 0 } ?: 0.0)
 
-        /** Band priors of P0 (dBm at 1 m) and the path-loss exponent. */
-        fun optionsFor(freq: Int, band: String): Options = when {
-            freq >= 5925 || (freq <= 0 && band == "6") -> Options(p0Mean = -48.0, defaultN = 2.7)
-            freq >= 4900 || (freq <= 0 && band == "5") -> Options(p0Mean = -47.0, defaultN = 2.7)
-            else -> Options(p0Mean = -40.0, defaultN = 2.4)
-        }
-        fun optionsFor(ap: ApEntity): Options = optionsFor(ap.freq, ap.band)
+        /**
+         * The desktop's options for an AP on [freq] MHz (Locator::estimatorOptions): band priors of P0 (dBm at 1 m) and the
+         * path-loss exponent (unknown band: wide), the environment's n per band and the anchors' κ from [cal].
+         */
+        fun optionsFor(freq: Int, cal: EstimatorCalibration? = null): Options = EstimatorCalibration.optionsFor(freq, cal)
+        fun optionsFor(ap: ApEntity, cal: EstimatorCalibration? = null): Options = optionsFor(ap.freq, cal)
 
-        /** The previous fit (drift, hysteresis), the "travels with you" flag, and a position somebody else placed. */
-        fun contextFor(ap: ApEntity): Context {
-            val ctx = Context(mobile = ap.travelling)
+        /**
+         * The previous fit (drift, hysteresis), the "travels with you" flag, a position somebody else placed, and the
+         * devices' calibrated offsets in this phone's frame ([cal]). The misses are added by [refit].
+         */
+        fun contextFor(ap: ApEntity, cal: EstimatorCalibration? = null): Context {
+            val ctx = Context(mobile = ap.travelling, deviceOffset = cal?.deviceOffsets() ?: emptyMap())
             prevFit(ap)?.let { ctx.hasPrev = true; ctx.prev = it }
             if (ap.lat != null && ap.lon != null && ap.posSource in EXTERNAL_SOURCES)
                 ctx.external = External(has = true, lat = ap.lat, lon = ap.lon, acc = ap.acc ?: 50.0, source = ap.posSource)

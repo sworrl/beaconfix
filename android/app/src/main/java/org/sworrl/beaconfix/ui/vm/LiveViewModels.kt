@@ -12,6 +12,8 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -42,7 +44,7 @@ import javax.inject.Inject
 data class PhoneFix(val fix: FixEntity? = null, val place: String = "", val countryCode: String = "", val sun: org.sworrl.beaconfix.ui.SunCalc.Times? = null, val timezone: String = java.util.TimeZone.getDefault().id)
 
 @HiltViewModel
-class LiveViewModel @Inject constructor(private val live: DesktopLive, db: AppDatabase, val status: CollectorStatus, private val prefs: Prefs, @ApplicationContext private val ctx: Context, val refits: org.sworrl.beaconfix.estimate.RefitBus, val ranging: org.sworrl.beaconfix.ranging.RangingRepository) : ViewModel() {
+class LiveViewModel @Inject constructor(private val live: DesktopLive, db: AppDatabase, val status: CollectorStatus, private val prefs: Prefs, @ApplicationContext private val ctx: Context, val refits: org.sworrl.beaconfix.estimate.RefitBus, val ranging: org.sworrl.beaconfix.ranging.RangingRepository, val snapper: org.sworrl.beaconfix.route.RoadSnapper) : ViewModel() {
     val ranges: StateFlow<Map<String, org.sworrl.beaconfix.ranging.RangeSession>> = ranging.sessions
     /** local refits also appear in the ticker, as the desktop's do */
     val localRefits: StateFlow<List<org.sworrl.beaconfix.estimate.RefitEvent>> = refits.events.let { f -> MutableStateFlow<List<org.sworrl.beaconfix.estimate.RefitEvent>>(emptyList()).also { st -> viewModelScope.launch { f.collect { e -> st.value = (st.value + e).takeLast(30) } } } }
@@ -53,8 +55,15 @@ class LiveViewModel @Inject constructor(private val live: DesktopLive, db: AppDa
     val phone: StateFlow<PhoneFix> = phoneEnriched
     val aps: StateFlow<List<ApEntity>> = db.aps().all().stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
     val positioned: StateFlow<List<ApEntity>> = db.aps().positioned().stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+    /**
+     * [positioned] as the map draws it: without the counters every scan bumps (first/last seen, times seen), so a scan
+     * that only re-hears known beacons is an equal list and the map keeps its beacon layer instead of rebuilding it.
+     */
+    val mapAps: StateFlow<List<ApEntity>> = db.aps().positioned().map { l -> l.map { it.copy(firstSeen = 0, lastSeen = 0, timesSeen = 0) } }
+        .flowOn(Dispatchers.Default).stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
     val phoneTrack: StateFlow<List<FixEntity>> = db.fixes().since(System.currentTimeMillis() - 24 * 3600_000L).stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
     val desktopTrack: StateFlow<List<FixEntity>> = db.fixes().desktopTrack().stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+    val flockCameras: StateFlow<List<org.sworrl.beaconfix.data.api.FlockCameraDto>> = views.map { vs -> vs.flatMap { it.flockCameras }.distinctBy { it.id } }.flowOn(Dispatchers.Default).stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
     val collectorOn: StateFlow<Boolean> = prefs.collectorOn.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), false)
     val refreshing = MutableStateFlow(false)
 
@@ -63,15 +72,39 @@ class LiveViewModel @Inject constructor(private val live: DesktopLive, db: AppDa
         refresh()
     }
     fun refresh(what: Set<String> = setOf("location", "trip", "pois", "events", "emergency")) = viewModelScope.launch { refreshing.value = true; try { live.refreshAll(what) } finally { refreshing.value = false } }
+    /** Where the cameras now shown were last fetched for (null until a desktop answers): the map asks again only once it moves away. */
+    val camerasFrom = MutableStateFlow<Pair<Double, Double>?>(null)
+    private var camJob: kotlinx.coroutines.Job? = null; private var camAt: Pair<Double, Double>? = null
+    /**
+     * Surveillance cameras within [DesktopLive.FLOCK_KM] of ([lat], [lon]) from the paired desktops (the map, for the area
+     * it shows). One request at a time: a request still running for a spot within [nearM] is kept, any other is cancelled
+     * for this one; [camerasFrom] moves only on an answer, so a failed fetch is tried again on the next pan.
+     */
+    fun refreshCameras(lat: Double, lon: Double, nearM: Double) {
+        val at = camAt
+        if (camJob?.isActive == true && at != null && org.sworrl.beaconfix.estimate.Geo.distanceM(at.first, at.second, lat, lon) < nearM) return
+        camJob?.cancel(); camAt = lat to lon
+        camJob = viewModelScope.launch { if (live.refreshAll(setOf("flock"), lat to lon)) camerasFrom.value = lat to lon }
+    }
     fun stream(on: Boolean) { if (on) live.startStream() else live.stopStream() }
     fun toggleCollector(on: Boolean) = viewModelScope.launch { prefs.setCollectorOn(on); CollectorService.ensure(ctx, prefs) }
+    fun syncNationwideUs() = viewModelScope.launch { live.syncNationwideUs() }
+
+    /** The last place name the Geocoder gave: (lat, lon, place, country code). */
+    private var lastGeo: Pair<Pair<Double, Double>, Pair<String, String>>? = null
 
     private suspend fun enrich(f: FixEntity?): PhoneFix {
         if (f == null) return PhoneFix()
-        val geo = withContext(Dispatchers.IO) { runCatching { @Suppress("DEPRECATION") Geocoder(ctx).getFromLocation(f.lat, f.lon, 1)?.firstOrNull() }.getOrNull() }
-        val place = geo?.let { listOfNotNull(it.locality ?: it.subAdminArea, it.adminArea).filter { s -> s.isNotBlank() }.joinToString(", ") } ?: f.place
-        return PhoneFix(f, place, geo?.countryCode ?: "", org.sworrl.beaconfix.ui.SunCalc.today(f.lat, f.lon))
+        // a town-level name: ask the Geocoder (a network lookup) only after moving GEO_MOVED_M, not on every fix
+        val near = lastGeo?.takeIf { (at, _) -> org.sworrl.beaconfix.estimate.Geo.distanceM(at.first, at.second, f.lat, f.lon) < GEO_MOVED_M }
+        val named = near?.second ?: withContext(Dispatchers.IO) { runCatching { @Suppress("DEPRECATION") Geocoder(ctx).getFromLocation(f.lat, f.lon, 1)?.firstOrNull() }.getOrNull() }
+            ?.let { geo -> listOfNotNull(geo.locality ?: geo.subAdminArea, geo.adminArea).filter { s -> s.isNotBlank() }.joinToString(", ") to (geo.countryCode ?: "") }
+            ?.also { lastGeo = (f.lat to f.lon) to it }
+        val place = named?.first ?: f.place
+        return PhoneFix(f, place, named?.second ?: "", org.sworrl.beaconfix.ui.SunCalc.today(f.lat, f.lon))
     }
+
+    private companion object { const val GEO_MOVED_M = 500.0 }
 }
 
 /** The other BeaconFix installs on this network and the two adjacency actions: "that's me" (import) and "link my identity with it". */

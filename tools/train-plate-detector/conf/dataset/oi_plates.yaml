@@ -1,0 +1,10 @@
+# Open Images V7 "Vehicle registration plate", as written by fetch_data.py (COCO JSON under annotations/).
+# Images CC BY 2.0 (per-image list in ATTRIBUTION.csv), annotations CC BY 4.0 (Google LLC).
+path: data/oi-plates
+train: train
+validation: val
+
+class_num: 1
+class_list: ['License_plate']
+
+auto_download: null

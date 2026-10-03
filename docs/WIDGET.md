@@ -71,10 +71,28 @@ devices attached to that SSID.
 | `spotlightMinutes` | 10 | at most one glide to an event per this many minutes (0 never, up to 240; under 10 means every 10) |
 | `showMapTab` / `showNearbyTab` / `showRadarTab` / `showTripTab` | true | which tabs exist |
 | `binary` | beaconfix | the executable to run |
+| `satSource` | 0 | satellite imagery: 0 Esri World Imagery (newest high-res), 1 Esri Clarity, 2 USGS National Map (US), 3 NASA VIIRS (yesterday) |
+| `showContours` | true | contour lines (feet) over the satellite map |
 
 Tiles come from the tray's localhost tile server (`http://127.0.0.1:47821/t/<layer>/<z>/<x>/<y>.png`,
 tiles only) because OpenStreetMap refuses QML's generic User-Agent; without the tray the widget
-falls back to Esri tiles.
+falls back to Esri tiles. Layers are `0`–`3`, `L` (satellite labels), and the other satellite
+sources `C` (Esri Clarity), `U` (USGS, to z16) and `V` (NASA GIBS VIIRS, yesterday's pass, to z9).
+All are free and keyless; each layer shows its own credit line.
+
+Satellite (the default, `mapLayer` 2) is a hybrid for placing beacons in the real world: imagery, then
+contour lines (`K`: drawn by the tray from the AWS Terrain Tiles, USGS 3DEP elevation in the US;
+100 ft zoomed out down to 5 ft from z18, every fifth labelled), Esri roads (`R`) and place labels (`L`).
+The map zooms to z23 (~2 cm a pixel): imagery is scaled past its deepest level, while beacons, error
+ellipses, contours, heat tiles and the scale bar (metric and feet) stay sharp. Beacons closer than a
+zoom-dependent distance share one area marker with a count (one per beacon from z19); clicking it
+zooms in. From z16 the heat map shows each fix as a dot (the vantage points the estimates come from)
+over a hairline path, instead of the route glow.
+
+The route heat map is drawn by the tray as transparent tiles too
+(`/h/<heatGen>/<z>/<x>/<y>.png`; `heatGen` in the state changes when the route does), so the shell
+never strokes thousands of route points itself. While a zoom is in progress the map only scales
+what it last painted (GPU) and repaints once it settles: zooming holds 60 fps.
 
 ## Nearby: help, addresses and phone numbers (3.5)
 

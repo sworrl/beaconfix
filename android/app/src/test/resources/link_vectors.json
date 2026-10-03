@@ -1,0 +1,19 @@
+{
+  "spec": "docs/LINKING.md",
+  "pc_sk": "MzQ1Njc4OTo7PD0-P0BBQkNERUZHSElKS0xNTk9QUVI",
+  "pc_pub": "wV0iZUWUVcn_FW5sHaa_t5ELuK9Q8rL5-FPqkyUlnU0",
+  "phone_sk": "l5iZmpucnZ6foKGio6SlpqeoqaqrrK2ur7CxsrO0tbY",
+  "phone_pub": "FThkYS9cXUf2hNZomaneT3wwtfdKjr1plkIhK84A2Tg",
+  "shared": "hr3-yyrZidGm842mY_BU0_6eo4UJnwA7IY-bZOCDFUg",
+  "sid": "a1b2c3d4e5f60718",
+  "k": "BwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyAhIiMkJSY",
+  "qr": "bflink:eyJ2IjoxLCJzaWQiOiJhMWIyYzNkNGU1ZjYwNzE4IiwibmFtZSI6ImRlc2stcGMiLCJob3N0cyI6WyIxOTIuMC4yLjIwMiIsImRlc2stcGMubG9jYWwiXSwicG9ydCI6NDc4OTcsInB1YiI6IndWMGlaVVdVVmNuX0ZXNXNIYWFfdDVFTHVLOVE4ckw1LUZQcWt5VWxuVTAiLCJrIjoiQndnSkNnc01EUTRQRUJFU0V4UVZGaGNZR1JvYkhCMGVIeUFoSWlNa0pTWSIsImUiOjE3OTA5MDA2MDAsImh1YiI6ImJmczM6ZXhhbXBsZSJ9",
+  "mac": "e273728835fd475ec71ad8305291b2a714be218518bd4558dde83f9069498564",
+  "mac_name": "Pixel 10 Pro XL",
+  "mac_kind": "android",
+  "commit": "699d6d6f6fa3891b16346ae670c94c9fffd5da07bac283a39a3370b9024fb4a6",
+  "code": "740948",
+  "payload": "{\"token\":\"tok_example\",\"scopes\":[\"read\",\"control\"],\"pc\":{\"name\":\"desk-pc\",\"id\":\"\",\"hosts\":[\"192.0.2.202\"],\"port\":47897},\"hub\":\"bfs3:example\"}",
+  "nonce": "ekk7qc00dZQtM2si",
+  "sealed": "ekk7qc00dZQtM2sixk9OWOnOdIMWiDwGfYjZmPkD5SQEkbHT6Jvfmc4oXpmtMQeOikpMwZbr8nnFTBsjYZLxE_cl7Yo4EMB1dVD-YEV1w1OHl6lNi-BMq9ht7StKx5bABfNjNIqSXOTsXmrv4aWcqNKs2lx51Cr7sg7nWETznZv1LTsq0AwXFqIkSm6tQb70BGdUwcsnaiRI2d6corJTKdn_dPpUymIE6A"
+}

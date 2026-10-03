@@ -5,6 +5,8 @@
 #include <QString>
 #include <cstdio>
 #include <random>
+#include <algorithm>
+#include <vector>
 
 using namespace Estimator;
 static int fails = 0;
@@ -62,7 +64,8 @@ int main()
         CHECK(f.r95 >= err(f), "R95 %.1f covers the error %.1f", f.r95, err(f));
         CHECK(f.grade == QLatin1String("A") || f.grade == QLatin1String("B"), "surrounded, many places: grade %s (score %.1f, P %.2f G %.2f E %.2f F %.2f S %.2f T %.2f)", qPrintable(f.grade), f.score, f.cP, f.cG, f.cE, f.cF, f.cS, f.cT);
         CHECK(f.inHull && f.rbar < 0.2 && f.linRatio > 0.5 && f.modes == 1 && !f.ambiguous, "geometry metrics: inHull %d rbar %.2f lin %.2f modes %d", f.inHull, f.rbar, f.linRatio, f.modes);
-        CHECK(f.rssDop > 0 && f.rssDop < 200 && f.crlbR95 > 0 && f.crlbR95 <= f.r95 + 1e-6, "DOP %.1f m, CRLB R95 %.1f ≤ R95 %.1f", f.rssDop, f.crlbR95, f.r95);
+        // 3 dB of noise against σ0 = 6: the noise-scale posterior takes the R95 below what the CRLB allows at σ0
+        CHECK(f.rssDop > 0 && f.rssDop < 200 && f.crlbR95 > 0 && f.r95 < f.crlbR95, "DOP %.1f m, R95 %.1f < CRLB R95 at σ0 %.1f (σ %.1f dB)", f.rssDop, f.r95, f.crlbR95, f.sigmaDb);
         CHECK(f.spearman < -0.5, "distance decay: Spearman %.2f", f.spearman);
         CHECK(f.quality == QLatin1String("good"), "compat quality %s", qPrintable(f.quality));
     }
@@ -169,14 +172,45 @@ int main()
         const Fit f = fitAp(obs, T0);
         CHECK(f.valid && f.moved && err(f) < 25, "moved AP: moved %d, error %.1f m from the new place", f.moved, err(f));
     }
-    // 10. A second device hearing 8 dB louder: its offset, once known, restores the fit
+    // 10. A second device hearing 8 dB louder: its per-AP deviation δ absorbs the offset even before it is calibrated, so
+    //     the uncalibrated fit matches the calibrated one
     {
         QList<Obs> obs;
         for (int i = 0; i < 24; ++i) { const double ang = i * 2 * M_PI / 24, rad = 60 + (i % 3) * 40; obs << at(rad * std::cos(ang), rad * std::sin(ang), 8, 2.5, T0, i % 2 ? QStringLiteral("phone") : QString(), i % 2 ? 8.0 : 0.0); }
         const Fit raw = fitAp(obs, T0);
         Context c; c.deviceOffset.insert(QStringLiteral("phone"), 8.0);
         const Fit fixd = fitAp(obs, T0, Options(), c);
-        CHECK(fixd.valid && fixd.rms < raw.rms && fixd.devices == 2, "device offset: rms %.1f → %.1f dB, error %.1f → %.1f m", raw.rms, fixd.rms, err(raw), err(fixd));
+        CHECK(fixd.valid && raw.valid && std::fabs(raw.rms - fixd.rms) < 0.5 && err(raw) < err(fixd) + 3 && fixd.devices == 2,
+              "device offset absorbed: rms %.1f vs %.1f dB, error %.1f vs %.1f m", raw.rms, fixd.rms, err(raw), err(fixd));
+    }
+    // 10b. A second device that hears THIS AP 7 dB quieter than its calibration says, at a third of the places: δ takes it,
+    //      the position does not move (was: those places dragged the fit — the Steam Deck vs the hidden AP at the desk)
+    {
+        std::vector<double> e0, e1;
+        for (int trial = 0; trial < 20; ++trial) {
+            QList<Obs> one, two;
+            for (int i = 0; i < 24; ++i) {
+                const double ang = i * 2 * M_PI / 24, rad = 40 + (i % 4) * 30;
+                const bool deck = i % 3 == 0;
+                one << at(rad * std::cos(ang), rad * std::sin(ang), 6, 4.0, T0, QStringLiteral("phone"));
+                two << at(rad * std::cos(ang), rad * std::sin(ang), 6, 4.0, T0, deck ? QStringLiteral("deck") : QStringLiteral("phone"), deck ? -7.0 : 0.0);
+            }
+            e0.push_back(err(fitAp(one, T0))); e1.push_back(err(fitAp(two, T0)));
+        }
+        std::sort(e0.begin(), e0.end()); std::sort(e1.begin(), e1.end());
+        CHECK(e1[10] < e0[10] + 4, "a quieter second device does not drag the fit: median error %.1f m (one device %.1f m)", e1[10], e0[10]);
+    }
+    // 10c. Incremental update: a device's calibrated offset is removed from its level, as the batch fit does
+    {
+        Fit base = ring;
+        const Frame fr(base.lat, base.lon);
+        Obs o = at(100, 0, 5, 0.0, T0, QStringLiteral("phone"), 8.0);      // heard 8 dB louder than this host would
+        const Fit raw = update(base, o, Options(), 0.0), cal = update(base, o, Options(), 8.0);
+        Obs h = at(100, 0, 5, 0.0, T0); h.lat = o.lat; h.lon = o.lon; h.dbm = o.dbm - 8;
+        const Fit host = update(base, h, Options(), 0.0);
+        CHECK(std::fabs(distanceM(cal.lat, cal.lon, host.lat, host.lon)) < 1e-6 && distanceM(raw.lat, raw.lon, host.lat, host.lon) > 0.01,
+              "update with the device offset equals the host's update (uncorrected differs by %.2f m)", distanceM(raw.lat, raw.lon, host.lat, host.lon));
+        (void)fr;
     }
     // 11. Wi-Fi RTT ranges tighten a thin fit
     {
@@ -220,6 +254,74 @@ int main()
             ++total; if (err(f) <= f.r95) ++inside;
         }
         CHECK(total >= 20 && inside >= 0.85 * total, "R95 coverage on random geometry: %d / %d", inside, total);
+    }
+    // 14b. Places along one road: the AP and its mirror across the road explain the levels equally; R95 must reach
+    //      whichever is the AP (it was 70 %: half the fits sat on the mirror with R95 around one side only)
+    {
+        int inside = 0, total = 0;
+        std::uniform_real_distribution<double> ux(-150, 150);
+        for (int trial = 0; trial < 60; ++trial) {
+            QList<Obs> obs;
+            for (int i = 0; i < 30; ++i) obs << at(ux(rng), -30, 5, 5.0);
+            const Fit f = fitAp(obs, T0);
+            if (f.kind != QLatin1String("fix")) continue;
+            ++total; if (err(f) <= f.r95) ++inside;
+        }
+        CHECK(total >= 20 && inside >= 0.85 * total, "one road 30 m off: R95 covers %d / %d", inside, total);
+    }
+    // 14c. One absurd reading (+60 dBm) among clean ones must not void a region: at the floor scale (τ 0.5) its robust weight
+    //      underflowed to 0, ln(s²/0) = ∞ made the reweighted posterior NaN, and a region (centred on that posterior) became "none"
+    {
+        QList<Obs> obs;
+        for (int i = 0; i < 4; ++i) {                     // exact levels (no noise, no jitter): τ sits at its 0.5 floor
+            const double x = -30 + i * 20, y = 40, d = std::sqrt(x * x + y * y + 9.0);
+            Obs o; o.lat = AP_LAT + mLat(y); o.lon = AP_LON + mLon(x); o.acc = 6; o.t = T0; o.dbm = int(std::lround(modelDbm(P0, N, d))); obs << o;
+        }
+        Obs wild; wild.lat = AP_LAT + mLat(340); wild.lon = AP_LON; wild.acc = 6; wild.t = T0; wild.dbm = 60; obs << wild;
+        const Fit f = fitAp(obs, T0);
+        CHECK(f.valid && f.kind == QLatin1String("region") && std::isfinite(f.lat) && std::isfinite(f.lon), "a +60 dBm reading: still a %s (valid %d, R95 %.0f m)", qPrintable(f.kind), int(f.valid), f.r95);
+    }
+    // 15. The error bars follow the data: many well-fitting places shrink them, a handful do not (fixes ±2 m, so the
+    //     shared GPS error, which no number of places averages away, stays small)
+    {
+        auto ringAt = [&](int places, double db) {
+            QList<Obs> obs;
+            for (int i = 0; i < places; ++i) { const double ang = i * 2 * M_PI / places, rad = 50 + (i % 3) * 25; for (int r = 0; r < 3; ++r) obs << at(rad * std::cos(ang), rad * std::sin(ang), 2, db); }
+            return fitAp(obs, T0);
+        };
+        const Fit tight = ringAt(36, 1.5), loose = ringAt(36, 6.0), few = ringAt(4, 1.5);
+        CHECK(tight.kind == QLatin1String("fix") && tight.r95 < 0.6 * loose.r95 && err(tight) <= tight.r95, "36 places at 1.5 dB: R95 %.1f vs %.1f at 6 dB (error %.1f)", tight.r95, loose.r95, err(tight));
+        CHECK(few.valid && few.r95 > 0.8 * few.crlbR95, "4 places at 1.5 dB: σ stays near σ0 (R95 %.1f, CRLB R95 at σ0 %.1f)", few.r95, few.crlbR95);
+    }
+    // 16. A walk around a building (smoothed fixes ±5 m): the walk keeps its places, and the AP inside is found to the
+    //     building with an honest R95 — spatially correlated shadowing (8 m), one wall 8 dB lossier, a shared GPS bias
+    {
+        int inside = 0, total = 0; std::vector<double> errs; int places = 0;
+        for (int trial = 0; trial < 40; ++trial) {
+            std::normal_distribution<double> g(0, 1); std::uniform_real_distribution<double> u(0, 1);
+            std::vector<double> wx, wy, ph;                                   // random Fourier features: exp(−d/8 m), σ 5 dB
+            for (int m = 0; m < 300; ++m) { const double c = std::max(1e-6, std::fabs(g(rng))); wx.push_back(g(rng) / (8 * c)); wy.push_back(g(rng) / (8 * c)); ph.push_back(2 * M_PI * u(rng)); }
+            auto field = [&](double x, double y) { double v = 0; for (size_t m = 0; m < wx.size(); ++m) v += std::cos(wx[m] * x + wy[m] * y + ph[m]); return 5.0 * std::sqrt(2.0 / wx.size()) * v; };
+            const double bx = 3 * g(rng), by = 3 * g(rng), hw = 20, hh = 14;    // GPS bias; the walk, 8 m from a 24 × 12 m building
+            const double ax = (u(rng) - 0.5) * 16, ay = (u(rng) - 0.5) * 8;     // the AP somewhere inside
+            QList<Obs> obs;
+            for (double s = 0; s < 4 * (hw + hh); s += 3.6) {
+                double t = s, x, y;
+                if (t < 2 * hw) { x = -hw + t; y = -hh; } else if ((t -= 2 * hw) < 2 * hh) { x = hw; y = -hh + t; } else if ((t -= 2 * hh) < 2 * hw) { x = hw - t; y = hh; } else { t -= 2 * hw; x = -hw; y = hh - t; }
+                const double d = std::sqrt((x - ax) * (x - ax) + (y - ay) * (y - ay) + 9.0);
+                Obs o; o.lat = AP_LAT + mLat(y + by - ay); o.lon = AP_LON + mLon(x + bx - ax); o.acc = 5; o.t = T0 + qint64(s); o.device = QStringLiteral("phone");
+                o.dbm = int(std::lround(modelDbm(P0, N, d) + field(x, y) - (x > hw - 1 ? 8.0 : 0.0) + 4 * g(rng)));
+                obs << o;
+            }
+            const Fit f = fitAp(obs, T0 + 400);
+            places += f.vantage;
+            if (f.kind != QLatin1String("fix")) continue;
+            ++total; if (err(f) <= f.r95) ++inside; errs.push_back(err(f));
+        }
+        std::sort(errs.begin(), errs.end());
+        const double med = errs.empty() ? 1e9 : errs[errs.size() / 2];
+        CHECK(places / 40 >= 11, "a 136 m walk keeps %d places (one radius of 15 m kept ~7)", places / 40);
+        CHECK(total >= 30 && med < 12 && inside >= 0.85 * total, "walk around a building: median error %.1f m, R95 covers %d / %d", med, inside, total);
     }
     std::printf("%s (%d failure%s)\n", fails ? "FAILED" : "ALL PASSED", fails, fails == 1 ? "" : "s");
     return fails ? 1 : 0;

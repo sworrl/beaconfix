@@ -1,0 +1,16 @@
+{
+  "uniqueId": "ankandrew:open-image-models",
+  "artifactVersion": "yolo-v9-t-640-license-plates-end2end",
+  "name": "open-image-models plate detector (ALPR model)",
+  "description": "The dash cam's plate detector, yolo-v9-t-640-license-plates-end2end.onnx. Bundled at build time (or downloaded once), SHA-256 pinned.",
+  "website": "https://github.com/ankandrew/open-image-models",
+  "developers": [
+    {
+      "name": "ankandrew",
+      "organisationUrl": "https://github.com/ankandrew"
+    }
+  ],
+  "licenses": [
+    "mit_ankandrew"
+  ]
+}

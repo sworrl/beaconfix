@@ -20,11 +20,15 @@ import org.sworrl.beaconfix.ui.theme.Slate
 
 data class MoreItem(val route: String, val icon: String, val title: String, val body: String)
 val MORE = listOf(
+    MoreItem("link", "🔗", "Link a PC", "Scan the QR on your PC or tap it on this network — links the PC and enrols with your hub. Nothing to type"),
     MoreItem("help?focus=", "🏥", "Help & nearest ER", "The emergency number, your position for the dispatcher, the nearest children's ER, ER, urgent care, police and fire"),
     MoreItem("trip", "🧭", "Trip", "Distances, stops, places visited, the rank ladder and milestones"),
     MoreItem("events", "📻", "Events", "What the desktop hears, live"),
+    MoreItem("sightings", "📷", "Sightings", "ALPR cameras your routes passed (your plate was likely read) and searches for your plate in released Flock audit logs"),
+    MoreItem("detector", "📡", "ALPR Detector", "Radar sweep, proximity geiger alerts, and audio/haptic customization for surveillance cameras"),
     MoreItem("survey", "◎", "Survey", "Scan continuously and watch signal strengths"),
     MoreItem("sync", "⇅", "Sync", "Push your samples, pull the desktop's map"),
+    MoreItem("hub", "🛰", "Hub", "Your BeaconFix hub over WireGuard: sync to the master database, every node's live position"),
     MoreItem("anchors", "⌖", "Anchors", "Antennas you surveyed: your computer's Wi-Fi card, your router — ground truth for ranging"),
     MoreItem("identity", "🪪", "Identity", "Your key pair: export, link, devices"),
     MoreItem("widgets", "▦", "Widgets", "Preview and add the home-screen widgets"),

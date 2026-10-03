@@ -14,6 +14,7 @@ public:
 signals:
     void openWindowRequested();
     void openIdentityRequested();
+    void openLinkRequested();
     void openEmergencyRequested();
     void quitRequested();
 

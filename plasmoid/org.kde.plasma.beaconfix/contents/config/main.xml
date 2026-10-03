@@ -15,10 +15,20 @@
             <default>true</default>
         </entry>
         <entry name="mapLayer" type="Int">
-            <label>Map style: 0 dark, 1 streets, 2 satellite, 3 topographic</label>
+            <label>Map style: 0 dark, 1 streets, 2 satellite (hybrid: imagery, contours, roads, labels), 3 topographic</label>
+            <default>2</default>
+            <min>0</min>
+            <max>3</max>
+        </entry>
+        <entry name="satSource" type="Int">
+            <label>Satellite imagery: 0 Esri World Imagery, 1 Esri Clarity, 2 USGS National Map (US), 3 NASA VIIRS (yesterday)</label>
             <default>0</default>
             <min>0</min>
             <max>3</max>
+        </entry>
+        <entry name="showContours" type="Bool">
+            <label>Contour lines (USGS, US only) over the satellite map</label>
+            <default>true</default>
         </entry>
         <entry name="hiddenCategories" type="StringList">
             <label>Place categories hidden on the map</label>

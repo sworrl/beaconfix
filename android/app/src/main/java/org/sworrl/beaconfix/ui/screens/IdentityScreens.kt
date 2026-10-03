@@ -49,19 +49,22 @@ import org.sworrl.beaconfix.ui.vm.IdentityViewModel
 
 /** First launch: no identity yet. Create one or bring one over from another BeaconFix. */
 @Composable
-fun OnboardingScreen(initialName: String? = null, onImportHistory: (() -> Unit)? = null, vm: IdentityViewModel = hiltViewModel()) {
+fun OnboardingScreen(initialName: String? = null, onImportHistory: (() -> Unit)? = null, onLinkPc: (() -> Unit)? = null, vm: IdentityViewModel = hiltViewModel()) {
     val busy by vm.busy.collectAsState(); val msg by vm.message.collectAsState(); val staged by vm.importBundle.collectAsState()
     var name by remember { mutableStateOf(initialName ?: "") }
-    var mode by remember { mutableStateOf("choose") }     // choose | scan | paste | code
+    var mode by remember { mutableStateOf("choose") }     // choose | scan | paste (debug builds)
     var pass by remember { mutableStateOf("") }
-    var host by remember { mutableStateOf("") }; var code by remember { mutableStateOf("") }
     val openFile = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri -> uri?.let { vm.importFromFile(it) } }
     LaunchedEffect(initialName) { if (!initialName.isNullOrBlank()) vm.create(initialName) }
     if (mode == "scan") { QrScanner("Point the camera at the identity QR shown by another BeaconFix", onResult = { vm.handleScanned(it); mode = "choose" }); return }
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(vertical = 16.dp)) {
         Text("Who are you?", style = MaterialTheme.typography.headlineMedium, modifier = Modifier.padding(horizontal = 16.dp))
         Text("BeaconFix keeps everything you learn under one identity — a key pair that lives on each of your devices. Bring yours over from a device on this network, or make a new one.", color = Slate, modifier = Modifier.padding(16.dp))
-        PeersList(haveIdentity = false)
+        if (onLinkPc != null && staged.isEmpty()) InfoCard("Link to your PC") {
+            Text("BeaconFix on your PC: scan its QR, or pick it from the list on this network and check the same code on both screens. Nothing to type. " +
+                "Linking also enrols this phone with your hub when the PC has one.", color = Slate, style = MaterialTheme.typography.bodySmall)
+            Button(onClick = { vm.create(name); onLinkPc() }, enabled = !busy) { Text("Link a PC") }
+        }
         if (staged.isNotEmpty()) InfoCard("Identity bundle received") {
             Text("Enter the passphrase or the six-word code shown where it was exported.", color = Slate, style = MaterialTheme.typography.bodySmall)
             OutlinedTextField(pass, { pass = it }, Modifier.fillMaxWidth(), label = { Text("Passphrase / 6-word code") }, singleLine = true)
@@ -72,14 +75,12 @@ fun OnboardingScreen(initialName: String? = null, onImportHistory: (() -> Unit)?
                 Button(onClick = { vm.create(name) }, enabled = !busy && name.isNotBlank()) { Text("Create") }
             }
             InfoCard("Import an existing identity") {
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) { OutlinedButton(onClick = { mode = "scan" }) { Text("Scan QR") }; OutlinedButton(onClick = { mode = "paste" }) { Text("Paste text") }; OutlinedButton(onClick = { openFile.launch(arrayOf("*/*")) }) { Text("Open file") } }
-                OutlinedButton(onClick = { mode = "code" }) { Text("From another BeaconFix on this network (6-digit code)") }
-                if (mode == "paste") { var t by remember { mutableStateOf("") }; OutlinedTextField(t, { t = it }, Modifier.fillMaxWidth(), label = { Text("BFID1:…") }, minLines = 3); Button(onClick = { vm.handleScanned(t) }, enabled = t.isNotBlank()) { Text("Use") } }
-                if (mode == "code") {
-                    OutlinedTextField(host, { host = it }, Modifier.fillMaxWidth(), label = { Text("Host or IP of the other BeaconFix") }, singleLine = true)
-                    OutlinedTextField(code, { code = it.filter(Char::isDigit).take(6) }, Modifier.fillMaxWidth(), label = { Text("6-digit code it shows") }, singleLine = true)
-                    Button(onClick = { vm.importFromCode(host.trim(), 47822, code) }, enabled = !busy && host.isNotBlank() && code.length == 6) { Text("Fetch") }
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedButton(onClick = { mode = "scan" }) { Text("Scan QR") }
+                    OutlinedButton(onClick = { openFile.launch(arrayOf("*/*")) }) { Text("Open file") }
+                    if (org.sworrl.beaconfix.BuildConfig.DEBUG) TextButton(onClick = { mode = "paste" }) { Text("Paste (debug)") }
                 }
+                if (mode == "paste" && org.sworrl.beaconfix.BuildConfig.DEBUG) { var t by remember { mutableStateOf("") }; OutlinedTextField(t, { t = it }, Modifier.fillMaxWidth(), label = { Text("BFID1:…") }, minLines = 3); Button(onClick = { vm.handleScanned(t) }, enabled = t.isNotBlank()) { Text("Use") } }
             }
         }
         if (onImportHistory != null) InfoCard("Import your history (optional)") {
@@ -92,7 +93,7 @@ fun OnboardingScreen(initialName: String? = null, onImportHistory: (() -> Unit)?
 
 /** Settings → Identity: show, export, link, forget. */
 @Composable
-fun IdentityScreen(onBack: () -> Unit, vm: IdentityViewModel = hiltViewModel()) {
+fun IdentityScreen(onBack: () -> Unit, onLink: () -> Unit = {}, vm: IdentityViewModel = hiltViewModel()) {
     val rec by vm.identity.collectAsState(); val pending by vm.pending.collectAsState()
     val busy by vm.busy.collectAsState(); val msg by vm.message.collectAsState()
     val exportText by vm.exportText.collectAsState(); val exportCode by vm.exportCode.collectAsState()
@@ -140,11 +141,14 @@ fun IdentityScreen(onBack: () -> Unit, vm: IdentityViewModel = hiltViewModel()) 
                 TextButton(onClick = { vm.statementText.value = vm.statementFor(p) }) { Text("Show QR") }; TextButton(onClick = { vm.dismissPending(p.id) }) { Text("Dismiss") }
             }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) { OutlinedButton(onClick = { vm.showOffer() }) { Text("Show my link QR") }; OutlinedButton(onClick = { mode = "scan" }) { Text("Scan") } }
-            Text("To link: one side shows its link QR, the other scans it. If the shown side is a paired desktop the link completes over the LAN; otherwise the scanner shows a QR back for the first side to scan. Devices on this network can be linked with one tap below.", color = Slate, style = MaterialTheme.typography.bodySmall)
+            Text("To link: one side shows its link QR, the other scans it. If the shown side is a paired desktop the link completes over the LAN; otherwise the scanner shows a QR back for the first side to scan. To connect a PC (its live view, sync and the hub), use Link a PC below.", color = Slate, style = MaterialTheme.typography.bodySmall)
             if (offer.isNotEmpty()) QrBlock("My link QR", offer, onClose = { vm.clearLinkUi() })
             if (statement.isNotEmpty()) QrBlock("Link statement — scan this on the other side", statement, onClose = { vm.clearLinkUi() })
         }
-        PeersList(haveIdentity = true)
+        InfoCard("PCs") {
+            Text("Connect this phone to BeaconFix on a PC — and through it to your hub — by scanning its QR or picking it on this network. Nothing to type.", color = Slate, style = MaterialTheme.typography.bodySmall)
+            Button(onClick = onLink) { Text("Link a PC") }
+        }
         InfoCard("Export this identity") {
             Text("Moves your identity (its private key included) to another BeaconFix. Protected by a passphrase you choose, or a six-word code shown once.", color = Slate, style = MaterialTheme.typography.bodySmall)
             if (exportText.isEmpty()) {

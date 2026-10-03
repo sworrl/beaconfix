@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- ALPR dash cam: a camera body with a plate below the lens (notification / Quick Settings icon, white on transparent) -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp" android:height="24dp" android:viewportWidth="24" android:viewportHeight="24">
+    <path android:fillColor="#FFFFFFFF"
+        android:pathData="M8.5,3 L7,5 H4 C2.9,5 2,5.9 2,7 V15 C2,16.1 2.9,17 4,17 H20 C21.1,17 22,16.1 22,15 V7 C22,5.9 21.1,5 20,5 H17 L15.5,3 Z M12,7.2 A3.8,3.8 0 1,1 12,14.8 A3.8,3.8 0 1,1 12,7.2 Z M12,9 A2,2 0 1,0 12,13 A2,2 0 1,0 12,9 Z" />
+    <path android:fillColor="#FFFFFFFF"
+        android:pathData="M6,18.5 H18 C18.55,18.5 19,18.95 19,19.5 V21 C19,21.55 18.55,22 18,22 H6 C5.45,22 5,21.55 5,21 V19.5 C5,18.95 5.45,18.5 6,18.5 Z" />
+</vector>

@@ -20,8 +20,8 @@ class QNetworkAccessManager;
 // for the others, so a phone or laptop can list "BeaconFix devices on this network" and
 // pair / link / sync with them by name.
 //
-// TXT record: v=<version> api=2 id=<identity id> name=<identity name> host=<hostname>
-//             kind=desktop pair=<0|1> features=<a,b,c> addr=<ip,ip,…> tls=<0|1>
+// TXT record: v=<version> api=3 id=<identity id> name=<PC name> iname=<identity name> host=<hostname> port=<API port>
+//             link=1 kind=desktop pair=<0|1> features=<a,b,c> addr=<ip,ip,…> tls=<0|1>   (link/api/port/name: docs/LINKING.md)
 // `addr` carries the addresses of the real interfaces (docker0, virbr, veth, tun… skipped),
 // so clients never depend on the .local A record — which, with Docker on the host, may
 // resolve to the bridge. Registration is done per interface for the same reason.
@@ -52,6 +52,7 @@ public:
 
     bool available() const { return m_available; }       // Avahi reachable over D-Bus
     bool published() const { return m_published; }
+    QString hostFqdn() const;                             // "<avahi host name>.local" (what .local resolves to), hostname.local without Avahi
     QString error() const { return m_error; }
 
     // Advertise (or re-advertise) our service. txt: "k=v" entries. port 0 = withdraw.

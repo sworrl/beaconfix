@@ -10,6 +10,7 @@ import retrofit2.Response
 import retrofit2.Retrofit
 import retrofit2.converter.kotlinx.serialization.asConverterFactory
 import retrofit2.http.Body
+import retrofit2.http.DELETE
 import retrofit2.http.GET
 import retrofit2.http.Header
 import retrofit2.http.POST
@@ -33,6 +34,7 @@ interface BeaconFixApi {
     @POST("api/v1/locate") suspend fun locate(@Header("Authorization") auth: String, @Body body: LocateBody): Response<LocateResult>
     @GET("api/v1/db/stats") suspend fun dbStats(@Header("Authorization") auth: String): Response<DbStats>
     @POST("api/v1/db/observations") suspend fun pushObservations(@Header("Authorization") auth: String, @Body body: ObservationsBody): Response<ObservationsResult>
+    @POST("api/v1/db/fixes") suspend fun pushFixes(@Header("Authorization") auth: String, @Body body: FixesBody): Response<FixesResult>
     @Streaming @GET("api/v1/db/export") suspend fun export(@Header("Authorization") auth: String): Response<ResponseBody>
     @GET("api/v1/db/changes") suspend fun changes(@Header("Authorization") auth: String, @Query("since") since: String): Response<ChangesDto>
     @POST("api/v1/db/sync") suspend fun sync(@Header("Authorization") auth: String, @Body body: SyncBody): Response<ChangesDto>
@@ -59,10 +61,39 @@ interface BeaconFixApi {
     @GET("api/v1/ranging/info") suspend fun rangingInfo(@Header("Authorization") auth: String): Response<RangingInfo>
     @POST("api/v1/ranging") suspend fun postRanging(@Header("Authorization") auth: String, @Body body: RangingPost): Response<DeviceRange>
     @GET("api/v1/ranging") suspend fun ranging(@Header("Authorization") auth: String): Response<RangingList>
+    /** The estimator's calibration (κ, device offsets, per-band environment); a 404 means an older desktop. */
+    @GET("api/v1/estimator") suspend fun estimator(@Header("Authorization") auth: String): Response<EstimatorDto>
     // help + places (desktop 3.8 adds the "pediatric" keys; treat a 404 from /emergency as an older desktop)
     @GET("api/v1/emergency") suspend fun emergency(@Header("Authorization") auth: String): Response<EmergencyDto>
     @GET("api/v1/pois") suspend fun poisFiltered(@Header("Authorization") auth: String, @Query("cat") cat: String?, @Query("group") group: String?, @Query("radius") radius: Int?): Response<PoisTyped>
     @POST("api/v1/prefetch") suspend fun prefetch(@Header("Authorization") auth: String): Response<JsonObject>
+    // Flock surveillance & route heatmap
+    @POST("api/v1/flock/sighting") suspend fun reportFlockSighting(@Header("Authorization") auth: String, @Body body: FlockSightingBody): Response<ResponseBody>
+    /**
+     * Cameras in an area, nearest first: around [lat],[lon] within [km] (the desktop's default without them: 50 km around
+     * its own fix), at most [limit] (desktop default 5000, max 20000). Null parameters are left out of the request.
+     */
+    @GET("api/v1/flock") suspend fun flockCameras(@Header("Authorization") auth: String, @Query("lat") lat: Double? = null, @Query("lon") lon: Double? = null,
+                                                  @Query("km") km: Double? = null, @Query("limit") limit: Int? = null): Response<FlockCamerasDto>
+    @GET("api/v1/flock/summary") suspend fun flockSummary(@Header("Authorization") auth: String): Response<AlprSummaryDto>
+    @GET("api/v1/plates") suspend fun licensePlates(@Header("Authorization") auth: String): Response<JsonObject>
+    @POST("api/v1/plates") suspend fun saveLicensePlate(@Header("Authorization") auth: String, @Body plate: LicensePlateDto): Response<JsonObject>
+    @DELETE("api/v1/plates/{plate}") suspend fun deleteLicensePlate(@Header("Authorization") auth: String, @Path("plate") plate: String): Response<JsonObject>
+    @GET("api/v1/flock/encounters") suspend fun cameraEncounters(@Header("Authorization") auth: String, @Query("limit") limit: Int = 100): Response<JsonObject>
+    @GET("api/v1/flock/audits") suspend fun plateAudits(@Header("Authorization") auth: String, @Query("limit") limit: Int = 100): Response<JsonObject>
+    @POST("api/v1/flock/crossref") suspend fun crossrefOpenDatabases(@Header("Authorization") auth: String): Response<JsonObject>
+    @POST("api/v1/flock/recalculate") suspend fun recalculatePasses(@Header("Authorization") auth: String): Response<JsonObject>
+    @POST("api/v1/flock/sync-us") suspend fun syncNationwideUs(@Header("Authorization") auth: String): Response<JsonObject>
+    @GET("api/v1/flock/sync-us") suspend fun getSyncNationwideUsStatus(@Header("Authorization") auth: String): Response<JsonObject>
+    @GET("api/v1/routes/heatmap") suspend fun routeHeatmap(@Header("Authorization") auth: String): Response<RouteHeatmapDto>
+    // plate events (docs/SIGHTINGS.md §5; feature-detected: a 404 means a desktop without them)
+    @GET("api/v1/plate-events") suspend fun plateEvents(@Header("Authorization") auth: String, @Query("since") since: Long, @Query("limit") limit: Int? = null,
+                                                       @Query("kind") kind: String? = null): Response<PlateEventsPage>
+    @GET("api/v1/plate-events/{uid}") suspend fun plateEvent(@Header("Authorization") auth: String, @Path("uid") uid: String): Response<PlateEventDto>
+    @POST("api/v1/plate-events") suspend fun pushPlateEvents(@Header("Authorization") auth: String, @Body body: PlateEventsPush): Response<PlateEventsAccepted>
+    @POST("api/v1/plate-events/{uid}/media") suspend fun pushPlateMedia(@Header("Authorization") auth: String, @Path("uid") uid: String, @Body body: PlateMediaUpload): Response<PlateMediaUploaded>
+    @Streaming @GET("api/v1/plate-events/media/{uid}") suspend fun plateMedia(@Header("Authorization") auth: String, @Path("uid") uid: String, @Query("as") asWhat: String = "display"): Response<ResponseBody>
+    @GET("api/v1/plate-events/status") suspend fun plateEventsStatus(@Header("Authorization") auth: String): Response<PlateEventsStatus>
     @POST("api/v1/db/import") suspend fun dbImport(@Header("Authorization") auth: String, @Query("name") name: String, @Body body: RequestBody): Response<JsonObject>
 }
 
@@ -85,6 +116,17 @@ object ApiFactory {
         Retrofit.Builder()
             .baseUrl(baseUrl(host, port, tls))
             .client(client)
+            .addConverterFactory(json.asConverterFactory("application/json".toMediaType()))
+            .build()
+            .create(BeaconFixApi::class.java)
+
+    /** The same client with room for a 40 MB media upload / download on a slow link. */
+    val bulkClient: OkHttpClient by lazy { client.newBuilder().readTimeout(120, TimeUnit.SECONDS).writeTimeout(180, TimeUnit.SECONDS).build() }
+
+    fun createBulk(host: String, port: Int, tls: Boolean): BeaconFixApi =
+        Retrofit.Builder()
+            .baseUrl(baseUrl(host, port, tls))
+            .client(bulkClient)
             .addConverterFactory(json.asConverterFactory("application/json".toMediaType()))
             .build()
             .create(BeaconFixApi::class.java)

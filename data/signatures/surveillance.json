@@ -1,0 +1,125 @@
+{
+  "format": 1,
+  "version": 1,
+  "updated": "2026-10-02",
+  "about": "Passive signatures of Flock Safety hardware and other surveillance / police gear, shared by the desktop (src/flockdetector.cpp, compiled in, overridable by <data dir>/signatures/surveillance.json) and Android (collector/FlockDetectorKotlin.kt, an asset copied from this file at build time). One file, one rule set: both evaluate it the same way (docs/DETECTION.md). Identifiers such as OUIs, UUIDs and SSIDs are facts, re-derived from the cited public registries.",
+  "tiers": {
+    "0": "weak: corroborates other evidence, never a detection on its own",
+    "1": "possible",
+    "2": "likely",
+    "3": "strong",
+    "4": "conclusive"
+  },
+  "confidence": [15, 40, 65, 85, 98],
+  "detectTier": 2,
+  "classes": {
+    "flock":       {"label": "Flock Safety",                          "flock": true,  "cameraType": "alpr"},
+    "raven":       {"label": "Flock Raven gunshot detector",          "flock": true,  "cameraType": "not_camera"},
+    "axon":        {"label": "Axon body / in-car camera gear",        "flock": false},
+    "shotspotter": {"label": "ShotSpotter (SoundThinking) gunshot sensor", "flock": false},
+    "watchguard":  {"label": "WatchGuard (Motorola) in-car video",    "flock": false},
+    "ubicquia":    {"label": "Ubicquia smart-streetlight node",       "flock": false},
+    "verkada":     {"label": "Verkada camera",                        "flock": false},
+    "avigilon":    {"label": "Avigilon Alta (Openpath) access / video", "flock": false},
+    "genetec":     {"label": "Genetec (AutoVu ALPR, Security Center)", "flock": false},
+    "neology":     {"label": "Neology ALPR / tolling",                "flock": false},
+    "elsag":       {"label": "Elsag (Leonardo) ALPR",                 "flock": false},
+    "perceptics":  {"label": "Perceptics ALPR",                       "flock": false},
+    "fusus":       {"label": "Fusus real-time crime center hub",      "flock": false}
+  },
+  "sources": {
+    "ieee": "IEEE Registration Authority public listing (MA-L / MA-M / MA-S), https://standards-oui.ieee.org/ (cross-checked with the Wireshark manuf file)",
+    "sig-company": "Bluetooth SIG Assigned Numbers, company identifiers, https://www.bluetooth.com/specifications/assigned-numbers/",
+    "sig-member": "Bluetooth SIG Assigned Numbers, 16-bit member UUIDs, https://www.bluetooth.com/specifications/assigned-numbers/",
+    "field": "field captures of Flock units published by the flock-detection community (DeFlock, flock-you); re-observed, not copied",
+    "cve-2025-59409": "CVE-2025-59409: Flock cameras probe for a hard-coded test SSID"
+  },
+  "mac": [
+    {"prefix": "B4:1E:52", "class": "flock", "tier": 2, "family": true, "model": "Falcon", "vendor": "Flock Safety (MA-L)", "source": "ieee"},
+    {"prefix": "00:03:7F:50:00:01", "class": "flock", "tier": 4, "family": true, "model": "Falcon", "vendor": "factory MAC shipped on Flock units (Atheros OUI)", "source": "field"},
+    {"prefix": "00:03:7F:4F:00:16", "class": "flock", "tier": 4, "family": true, "model": "Falcon", "vendor": "factory MAC shipped on Flock units (Atheros OUI)", "source": "field"},
+
+    {"prefix": "70:C9:4E", "class": "flock", "tier": 0, "family": true, "vendor": "Liteon Technology (Wi-Fi modules in Flock units; also in laptops)", "source": "ieee"},
+    {"prefix": "3C:91:80", "class": "flock", "tier": 0, "family": true, "vendor": "Liteon Technology", "source": "ieee"},
+    {"prefix": "D8:F3:BC", "class": "flock", "tier": 0, "family": true, "vendor": "Liteon Technology", "source": "ieee"},
+    {"prefix": "80:30:49", "class": "flock", "tier": 0, "family": true, "vendor": "Liteon Technology", "source": "ieee"},
+    {"prefix": "14:5A:FC", "class": "flock", "tier": 0, "family": true, "vendor": "Liteon Technology", "source": "ieee"},
+    {"prefix": "74:4C:A1", "class": "flock", "tier": 0, "family": true, "vendor": "Liteon Technology", "source": "ieee"},
+    {"prefix": "9C:2F:9D", "class": "flock", "tier": 0, "family": true, "vendor": "Liteon Technology", "source": "ieee"},
+    {"prefix": "94:08:53", "class": "flock", "tier": 0, "family": true, "vendor": "Liteon Technology", "source": "ieee"},
+    {"prefix": "E4:AA:EA", "class": "flock", "tier": 0, "family": true, "vendor": "Liteon Technology", "source": "ieee"},
+    {"prefix": "C0:35:32", "class": "flock", "tier": 0, "family": true, "vendor": "Liteon Technology", "source": "ieee"},
+    {"prefix": "24:B2:B9", "class": "flock", "tier": 0, "family": true, "vendor": "Liteon Technology", "source": "ieee"},
+    {"prefix": "B8:1E:A4", "class": "flock", "tier": 0, "family": true, "vendor": "Liteon Technology", "source": "ieee"},
+    {"prefix": "70:08:94", "class": "flock", "tier": 0, "family": true, "vendor": "Liteon Technology", "source": "ieee"},
+    {"prefix": "58:00:E3", "class": "flock", "tier": 0, "family": true, "vendor": "Liteon Technology", "source": "ieee"},
+    {"prefix": "5C:93:A2", "class": "flock", "tier": 0, "family": true, "vendor": "Liteon Technology", "source": "ieee"},
+    {"prefix": "64:6E:69", "class": "flock", "tier": 0, "family": true, "vendor": "Liteon Technology", "source": "ieee"},
+    {"prefix": "F4:6A:DD", "class": "flock", "tier": 0, "family": true, "vendor": "Liteon Technology", "source": "ieee"},
+    {"prefix": "00:F4:8D", "class": "flock", "tier": 0, "family": true, "vendor": "Liteon Technology", "source": "ieee"},
+    {"prefix": "D0:39:57", "class": "flock", "tier": 0, "family": true, "vendor": "Liteon Technology", "source": "ieee"},
+    {"prefix": "E8:D0:FC", "class": "flock", "tier": 0, "family": true, "vendor": "Liteon Technology", "source": "ieee"},
+    {"prefix": "E0:0A:F6", "class": "flock", "tier": 0, "family": true, "vendor": "Liteon Technology", "source": "ieee"},
+    {"prefix": "14:B5:CD", "class": "flock", "tier": 0, "family": true, "vendor": "Liteon Technology", "source": "ieee"},
+    {"prefix": "08:3A:88", "class": "flock", "tier": 0, "family": true, "vendor": "Universal Global Scientific Industrial (USI) module", "source": "ieee"},
+    {"prefix": "E0:4F:43", "class": "flock", "tier": 0, "family": true, "vendor": "Universal Global Scientific Industrial (USI) module", "source": "ieee"},
+    {"prefix": "82:6B:F2", "class": "flock", "tier": 0, "family": true, "vendor": "locally administered prefix seen on Flock units (no IEEE assignment)", "source": "field"},
+    {"prefix": "B8:35:32", "class": "flock", "tier": 0, "family": true, "vendor": "unassigned prefix seen on Flock units (no IEEE assignment)", "source": "field"},
+
+    {"prefix": "00:25:DF", "class": "axon",        "tier": 2, "vendor": "Axon Enterprise (MA-L)", "source": "ieee"},
+    {"prefix": "D4:11:D6", "class": "shotspotter", "tier": 2, "vendor": "ShotSpotter, Inc. (MA-L)", "source": "ieee"},
+    {"prefix": "00:1D:96", "class": "watchguard",  "tier": 2, "vendor": "WatchGuard Video (MA-L)", "source": "ieee"},
+    {"prefix": "94:7B:BE", "class": "ubicquia",    "tier": 2, "vendor": "Ubicquia LLC (MA-L)", "source": "ieee"},
+    {"prefix": "E0:A7:00", "class": "verkada",     "tier": 2, "vendor": "Verkada Inc (MA-L)", "source": "ieee"},
+    {"prefix": "70:1A:D5", "class": "avigilon",    "tier": 2, "vendor": "Avigilon Alta (MA-L)", "source": "ieee"},
+    {"prefix": "00:BF:15", "class": "genetec",     "tier": 2, "vendor": "Genetec Inc. (MA-L)", "source": "ieee"},
+    {"prefix": "0C:BF:15", "class": "genetec",     "tier": 2, "vendor": "Genetec Inc. (MA-L)", "source": "ieee"},
+    {"prefix": "00:17:3D", "class": "neology",     "tier": 2, "vendor": "Neology (MA-L)", "source": "ieee"},
+    {"prefix": "00:40:DE", "class": "elsag",       "tier": 2, "vendor": "Elsag Datamat spa (MA-L)", "source": "ieee"},
+    {"prefix": "70:B3:D5:1C:5", "class": "elsag",  "tier": 2, "vendor": "Elsag (MA-S, 36-bit)", "source": "ieee"},
+    {"prefix": "70:B3:D5:88:A", "class": "perceptics", "tier": 2, "vendor": "Perceptics, LLC (MA-S, 36-bit)", "source": "ieee"},
+    {"prefix": "7C:83:34:4", "class": "fusus",     "tier": 2, "vendor": "Fusus (MA-M, 28-bit)", "source": "ieee"},
+    {"prefix": "84:B3:86:5", "class": "fusus",     "tier": 2, "vendor": "Fusus (MA-M, 28-bit)", "source": "ieee"}
+  ],
+  "ssid": [
+    {"id": "flock_name",   "regex": "^(Flock|Flock Camera net\\.|Flock[0-9]{3})$", "class": "flock", "tier": 1, "model": "Falcon", "source": "field"},
+    {"id": "flock_serial", "regex": "^Flock-([0-9A-Fa-f]{6})$", "class": "flock", "tier": 1, "bssidSuffixTier": 2, "model": "Falcon", "source": "field",
+     "note": "the 6 hex digits are the last 3 bytes of the BSSID on ~97% of real units: tier 2 when they match"},
+    {"id": "axon",         "regex": "^AXON-X[0-9A-Z]+", "class": "axon", "tier": 2, "source": "field"}
+  ],
+  "ssidWithFamilyMacTier": 3,
+  "probe": [
+    {"id": "test_flck", "regex": "^test_flck$", "class": "flock", "tier": 3, "model": "Falcon", "source": "cve-2025-59409"}
+  ],
+  "ble": {
+    "company": [
+      {"id": 2504, "hex": "0x09C8", "class": "flock", "tier": 0, "corroboratedTier": 3, "vendor": "XUNTONG (radio module in Flock units; also generic products)", "source": "sig-company",
+       "note": "only with a Flock BLE name or a TN serial in the advert; alone it is tier 0"},
+      {"id": 845, "hex": "0x034D", "class": "axon", "tier": 2, "vendor": "Axon Enterprise", "source": "sig-company"}
+    ],
+    "tnSerialRegex": "TN[0-9A-Z]{16}",
+    "service": [
+      {"uuid": "e8ccbb38-9532-46a8-9fe5-1814df172e6f", "class": "flock", "tier": 3, "model": "Flock device", "source": "field"},
+      {"uuid": "20c944c1-add2-42d7-a638-967ee9a26ff6", "class": "flock", "tier": 3, "model": "Flock device", "source": "field"},
+      {"uuid": "3100", "class": "raven", "tier": 3, "model": "Raven", "source": "field"},
+      {"uuid": "3200", "class": "raven", "tier": 3, "model": "Raven", "source": "field"},
+      {"uuid": "3300", "class": "raven", "tier": 3, "model": "Raven", "source": "field"},
+      {"uuid": "3400", "class": "raven", "tier": 3, "model": "Raven", "source": "field"},
+      {"uuid": "3500", "class": "raven", "tier": 3, "model": "Raven", "source": "field"},
+      {"uuid": "FC81", "class": "axon",    "tier": 2, "source": "sig-member"},
+      {"uuid": "FE6B", "class": "axon",    "tier": 2, "source": "sig-member"},
+      {"uuid": "FE6C", "class": "axon",    "tier": 2, "source": "sig-member"},
+      {"uuid": "FD3A", "class": "verkada", "tier": 2, "source": "sig-member"},
+      {"uuid": "FD3B", "class": "verkada", "tier": 2, "source": "sig-member"},
+      {"uuid": "FC2C", "class": "verkada", "tier": 2, "source": "sig-member"}
+    ],
+    "serviceRange": [
+      {"from": "3101", "to": "35FF", "class": "raven", "tier": 1, "model": "Raven", "source": "field", "note": "the Raven block outside the five known services"}
+    ],
+    "name": [
+      {"id": "fs_serial",   "regex": "^FS-[0-9A-F]{6}$",  "class": "flock", "tier": 3, "model": "Flock device",   "source": "field"},
+      {"id": "penguin",     "regex": "^Penguin-[0-9]{10}$", "class": "flock", "tier": 3, "model": "Flock device", "source": "field"},
+      {"id": "ext_battery", "regex": "^FS Ext Battery$",  "class": "flock", "tier": 3, "model": "FS Ext Battery", "source": "field"}
+    ]
+  }
+}

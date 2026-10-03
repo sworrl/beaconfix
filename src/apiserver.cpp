@@ -2,10 +2,16 @@
 #include "ranging/rangingservice.h"
 #include "locator.h"
 #include "identity.h"
+#include "hubclient.h"
 #include "mapdb.h"
+#include "platewatch.h"
+#include "routeplanner.h"
+#include <QPointer>
 #include "mdns.h"
+#include "telegrambot.h"
 #include "pairing.h"
 #include "wifiscanner.h"
+#include "webdashboard.h"
 #include <QCoreApplication>
 #include <QCryptographicHash>
 #include <QDir>
@@ -31,6 +37,7 @@
 #include <QTimer>
 #include <QUrl>
 #include <QUrlQuery>
+#include <algorithm>
 
 static const int   PAIR_MINUTES   = 10;
 static const int   MAX_PENDING    = 5;
@@ -40,11 +47,44 @@ static const int   MAX_BODY       = 4096;
 static const int   MAX_BODY_SYNC  = 1024 * 1024;         // /db/sync: a phone reconnecting after a day pushes thousands of samples
 static const int   MAX_BODY_OBS   = 256 * 1024;          // /db/observations
 static const qint64 MAX_BODY_IMPORT = qint64(200) * 1024 * 1024;   // /db/import: streamed to a temporary file, never held in memory
+static const int   MAX_BODY_MEDIA = 40 * 1024 * 1024;     // POST /plate-events/<uid>/media: a dash-cam frame, base64 (docs/SIGHTINGS.md §5)
+// Public webcam stills are kept on this device only, never served onward (WV511's terms, docs/SIGHTINGS.md §2.0)
+static QJsonObject withoutLocalMedia(QJsonObject ev)
+{
+    QJsonArray keep;
+    for (const QJsonValue &m : ev.value(QLatin1String("media")).toArray()) if (m.toObject().value(QLatin1String("kind")).toString() != QLatin1String("webcam")) keep.append(m);
+    if (ev.contains(QLatin1String("media"))) ev["media"] = keep;
+    return ev;
+}
 static int bodyLimitFor(const QString &path)
 {
-    if (path == QLatin1String("/api/v1/db/sync")) return MAX_BODY_SYNC;
+    if (path == QLatin1String("/api/v1/db/sync") || path == QLatin1String("/api/v1/plate-events")) return MAX_BODY_SYNC;
+    if (path.startsWith(QLatin1String("/api/v1/plate-events/")) && path.endsWith(QLatin1String("/media"))) return MAX_BODY_MEDIA;
     if (path == QLatin1String("/api/v1/db/observations")) return MAX_BODY_OBS;
+    if (path.startsWith(QLatin1String("/api/v3/"))) {          // sealed: + the 16-byte tag
+        const QString ep = path.mid(8);
+        if (ep == QLatin1String("db/sync") || ep == QLatin1String("db/fixes") || ep == QLatin1String("flock/import") || ep == QLatin1String("jobs/results")
+            || ep == QLatin1String("plate-events")) return MAX_BODY_SYNC + 16;
+        if (ep.startsWith(QLatin1String("jobs/")) || ep == QLatin1String("nodes/heartbeat")) return MAX_BODY_OBS + 16;
+        if (ep == QLatin1String("db/observations") || ep == QLatin1String("devices/position") || ep == QLatin1String("anchors") || ep == QLatin1String("ranging")) return MAX_BODY_OBS + 16;
+        return MAX_BODY + 16;
+    }
     return MAX_BODY;
+}
+// Hub settings: the environment (deploy/beaconfix-hub.env) first, then QSettings hub/<key>
+static QString hubSetting(const char *env, const char *key, const QString &def)
+{
+    const QString e = qEnvironmentVariable(env).trimmed();
+    if (!e.isEmpty()) return e;
+    return QSettings().value(QStringLiteral("hub/") + QLatin1String(key), def).toString().trimmed();
+}
+static bool parseHostPort(const QString &s, QHostAddress *a, int *port)       // "0.0.0.0:443", "[::]:443", "443"
+{
+    const int c = s.lastIndexOf(QLatin1Char(':'));
+    QString host = c > 0 ? s.left(c) : QStringLiteral("0.0.0.0");
+    bool ok = false; *port = (c >= 0 ? s.mid(c + 1) : s).toInt(&ok);
+    if (host.startsWith(QLatin1Char('[')) && host.endsWith(QLatin1Char(']'))) host = host.mid(1, host.size() - 2);
+    return ok && *port > 0 && *port < 65536 && a->setAddress(host);
 }
 static const int   RATE_PER_MIN   = 60;
 static const int   LOG_KEEP       = 100;
@@ -227,6 +267,9 @@ ApiServer::ApiServer(Locator *loc, QObject *parent) : QObject(parent), m_loc(loc
         bool changedAny = false;
         for (int i = m_pending.size() - 1; i >= 0; --i)
             if (m_pending[i].expires < now) { m_pending.removeAt(i); changedAny = true; }
+        QStringList orphans;                                     // link tokens nobody fetched in time: never handed out, removed
+        if (m_links.sweep(now.toSecsSinceEpoch(), &orphans)) emit linkChanged();
+        for (const QString &id : orphans) remove(id);
         static bool wasOpen = false;
         if (wasOpen != pairingOpen()) { wasOpen = pairingOpen(); changedAny = true; updateDiscovery(); }
         for (auto it = m_hits.begin(); it != m_hits.end();) {
@@ -239,9 +282,34 @@ ApiServer::ApiServer(Locator *loc, QObject *parent) : QObject(parent), m_loc(loc
     });
     m_sweepTimer.start();
 
-    m_mdns = new Mdns(this);
-    connect(m_mdns, &Mdns::peersChanged, this, &ApiServer::peersChanged);
-    connect(m_mdns, &Mdns::stateChanged, this, &ApiServer::changed);
+    if (Locator::hubRole()) {                                  // the hub: BFS3 on the network, no discovery
+        m_hub = new Hub(m_loc->mapDb(), Locator::stateDir(), hubSetting("BEACONFIX_HUB_URL", "url", QStringLiteral("https://hub.example.com")), this);
+        connect(m_hub, &Hub::changed, this, [this] {          // a revoked device's open streams end now
+            for (int i = m_streams.size() - 1; i >= 0; --i) {
+                if (!m_streams[i].sealed) continue;
+                bool live = false;
+                for (const QJsonValue &v : m_hub->devicesJson()) if (v.toObject()["id"].toString() == m_streams[i].sess.deviceId && !v.toObject()["revoked"].toBool()) live = true;
+                if (!live) { if (m_streams[i].sock) m_streams[i].sock->disconnectFromHost(); m_streams.removeAt(i); }
+            }
+            emit changed();
+        });
+        // Jobs (docs/HUB.md): the hub's refits become jobs for the nodes; their results are stored as if computed here;
+        // BEACONFIX_HUB_SELF_COMPUTE_MINUTES > 0: the hub computes itself when no node leased for that long (default off)
+        m_loc->setRefitSink([this](const QString &bssid) { if (m_loc->mapDb()) m_hub->enqueue(QStringLiteral("refit"), bssid, m_loc->mapDb()->currentSeq()); });
+        QTimer::singleShot(5000, m_loc, [this] { m_loc->queueStaleRefits(); });   // fits from an older estimator: jobs for the nodes
+        m_hub->setResultSink([this](const QString &type, const QString &key, const QJsonObject &result) { return type == QLatin1String("refit") && m_loc->applyRefitResult(key, result); });
+        m_hub->setSelfCompute([this](const QString &type, const QString &key) { return type == QLatin1String("refit") && m_loc->refitNow(key); },
+                              hubSetting("BEACONFIX_HUB_SELF_COMPUTE_MINUTES", "selfComputeMinutes", QStringLiteral("0")).toInt());
+        m_certTimer.setInterval(3600 * 1000);                 // renewals: a new file → new connections get it
+        connect(&m_certTimer, &QTimer::timeout, this, [this] {
+            const QDateTime t = QFileInfo(m_certPath).lastModified();
+            if (!m_certPath.isEmpty() && t.isValid() && t != m_certStamp) { qInfo("beaconfix: hub: certificate changed, reloading"); restart(); }
+        });
+    } else {
+        m_mdns = new Mdns(this);
+        connect(m_mdns, &Mdns::peersChanged, this, &ApiServer::peersChanged);
+        connect(m_mdns, &Mdns::stateChanged, this, &ApiServer::changed);
+    }
     if (Identity *idn = m_loc->identity()) connect(idn, &Identity::changed, this, [this] { updateDiscovery(); });
     connect(m_loc, &Locator::FixChanged, this, [this] { if (!m_streams.isEmpty()) broadcast("fix", locationJson()); });
     connect(m_loc, &Locator::eventLogged, this, [this](const QString &json) {
@@ -282,8 +350,10 @@ void ApiServer::restart()
     m_streams.clear();
     m_pingTimer.stop();
     if (m_server) { m_server->close(); m_server->deleteLater(); m_server = nullptr; }
+    if (m_admin) { m_admin->close(); m_admin->deleteLater(); m_admin = nullptr; }
     m_error.clear();
     m_tls = false;
+    if (m_hub) { if (startHub()) m_pingTimer.start(); emit changed(); return; }
     if (m_enabled) {
         const QString dir = QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation) + QStringLiteral("/sworrl/");
         QFile crt(dir + QStringLiteral("beaconfix.crt")), key(dir + QStringLiteral("beaconfix.key"));
@@ -301,7 +371,7 @@ void ApiServer::restart()
         }
         if (!m_server) m_server = new QTcpServer(this);
         m_server->setMaxPendingConnections(16);
-        connect(m_server, &QTcpServer::pendingConnectionAvailable, this, &ApiServer::onConnection);
+        connect(m_server, &QTcpServer::pendingConnectionAvailable, this, [this, srv = m_server] { onConnection(srv); });
         bool ok = false;
         for (int p = m_port; p < m_port + 10 && !ok; ++p) ok = m_server->listen(QHostAddress::Any, quint16(p));
         if (!ok) { m_error = QStringLiteral("cannot listen on port %1: %2").arg(m_port).arg(m_server->errorString()); m_server->deleteLater(); m_server = nullptr; }
@@ -310,6 +380,70 @@ void ApiServer::restart()
     updateDiscovery();
     emit changed();
 }
+
+// Hub listeners. Network: BEACONFIX_HUB_LISTEN (default 0.0.0.0:443), TLS with the full chain from BEACONFIX_HUB_CERT and
+// the key from BEACONFIX_HUB_KEY (EC or RSA); plain HTTP only on a loopback address (a reverse proxy in front) or with
+// BEACONFIX_HUB_INSECURE_HTTP=1 (tests). Admin: BEACONFIX_HUB_ADMIN (default 127.0.0.1:47823, loopback only), plain,
+// /api/v1 with the admin token — written fresh on every start to <state>/hub-admin.json (0600) for the CLI.
+bool ApiServer::startHub()
+{
+    if (!m_hub->ready()) { m_error = QStringLiteral("hub: ") + m_hub->error(); return false; }
+    QHostAddress addr; int port = 0;
+    const QString listen = hubSetting("BEACONFIX_HUB_LISTEN", "listen", QStringLiteral("0.0.0.0:443"));
+    if (!parseHostPort(listen, &addr, &port)) { m_error = QStringLiteral("hub: bad listen address %1").arg(listen); return false; }
+    m_allow.clear();
+    for (const QString &c : hubSetting("BEACONFIX_HUB_ALLOW", "allow", QString()).split(QLatin1Char(','), Qt::SkipEmptyParts)) {
+        const auto sn = QHostAddress::parseSubnet(c.trimmed());
+        if (sn.first.isNull()) { m_error = QStringLiteral("hub: bad subnet in BEACONFIX_HUB_ALLOW: %1").arg(c); return false; }
+        m_allow << sn;
+    }
+    m_certPath = hubSetting("BEACONFIX_HUB_CERT", "cert", QString()); m_keyPath = hubSetting("BEACONFIX_HUB_KEY", "key", QString());
+    if (!m_certPath.isEmpty() || !m_keyPath.isEmpty()) {
+        const QList<QSslCertificate> chain = QSslCertificate::fromPath(m_certPath, QSsl::Pem);
+        QFile kf(m_keyPath);
+        if (chain.isEmpty()) { m_error = QStringLiteral("hub: no certificate in %1").arg(m_certPath); return false; }
+        if (!kf.open(QIODevice::ReadOnly)) { m_error = QStringLiteral("hub: cannot read %1: %2").arg(m_keyPath, kf.errorString()); return false; }
+        const QByteArray pem = kf.readAll();
+        QSslKey key(pem, QSsl::Ec, QSsl::Pem);
+        if (key.isNull()) key = QSslKey(pem, QSsl::Rsa, QSsl::Pem);
+        if (key.isNull()) { m_error = QStringLiteral("hub: unreadable private key %1").arg(m_keyPath); return false; }
+        auto *ssl = new QSslServer(this);
+        QSslConfiguration cfg = QSslConfiguration::defaultConfiguration();
+        cfg.setLocalCertificateChain(chain);                   // leaf + intermediates: clients verify against their own roots
+        cfg.setPrivateKey(key);
+        cfg.setProtocol(QSsl::TlsV1_2OrLater);
+        cfg.setPeerVerifyMode(QSslSocket::VerifyNone);
+        ssl->setSslConfiguration(cfg);
+        ssl->setHandshakeTimeout(15000);
+        m_server = ssl; m_tls = true;
+        m_certStamp = QFileInfo(m_certPath).lastModified();
+        m_certTimer.start();
+    } else if (!addr.isLoopback() && qEnvironmentVariable("BEACONFIX_HUB_INSECURE_HTTP") != QLatin1String("1")) {
+        m_error = QStringLiteral("hub: %1 is not loopback: set BEACONFIX_HUB_CERT and BEACONFIX_HUB_KEY (or BEACONFIX_HUB_INSECURE_HTTP=1 for a test)").arg(listen);
+        return false;
+    } else m_server = new QTcpServer(this);
+    m_server->setMaxPendingConnections(32);
+    connect(m_server, &QTcpServer::pendingConnectionAvailable, this, [this, srv = m_server] { onConnection(srv); });
+    if (!m_server->listen(addr, quint16(port))) { m_error = QStringLiteral("hub: cannot listen on %1: %2").arg(listen, m_server->errorString()); m_server->deleteLater(); m_server = nullptr; return false; }
+    m_port = port;
+    // Admin listener (loopback) + its token
+    QHostAddress aaddr; int aport = 0;
+    const QString admin = hubSetting("BEACONFIX_HUB_ADMIN", "admin", QStringLiteral("127.0.0.1:47823"));
+    if (!parseHostPort(admin, &aaddr, &aport) || !aaddr.isLoopback()) { m_error = QStringLiteral("hub: the admin address must be loopback (%1)").arg(admin); return false; }
+    m_admin = new QTcpServer(this);
+    connect(m_admin, &QTcpServer::pendingConnectionAvailable, this, [this, srv = m_admin] { onConnection(srv); });
+    if (!m_admin->listen(aaddr, quint16(aport))) { m_error = QStringLiteral("hub: cannot listen on %1: %2").arg(admin, m_admin->errorString()); return false; }
+    if (m_adminToken.isEmpty()) m_adminToken = Bfs3::b64u(Bfs3::random(32));
+    QSaveFile f(adminFile());
+    if (!f.open(QIODevice::WriteOnly)) { m_error = QStringLiteral("hub: cannot write %1").arg(adminFile()); return false; }
+    f.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner);
+    f.write(QJsonDocument(QJsonObject{{"url", QStringLiteral("http://%1:%2").arg(aaddr.protocol() == QAbstractSocket::IPv6Protocol ? QStringLiteral("[%1]").arg(aaddr.toString()) : aaddr.toString()).arg(m_admin->serverPort())},
+                                      {"token", QString::fromLatin1(m_adminToken)}, {"pid", QCoreApplication::applicationPid()}}).toJson(QJsonDocument::Compact));
+    if (!f.commit()) { m_error = QStringLiteral("hub: cannot write %1").arg(adminFile()); return false; }
+    return true;
+}
+
+QString ApiServer::adminFile() const { return Locator::stateDir() + QStringLiteral("/hub-admin.json"); }
 
 // ── Pairing / devices ─────────────────────────────────────────────────────────
 bool ApiServer::pairingOpen() const { return m_pairingUntil.isValid() && m_pairingUntil > QDateTime::currentDateTime(); }
@@ -635,10 +769,11 @@ void ApiServer::updateDiscovery()
     if (!m_mdns) return;
     if (!listening() || !mdnsAllowed()) { m_mdns->withdraw(); return; }
     Identity *idn = m_loc->identity();
-    QStringList txt{QStringLiteral("v=%1").arg(QStringLiteral(BEACONFIX_VERSION)), QStringLiteral("api=2"),
-                    QStringLiteral("id=%1").arg(idn && idn->exists() ? idn->id() : QString()),
-                    QStringLiteral("name=%1").arg(idn && idn->exists() ? idn->name().left(60) : QString()),
-                    QStringLiteral("host=%1").arg(QHostInfo::localHostName()), QStringLiteral("kind=desktop"),
+    // name / id / link=1 / api=3 / port: what a phone's Link screen lists (docs/LINKING.md); iname: the identity's name
+    QStringList txt = Link::mdnsTxt(linkName(), idn && idn->exists() ? idn->id() : QString(), boundPort());
+    txt << QStringLiteral("v=%1").arg(QStringLiteral(BEACONFIX_VERSION))
+        << QStringLiteral("iname=%1").arg(idn && idn->exists() ? idn->name().left(60) : QString());
+    txt << QStringList{QStringLiteral("host=%1").arg(QHostInfo::localHostName()), QStringLiteral("kind=desktop"),
                     QStringLiteral("pair=%1").arg(pairingOpen() ? 1 : 0), QStringLiteral("tls=%1").arg(m_tls ? 1 : 0),
                     QStringLiteral("features=%1").arg(featureList().join(QLatin1Char(','))),
                     QStringLiteral("addr=%1").arg(Mdns::lanAddresses().mid(0, 6).join(QLatin1Char(',')))};
@@ -664,12 +799,19 @@ QJsonArray ApiServer::peersJson(bool includeSelf) const
 void ApiServer::scanPeers(std::function<void()> done) { if (m_mdns) m_mdns->scanSubnets(m_port, std::move(done)); else if (done) done(); }
 
 // ── HTTP ──────────────────────────────────────────────────────────────────────
-void ApiServer::onConnection()
+void ApiServer::onConnection(QTcpServer *srv)
 {
-    while (m_server && m_server->hasPendingConnections()) {
-        QTcpSocket *s = m_server->nextPendingConnection();
+    while (srv && srv->hasPendingConnections()) {
+        QTcpSocket *s = srv->nextPendingConnection();
         if (!s) break;
-        if (!isLanAddress(s->peerAddress())) {                // not our network: refuse before reading anything
+        const bool hubNet = m_hub && srv == m_server;          // the hub's network side: BFS3 only, any allowed source
+        if (hubNet) {
+            s->setProperty("hubNet", true);
+            const QHostAddress pa = s->peerAddress();
+            bool allowed = m_allow.isEmpty();
+            for (const auto &sn : m_allow) if (pa.isInSubnet(sn) || (pa.toIPv4Address() && QHostAddress(pa.toIPv4Address()).isInSubnet(sn))) allowed = true;
+            if (!allowed || m_hub->blocked(clientIp(s))) { s->abort(); s->deleteLater(); continue; }   // say nothing
+        } else if (!isLanAddress(s->peerAddress())) {           // not our network: refuse before reading anything
             logAccess(s, QStringLiteral("-"), QStringLiteral("-"), 403);
             replyRaw(s, 403, "application/json", "{\"error\":\"forbidden\"}");
             continue;
@@ -677,8 +819,9 @@ void ApiServer::onConnection()
         if (m_open >= MAX_OPEN) { replyRaw(s, 503, "application/json", "{\"error\":\"busy\"}"); continue; }
         ++m_open;
         connect(s, &QTcpSocket::disconnected, this, [this, s] { --m_open; s->deleteLater(); });
+        connect(s, &QObject::destroyed, this, [this, s] { m_v3.remove(s); });
         connect(s, &QTcpSocket::readyRead, this, [this, s] { onReadyRead(s); });
-        QTimer::singleShot(10000, s, [s] { if (!s->property("handled").toBool()) s->disconnectFromHost(); });   // slowloris guard
+        QTimer::singleShot(hubNet ? 60000 : 10000, s, [s] { if (!s->property("handled").toBool()) s->disconnectFromHost(); });   // slowloris guard (a phone on mobile data: 1 MB in a minute)
         if (s->bytesAvailable()) onReadyRead(s);
     }
 }
@@ -701,6 +844,8 @@ void ApiServer::onReadyRead(QTcpSocket *s)
         return;
     }
     if (s->property("handled").toBool()) { s->readAll(); return; }
+    // A large body (an image upload): let the socket buffer it until it is complete, not one copy per chunk
+    if (const qint64 need = s->property("need").toLongLong(); need > 0 && s->property("buf").toByteArray().size() + s->bytesAvailable() < need) return;
     QByteArray buf = s->property("buf").toByteArray() + s->readAll();
     const int hdrEnd = buf.indexOf("\r\n\r\n");
     if (hdrEnd < 0) {
@@ -712,11 +857,15 @@ void ApiServer::onReadyRead(QTcpSocket *s)
     if (reqLine.size() < 2) { s->setProperty("handled", true); replyRaw(s, 400, "application/json", "{\"error\":\"bad request\"}"); return; }
     Request r;
     r.method = QString::fromLatin1(reqLine[0]).toUpper();
+    r.target = reqLine[1];
     const QUrl u = QUrl::fromEncoded(reqLine[1], QUrl::StrictMode);
     r.path = u.path(); r.query = u.query();
     for (int i = 1; i < lines.size(); ++i) {
         const int c = lines[i].indexOf(':');
         if (c > 0) r.headers.insert(lines[i].left(c).trimmed().toLower(), lines[i].mid(c + 1).trimmed());
+    }
+    if (s->property("hubNet").toBool() && !r.path.startsWith(QLatin1String("/api/v3/")) && r.path != QLatin1String("/healthz")) {   // before any body is read
+        s->setProperty("handled", true); logAccess(s, r.method, r.path, 404); replyRaw(s, 404, "application/json", "{\"error\":\"not found\"}"); return;
     }
     if (r.method == QLatin1String("POST") && r.path == QLatin1String("/api/v1/db/import")) {   // large: check auth first, then stream the body to disk
         s->setProperty("handled", true);
@@ -742,7 +891,13 @@ void ApiServer::onReadyRead(QTcpSocket *s)
     }
     const int len = r.headers.value("content-length", "0").toInt();
     if (len < 0 || len > bodyLimitFor(r.path)) { s->setProperty("handled", true); replyRaw(s, 413, "application/json", "{\"error\":\"body too large\"}"); return; }
-    if (buf.size() < hdrEnd + 4 + len) { s->setProperty("buf", buf); return; }
+    if (len > MAX_BODY_SYNC + 64 && r.path.startsWith(QLatin1String("/api/v1/")) && !s->property("authed").toBool()) {   // authenticate before buffering tens of megabytes
+        const QString ip = clientIp(s);
+        Device *dev = authenticate(r, ip);
+        if (!dev) { s->setProperty("handled", true); rateLimited(ip, true); logAccess(s, r.method, r.path, 401); reply(s, 401, QJsonObject{{"error", "unauthorized"}}, {"WWW-Authenticate: Bearer realm=\"BeaconFix\""}); return; }
+        s->setProperty("authed", true);
+    }
+    if (buf.size() < hdrEnd + 4 + len) { s->setProperty("buf", buf); s->setProperty("need", qint64(hdrEnd + 4 + len)); return; }
     r.body = buf.mid(hdrEnd + 4, len);
     s->setProperty("handled", true);
     handle(s, r);
@@ -751,12 +906,25 @@ void ApiServer::onReadyRead(QTcpSocket *s)
 void ApiServer::replyRaw(QTcpSocket *s, int code, const QByteArray &type, const QByteArray &body, const QList<QByteArray> &extra)
 {
     static const QHash<int, QByteArray> text{{200, "OK"}, {202, "Accepted"}, {204, "No Content"}, {400, "Bad Request"}, {401, "Unauthorized"}, {500, "Internal Server Error"},
-                                             {403, "Forbidden"}, {404, "Not Found"}, {405, "Method Not Allowed"}, {413, "Payload Too Large"},
+                                             {403, "Forbidden"}, {404, "Not Found"}, {405, "Method Not Allowed"}, {409, "Conflict"}, {413, "Payload Too Large"},
                                              {429, "Too Many Requests"}, {503, "Service Unavailable"}};
-    QByteArray h = "HTTP/1.1 " + QByteArray::number(code) + " " + text.value(code, "OK") + "\r\nContent-Type: " + type
-                 + "\r\nContent-Length: " + QByteArray::number(body.size()) + "\r\nCache-Control: no-store\r\nConnection: close\r\n";
-    for (const QByteArray &e : extra) h += e + "\r\n";
-    s->write(h + "\r\n" + body);
+    QByteArray out = body, ctype = type;
+    QList<QByteArray> more = extra;
+    if (m_hub && s->property("hubNet").toBool()) {
+        more << "X-BF-Time: " + QByteArray::number(QDateTime::currentSecsSinceEpoch());   // informative: lets a client see clock skew
+        if (const auto it = m_v3.constFind(s); it != m_v3.constEnd()) {        // a BFS3 reply: sealed for that request's counter
+            QByteArray nonce;
+            out = m_hub->sealResponse(*it, code, body, &nonce);
+            ctype = "application/vnd.beaconfix.sealed";
+            more.erase(std::remove_if(more.begin(), more.end(), [](const QByteArray &e) { return e.toLower().startsWith("www-authenticate"); }), more.end());
+            more << "X-BF-Counter: " + QByteArray::number(it->counter) << "X-BF-Nonce: " + Bfs3::b64u(nonce) << "X-BF-Type: " + type;
+            m_v3.remove(s);
+        }
+    }
+    QByteArray h = "HTTP/1.1 " + QByteArray::number(code) + " " + text.value(code, "OK") + "\r\nContent-Type: " + ctype
+                 + "\r\nContent-Length: " + QByteArray::number(out.size()) + "\r\nCache-Control: no-store\r\nConnection: close\r\n";
+    for (const QByteArray &e : more) h += e + "\r\n";
+    s->write(h + "\r\n" + out);
     s->disconnectFromHost();
 }
 
@@ -770,6 +938,15 @@ void ApiServer::logAccess(QTcpSocket *s, const QString &method, const QString &p
     m_log.append({QDateTime::currentDateTime(), clientIp(s), method, path, status});
     while (m_log.size() > LOG_KEEP) m_log.removeFirst();
     emit accessLogged();
+}
+
+bool ApiServer::overLimit(const QString &ip)
+{
+    auto it = m_hits.find(ip);
+    if (it == m_hits.end()) return false;
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    while (!it->isEmpty() && it->first() < now - 60000) it->removeFirst();
+    return it->size() > RATE_PER_MIN;
 }
 
 bool ApiServer::rateLimited(const QString &ip, bool authFailure)
@@ -840,13 +1017,22 @@ QJsonObject ApiServer::stateObject() const
     return QJsonDocument::fromJson(m_loc->StateJson().toUtf8()).object();
 }
 
+// v1: "event: <name>\ndata: <json>". BFS3: only "data: b64u(nonce ‖ sealed)" — the name travels inside,
+// {"type": name, "seq": n, "data": json}, sealed with the stream's request counter and n (docs/SECURE-API.md)
+QByteArray ApiServer::sseFrame(Stream &st, const QByteArray &event, const QJsonObject &data)
+{
+    if (!st.sealed || !m_hub) return "event: " + event + "\ndata: " + QJsonDocument(data).toJson(QJsonDocument::Compact) + "\n\n";
+    ++st.seq;
+    const QJsonObject o{{"type", QString::fromLatin1(event)}, {"seq", double(st.seq)}, {"data", data}};
+    return "data: " + m_hub->sealEvent(st.sess, st.seq, QJsonDocument(o).toJson(QJsonDocument::Compact)) + "\n\n";
+}
+
 void ApiServer::broadcast(const QByteArray &event, const QJsonObject &data)
 {
-    const QByteArray frame = "event: " + event + "\ndata: " + QJsonDocument(data).toJson(QJsonDocument::Compact) + "\n\n";
     for (int i = m_streams.size() - 1; i >= 0; --i) {
         QTcpSocket *s = m_streams[i].sock;
         if (!s || s->state() != QAbstractSocket::ConnectedState) { m_streams.removeAt(i); continue; }
-        s->write(frame);
+        s->write(sseFrame(m_streams[i], event, data));
     }
 }
 
@@ -858,7 +1044,49 @@ void ApiServer::handle(QTcpSocket *s, const Request &r)
         rateLimited(ip, true);
         finish(401, QJsonObject{{"error", "unauthorized"}}, {"WWW-Authenticate: Bearer realm=\"BeaconFix\""});
     };
-    if (rateLimited(ip, false)) { finish(429, QJsonObject{{"error", "rate limited"}}, {"Retry-After: 60"}); return; }
+    if (m_hub && s->property("hubNet").toBool()) {              // the hub's network side: /healthz (no data) and BFS3, nothing else
+        // Only what is unauthenticated is budgeted here (/healthz, and every BFS3 failure counts double in handleV3):
+        // a node's first sync pulls the whole master database in hundreds of sealed pages, and a sealed request is
+        // already bound to an enrolled key, a counter window and the ±300 s clock
+        if (overLimit(ip) || (r.path == QLatin1String("/healthz") && rateLimited(ip, false))) { finish(429, QJsonObject{{"error", "rate limited"}}, {"Retry-After: 60"}); return; }
+        if (r.path == QLatin1String("/healthz")) {
+            if (r.method != QLatin1String("GET")) { finish(405, QJsonObject{{"error", "method not allowed"}}, {"Allow: GET"}); return; }
+            finish(200, QJsonObject{{"ok", m_hub->ready()}, {"api", "bfs3"}}); return;
+        }
+        handleV3(s, r);
+        return;
+    }
+    // Only anonymous traffic and failures count: a paired phone's chunked sync plus live polling easily passes 60/min
+    if (overLimit(ip) || (!authenticate(r, ip) && rateLimited(ip, false))) { finish(429, QJsonObject{{"error", "rate limited"}}, {"Retry-After: 60"}); return; }
+    if (r.path == QLatin1String("/") || r.path == QLatin1String("/web") || r.path == QLatin1String("/web/") || r.path == QLatin1String("/alpr")) {
+        logAccess(s, r.method, r.path, 200);
+        replyRaw(s, 200, "text/html; charset=utf-8", WebDashboard::html());
+        return;
+    }
+    if (r.path == QLatin1String("/favicon.ico") || r.path == QLatin1String("/api/v1/icon/low")) {
+        QFile f(QStringLiteral(":/icons/hicolor/32x32/apps/beaconfix.png"));     // compiled in (appicon.h): low detail
+        if (f.open(QIODevice::ReadOnly)) {
+            logAccess(s, r.method, r.path, 200);
+            replyRaw(s, 200, "image/png", f.readAll());
+            return;
+        }
+    }
+    if (r.path == QLatin1String("/icon.png") || r.path == QLatin1String("/api/v1/icon") || r.path == QLatin1String("/api/v1/icon/high")) {
+        QFile f(QStringLiteral(":/icons/hicolor/256x256/apps/beaconfix.png"));   // high detail
+        if (f.open(QIODevice::ReadOnly)) {
+            logAccess(s, r.method, r.path, 200);
+            replyRaw(s, 200, "image/png", f.readAll());
+            return;
+        }
+    }
+    if (r.path == QLatin1String("/api/v1/icon/medium")) {
+        QFile f(QStringLiteral(":/icons/hicolor/128x128/apps/beaconfix.png"));   // medium detail
+        if (f.open(QIODevice::ReadOnly)) {
+            logAccess(s, r.method, r.path, 200);
+            replyRaw(s, 200, "image/png", f.readAll());
+            return;
+        }
+    }
     if (!r.path.startsWith(QLatin1String("/api/v1/"))) { finish(404, QJsonObject{{"error", "not found"}}); return; }
     const QString ep = r.path.mid(8);                       // after /api/v1/
 
@@ -868,7 +1096,7 @@ void ApiServer::handle(QTcpSocket *s, const Request &r)
         Identity *hid = m_loc->identity();
         finish(200, QJsonObject{{"name", "BeaconFix"}, {"version", QStringLiteral(BEACONFIX_VERSION)}, {"hostname", QHostInfo::localHostName()},
                                 {"pairing", pairingOpen()}, {"tls", m_tls}, {"ts", QDateTime::currentDateTime().toString(Qt::ISODate)},
-                                {"features", QJsonArray::fromStringList(featureList())}, {"api", 2}, {"kind", "desktop"},
+                                {"features", QJsonArray::fromStringList(featureList())}, {"api", 3}, {"link", !m_hub}, {"pcName", linkName()}, {"kind", "desktop"},
                                 {"mdns", m_mdns && m_mdns->published()},
                                 {"identity", hid && hid->exists() ? QJsonValue(QJsonObject{{"id", hid->id()}, {"name", hid->name()}}) : QJsonValue()}});
         return;
@@ -976,6 +1204,54 @@ void ApiServer::handle(QTcpSocket *s, const Request &r)
         return;
     }
 
+    // ── linking v3 (docs/LINKING.md): QR (MAC → approved at once) or mDNS (commitment, key, Link on the PC) ──
+    if (!m_hub && (ep == QLatin1String("link") || (ep.startsWith(QLatin1String("link/")) && ep != QLatin1String("link/hub-invite")))) {
+        const qint64 nowMs = QDateTime::currentMSecsSinceEpoch(), now = nowMs / 1000;
+        const QJsonObject b = QJsonDocument::fromJson(r.body).object();
+        QJsonObject out; int code = 0;
+        if (ep == QLatin1String("link")) {
+            if (r.method != QLatin1String("POST")) { finish(405, QJsonObject{{"error", "method not allowed"}}, {"Allow: POST"}); return; }
+            QString sid;
+            code = m_links.request(b, ip, nowMs, &out, &sid);
+            if (code == 202) {
+                Link::Session *ls = m_links.find(sid);
+                if (ls->origin == Link::Session::Qr) {                   // it saw our screen: linked now
+                    QString e;
+                    if (!issueLink(sid, &e)) { m_links.deny(sid, e, now); code = 500; out = QJsonObject{{"error", e}}; }
+                } else {                                                  // the verdict is information for the person tapping Link
+                    Pairing::Proximity px = Pairing::score(b["proximity"].toObject(), m_loc->accessPoints(), m_loc->fix());
+                    ls->proximity = px.toJson();
+                    ls->proximity["label"] = Pairing::verdictLabel(px.verdict);
+                }
+                emit linkChanged();
+            }
+        } else {
+            const QString sid = ep.mid(5);
+            if (r.method == QLatin1String("POST")) {                     // mDNS: the key behind the commitment
+                code = m_links.reveal(sid, b, ip, nowMs, &out);
+                if (code == 202 || code == 403) emit linkChanged();
+                if (code == 202) {
+                    const Link::Session *ls = m_links.find(sid);
+                    const QString who = ls->name, kind = ls->kind, codeText = Link::codeText(ls->code), where = ls->proximity["label"].toString();
+                    m_loc->notifyWithActions(QStringLiteral("%1 wants to link — code %2").arg(who, codeText),
+                                             QStringLiteral("%1 (%2) at %3 · %4 (information only).\nTap Link only if the phone shows %5.").arg(who, kind.isEmpty() ? QStringLiteral("device") : kind, ip, where, codeText),
+                                             QStringLiteral("network-connect"), {QStringLiteral("default"), QStringLiteral("Open"), QStringLiteral("link"), QStringLiteral("Link"), QStringLiteral("reject"), QStringLiteral("Reject")},
+                                             [this, sid](const QString &key) { if (key == QLatin1String("link")) linkApprove(sid); else if (key == QLatin1String("reject")) linkReject(sid); else emit linkRequested(sid); },
+                                             Link::kRequestSecs * 1000);
+                    emit linkRequested(sid);
+                }
+            } else if (r.method == QLatin1String("GET")) {
+                const Link::Session *ls = m_links.find(sid);
+                const QString who = ls ? ls->name : QString(), c = ls ? ls->code : QString();
+                code = m_links.poll(sid, now, &out);
+                if (out["status"].toString() == QLatin1String("approved")) { emit linked(sid, who, c); emit linkChanged(); }
+            } else { finish(405, QJsonObject{{"error", "method not allowed"}}, {"Allow: GET, POST"}); return; }
+        }
+        if (code == 403 || code == 429) rateLimited(ip, true);
+        finish(code, out, code == 429 ? QList<QByteArray>{"Retry-After: 60"} : QList<QByteArray>{});
+        return;
+    }
+
     // ── identity (docs/IDENTITY.md): public record, challenge/auth, link, LAN hand-off ──
     Identity *idn = m_loc->identity();
     if (ep == QLatin1String("identity")) {
@@ -1056,13 +1332,60 @@ void ApiServer::handle(QTcpSocket *s, const Request &r)
     }
 
     // ── authenticated ──
-    if (m_knownOnly && !knownFor(ip)) {                          // tokens only work from OUR devices
+    if (m_knownOnly && !m_hub && !knownFor(ip)) {               // tokens only work from OUR devices (the hub: admin token on loopback only)
         rateLimited(ip, true);
         finish(403, QJsonObject{{"error", "unknown device"}, {"hint", "this address is not in BeaconFix's known-device list"}});
         return;
     }
     Device *dev = authenticate(r, ip);
+    static Device loopbackDev;
+    // Loopback is trusted, but not every loopback caller is us: any web page can make the browser send "simple"
+    // requests (a text/plain POST needs no preflight) to localhost, and a rebound DNS name can point at 127.0.0.1.
+    // So a browser request only gets the grant from our own origin (the dashboard), and only under a local Host;
+    // the tray, the widget and curl send no Origin.
+    auto localHost = [](QByteArray h) {
+        if (int i = h.indexOf("://"); i >= 0) h = h.mid(i + 3);
+        const int c = h.startsWith('[') ? h.indexOf("]:") + 1 : h.lastIndexOf(':');
+        if (c > 0) h.truncate(c);
+        h = h.toLower();
+        return h == "localhost" || h == "127.0.0.1" || h == "[::1]";
+    };
+    const QByteArray origin = r.headers.value("origin"), hostHdr = r.headers.value("host");
+    const bool browserForeign = (!hostHdr.isEmpty() && !localHost(hostHdr))
+                             || (!origin.isEmpty() && (origin.toLower() != "http://" + hostHdr.toLower() || !localHost(origin)));
+    // The hub: loopback alone is not enough (other local users of the container), the admin token from hub-admin.json is
+    const bool adminOk = !m_hub || (!m_adminToken.isEmpty() && Bfs3::constantTimeEqual(r.headers.value("x-bf-admin"), m_adminToken));
+    if (!dev && QHostAddress(ip).isLoopback() && !browserForeign && adminOk) {
+        loopbackDev.name = QStringLiteral("localhost");
+        loopbackDev.kind = QStringLiteral("desktop");
+        loopbackDev.scopes = QStringList{QStringLiteral("read"), QStringLiteral("control")};
+        dev = &loopbackDev;
+    }
     if (!dev) { deny401(); return; }
+    if (m_hub && ep.startsWith(QLatin1String("hub/"))) {         // hub administration (beaconfix --server --invite / --devices / --revoke)
+        if (dev != &loopbackDev) { finish(403, QJsonObject{{"error", "admin only"}}); return; }
+        const QJsonObject b = QJsonDocument::fromJson(r.body).object();
+        if (ep == QLatin1String("hub/status") && r.method == QLatin1String("GET")) { QJsonObject o = m_hub->statusJson(); o["listen"] = statusJson(); finish(200, o); return; }
+        if (ep == QLatin1String("hub/devices") && r.method == QLatin1String("GET")) { finish(200, QJsonObject{{"devices", m_hub->devicesJson()}, {"fingerprint", m_hub->fingerprint()}}); return; }
+        if (ep == QLatin1String("hub/invite") && r.method == QLatin1String("POST")) {
+            QStringList sc; for (const QJsonValue &v : b["scopes"].toArray()) sc << v.toString();
+            const QJsonObject o = m_hub->createInvite(b["name"].toString(), b["kind"].toString(), sc, b["minutes"].isDouble() ? b["minutes"].toInt() : 15);
+            finish(o.contains("error") ? 500 : 200, o); return;
+        }
+        if (ep == QLatin1String("hub/revoke") && r.method == QLatin1String("POST")) { const bool ok = m_hub->revoke(b["id"].toString()); finish(ok ? 200 : 404, QJsonObject{{"revoked", ok}, {"id", b["id"].toString()}}); return; }
+        finish(404, QJsonObject{{"error", "not found"}});
+        return;
+    }
+    serve(s, r, dev, ep);
+}
+
+// An authenticated /api/v1 route for `dev` (a LAN token, the loopback grant, or a hub device through BFS3 — then every
+// reply is sealed by replyRaw()). Scopes are the v1 ones: read [, control].
+void ApiServer::serve(QTcpSocket *s, const Request &r, Device *dev, const QString &ep)
+{
+    const QString ip = clientIp(s);
+    auto finish = [&](int code, const QJsonObject &body, const QList<QByteArray> &extra = {}) { logAccess(s, r.method, r.path, code); reply(s, code, body, extra); };
+    Identity *idn = m_loc->identity();
     const bool control = dev->scopes.contains(QStringLiteral("control"));
     const bool get = r.method == QLatin1String("GET"), post = r.method == QLatin1String("POST");
     // A token paired without a kind learns it from the first message that says what it is (the Pi agent has no fix yet, so no position)
@@ -1085,6 +1408,20 @@ void ApiServer::handle(QTcpSocket *s, const Request &r)
         QJsonObject o{{"code", code}, {"expires", QDateTime::currentDateTime().addSecs(600).toString(Qt::ISODate)}, {"fetch", QStringLiteral("/api/v1/identity/export/%1").arg(code)}};
         if (words) o["words"] = pass;                            // generated for the caller: shown once here, never stored
         finish(200, o);
+        return;
+    }
+    if (ep == QLatin1String("link/hub-invite")) {                // a linked phone whose invite expired asks for a fresh one (docs/LINKING.md)
+        if (!post) { finish(405, QJsonObject{{"error", "method not allowed"}}, {"Allow: POST"}); return; }
+        if (!control) { finish(403, QJsonObject{{"error", "control scope required"}}); return; }
+        HubClient *hc = m_loc->hubClient();
+        if (m_hub || !hc || !hc->enrolled()) { finish(409, QJsonObject{{"error", "this PC is not enrolled with a hub"}}); return; }
+        QPointer<QTcpSocket> sock(s); const QString method = r.method, path = r.path;
+        hc->requestInvite(dev->name, dev->kind, [this, sock, method, path](const QString &inv, const QString &error) {
+            if (!sock) return;
+            const int code = inv.isEmpty() ? 503 : 200;
+            logAccess(sock, method, path, code);
+            reply(sock, code, inv.isEmpty() ? QJsonObject{{"error", QStringLiteral("the hub is not reachable from this PC: %1").arg(error)}} : QJsonObject{{"hub", inv}});
+        });
         return;
     }
     if (ep == QLatin1String("devices/me")) {                  // the calling token's own record: its scopes now (after --grant-control)
@@ -1283,6 +1620,382 @@ void ApiServer::handle(QTcpSocket *s, const Request &r)
         finish(200, o);
         return;
     }
+    // ── Plate events (docs/SIGHTINGS.md §5) ──
+    if (ep == QLatin1String("plate-events") || ep.startsWith(QLatin1String("plate-events/"))) {
+        PlateWatch *pw = m_loc->plateWatch();
+        MapDb *db = m_loc->mapDb();
+        if (!pw || !db || !db->isOpen()) { finish(503, QJsonObject{{"error", "map database unavailable"}}); return; }
+        const QString rest = ep.size() > 13 ? ep.mid(13) : QString();          // after "plate-events/" (a uid may contain '/')
+        const QJsonObject b = QJsonDocument::fromJson(r.body).object();
+        if (ep == QLatin1String("plate-events")) {
+            if (get) {
+                const QUrlQuery qq(r.query);
+                const qint64 since = qq.queryItemValue(QStringLiteral("since")).toLongLong();
+                const int limit = qq.hasQueryItem(QStringLiteral("limit")) ? qBound(1, qq.queryItemValue(QStringLiteral("limit")).toInt(), 1000) : 200;
+                const QString kind = qq.queryItemValue(QStringLiteral("kind"));
+                if (!kind.isEmpty() && kind != QLatin1String("camera_pass") && kind != QLatin1String("plate_search")) { finish(400, QJsonObject{{"error", "kind: camera_pass | plate_search"}}); return; }
+                if (qq.queryItemValue(QStringLiteral("latest")) == QLatin1String("1")) {   // a view, not the feed: newest first by time
+                    QJsonArray evs;
+                    for (const QJsonValue &v : db->plateEventsLatest(limit, kind, true)) {
+                        QJsonObject e = withoutLocalMedia(v.toObject());
+                        const QJsonObject f = pw->agencyFacts(e);              // §4.6 Eyes on Flock (a view only, never in the feed)
+                        if (!f.isEmpty()) e["agencyFacts"] = f;
+                        evs.append(e);
+                    }
+                    finish(200, QJsonObject{{"events", evs}, {"cursor", double(db->currentSeq())}, {"more", false}});
+                    return;
+                }
+                bool more = false; qint64 cursor = since;
+                const QJsonArray events = db->plateEventsSince(since, limit, kind, &more, &cursor);
+                finish(200, QJsonObject{{"events", events}, {"cursor", double(cursor)}, {"more", more}});
+                return;
+            }
+            if (!post) { finish(405, QJsonObject{{"error", "method not allowed"}}, {"Allow: GET, POST"}); return; }
+            if (!control) { finish(403, QJsonObject{{"error", "control scope required"}}); return; }
+            if (db->readOnly()) { finish(503, QJsonObject{{"error", "map database not writable"}}); return; }
+            if (!b["events"].isArray()) { finish(400, QJsonObject{{"error", "{\"events\":[…]} required"}}); return; }
+            learnKind(b);
+            const QString from = b["device"].toString().isEmpty() ? dev->name : b["device"].toString().left(64);
+            finish(200, pw->ingest(b["events"].toArray(), from, true));
+            return;
+        }
+        if (rest == QLatin1String("status")) {
+            if (!get) { finish(405, QJsonObject{{"error", "method not allowed"}}, {"Allow: GET"}); return; }
+            finish(200, pw->status());
+            return;
+        }
+        if (rest == QLatin1String("backfill")) {
+            if (!post) { finish(405, QJsonObject{{"error", "method not allowed"}}, {"Allow: POST"}); return; }
+            if (!control) { finish(403, QJsonObject{{"error", "control scope required"}}); return; }
+            if (!pw->active()) { finish(409, QJsonObject{{"error", "this instance does not detect passes (the hub stores what the nodes send)"}}); return; }
+            const bool restart = b["restart"].toBool();
+            pw->startBackfill(restart);
+            finish(202, QJsonObject{{"ok", true}, {"restart", restart}, {"backfill", pw->status()["backfill"]}});
+            return;
+        }
+        if (rest.startsWith(QLatin1String("media/"))) {
+            if (!get) { finish(405, QJsonObject{{"error", "method not allowed"}}, {"Allow: GET"}); return; }
+            const QString as = QUrlQuery(r.query).queryItemValue(QStringLiteral("as"));
+            if (!as.isEmpty() && as != QLatin1String("display") && as != QLatin1String("stored")) { finish(400, QJsonObject{{"error", "as: display | stored"}}); return; }
+            MapDb::MediaRow meta;
+            if (db->mediaData(rest.mid(6), &meta).isEmpty() || meta.kind == QLatin1String("webcam")) {   // webcam stills are kept on this device only (§2.0)
+                finish(404, QJsonObject{{"error", "no such media"}}); return;
+            }
+            QPointer<QTcpSocket> sock(s);
+            const QString method = r.method, path = r.path;
+            pw->mediaFor(rest.mid(6), as != QLatin1String("stored"), [this, sock, method, path](int code, const QByteArray &type, const QByteArray &data) {
+                if (!sock) return;
+                logAccess(sock, method, path, code);
+                replyRaw(sock, code, type, data, code == 200 ? QList<QByteArray>{"Cache-Control: private, max-age=86400"} : QList<QByteArray>{});
+            });
+            return;
+        }
+        if (rest.endsWith(QLatin1String("/media"))) {
+            if (!post) { finish(405, QJsonObject{{"error", "method not allowed"}}, {"Allow: POST"}); return; }
+            if (!control) { finish(403, QJsonObject{{"error", "control scope required"}}); return; }
+            if (Locator::hubRole()) { finish(404, QJsonObject{{"error", "media stay on the nodes: post it to the desktop"}}); return; }
+            QPointer<QTcpSocket> sock(s);
+            const QString method = r.method, path = r.path;
+            pw->addMedia(rest.chopped(6), b, [this, sock, method, path](int code, const QJsonObject &o) {
+                if (!sock) return;
+                logAccess(sock, method, path, code);
+                reply(sock, code, o);
+            });
+            return;
+        }
+        if (!get) { finish(405, QJsonObject{{"error", "method not allowed"}}, {"Allow: GET"}); return; }
+        const QJsonObject ev = db->plateEvent(rest, true, true);
+        if (ev.isEmpty()) { finish(404, QJsonObject{{"error", "no such plate event"}, {"uid", rest}}); return; }
+        QJsonObject out = withoutLocalMedia(ev);
+        const QJsonObject facts = pw->agencyFacts(out);
+        if (!facts.isEmpty()) out["agencyFacts"] = facts;
+        finish(200, out);
+        return;
+    }
+    // ── A camera: its trust, the road it watches, its agency; the user's verdict (docs/SIGHTINGS.md §2.7) ──
+    if (ep.startsWith(QLatin1String("cameras/"))) {
+        PlateWatch *pw = m_loc->plateWatch();
+        MapDb *db = m_loc->mapDb();
+        if (!pw || !db || !db->isOpen()) { finish(503, QJsonObject{{"error", "map database unavailable"}}); return; }
+        QString rest = ep.mid(8);
+        const bool verdict = rest.endsWith(QLatin1String("/verdict"));
+        if (verdict) rest.chop(8);
+        const QString id = QUrl::fromPercentEncoding(rest.toUtf8());
+        if (id.isEmpty()) { finish(404, QJsonObject{{"error", "not found"}}); return; }
+        if (verdict) {
+            if (!post) { finish(405, QJsonObject{{"error", "method not allowed"}}, {"Allow: POST"}); return; }
+            if (!control) { finish(403, QJsonObject{{"error", "control scope required"}}); return; }
+            if (db->readOnly()) { finish(503, QJsonObject{{"error", "map database not writable"}}); return; }
+            const QJsonObject b = QJsonDocument::fromJson(r.body).object();
+            const QJsonObject res = pw->setCameraVerdict(id, b["verdict"].toString());
+            if (res.contains(QLatin1String("error"))) { finish(res.value(QLatin1String("status")).toInt() == 404 ? 404 : 400, res); return; }
+            finish(200, res);
+            return;
+        }
+        if (!get) { finish(405, QJsonObject{{"error", "method not allowed"}}, {"Allow: GET"}); return; }
+        const QJsonObject info = pw->cameraInfo(id);
+        if (info.isEmpty()) { finish(404, QJsonObject{{"error", "no such camera"}, {"id", id}}); return; }
+        finish(200, info);
+        return;
+    }
+    // ── Routing around ALPR cameras (docs/SIGHTINGS.md §8): the user's own OpenRouteService / GraphHopper key ──
+    if (ep == QLatin1String("route/avoid") || ep == QLatin1String("route/status")) {
+        PlateWatch *pw = m_loc->plateWatch();
+        RoutePlanner *rp = pw ? pw->routePlanner() : nullptr;
+        if (!rp) { finish(503, QJsonObject{{"error", "routing unavailable"}}); return; }
+        if (ep == QLatin1String("route/status")) {
+            if (!get) { finish(405, QJsonObject{{"error", "method not allowed"}}, {"Allow: GET"}); return; }
+            finish(200, rp->status());
+            return;
+        }
+        if (!post) { finish(405, QJsonObject{{"error", "method not allowed"}}, {"Allow: POST"}); return; }
+        const QJsonObject b = QJsonDocument::fromJson(r.body).object();
+        auto point = [](const QJsonValue &v, AvoidRoute::LatLon *out) {
+            if (v.isObject()) { const QJsonObject o = v.toObject(); if (!o["lat"].isDouble() || !o["lon"].isDouble()) return false; *out = {o["lat"].toDouble(), o["lon"].toDouble()}; return true; }
+            if (v.isArray() && v.toArray().size() >= 2) { *out = {v.toArray()[0].toDouble(), v.toArray()[1].toDouble()}; return true; }   // [lat, lon]
+            return false;
+        };
+        AvoidRoute::LatLon from, to;
+        if (!point(b["to"], &to)) { finish(400, QJsonObject{{"error", "{\"to\":{\"lat\",\"lon\"}} required (from: default the current fix)"}}); return; }
+        if (!point(b["from"], &from)) {
+            const Fix &f = m_loc->fix();
+            if (!f.valid) { finish(400, QJsonObject{{"error", "no from given and no current fix"}}); return; }
+            from = {f.lat, f.lon};
+        }
+        QPointer<QTcpSocket> sock(s);
+        const QString method = r.method, path = r.path;
+        rp->route(from, to, b["provider"].toString(), [this, sock, method, path](int code, const QJsonObject &o) {
+            if (!sock) return;
+            logAccess(sock, method, path, code);
+            reply(sock, code, o);
+        });
+        return;
+    }
+    if (ep == QLatin1String("flock")) {
+        if (!get) { finish(405, QJsonObject{{"error", "method not allowed"}}, {"Allow: GET"}); return; }
+        if (QUrlQuery(r.query).queryItemValue(QStringLiteral("geojson")) == QLatin1String("1")) {
+            logAccess(s, r.method, r.path, 200);
+            replyRaw(s, 200, "application/geo+json", m_loc->exportFlockGeoJson());
+            return;
+        }
+        // An area, not the table: after a nationwide sync that is ~140k rows (~30 MB, seconds on the GUI thread).
+        // ?bbox=south,west,north,east  or  ?lat=&lon=&km=  (default: around the fix, 50 km); ?limit= (≤ 20000, nearest
+        // first); ?all=1 for everything (or ?geojson=1 for the export).
+        const QUrlQuery qq(r.query);
+        const int limit = qBound(1, qq.hasQueryItem(QStringLiteral("limit")) ? qq.queryItemValue(QStringLiteral("limit")).toInt() : 5000, 20000);
+        QList<FlockCamera> cams;
+        QJsonObject area;
+        const QStringList bb = qq.queryItemValue(QStringLiteral("bbox")).split(QLatin1Char(','));
+        if (qq.queryItemValue(QStringLiteral("all")) == QLatin1String("1")) cams = m_loc->flockCameras();
+        else if (bb.size() == 4) {
+            const double s = bb[0].toDouble(), w = bb[1].toDouble(), n = bb[2].toDouble(), e = bb[3].toDouble();
+            cams = m_loc->flockCamerasIn(qMin(s, n), qMax(s, n), qMin(w, e), qMax(w, e), limit);
+            area = QJsonObject{{"south", qMin(s, n)}, {"west", qMin(w, e)}, {"north", qMax(s, n)}, {"east", qMax(w, e)}};
+        } else {
+            bool okLa = false, okLo = false;
+            double lat = qq.queryItemValue(QStringLiteral("lat")).toDouble(&okLa), lon = qq.queryItemValue(QStringLiteral("lon")).toDouble(&okLo);
+            if (!okLa || !okLo) { lat = m_loc->latitude(); lon = m_loc->longitude(); }
+            const double km = qBound(0.1, qq.hasQueryItem(QStringLiteral("km")) ? qq.queryItemValue(QStringLiteral("km")).toDouble() : 50.0, 2000.0);
+            if (lat != 0.0 || lon != 0.0) cams = m_loc->flockCamerasNear(lat, lon, km, limit);
+            area = QJsonObject{{"lat", lat}, {"lon", lon}, {"km", km}};
+        }
+        QJsonArray arr;
+        MapDb *tdb = m_loc->mapDb();
+        const bool withTrust = tdb && cams.size() <= 5000;     // area queries (the phone): each camera's trust (§2.6); not the 150k "all" dump
+        for (const FlockCamera &c : cams) {
+            QJsonObject o = c.toJson();
+            if (withTrust) { const MapDb::CameraExtra x = tdb->cameraExtra(c.id); if (x.hasTrust) o[QStringLiteral("trust")] = std::round(x.trust * 1000) / 1000; }
+            arr.append(o);
+        }
+        finish(200, QJsonObject{{"cameras", arr}, {"area", area}, {"limit", limit}, {"truncated", !area.isEmpty() && cams.size() >= limit},
+                                {"stats", m_loc->flockStats()}, {"loading", m_loc->flockLoading()}});
+        return;
+    }
+    if (ep == QLatin1String("flock/refresh")) {
+        if (!post) { finish(405, QJsonObject{{"error", "method not allowed"}}, {"Allow: POST"}); return; }
+        m_loc->refreshFlockCameras(true);
+        finish(200, QJsonObject{{"status", "ok"}, {"message", "Surveillance camera refresh started"}});
+        return;
+    }
+    if (ep == QLatin1String("flock/sighting")) {
+        if (!post) { finish(405, QJsonObject{{"error", "method not allowed"}}, {"Allow: POST"}); return; }
+        const QJsonObject b = QJsonDocument::fromJson(r.body).object();
+        const QString bssid = b["bssid"].toString();
+        const double lat = b["lat"].toDouble();
+        const double lon = b["lon"].toDouble();
+        if (bssid.isEmpty() || lat == 0.0 || lon == 0.0) {
+            finish(400, QJsonObject{{"error", "bssid, lat, and lon are required"}});
+            return;
+        }
+        // docs/DETECTION.md: a phone that sends the SSID is re-checked against our own rule set; an older one is taken
+        // at its word, but only as Flock (the class it could report)
+        FlockDetector::Detection det = FlockDetector::evaluateWifi(bssid, b["ssid"].toString());
+        if (b.contains(QStringLiteral("ssid")) && !det.isFlock) { finish(200, QJsonObject{{"recorded", false}, {"reason", "not a Flock signature here"}}); return; }
+        if (!det.isFlock) {
+            det.isFlock = true;
+            det.cls = QStringLiteral("flock");
+            det.cameraType = QStringLiteral("alpr");
+            det.tier = b["tier"].toInt(2);
+            det.model = b["model"].toString();
+            det.method = b["method"].toString(QStringLiteral("reported"));
+            det.confidence = b["confidence"].toInt(65);
+            det.details = b["details"].toString();
+        }
+        MapDb *db = m_loc->mapDb();
+        if (!db) { finish(500, QJsonObject{{"error", "database not available"}}); return; }
+        const bool recorded = db->recordFlockSighting(bssid, lat, lon, det);
+        if (recorded) emit m_loc->flockCamerasUpdated();
+        finish(200, QJsonObject{{"recorded", recorded}});
+        return;
+    }
+    if (ep == QLatin1String("flock/import")) {
+        if (!post) { finish(405, QJsonObject{{"error", "method not allowed"}}, {"Allow: POST"}); return; }
+        const QJsonArray arr = QJsonDocument::fromJson(r.body).array();
+        QList<FlockCamera> cams;
+        for (const QJsonValue &v : arr) cams.append(FlockCamera::fromJson(v.toObject()));
+        MapDb *db = m_loc->mapDb();
+        if (!db) { finish(500, QJsonObject{{"error", "database not available"}}); return; }
+        const int saved = db->saveFlockCameras(cams);
+        if (saved > 0) {
+            m_loc->recalculatePasses();
+            m_loc->crossReferenceOpenDatabases();
+            emit m_loc->flockCamerasUpdated();
+        }
+        finish(200, QJsonObject{{"ok", true}, {"imported", saved}});
+        return;
+    }
+    if (ep == QLatin1String("flock/encounters")) {
+        if (!get) { finish(405, QJsonObject{{"error", "method not allowed"}}, {"Allow: GET"}); return; }
+        const QUrlQuery q(r.query);
+        const QString camId = q.queryItemValue(QStringLiteral("cameraId"));
+        const int limit = q.hasQueryItem(QStringLiteral("limit")) ? q.queryItemValue(QStringLiteral("limit")).toInt() : 200;
+        QJsonArray arr;
+        for (const CameraEncounter &enc : m_loc->cameraEncounters(camId, limit)) arr.append(enc.toJson());
+        finish(200, QJsonObject{{"encounters", arr}, {"count", arr.size()}});
+        return;
+    }
+    if (ep == QLatin1String("flock/audits")) {
+        if (!get) { finish(405, QJsonObject{{"error", "method not allowed"}}, {"Allow: GET"}); return; }
+        const QUrlQuery q(r.query);
+        const QString plate = q.queryItemValue(QStringLiteral("plate"));
+        const int limit = q.hasQueryItem(QStringLiteral("limit")) ? q.queryItemValue(QStringLiteral("limit")).toInt() : 200;
+        QJsonArray arr;
+        for (const PlateAudit &aud : m_loc->plateAudits(plate, limit)) arr.append(aud.toJson());
+        finish(200, QJsonObject{{"audits", arr}, {"count", arr.size()}});
+        return;
+    }
+    if (ep == QLatin1String("flock/summary")) {
+        if (!get) { finish(405, QJsonObject{{"error", "method not allowed"}}, {"Allow: GET"}); return; }
+        QJsonObject summary = m_loc->alprSummary();
+        summary["flockStats"] = m_loc->flockStats();
+        finish(200, summary);
+        return;
+    }
+    if (ep == QLatin1String("flock/crossref")) {
+        if (!post) { finish(405, QJsonObject{{"error", "method not allowed"}}, {"Allow: POST"}); return; }
+        const QJsonObject b = QJsonDocument::fromJson(r.body).object();
+        const QString plate = b["plate"].toString();
+        const int matches = m_loc->crossReferenceOpenDatabases(plate);
+        finish(200, QJsonObject{{"ok", true}, {"matches", matches}});
+        return;
+    }
+    if (ep == QLatin1String("flock/recalculate")) {
+        if (!post) { finish(405, QJsonObject{{"error", "method not allowed"}}, {"Allow: POST"}); return; }
+        const int count = m_loc->recalculatePasses();
+        finish(200, QJsonObject{{"ok", true}, {"encounters", count}});
+        return;
+    }
+    if (ep == QLatin1String("flock/sync-us")) {
+        if (post) {
+            m_loc->syncNationwideUsCameras(true);
+            finish(200, QJsonObject{{"ok", true}, {"active", m_loc->usSyncActive()}, {"status", m_loc->usSyncStatus()}});
+            return;
+        }
+        if (get) {
+            finish(200, QJsonObject{
+                {"ok", true},
+                {"active", m_loc->usSyncActive()},
+                {"sector", m_loc->usSyncSector()},
+                {"totalSectors", m_loc->usSyncSteps()},
+                {"totalAdded", m_loc->usSyncTotalAdded()},
+                {"status", m_loc->usSyncStatus()}
+            });
+            return;
+        }
+        finish(405, QJsonObject{{"error", "method not allowed"}}, {"Allow: GET, POST"});
+        return;
+    }
+    if (ep == QLatin1String("plates")) {
+        if (get) {
+            QJsonArray arr;
+            for (const LicensePlate &p : m_loc->licensePlates()) arr.append(p.toJson());
+            finish(200, QJsonObject{{"plates", arr}, {"count", arr.size()}});
+            return;
+        }
+        if (!post) { finish(405, QJsonObject{{"error", "method not allowed"}}, {"Allow: GET, POST"}); return; }
+        if (!control) { finish(403, QJsonObject{{"error", "control scope required"}}); return; }
+        const QJsonObject b = QJsonDocument::fromJson(r.body).object();
+        LicensePlate p = LicensePlate::fromJson(b);
+        if (p.plate.isEmpty()) { finish(400, QJsonObject{{"error", "plate required"}}); return; }
+        const bool saved = m_loc->saveLicensePlate(p);
+        finish(saved ? 200 : 500, QJsonObject{{"ok", saved}, {"plate", p.toJson()}});
+        return;
+    }
+    if (ep.startsWith(QLatin1String("plates/"))) {
+        const QString plate = QUrl::fromPercentEncoding(ep.mid(7).toUtf8()).toUpper().remove(QLatin1Char(' ')).remove(QLatin1Char('-'));
+        if (r.method == QLatin1String("DELETE")) {
+            if (!control) { finish(403, QJsonObject{{"error", "control scope required"}}); return; }
+            const bool deleted = m_loc->deleteLicensePlate(plate);
+            finish(deleted ? 200 : 404, QJsonObject{{"ok", deleted}, {"deleted", plate}});
+            return;
+        }
+        finish(405, QJsonObject{{"error", "method not allowed"}}, {"Allow: DELETE"});
+        return;
+    }
+    if (ep == QLatin1String("telegram")) {
+        // The live bot (main.cpp sets the property): a POST takes effect now, not at the next start. The token is
+        // never echoed; the pairing code ("/start <code>" binds the owner's chat) only goes to a control-scope caller
+        auto *bot = qobject_cast<TelegramBot *>(property("telegramBot").value<QObject *>());
+        if (!bot) { finish(503, QJsonObject{{"error", "telegram bot unavailable"}}); return; }
+        auto status = [&] {
+            QJsonObject o{{"configured", bot->isConfigured()}, {"polling", bot->isPolling()}, {"paired", bot->chatId() != 0},
+                          {"chatId", bot->chatId()}, {"botUsername", bot->botUsername()}};
+            if (control && !bot->pairCode().isEmpty()) {
+                o["pairCode"] = bot->pairCode();
+                if (!bot->botUsername().isEmpty()) o["pairLink"] = QStringLiteral("https://t.me/%1?start=%2").arg(bot->botUsername(), bot->pairCode());
+            }
+            return o;
+        };
+        if (get) { finish(200, status()); return; }
+        if (post) {
+            if (!control) { finish(403, QJsonObject{{"error", "control scope required"}}); return; }
+            const QJsonObject b = QJsonDocument::fromJson(r.body).object();
+            if (b.contains("token")) bot->setToken(b["token"].toString());
+            if (b["unpair"].toBool()) bot->setChatId(0);   // binding a chat: only "/start <code>" in Telegram (no setter here)
+            QJsonObject o = status(); o["ok"] = true;
+            finish(200, o);
+            return;
+        }
+        finish(405, QJsonObject{{"error", "method not allowed"}}, {"Allow: GET, POST"});
+        return;
+    }
+    if (ep == QLatin1String("routes/heatmap") || ep == QLatin1String("routes")) {
+        if (!get) { finish(405, QJsonObject{{"error", "method not allowed"}}, {"Allow: GET"}); return; }
+        const QList<Fix> fixes = m_loc->allRouteFixes();
+        QJsonArray pts;
+        for (const Fix &f : fixes) {
+            if (!f.valid) continue;
+            pts.append(QJsonObject{
+                {"lat", f.lat},
+                {"lon", f.lon},
+                {"acc", f.accuracy},
+                {"time", f.time.isValid() ? f.time.toString(Qt::ISODate) : QString()},
+                {"source", f.source}
+            });
+        }
+        finish(200, QJsonObject{{"points", pts}, {"count", pts.size()}});
+        return;
+    }
     if (ep == QLatin1String("home")) {
         if (get) { finish(200, homeJson()); return; }
         if (r.method != QLatin1String("PUT") && !post) { finish(405, QJsonObject{{"error", "method not allowed"}}, {"Allow: GET, PUT"}); return; }
@@ -1333,6 +2046,18 @@ void ApiServer::handle(QTcpSocket *s, const Request &r)
         finish(200, QJsonObject{{"added", n}, {"device", from}, {"cursor", double(db->currentSeq())}, {"refitQueued", n > 0}});
         return;
     }
+    if (ep == QLatin1String("db/fixes")) {
+        if (!post) { finish(405, QJsonObject{{"error", "method not allowed"}}, {"Allow: POST"}); return; }
+        if (!control) { finish(403, QJsonObject{{"error", "control scope required"}}); return; }
+        MapDb *db = m_loc->mapDb();
+        if (!db || !db->isOpen() || db->readOnly()) { finish(503, QJsonObject{{"error", "map database not writable"}}); return; }
+        const QJsonObject b = QJsonDocument::fromJson(r.body).object();
+        const QString from = b["device"].toString().isEmpty() ? dev->name : b["device"].toString().left(64);
+        const int n = m_loc->appendPeerFixes(b["fixes"].toArray(), from);
+        if (n < 0) { finish(500, QJsonObject{{"error", "failed to append fixes"}}); return; }
+        finish(200, QJsonObject{{"added", n}, {"device", from}, {"cursor", double(db->currentSeq())}});
+        return;
+    }
     if (ep == QLatin1String("db/changes")) {                  // the sync feed: everything after a cursor, oldest first
         if (!get) { finish(405, QJsonObject{{"error", "method not allowed"}}, {"Allow: GET"}); return; }
         MapDb *db = m_loc->mapDb();
@@ -1373,8 +2098,15 @@ void ApiServer::handle(QTcpSocket *s, const Request &r)
         const int aps = m_loc->mergePeerAps(b["aps"].toArray(), from);
         const int fixes = m_loc->appendPeerFixes(b["fixes"].toArray(), from);
         const int anchors = m_loc->mergeAnchors(b["anchors"].toArray());
+        int plateEvents = 0;                                     // docs/SIGHTINGS.md §5: records only, merged per §1.1
+        QJsonArray plateEventUids;            // where each pushed plate event landed (its uid after the ±10 min merge), null = refused
+        if (m_loc->plateWatch() && b["plateEvents"].isArray()) {
+            const QJsonObject res = m_loc->plateWatch()->ingest(b["plateEvents"].toArray(), from, false);
+            plateEvents = res["accepted"].toInt(); plateEventUids = res["uids"].toArray();
+        }
         if (obs < 0 || aps < 0 || fixes < 0) { finish(500, QJsonObject{{"error", err.isEmpty() ? QStringLiteral("merge failed") : err}}); return; }
-        QJsonObject o{{"accepted", QJsonObject{{"observations", obs}, {"aps", aps}, {"fixes", fixes}, {"anchors", anchors}}}, {"cursor", double(db->currentSeq())}, {"refitQueued", obs > 0 || aps > 0}, {"device", from}};
+        QJsonObject o{{"accepted", QJsonObject{{"observations", obs}, {"aps", aps}, {"fixes", fixes}, {"anchors", anchors}, {"plateEvents", plateEvents}}}, {"cursor", double(db->currentSeq())}, {"refitQueued", obs > 0 || aps > 0}, {"device", from}};
+        if (!plateEventUids.isEmpty()) o["plateEventUids"] = plateEventUids;
         if (idn && idn->exists()) o["identity"] = idn->id();
         if (b.contains("sinceCursor")) {                        // convenience: the peer's pull in the same round trip
             bool more = false; qint64 cursor = 0;
@@ -1413,9 +2145,14 @@ void ApiServer::handle(QTcpSocket *s, const Request &r)
         for (int i = m_streams.size() - 1; i >= 0; --i) if (!m_streams[i].sock || m_streams[i].sock->state() != QAbstractSocket::ConnectedState) m_streams.removeAt(i);
         if (m_streams.size() >= MAX_STREAMS) { finish(503, QJsonObject{{"error", "too many streams"}}); return; }
         logAccess(s, r.method, r.path, 200);
-        s->write("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nConnection: keep-alive\r\nX-Accel-Buffering: no\r\n\r\n"
-                 "retry: 5000\nevent: fix\ndata: " + QJsonDocument(locationJson()).toJson(QJsonDocument::Compact) + "\n\n");
-        m_streams.append({s, dev->id});
+        Stream st; st.sock = s; st.device = dev->id;
+        QByteArray head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nConnection: keep-alive\r\nX-Accel-Buffering: no\r\n";
+        if (const auto it = m_v3.constFind(s); it != m_v3.constEnd()) {   // BFS3: every event sealed with this request's counter + its seq
+            st.sealed = true; st.sess = *it; m_v3.remove(s);
+            head += "X-BF-Counter: " + QByteArray::number(st.sess.counter) + "\r\n";
+        }
+        s->write(head + "\r\nretry: 5000\n" + sseFrame(st, "fix", locationJson()));
+        m_streams.append(st);
         return;
     }
     if (ep == QLatin1String("refresh") || ep == QLatin1String("prefetch")) {
@@ -1426,6 +2163,215 @@ void ApiServer::handle(QTcpSocket *s, const Request &r)
         return;
     }
     finish(404, QJsonObject{{"error", "not found"}});
+}
+
+// ── BFS3 (hub) ────────────────────────────────────────────────────────────────
+// The scope a v3 route needs: "" = not served over BFS3 (pairing, identity and the streamed import are LAN things)
+static QString v3Scope(const QString &method, const QString &ep)
+{
+    if (ep == QLatin1String("pair") || ep.startsWith(QLatin1String("pair/")) || ep == QLatin1String("link") || ep.startsWith(QLatin1String("link/"))
+        || ep.startsWith(QLatin1String("identity")) || ep == QLatin1String("db/import") || ep.startsWith(QLatin1String("hub/"))) return {};
+    if (method == QLatin1String("GET")) return ep == QLatin1String("db/export") ? QStringLiteral("control") : QStringLiteral("read");
+    static const QStringList sync{QStringLiteral("db/sync"), QStringLiteral("db/observations"), QStringLiteral("db/fixes"), QStringLiteral("devices/position"),
+                                  QStringLiteral("anchors"), QStringLiteral("ranging"), QStringLiteral("flock/sighting"), QStringLiteral("plate-events")};
+    if (sync.contains(ep) || ep.startsWith(QLatin1String("anchors/"))) return QStringLiteral("sync");
+    if (ep == QLatin1String("route/avoid")) return QStringLiteral("read");   // computes, changes nothing (docs/SIGHTINGS.md §8)
+    return QStringLiteral("control");
+}
+
+void ApiServer::handleV3(QTcpSocket *s, const Request &r)
+{
+    const QString ip = clientIp(s), ep = r.path.mid(8);       // after /api/v3/
+    auto plain = [&](int code, const QJsonObject &body) { logAccess(s, r.method, r.path, code); reply(s, code, body); };
+    if (ep == QLatin1String("enroll")) {                       // plain JSON inside TLS: nothing secret in it
+        if (r.method != QLatin1String("POST")) { plain(405, QJsonObject{{"error", "method not allowed"}}); return; }
+        QJsonObject out;
+        const int code = m_hub->enroll(QJsonDocument::fromJson(r.body).object(), ip, &out);
+        if (code == 200) { const QJsonObject b = QJsonDocument::fromJson(r.body).object(); m_loc->noteDeviceSeen(b["name"].toString(), b["kind"].toString()); }
+        plain(code, out);
+        return;
+    }
+    Hub::Session sess; QByteArray body;
+    if (!m_hub->open(r.method.toLatin1(), r.target, r.headers, r.body, ip, &sess, &body)) {
+        m_hub->noteFailure(ip); rateLimited(ip, true);
+        plain(401, QJsonObject{{"error", "unauthorized"}});
+        return;
+    }
+    m_v3.insert(s, sess);                                      // from here on every reply on this socket is sealed
+    // The hub's own routes (docs/HUB.md): node registry + job orchestration
+    if (ep == QLatin1String("nodes/heartbeat") || ep == QLatin1String("jobs") || ep.startsWith(QLatin1String("jobs/"))) {
+        const bool get = r.method == QLatin1String("GET"), post = r.method == QLatin1String("POST");
+        const QString need = get ? QStringLiteral("read") : QStringLiteral("sync");
+        if (!sess.scopes.contains(need)) { plain(403, QJsonObject{{"error", QStringLiteral("%1 scope required").arg(need)}}); return; }
+        const QJsonObject b = QJsonDocument::fromJson(body).object();
+        m_loc->noteDeviceSeen(sess.name, m_loc->kindForDevice(sess.name, sess.kind));
+        if (ep == QLatin1String("jobs") && get) { plain(200, m_hub->jobsJson()); return; }
+        if (ep == QLatin1String("nodes/heartbeat") && post) { plain(200, m_hub->heartbeat(sess, b)); return; }
+        if (ep == QLatin1String("jobs/lease") && post) { plain(200, m_hub->lease(sess, b)); return; }
+        if (ep == QLatin1String("jobs/results") && post) {     // several results in one request: {"results":[{"id", "lease", "result" | "error"}]}
+            QJsonArray res; int accepted = 0;
+            for (const QJsonValue &v : b["results"].toArray()) {
+                QJsonObject out; const int code = m_hub->submit(sess, v.toObject()["id"].toString(), v.toObject(), &out);
+                out["status"] = code; if (code == 200 && out["accepted"].toBool()) ++accepted;
+                res.append(out);
+            }
+            plain(200, QJsonObject{{"results", res}, {"accepted", accepted}});
+            return;
+        }
+        if (ep.startsWith(QLatin1String("jobs/")) && ep.endsWith(QLatin1String("/result")) && post) {
+            QJsonObject out; const int code = m_hub->submit(sess, ep.mid(5, ep.size() - 5 - 7), b, &out);
+            plain(code, out); return;
+        }
+        plain(get || post ? 404 : 405, QJsonObject{{"error", get || post ? "not found" : "method not allowed"}});
+        return;
+    }
+    // A PC links a phone (docs/LINKING.md): a fresh single-use invite for it, never wider than the inviter's own scopes
+    if (ep == QLatin1String("hub/invites")) {
+        if (r.method != QLatin1String("POST")) { plain(405, QJsonObject{{"error", "method not allowed"}}); return; }
+        static const QStringList inviters{QStringLiteral("desktop"), QStringLiteral("laptop"), QStringLiteral("node")};
+        if (!inviters.contains(sess.kind) || !sess.scopes.contains(QStringLiteral("control"))) {
+            plain(403, QJsonObject{{"error", "only an enrolled desktop, laptop or node with the control scope may invite"}}); return;
+        }
+        const QJsonObject b = QJsonDocument::fromJson(body).object();
+        const QString name = b["name"].toString().trimmed(), kind = b["kind"].toString().trimmed().toLower();
+        if (name.isEmpty() || name.size() > 64 || kind.size() > 16) { plain(400, QJsonObject{{"error", "name (1-64) and kind (≤16) required"}}); return; }
+        if (m_hub->openInvites(sess.deviceId) >= 10) { plain(429, QJsonObject{{"error", "10 open invites from this device already"}}); return; }
+        const QJsonObject o = m_hub->createInvite(name, kind, sess.scopes, 15, sess.deviceId);
+        if (o.contains("error")) { plain(500, QJsonObject{{"error", o["error"].toString()}}); return; }
+        qInfo("beaconfix: hub: %s (%s, %s) invited \"%s\" (%s), invite %s, from %s", qPrintable(sess.deviceId), qPrintable(sess.name), qPrintable(sess.kind),
+              qPrintable(name), qPrintable(kind.isEmpty() ? QStringLiteral("-") : kind), qPrintable(o["inviteId"].toString()), qPrintable(ip));
+        plain(200, QJsonObject{{"invite", o["invite"].toString()}, {"expires", double(QDateTime::fromString(o["expires"].toString(), Qt::ISODate).toSecsSinceEpoch())}});
+        return;
+    }
+    const QString need = v3Scope(r.method, ep);
+    if (need.isEmpty()) { plain(404, QJsonObject{{"error", "not found"}}); return; }
+    if (!sess.scopes.contains(need)) { plain(403, QJsonObject{{"error", QStringLiteral("%1 scope required").arg(need)}}); return; }
+    Device &d = m_v3dev[sess.deviceId];                        // what the v1 handlers see: read, + control when the route's scope is held
+    d.id = sess.deviceId; d.name = sess.name; d.kind = sess.kind; d.lastIp = ip; d.lastSeen = QDateTime::currentDateTime();
+    d.scopes = QStringList{QStringLiteral("read")};
+    if (need != QLatin1String("read") || sess.scopes.contains(QStringLiteral("control"))) d.scopes << QStringLiteral("control");
+    m_loc->noteDeviceSeen(d.name, m_loc->kindForDevice(d.name, d.kind));
+    Request inner = r;
+    inner.path = QStringLiteral("/api/v1/") + ep; inner.body = body;
+    inner.headers.remove("authorization"); inner.headers.remove("x-bf-admin");
+    serve(s, inner, &d, ep);
+}
+
+// ── Linking v3 ────────────────────────────────────────────────────────────────
+QString ApiServer::linkName() const { return Locator::deviceName(); }
+
+QStringList ApiServer::linkHosts() const
+{
+    QStringList h;
+    for (const QString &a : Mdns::lanAddresses()) if (QHostAddress(a).protocol() == QAbstractSocket::IPv4Protocol && h.size() < 4) h << a;
+    h << (m_mdns ? m_mdns->hostFqdn() : QHostInfo::localHostName() + QStringLiteral(".local"));
+    return h;
+}
+
+QString ApiServer::linkOffer()
+{
+    if (m_hub || !listening()) return {};
+    Link::Session *s = m_links.offer(QDateTime::currentSecsSinceEpoch());
+    if (!s) return {};
+    const QString sid = s->sid;
+    emit linkChanged();
+    fetchHubInvite(QStringLiteral("linked at %1").arg(linkName()), QString(), [this, sid](const QString &inv) {   // into the QR when it comes
+        if (!inv.isEmpty() && m_links.setHub(sid, inv)) emit linkChanged();
+    });
+    return sid;
+}
+
+QString ApiServer::linkQr(const QString &sid) const
+{
+    const Link::Session *s = m_links.find(sid);
+    if (!s || s->state != Link::Session::Open || s->expires < QDateTime::currentSecsSinceEpoch()) return {};
+    return Link::qrText(sid, linkName(), linkHosts(), boundPort(), s->pub, s->k, s->expires, s->hub);
+}
+
+qint64 ApiServer::linkExpires(const QString &sid) const { const Link::Session *s = m_links.find(sid); return s && s->live() ? s->expires : 0; }
+
+void ApiServer::linkCancel(const QString &sid) { if (m_links.cancel(sid)) emit linkChanged(); }
+
+QList<Link::Session> ApiServer::linkSessions() const
+{
+    QList<Link::Session> out;
+    const qint64 now = QDateTime::currentSecsSinceEpoch();
+    for (const Link::Session &s : m_links.sessions()) if (s.live() && s.expires >= now) out << s;
+    return out;
+}
+
+bool ApiServer::linkApprove(const QString &sid)
+{
+    if (!m_links.startApproval(sid, QDateTime::currentSecsSinceEpoch())) return false;
+    const Link::Session *s = m_links.find(sid);
+    const QString name = s->name, kind = s->kind;
+    emit linkChanged();
+    fetchHubInvite(name, kind, [this, sid](const QString &inv) {   // a few seconds at most; without a hub: null, the phone is linked on the LAN
+        Link::Session *ls = m_links.find(sid);
+        if (!ls || ls->state != Link::Session::Approving) return;
+        ls->hub = inv;
+        QString e;
+        if (!issueLink(sid, &e)) m_links.deny(sid, e, QDateTime::currentSecsSinceEpoch());
+        emit linkChanged();
+    });
+    return true;
+}
+
+bool ApiServer::linkReject(const QString &sid)
+{
+    const bool ok = m_links.deny(sid, QStringLiteral("rejected on the PC"), QDateTime::currentSecsSinceEpoch());
+    if (ok) emit linkChanged();
+    return ok;
+}
+
+// The phone becomes one of our devices: a read + control token under Devices (its kind and name), a known device (so
+// "only known devices may use tokens" lets it in), and the payload sealed to the session key — handed out once
+bool ApiServer::issueLink(const QString &sid, QString *error)
+{
+    Link::Session *s = m_links.find(sid);
+    if (!s || s->state != Link::Session::Approving) { *error = QStringLiteral("link session gone"); return false; }
+    const QStringList scopes{QStringLiteral("read"), QStringLiteral("control")};
+    const QString tok = createToken(s->name, scopes);
+    const QByteArray h = tokenHash(tok);
+    for (Device &d : m_devices) if (d.hash == h) { d.kind = s->kind.isEmpty() ? QStringLiteral("device") : s->kind.toLower(); s->deviceId = d.id; }
+    if (s->deviceId.isEmpty()) { *error = QStringLiteral("cannot store the token"); return false; }
+    save();
+    rememberKnown(s->ip, s->name, s->deviceId);
+    m_loc->noteDeviceSeen(s->name, s->kind);
+    Identity *idn = m_loc->identity();
+    const QByteArray payload = Link::payloadJson(tok, scopes, linkName(), idn && idn->exists() ? idn->id() : QString(), linkHosts(), boundPort(), s->hub);
+    const QString name = s->name, code = s->code;
+    if (!m_links.approve(sid, payload, QDateTime::currentSecsSinceEpoch())) { remove(s->deviceId); *error = QStringLiteral("cannot seal the payload"); return false; }
+    qInfo("beaconfix: linked %s (%s) from %s, code %s%s", qPrintable(name), qPrintable(s->kind), qPrintable(s->ip), qPrintable(code), s->hub.isEmpty() ? "" : ", with a hub invite");
+    emit deviceApproved(name);
+    emit changed();
+    return true;
+}
+
+void ApiServer::fetchHubInvite(const QString &name, const QString &kind, std::function<void(const QString &)> done)
+{
+    HubClient *hc = m_loc->hubClient();
+    if (m_hub || !hc || !hc->enrolled()) { done(QString()); return; }
+    hc->requestInvite(name, kind, [done, name](const QString &inv, const QString &error) {
+        if (inv.isEmpty()) qInfo("beaconfix: link: no hub invite for %s (%s)", qPrintable(name), qPrintable(error));
+        done(inv);
+    });
+}
+
+void ApiServer::rememberKnown(const QString &ip, const QString &name, const QString &deviceId)
+{
+    if (knownFor(ip) || QHostAddress(ip).isLoopback() || QNetworkInterface::allAddresses().contains(QHostAddress(ip))) return;   // already ours, or this computer
+    bool sameSubnet = false;                                    // on another VLAN the neighbour table shows the router: pin the address instead
+    for (const QNetworkInterface &nif : QNetworkInterface::allInterfaces())
+        for (const QNetworkAddressEntry &e : nif.addressEntries())
+            if (e.ip().protocol() == QHostAddress(ip).protocol() && e.prefixLength() > 0 && QHostAddress(ip).isInSubnet(e.ip(), e.prefixLength())) sameSubnet = true;
+    const QString mac = sameSubnet ? macForIp(ip) : QString();
+    Known k; k.mac = mac.isEmpty() ? QStringLiteral("linked:%1").arg(deviceId) : mac; k.name = name; k.ours = true;
+    k.lastSeen = QDateTime::currentDateTime(); k.network = QStringLiteral("linked");
+    if (mac.isEmpty()) k.ip = ip;
+    for (Known &e : m_known) if (e.mac == k.mac) { e.name = name; e.ours = true; if (mac.isEmpty()) e.ip = ip; saveKnown(); return; }
+    m_known << k;
+    saveKnown();
 }
 
 QString ApiServer::holdIdentityExport(const QString &bundle)

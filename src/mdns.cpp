@@ -162,6 +162,15 @@ void Mdns::onServerStateChanged(int state, const QString &error)
     emit stateChanged();
 }
 
+QString Mdns::hostFqdn() const
+{
+    if (m_server) {                                        // Avahi's name, which may differ from the hostname ("host-2.local" after a conflict)
+        const QDBusReply<QString> r = m_server->call(QStringLiteral("GetHostNameFqdn"));
+        if (r.isValid() && !r.value().isEmpty()) return r.value();
+    }
+    return QHostInfo::localHostName() + QStringLiteral(".local");
+}
+
 // ── Publishing ────────────────────────────────────────────────────────────────
 void Mdns::publish(int port, const QStringList &txt, const QString &instanceName)
 {
@@ -310,12 +319,14 @@ void Mdns::resolve(int iface, int proto, const QString &name, const QString &typ
         const uint flags = a[10].toUInt();
         TxtList txt = qdbus_cast<TxtList>(a[9]);
         QStringList addrTxt;
+        QString nameTxt, inameTxt;
         for (const QByteArray &t : txt) {
             const int eq = t.indexOf('=');
             if (eq <= 0) continue;
             const QString k = QString::fromUtf8(t.left(eq)), v = QString::fromUtf8(t.mid(eq + 1));
             if (k == QLatin1String("id")) p.identityId = v;
-            else if (k == QLatin1String("name")) p.identityName = v;
+            else if (k == QLatin1String("name")) nameTxt = v;
+            else if (k == QLatin1String("iname")) inameTxt = v;
             else if (k == QLatin1String("host")) p.host = v;
             else if (k == QLatin1String("v")) p.version = v;
             else if (k == QLatin1String("kind")) p.kind = v;
@@ -325,6 +336,7 @@ void Mdns::resolve(int iface, int proto, const QString &name, const QString &typ
             else if (k == QLatin1String("features")) p.features = v.split(QLatin1Char(','), Qt::SkipEmptyParts);
             else if (k == QLatin1String("addr")) addrTxt = v.split(QLatin1Char(','), Qt::SkipEmptyParts);
         }
+        p.identityName = !inameTxt.isEmpty() || p.api >= 3 ? inameTxt : nameTxt;   // api 3: name= is the PC's name, iname= the identity's
         if (p.host.isEmpty()) { p.host = hostLocal; if (p.host.endsWith(QLatin1String(".local"))) p.host.chop(6); }
         if (p.kind.isEmpty()) p.kind = QStringLiteral("desktop");
         // Addresses: the TXT list first (real interfaces, chosen by the peer), the resolved one as a fallback,

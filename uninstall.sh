@@ -22,6 +22,7 @@ rm -f "$PREFIX/bin/beaconfix" \
       "$PREFIX/share/applications/beaconfix.desktop" \
       "$PREFIX/share/dbus-1/services/org.sworrl.BeaconFix.service" \
       "$PREFIX/share/icons/hicolor/scalable/apps/beaconfix.svg" \
+      "$PREFIX"/share/icons/hicolor/*x*/apps/beaconfix.png \
       "$HOME/.config/autostart/beaconfix-tray.desktop"
 if command -v kpackagetool6 >/dev/null 2>&1 && [ -d "$HOME/.local/share/plasma/plasmoids/org.kde.plasma.beaconfix" ]; then
     kpackagetool6 --type Plasma/Applet --remove org.kde.plasma.beaconfix >/dev/null 2>&1 || true

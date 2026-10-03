@@ -65,8 +65,19 @@ class MapViewModel @Inject constructor(db: AppDatabase, private val store: Deskt
 }
 
 @HiltViewModel
-class BeaconsViewModel @Inject constructor(db: AppDatabase, private val estimates: EstimateRepository) : ViewModel() {
+class BeaconsViewModel @Inject constructor(db: AppDatabase, private val estimates: EstimateRepository, status: CollectorStatus) : ViewModel() {
     val query = MutableStateFlow(""); val sort = MutableStateFlow("seen")
+    /** bssid → its newest Wi-Fi RTT range: the stored ones of the last week (read once), overlaid by this session's live ones. */
+    private val stored = MutableStateFlow<Map<String, org.sworrl.beaconfix.ranging.ApRange>>(emptyMap())
+    val ranges: StateFlow<Map<String, org.sworrl.beaconfix.ranging.ApRange>> = combine(stored, status.state) { a, st -> if (st.rttRanges.isEmpty()) a else a + st.rttRanges }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyMap())
+    init {
+        viewModelScope.launch {
+            runCatching { db.observations().latestRanges(System.currentTimeMillis() - 7 * 86_400_000L) }.getOrNull()?.let { rows ->
+                stored.value = rows.associate { it.bssid to org.sworrl.beaconfix.ranging.ApRange(it.bssid, it.rangeM, it.rangeSd ?: 0.0, 0, it.time) }
+            }
+        }
+    }
     val aps: StateFlow<List<ApEntity>> = combine(db.aps().all(), query, sort) { list, q, s ->
         val f = if (q.isBlank()) list else list.filter { it.ssid.contains(q, true) || it.bssid.contains(q, true) }
         when (s) { "name" -> f.sortedBy { it.ssid.lowercase() }; "acc" -> f.sortedBy { it.acc ?: 1e9 }; "seen" -> f.sortedByDescending { it.lastSeen }; else -> f }

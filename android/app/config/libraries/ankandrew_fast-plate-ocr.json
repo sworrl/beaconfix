@@ -1,0 +1,16 @@
+{
+  "uniqueId": "ankandrew:fast-plate-ocr",
+  "artifactVersion": "cct_xs_v2_global",
+  "name": "fast-plate-ocr plate reader (ALPR model)",
+  "description": "The dash cam's plate recognizer, cct_xs_v2_global.onnx. Bundled at build time (or downloaded once), SHA-256 pinned.",
+  "website": "https://github.com/ankandrew/fast-plate-ocr",
+  "developers": [
+    {
+      "name": "ankandrew",
+      "organisationUrl": "https://github.com/ankandrew"
+    }
+  ],
+  "licenses": [
+    "mit_ankandrew"
+  ]
+}

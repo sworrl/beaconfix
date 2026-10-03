@@ -27,6 +27,8 @@ class BeaconFixApp : Application(), Configuration.Provider {
     @Inject lateinit var helpAlerts: org.sworrl.beaconfix.notify.HelpAlerts
     @Inject lateinit var wifiMonitor: org.sworrl.beaconfix.wifi.CurrentNetworkMonitor
     @Inject lateinit var estimates: org.sworrl.beaconfix.estimate.EstimateRepository
+    @Inject lateinit var link: org.sworrl.beaconfix.link.LinkRepository
+    @Inject lateinit var sightingAlerts: org.sworrl.beaconfix.sightings.SightingAlerts
 
     /** Lives as long as the process: pref mirrors, the help heads-up, launcher shortcuts. */
     private val appScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -48,7 +50,9 @@ class BeaconFixApp : Application(), Configuration.Provider {
             osmdroidTileCache = java.io.File(osmdroidBasePath, "tiles")
         }
         notifier.ensureChannel()
+        sightingAlerts.ensureChannels()
         syncScheduler.ensurePeriodic()
+        org.sworrl.beaconfix.sightings.HibfWatcher.ensurePeriodic(this)   // the plate watch (docs/SIGHTINGS.md §4.5)
         widgets.ensurePeriodic()
         widgets.touch("start")
         kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Main).launch { org.sworrl.beaconfix.collector.CollectorService.ensure(this@BeaconFixApp, prefs) }
@@ -56,6 +60,7 @@ class BeaconFixApp : Application(), Configuration.Provider {
         helpAlerts.ensureChannel(this); helpAlerts.start(appScope)
         org.sworrl.beaconfix.quick.Shortcuts.install(this, help, appScope)
         wifiMonitor.start()
+        link.start()          // a hub invite kept from a link (hub was unreachable) is retried, also on every network change
         // a new estimator generation (1.5: graded fits) recomputes every stored estimate once, in the background
         appScope.launch {
             if (prefs.estimatorVersion.first() < org.sworrl.beaconfix.estimate.Estimator.VERSION)

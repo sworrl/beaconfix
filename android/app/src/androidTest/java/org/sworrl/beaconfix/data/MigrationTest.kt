@@ -22,7 +22,7 @@ import org.sworrl.beaconfix.data.db.ALL_MIGRATIONS
 import org.sworrl.beaconfix.data.db.AppDatabase
 
 /**
- * Every database a released build can have (v1: 1.0/1.1, v2: 1.2, v3: 1.3.x, v4: 1.4.x) must reach v5 with its data intact.
+ * Every database a released build can have (v1: 1.0/1.1, v2: 1.2, v3: 1.3.x, v4: 1.4.x, v5: 1.5.x, v6: 1.6, v7: 1.6 + sightings) must reach v8 with its data intact.
  * Run on a device against the debug package (the release install is untouched):
  *   ./gradlew :app:connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=org.sworrl.beaconfix.data.MigrationTest
  */
@@ -38,24 +38,49 @@ class MigrationTest {
     @Before fun clean() { ctx.deleteDatabase(name) }
     @After fun cleanUp() { ctx.deleteDatabase(name) }
 
+    /** v8: what waited for a desktop waits for the hub too; what a desktop already has does not. */
+    @Test fun sevenToEight() {
+        helper.createDatabase(name, 7).use {
+            seed(it, 7)
+            it.execSQL("INSERT INTO plate_events (uid, kind, time, time_ms, source, dirty) VALUES ('pass:osm:node/1:29000000', 'camera_pass', '2026-10-02T12:00:00', 1, 'phone_live', 1)")
+            it.execSQL("INSERT INTO plate_events (uid, kind, time, time_ms, source, dirty) VALUES ('pass:osm:node/2:29000000', 'camera_pass', '2026-10-02T12:00:00', 1, 'route_backfill', 0)")
+        }
+        helper.runMigrationsAndValidate(name, LATEST, true, *ALL_MIGRATIONS).use { db ->
+            assertEquals(1L, long(db, "SELECT hub_dirty FROM plate_events WHERE uid = 'pass:osm:node/1:29000000'"))
+            assertEquals(0L, long(db, "SELECT hub_dirty FROM plate_events WHERE uid = 'pass:osm:node/2:29000000'"))
+            db.execSQL("DELETE FROM plate_events")
+            verify(db, 7)
+        }
+    }
+
+    @Test fun sixToSeven() {
+        helper.createDatabase(name, 6).use { seed(it, 6) }
+        helper.runMigrationsAndValidate(name, LATEST, true, *ALL_MIGRATIONS).use { verify(it, 6) }
+    }
+
+    @Test fun fiveToSix() {
+        helper.createDatabase(name, 5).use { seed(it, 5) }
+        helper.runMigrationsAndValidate(name, LATEST, true, *ALL_MIGRATIONS).use { verify(it, 5) }
+    }
+
     @Test fun fourToFive() {
         helper.createDatabase(name, 4).use { seed(it, 4) }
-        helper.runMigrationsAndValidate(name, 5, true, *ALL_MIGRATIONS).use { verify(it, 4) }
+        helper.runMigrationsAndValidate(name, LATEST, true, *ALL_MIGRATIONS).use { verify(it, 4) }
     }
 
     @Test fun threeToFive() {
         helper.createDatabase(name, 3).use { seed(it, 3) }
-        helper.runMigrationsAndValidate(name, 5, true, *ALL_MIGRATIONS).use { verify(it, 3) }
+        helper.runMigrationsAndValidate(name, LATEST, true, *ALL_MIGRATIONS).use { verify(it, 3) }
     }
 
     @Test fun twoToFive() {
         createRaw(2)
-        helper.runMigrationsAndValidate(name, 5, true, *ALL_MIGRATIONS).use { verify(it, 2) }
+        helper.runMigrationsAndValidate(name, LATEST, true, *ALL_MIGRATIONS).use { verify(it, 2) }
     }
 
     @Test fun oneToFive() {
         createRaw(1)
-        helper.runMigrationsAndValidate(name, 5, true, *ALL_MIGRATIONS).use { verify(it, 1) }
+        helper.runMigrationsAndValidate(name, LATEST, true, *ALL_MIGRATIONS).use { verify(it, 1) }
     }
 
     /** The app's own builder (AppModule: migrations, no destructive fallback) opens a migrated v3 file and its DAOs work. */
@@ -77,6 +102,22 @@ class MigrationTest {
             repeat(25) { db.estimateHistory().append(org.sworrl.beaconfix.data.db.EstimateHistoryEntity(bssid = "02:00:00:00:00:01", time = it.toLong(), lat = 40.0, lon = -75.0, grade = "B")) }
             assertEquals(20, db.estimateHistory().forAp("02:00:00:00:00:01").size)
             assertEquals(24L, db.estimateHistory().forAp("02:00:00:00:00:01").first().time)
+            // v7: plate events and their media work through the DAO; the uid is unique
+            val ev = org.sworrl.beaconfix.data.db.PlateEventEntity(uid = "pass:osm:node/1:29000000", kind = "camera_pass", time = "2026-10-02T12:00:00", timeMs = 1_740_000_000_000,
+                cameraId = "osm:node/1", source = "phone_live", confidence = 95, dirty = true)
+            db.plateEvents().insert(ev)
+            assertEquals("phone_live", db.plateEvents().byUid(ev.uid)?.source)
+            assertEquals(1, db.plateEvents().dirty().size)
+            assertEquals(0, db.plateEvents().hubDirty().size)
+            db.plateEvents().update(db.plateEvents().byUid(ev.uid)!!.copy(hubDirty = true))
+            assertEquals(1, db.plateEvents().hubDirty().size)
+            db.plateEvents().hubClean(listOf(ev.uid))
+            assertEquals(1, db.plateEvents().dirty().size); assertEquals(0, db.plateEvents().hubDirty().size)
+            assertEquals(ev.uid, db.plateEvents().passNear("osm:node/1", ev.timeMs - 600_000, ev.timeMs + 600_000, ev.timeMs)?.uid)
+            assertEquals(true, runCatching { db.plateEvents().insert(ev.copy(id = 0)) }.isFailure)
+            db.plateEvents().insertMedia(org.sworrl.beaconfix.data.db.PlateEventMediaEntity(uid = "0123456789abcdef0123456789abcdef", eventUid = ev.uid, kind = "dashcam", mime = "image/webp", path = "/x.webp"))
+            assertEquals(1, db.plateEvents().mediaForNow(ev.uid, ev.cameraId).size)
+            assertEquals(1, db.plateEvents().pendingUploads().size)
         } finally { db.close() }
     }
 
@@ -129,6 +170,8 @@ class MigrationTest {
         if (v >= 3) exec("INSERT INTO anchors (id, json, name, kind, lat, lon, rv, ref, deleted, placedAt, seq, dirty) VALUES ('a1', '{}', 'Test anchor', 'custom', 40.0, -75.0, 1, 0, 0, '2026-01-01T00:00:00Z', 1, 0)")
     }
 
+    private companion object { const val LATEST = 8 }
+
     private fun long(db: SupportSQLiteDatabase, sql: String): Long = db.query(sql).use { c -> c.moveToFirst(); c.getLong(0) }
     private fun text(db: SupportSQLiteDatabase, sql: String): String = db.query(sql).use { c -> c.moveToFirst(); c.getString(0) }
 
@@ -154,6 +197,14 @@ class MigrationTest {
         assertEquals("observed", text(db, "SELECT posSource FROM aps"))
         assertEquals(1L, long(db, "SELECT COUNT(*) FROM aps WHERE grade IS NULL AND fitKind IS NULL AND r95 IS NULL AND fitMetrics IS NULL"))
         assertEquals(0L, long(db, "SELECT COUNT(*) FROM estimate_history"))
+        // v6: existing observations have no RTT range
+        assertEquals(1L, long(db, "SELECT COUNT(*) FROM observations WHERE rangeM IS NULL AND rangeSd IS NULL"))
+        // v7: the plate-event tables exist and start empty; a row takes the column defaults
+        assertEquals(0L, long(db, "SELECT COUNT(*) FROM plate_events"))
+        assertEquals(0L, long(db, "SELECT COUNT(*) FROM plate_event_media"))
+        db.execSQL("INSERT INTO plate_events (uid, kind, time, time_ms, source) VALUES ('hibf:0123456789abcdef01234567', 'plate_search', '2026-10-02T12:00:00', 1, 'haveibeenflocked')")
+        assertEquals(0L, long(db, "SELECT leaky + seq + dirty + notified + hub_dirty FROM plate_events"))
+        db.execSQL("DELETE FROM plate_events")
     }
     private fun double(db: SupportSQLiteDatabase, sql: String): Double = db.query(sql).use { c -> c.moveToFirst(); c.getDouble(0) }
 }

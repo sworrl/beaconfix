@@ -11,6 +11,8 @@
 #include <QStringList>
 #include <QTimer>
 #include <functional>
+#include "hub.h"
+#include "linking.h"
 
 class Locator;
 class Mdns;
@@ -23,8 +25,12 @@ class QTemporaryFile;
 //
 //   GET  /api/v1/hello                 no auth · name, version, hostname, identity {id,name}, kind, mdns, pairing open?
 //   GET  /api/v1/peers[?scan=1]        read    · BeaconFix devices on this network (mDNS; scan=1 probes the /24s too — control scope)
-//   POST /api/v1/pair                  no auth · {"name","scopes"} → 202 {id, code, expires}  (only while pairing is open)
-//   GET  /api/v1/pair/<id>             no auth · {status: pending|denied|approved[, token — once]}
+//   POST /api/v1/link                  no auth · linking v3 (docs/LINKING.md): QR {sid,name,kind,pub,mac} → approved at once;
+//                                                mDNS {name,kind,commit[,proximity]} → 202 {sid, pub, status:"commit"}
+//   POST /api/v1/link/<sid>            no auth · mDNS: {pub} (must match the commitment) → pending; the PC shows the code + Link / Reject
+//   GET  /api/v1/link/<sid>            no auth · {status: pending|denied|approved[, sealed — once]}
+//   POST /api/v1/link/hub-invite       control · a fresh hub invite for the calling device {"hub"}
+//   POST /api/v1/pair, GET /pair/<id>  no auth · pairing v2 (old apps; only while pairing is open — no UI opens it any more)
 //   GET  /api/v1/location              read    · the fix, place, elevation, sun, geo: URI, map links
 //   GET  /api/v1/state                 read    · everything (Locator::StateJson)
 //   GET  /api/v1/events?since=<id>     read    · beacon/fix/stop events newer than <id>
@@ -38,13 +44,17 @@ class QTemporaryFile;
 //   POST /api/v1/db/observations       control · samples from one device (256 KB); /db/sync allows 1 MB bodies
 //
 // Security: only private / link-local peers are answered at all; everything
-// but hello and pairing needs "Authorization: Bearer <token>". Tokens are
-// 256-bit random, shown once, and only their SHA-256 is stored
-// (~/.config/sworrl/beaconfix-devices.json). Pairing is closed unless the user
-// opens it for a few minutes, and every request is shown with a 4-digit code
-// so the right device gets approved. Per-IP rate limit, connection cap, and an
-// access log for the Devices tab. If ~/.config/sworrl/beaconfix.crt + .key
+// but hello, linking and pairing needs "Authorization: Bearer <token>". Tokens are
+// 256-bit random and only their SHA-256 is stored (~/.config/sworrl/beaconfix-devices.json).
+// A phone gets its token by linking (docs/LINKING.md: the QR's MAC, or a six-digit code
+// compared on both screens and Link tapped here), sealed to the session key. Per-IP rate
+// limit, connection cap, and an access log for the Devices tab. If ~/.config/sworrl/beaconfix.crt + .key
 // exist the server speaks TLS instead of plain HTTP.
+//
+// Hub mode (beaconfix --server, Locator::hubRole()): the network listener (BEACONFIX_HUB_LISTEN, TLS from
+// BEACONFIX_HUB_CERT / _KEY, full chain sent) serves only /api/v3/* (BFS3, docs/SECURE-API.md: each route is the
+// /api/v1 handler for the device's identity and scopes, sealed both ways) and GET /healthz; /api/v1 is served only
+// on the loopback admin listener (BEACONFIX_HUB_ADMIN) and only with the admin token from <state>/hub-admin.json.
 class ApiServer : public QObject {
     Q_OBJECT
 public:
@@ -121,6 +131,17 @@ public:
     bool      revoke(const QString &nameOrId);
     bool      remove(const QString &id);
     QString   createToken(const QString &name, const QStringList &scopes, const QString &identity = QString());   // returns the token (shown once)
+
+    // Linking v3 (docs/LINKING.md): QR offers for the Link dialog; mDNS requests answered with Link / Reject
+    QString     linkName() const;                           // this PC in the QR, the TXT record and the payload (the hostname)
+    QStringList linkHosts() const;                          // LAN IPv4s (real interfaces) + "<avahi host>.local"
+    QString     linkOffer();                                // a fresh QR session → sid; a hub invite is fetched into it in the background
+    QString     linkQr(const QString &sid) const;           // its "bflink:" text ("" once used / gone)
+    qint64      linkExpires(const QString &sid) const;      // unix s, 0 = gone
+    void        linkCancel(const QString &sid);             // the dialog closed or renewed: that QR no longer links
+    bool        linkApprove(const QString &sid);            // mDNS: the user tapped Link (codes match)
+    bool        linkReject(const QString &sid);
+    QList<Link::Session> linkSessions() const;              // the live ones (the UI shows name, kind, ip, code, proximity, state)
     QString   holdIdentityExport(const QString &bundle);   // LAN hand-off: keeps the bundle 10 min under a one-time 6-digit code
     QJsonObject statusJson() const;
 
@@ -140,6 +161,9 @@ public:
     const Known *knownFor(const QString &ip);                              // nullptr when the peer is not ours
     static QString macForIp(const QString &ip);                            // from the kernel neighbour table ("" if unknown)
 
+    Hub      *hub() const { return m_hub; }                  // hub mode only
+    QString   adminFile() const;                             // hub mode: {port, token} for the local CLI (0600)
+
     static bool       isLanAddress(const QHostAddress &a);
     static QByteArray tokenHash(const QString &token);
     static bool       constantTimeEqual(const QByteArray &a, const QByteArray &b);
@@ -151,24 +175,33 @@ signals:
     void pairingRequested(const QString &json);
     void deviceApproved(const QString &name);
     void openPairRequested(const QString &id);               // the notification's button / body was clicked
+    void linkChanged();                                      // link sessions changed (offer renewed, request, approval)
+    void linkRequested(const QString &sid);                  // an mDNS request waits for Link / Reject (open the dialog)
+    void linked(const QString &sid, const QString &name, const QString &code);   // a phone fetched its sealed token
 
 private:
     struct Request {
         QString method, path, query;
+        QByteArray target;                                   // the request target exactly as on the wire (BFS3 AAD)
         QHash<QByteArray, QByteArray> headers;               // lower-case names
         QByteArray body;
     };
-    struct Stream { QPointer<QTcpSocket> sock; QString device; };
+    struct Stream { QPointer<QTcpSocket> sock; QString device; bool sealed = false; Hub::Session sess; quint64 seq = 0; };
     struct Upload { Request request; QTemporaryFile *file = nullptr; qint64 left = 0; };   // POST /db/import body on its way to disk
 
     void restart();
-    void onConnection();
+    void onConnection(QTcpServer *srv);
     void onReadyRead(QTcpSocket *s);
     void handle(QTcpSocket *s, const Request &r);
+    void serve(QTcpSocket *s, const Request &r, Device *dev, const QString &ep);   // an authenticated /api/v1 route
+    void handleV3(QTcpSocket *s, const Request &r);                                // hub: enrol, or open → serve → seal
+    bool startHub();                                                               // hub listeners (restart())
     void reply(QTcpSocket *s, int code, const QJsonObject &body, const QList<QByteArray> &extra = {});
     void replyRaw(QTcpSocket *s, int code, const QByteArray &type, const QByteArray &body, const QList<QByteArray> &extra = {});
     void logAccess(QTcpSocket *s, const QString &method, const QString &path, int status);
+    bool    overLimit(const QString &ip);              // the budget is spent (does not count this request)
     bool rateLimited(const QString &ip, bool authFailure);
+    QByteArray sseFrame(Stream &st, const QByteArray &event, const QJsonObject &data);
     Device *authenticate(const Request &r, const QString &ip);
     QJsonObject locationJson() const;
     QJsonObject homeJson() const;
@@ -179,6 +212,9 @@ private:
     void loadKnown();
     void saveKnown();
     void updateDiscovery();
+    bool issueLink(const QString &sid, QString *error);     // token (Devices) + known device + sealed payload → Approved
+    void fetchHubInvite(const QString &name, const QString &kind, std::function<void(const QString &invite)> done);
+    void rememberKnown(const QString &ip, const QString &name, const QString &deviceId);
     static bool mdnsAllowed();               // false for test instances (non-default XDG_CONFIG_HOME), --no-mdns, apiMdns=false
     static QString randomId(int bytes);
     static QString newToken();
@@ -203,8 +239,19 @@ private:
     QHash<QString, QDateTime> m_nonces;                       // identity challenges: nonce (b64) → expiry
     struct ExportHold { QString bundle; QDateTime expires; int tries = 0; };
     QHash<QString, ExportHold> m_exports;                     // one-time codes → bundle
+    Link::Book m_links;                                       // linking v3 sessions
     QTimer m_pingTimer, m_saveTimer, m_sweepTimer;
     bool m_dirty = false;
     Mdns *m_mdns = nullptr;
     int m_open = 0;
+    // hub mode
+    Hub *m_hub = nullptr;
+    QTcpServer *m_admin = nullptr;
+    QByteArray m_adminToken;
+    QHash<QTcpSocket *, Hub::Session> m_v3;                   // sockets whose replies are sealed
+    QHash<QString, Device> m_v3dev;                           // deviceId → the Device the v1 handlers see
+    QList<QPair<QHostAddress, int>> m_allow;                  // BEACONFIX_HUB_ALLOW subnets (empty = any)
+    QString m_certPath, m_keyPath;
+    QDateTime m_certStamp;
+    QTimer m_certTimer;                                       // a renewed certificate is picked up without a restart
 };

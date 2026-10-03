@@ -28,9 +28,11 @@ import org.sworrl.beaconfix.ui.theme.Slate
 import org.sworrl.beaconfix.ui.vm.SyncViewModel
 
 @Composable
-fun SyncScreen(onPair: () -> Unit, vm: SyncViewModel = hiltViewModel()) {
+fun SyncScreen(onPair: () -> Unit, onHub: () -> Unit = {}, vm: SyncViewModel = hiltViewModel(), hubVm: org.sworrl.beaconfix.ui.vm.HubViewModel = hiltViewModel()) {
     val ui by vm.ui.collectAsState()
+    val hub by hubVm.status.collectAsState()
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(vertical = 8.dp)) {
+        HubSyncCard(onOpen = onHub, vm = hubVm)
         InfoCard("Sync") {
             KeyValue("Observations waiting", "${ui.unsynced}")
             KeyValue("Observations total", "${ui.obs}")
@@ -38,8 +40,8 @@ fun SyncScreen(onPair: () -> Unit, vm: SyncViewModel = hiltViewModel()) {
             KeyValue("Last sync", ago(ui.lastAt))
             if (ui.lastReport.isNotEmpty()) Text(ui.lastReport, color = Slate, style = MaterialTheme.typography.bodySmall)
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(onClick = { vm.syncNow() }, enabled = !ui.running && ui.desktops.any { it.paired }) { Text(if (ui.running) "Syncing…" else "Sync now") }
-                OutlinedButton(onClick = onPair) { Text("Pair a desktop") }
+                Button(onClick = { vm.syncNow() }, enabled = !ui.running && (hub.config != null || ui.desktops.any { it.paired })) { Text(if (ui.running) "Syncing…" else "Sync now") }
+                OutlinedButton(onClick = onPair) { Text("Link a PC") }
             }
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) { Text("Sync every 15 min in the background"); Switch(ui.autoSync, { vm.setAuto(it) }) }
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) { Text("Only on unmetered networks"); Switch(ui.unmetered, { vm.setUnmetered(it) }) }
@@ -51,7 +53,7 @@ fun SyncScreen(onPair: () -> Unit, vm: SyncViewModel = hiltViewModel()) {
             KeyValue("Last sync", ago(d.lastSync))
             KeyValue("Pushed / pulled", "${d.pushedObs} obs / ${d.pulledAps} beacons")
             if (d.lastError.isNotEmpty()) Text(d.lastError, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
-            TextButton(onClick = { vm.forget(d) }) { Text("Forget this desktop") }
+            TextButton(onClick = { vm.forget(d) }) { Text("Unlink this PC") }
         }
     }
 }

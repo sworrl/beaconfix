@@ -56,6 +56,7 @@ fun SurveyScreen(vm: SurveyViewModel = hiltViewModel()) {
                 TextButton(onClick = { vm.surveyOff() }, enabled = st.survey) { Text("Pause") }
             }
             Text("Last scan ${ago(st.lastScanAt)} · ${st.apsInScan} beacons · fix ${st.lastFixSource.ifEmpty { "—" }} · recorded ${st.recordedTotal}" + if (st.error.isNotEmpty()) " · ${st.error}" else "", color = Slate, style = MaterialTheme.typography.bodySmall)
+            Text(rttLine(st.rttHeard, st.rttHeardAz, st.rttAnswered, st.rttState), color = Slate, style = MaterialTheme.typography.bodySmall)
         }
         LazyColumn {
             items(st.scan.sortedByDescending { it.dbm }, key = { it.bssid }) { s ->
@@ -64,6 +65,7 @@ fun SurveyScreen(vm: SurveyViewModel = hiltViewModel()) {
                         Column(Modifier.weight(1f)) {
                             Text(s.ssid.ifEmpty { "(hidden)" }, style = MaterialTheme.typography.titleSmall)
                             Text("${s.bssid} · ${s.freq} MHz · ${s.dbm} dBm", color = Slate, style = MaterialTheme.typography.bodySmall)
+                            st.rttRanges[s.bssid]?.takeIf { System.currentTimeMillis() - it.time < 120_000 }?.let { Text(it.text, color = Cyan, style = MaterialTheme.typography.bodySmall) }
                         }
                         Sparkline(st.history[s.bssid] ?: emptyList(), Modifier.width(96.dp).height(28.dp))
                     }
@@ -71,6 +73,19 @@ fun SurveyScreen(vm: SurveyViewModel = hiltViewModel()) {
             }
         }
     }
+}
+
+/** "802.11mc responders: 5 heard, 3 answered" (+ az count, + why none was ranged). */
+fun rttLine(heard: Int, az: Int, answered: Int, state: String): String {
+    val why = when (state) {
+        "", "ok", "cooldown" -> ""
+        "unsupported" -> " · no Wi-Fi RTT on this phone"
+        "no-permission" -> " · needs the location / nearby-devices permission"
+        "doze" -> " · RTT paused (Doze)"
+        "unavailable" -> " · RTT unavailable right now"
+        else -> " · $state"
+    }
+    return "802.11mc responders: $heard heard, $answered answered" + (if (az > 0) " · $az 802.11az" else "") + why
 }
 
 @Composable

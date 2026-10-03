@@ -4,7 +4,9 @@ import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonObject
 
-@Serializable data class Hello(val name: String = "", val version: String = "", val hostname: String = "", val pairing: Boolean = false, val tls: Boolean = false, val ts: String = "", val features: List<String> = emptyList(), val identity: HelloIdentity? = null)
+@Serializable data class Hello(val name: String = "", val version: String = "", val hostname: String = "", val pairing: Boolean = false, val tls: Boolean = false, val ts: String = "", val features: List<String> = emptyList(), val identity: HelloIdentity? = null,
+                              /** linking v3 (docs/LINKING.md): api 3, link true, the PC's name */
+                              val api: Int = 0, val link: Boolean = false, val pcName: String = "")
 @Serializable data class PairIdentity(val id: String, val pub: String)
 @Serializable data class SasPub(val pub: String = "", val picked: Boolean? = null)
 @Serializable data class ProxBeacon(val bssid: String, val dbm: Int)
@@ -63,7 +65,9 @@ data class ApDto(
 @Serializable data class TrackDto(val track: List<TrackPoint> = emptyList())
 
 @Serializable
-data class ObservationDto(val bssid: String, val ssid: String = "", val dbm: Int, val lat: Double, val lon: Double, val acc: Double, val time: String, val source: String = "android", val identity: String? = null)
+data class ObservationDto(val bssid: String, val ssid: String = "", val dbm: Int, val lat: Double, val lon: Double, val acc: Double, val time: String, val source: String = "android", val identity: String? = null,
+                          /** Wi-Fi RTT range to the AP at this time and place and its 1-σ (m); omitted when the AP did not answer (explicitNulls = false) */
+                          val rangeM: Double? = null, val rangeSd: Double? = null)
 @Serializable data class ObservationsBody(val observations: List<ObservationDto>, val identity: String? = null, val device: String? = null)
 @Serializable data class ObservationsResult(val added: Int = 0, val error: String = "")
 
@@ -74,9 +78,13 @@ data class ObservationDto(val bssid: String, val ssid: String = "", val dbm: Int
 
 @Serializable data class DbStats(val aps: Int = 0, val observations: Int = 0, val fixes: Int = 0, val pois: Int = 0, val encrypted: Boolean = false, val sizeBytes: Long = 0)
 
-/** Incremental sync (desktop feature "sync", feature-detected via hello.features). */
-@Serializable data class ChangesDto(val cursor: String = "", val aps: List<JsonObject> = emptyList(), val observations: List<JsonObject> = emptyList(), val fixes: List<JsonObject> = emptyList(), val anchors: List<JsonObject> = emptyList())
+/** `GET /db/changes`. [plateEvents] (records, `raw` included) stay raw rows here so one odd row cannot fail the page (sync.HubPlates decodes them). */
+@Serializable data class ChangesDto(val cursor: String = "", val aps: List<JsonObject> = emptyList(), val observations: List<JsonObject> = emptyList(), val fixes: List<JsonObject> = emptyList(), val anchors: List<JsonObject> = emptyList(), val more: Boolean = false,
+                                    val plateEvents: List<JsonObject> = emptyList())
 @Serializable data class SyncBody(val cursor: String, val observations: List<ObservationDto>, val identity: String? = null, val device: String? = null, val anchors: List<JsonObject>? = null)
+@Serializable data class FixDto(val lat: Double, val lon: Double, val acc: Double, val time: String, val source: String = "phone-gps", val provider: String = "gps", val place: String = "")
+@Serializable data class FixesBody(val fixes: List<FixDto>, val device: String? = null, val identity: String? = null)
+@Serializable data class FixesResult(val added: Int = 0, val device: String = "", val cursor: Double = 0.0)
 
 /** The full export: tables of raw rows; we only read what we understand. */
 @Serializable data class ExportDto(val aps: List<JsonObject> = emptyList(), val observations: List<JsonObject> = emptyList(), val fixes: List<JsonObject> = emptyList(), val pois: List<JsonObject> = emptyList())
@@ -178,8 +186,227 @@ data class ObservationDto(val bssid: String, val ssid: String = "", val dbm: Int
 @Serializable data class RangeSamples(val rtt: Int = 0, val ble: Int = 0, val wifiDiff: Int = 0)
 @Serializable data class RangeCalib(val rttOffsetM: Double? = null, val bleP0: Double? = null, val bleN: Double? = null, val bleP0Up: Double? = null,
                                     /** desktop 3.8+: the RTT bursts disagree with the calibrated offset (by [rttStaleByM] m); RTT is left out until a recalibration */
-                                    val rttStale: Boolean = false, val rttStaleByM: Double? = null)
+                                    val rttStale: Boolean = false, val rttStaleByM: Double? = null,
+                                    /** the offset's 1-σ (m) and whether a calibration whose bursts agreed set it (docs/RANGING.md §7, §8) */
+                                    val rttOffsetSigmaM: Double? = null, val rttCalibrated: Boolean? = null)
 @Serializable data class DeviceRange(val device: String = "", val distanceM: Double? = null, val sigmaM: Double? = null, val lowM: Double? = null, val highM: Double? = null,
                                      val method: List<String> = emptyList(), val bearingDeg: Double? = null, val bearingSigmaDeg: Double? = null, val dz: Double? = null,
                                      @SerialName("class") val cls: String = "unknown", val updated: String = "", val samples: RangeSamples? = null, val calib: RangeCalib? = null)
 @Serializable data class RangingList(val updated: String = "", val anchor: AnchorDto? = null, val devices: List<DeviceRange> = emptyList())
+
+// ── Flock surveillance & Route Heatmap ──────────────────────────────────────
+@Serializable
+data class FlockSightingBody(
+    val bssid: String,
+    val lat: Double,
+    val lon: Double,
+    val model: String = "Falcon",
+    val method: String = "reported",
+    val confidence: Int = 90,
+    val details: String = "",
+    /** docs/DETECTION.md: the SSID heard (the desktop re-evaluates it), the signature tier and class */
+    val ssid: String = "",
+    val tier: Int = -1,
+    @SerialName("class") val cls: String = "",
+)
+
+/**
+ * A camera of `/api/v1/flock` (FlockCamera::toJson writes camelCase; the snake_case names older builds of this app
+ * expected are still read). [cameraType], [surveillanceType] and [webcam] (OSM `contact:webcam`) are only present when
+ * the desktop sends them (docs/SIGHTINGS.md §2.0); without them the type is inferred from model / source / method.
+ */
+@OptIn(kotlinx.serialization.ExperimentalSerializationApi::class)
+@Serializable
+data class FlockCameraDto(
+    val id: String = "",
+    val lat: Double = 0.0,
+    val lon: Double = 0.0,
+    val source: String = "",
+    val model: String = "",
+    @SerialName("operator") val operatorName: String = "",
+    val direction: String = "",
+    val bssid: String = "",
+    @SerialName("bleMac") @kotlinx.serialization.json.JsonNames("ble_mac") val bleMac: String = "",
+    val confidence: Int = 100,
+    @SerialName("detectionMethod") @kotlinx.serialization.json.JsonNames("detection_method") val detectionMethod: String = "",
+    @SerialName("sightingCount") @kotlinx.serialization.json.JsonNames("sighting_count") val sightingCount: Int = 1,
+    @SerialName("passCount") val passCount: Int = 0,
+    val vetted: Boolean = false,
+    val notes: String = "",
+    /** §2.0: alpr | webcam | ptz | cctv | enforcement | not_camera (older desktops: absent, or alpr | camera) */
+    @SerialName("cameraType") @kotlinx.serialization.json.JsonNames("camera_type") val cameraType: String? = null,
+    /** a public live feed (OSM `contact:webcam`), when the desktop knows one */
+    @SerialName("webcam") @kotlinx.serialization.json.JsonNames("contact:webcam", "contactWebcam", "webcamUrl") val webcam: String? = null,
+    /** the OSM tags, when the desktop sends them (an object, or the compact JSON text) */
+    @SerialName("tags") val tagsRaw: kotlinx.serialization.json.JsonElement? = null,
+    /** the maker (DeFlock's brand / OSM manufacturer); "" unknown, never guessed */
+    val manufacturer: String = "",
+    /** the OSM element's version / timestamp, when the source gives them (DeFlock, Overpass meta) */
+    val osmVersion: Int = 0,
+    val osmTimestamp: String = "",
+    /** no longer confirmed by its source: kept on the desktop only for the passes it has (docs/DATABASE.md) */
+    val stale: Boolean = false,
+    /** §2.6 camera trust 0–1 from the desktop (area queries only); -1 = not sent */
+    val trust: Double = -1.0,
+) {
+    val tags: JsonObject? get() = when (val t = tagsRaw) {
+        is JsonObject -> t
+        is kotlinx.serialization.json.JsonPrimitive -> if (t.isString) runCatching { ApiFactory.json.parseToJsonElement(t.content) as? JsonObject }.getOrNull() else null
+        else -> null
+    }
+}
+
+@Serializable
+data class LicensePlateDto(
+    val plate: String = "",
+    val displayPlate: String = "",
+    val state: String = "",
+    val vehicleDesc: String = "",
+    val make: String = "",
+    val model: String = "",
+    val color: String = "",
+    val active: Boolean = true,
+    val addedAt: String = "",
+    val notes: String = ""
+)
+
+@Serializable
+data class CameraEncounterDto(
+    val id: Long = 0,
+    val cameraId: String = "",
+    val time: String = "",
+    val lat: Double = 0.0,
+    val lon: Double = 0.0,
+    val distanceM: Double = 0.0,
+    val speedKmh: Double = 0.0,
+    val plate: String = "",
+    val vehicleDesc: String = "",
+    val device: String = "",
+    val encounterNum: Int = 1,
+    val notes: String = ""
+)
+
+@Serializable
+data class PlateAuditDto(
+    val id: Long = 0,
+    val plate: String = "",
+    val cameraId: String = "",
+    val lat: Double = 0.0,
+    val lon: Double = 0.0,
+    @SerialName("operator") val operatorName: String = "",   // PlateAudit::toJson's key
+    val timestamp: String = "",
+    val source: String = "",
+    val confidence: Int = 100,
+    val details: String = ""
+)
+
+@Serializable
+/** `/flock/summary`, as MapDb::alprSummary writes it: camera counts (passed = cameras with a pass), passes summed over them, the plates, recent encounters and audits. */
+data class AlprSummaryDto(
+    val totalCameras: Int = 0,
+    val vettedCameras: Int = 0,
+    val passedCameras: Int = 0,
+    val totalPasses: Int = 0,
+    val plates: List<LicensePlateDto> = emptyList(),
+    val recentEncounters: List<CameraEncounterDto> = emptyList(),
+    val recentAudits: List<PlateAuditDto> = emptyList()
+) {
+    /** the plate being watched for: the server sends no such key, so the first active one */
+    val activePlate: LicensePlateDto? get() = plates.firstOrNull { it.active }
+}
+
+@Serializable
+data class FlockCamerasDto(
+    val cameras: List<FlockCameraDto> = emptyList(),
+    val stats: JsonObject? = null,
+    val loading: Boolean = false,
+    /** The area the desktop answered for (bbox or centre + radius), the cap it applied, and whether it had more. */
+    val area: JsonObject? = null,
+    val limit: Int = 0,
+    val truncated: Boolean = false,
+)
+
+@Serializable
+data class RoutePointDto(
+    val lat: Double = 0.0,
+    val lon: Double = 0.0,
+    val acc: Double = 0.0,
+    val time: String = "",
+    val source: String = ""
+)
+
+@Serializable
+data class RouteHeatmapDto(
+    val points: List<RoutePointDto> = emptyList(),
+    val count: Int = 0
+)
+
+/**
+ * `GET /api/v1/estimator` (Locator::estimatorJson): the desktop's estimator calibration. [kappa] scales every covariance
+ * (the anchors' leave-one-out test), [deviceOffsets] how many dB each device hears louder than the desktop, [environment]
+ * the path-loss fit per band ("2.4", "5", "6"). Everything else it sends (grades, groups, suggestions) is ignored here.
+ */
+@Serializable data class EstimatorDto(val version: Int = 0, val kappa: Double = 1.0, val deviceOffsets: Map<String, Double> = emptyMap(),
+                                      val environment: Map<String, EnvBandDto> = emptyMap())
+/** One band of [EstimatorDto.environment]: P0 and n with their covariance S = [S00, S01, S11], from [samples] anchor samples. */
+@Serializable data class EnvBandDto(val p0: Double = 0.0, val n: Double = 0.0, @SerialName("S") val s: List<Double> = emptyList(), val samples: Int = 0)
+
+
+// ── plate events (docs/SIGHTINGS.md §5) ─────────────────────────────────────
+/**
+ * One plate event on the wire. The keys are the `plate_events` column names (§1: "each event = all columns but raw");
+ * camelCase spellings are read too, in case the desktop writes them that way. [facing] / [leaky] may come as a number
+ * or a boolean, [metrics] / [raw] as an object or a JSON string — all kept as JSON and normalised by `sightings.PlateEvents`.
+ */
+@OptIn(kotlinx.serialization.ExperimentalSerializationApi::class)
+@Serializable
+data class PlateEventDto(
+    val uid: String = "",
+    val kind: String = "",
+    val plate: String? = null,
+    val time: String = "",
+    val lat: Double? = null, val lon: Double? = null, val acc: Double? = null,
+    @SerialName("camera_id") @kotlinx.serialization.json.JsonNames("cameraId") val cameraId: String? = null,
+    @SerialName("camera_lat") @kotlinx.serialization.json.JsonNames("cameraLat") val cameraLat: Double? = null,
+    @SerialName("camera_lon") @kotlinx.serialization.json.JsonNames("cameraLon") val cameraLon: Double? = null,
+    @SerialName("distance_m") @kotlinx.serialization.json.JsonNames("distanceM") val distanceM: Double? = null,
+    @SerialName("speed_kmh") @kotlinx.serialization.json.JsonNames("speedKmh") val speedKmh: Double? = null,
+    @SerialName("heading_deg") @kotlinx.serialization.json.JsonNames("headingDeg") val headingDeg: Double? = null,
+    @SerialName("approach_bearing_deg") @kotlinx.serialization.json.JsonNames("approachBearingDeg") val approachBearingDeg: Double? = null,
+    @SerialName("camera_dir_deg") @kotlinx.serialization.json.JsonNames("cameraDirDeg") val cameraDirDeg: Double? = null,
+    val facing: kotlinx.serialization.json.JsonElement? = null,
+    val operator: String? = null, val agency: String? = null, val model: String? = null,
+    @SerialName("camera_type") @kotlinx.serialization.json.JsonNames("cameraType") val cameraType: String? = null,
+    val source: String = "",
+    @SerialName("source_url") @kotlinx.serialization.json.JsonNames("sourceUrl") val sourceUrl: String? = null,
+    @SerialName("source_name") @kotlinx.serialization.json.JsonNames("sourceName") val sourceName: String? = null,
+    val confidence: Double? = null,
+    val leaky: kotlinx.serialization.json.JsonElement? = null,
+    val details: String? = null,
+    val metrics: kotlinx.serialization.json.JsonElement? = null,
+    val raw: kotlinx.serialization.json.JsonElement? = null,
+    val device: String? = null,
+    @SerialName("created_at") @kotlinx.serialization.json.JsonNames("createdAt") val createdAt: String? = null,
+    @SerialName("updated_at") @kotlinx.serialization.json.JsonNames("updatedAt") val updatedAt: String? = null,
+    val seq: Long? = null,
+    val media: List<PlateMediaDto>? = null,
+)
+/** An entry of an event's `media` list (`GET /plate-events`). */
+@OptIn(kotlinx.serialization.ExperimentalSerializationApi::class)
+@Serializable
+data class PlateMediaDto(val uid: String = "", val kind: String = "", val mime: String = "", val width: Int? = null, val height: Int? = null, val bytes: Long? = null,
+                         val attribution: String? = null, val license: String? = null,
+                         @SerialName("event_uid") @kotlinx.serialization.json.JsonNames("eventUid") val eventUid: String? = null,
+                         @SerialName("camera_id") @kotlinx.serialization.json.JsonNames("cameraId") val cameraId: String? = null,
+                         @SerialName("captured_at") @kotlinx.serialization.json.JsonNames("capturedAt") val capturedAt: String? = null,
+                         @SerialName("original_url") @kotlinx.serialization.json.JsonNames("originalUrl") val originalUrl: String? = null)
+/** `GET /plate-events?since=<seq>`: [cursor] is the seq to ask from next (a number; a string is accepted too). */
+@Serializable data class PlateEventsPage(val events: List<PlateEventDto> = emptyList(), val cursor: kotlinx.serialization.json.JsonElement? = null, val more: Boolean = false)
+@Serializable data class PlateEventsPush(val events: List<PlateEventDto>, val device: String? = null)
+/** `POST /plate-events` → the uids the events were stored under, in the order sent (a merged pass keeps the desktop's uid). */
+@Serializable data class PlateEventsAccepted(val accepted: Int = 0, val uids: List<String?> = emptyList(), val errors: List<String?> = emptyList())
+@Serializable data class PlateMediaUpload(val kind: String, val mime: String, val data: String, val width: Int, val height: Int, val capturedAt: String)
+@Serializable data class PlateMediaUploaded(val uid: String = "")
+/** `GET /plate-events/status`: [hibfSources] = the derived leaky-agency list (§4.4). */
+@Serializable data class PlateEventsStatus(val backfill: JsonObject? = null, val hibf: JsonObject? = null, val hibfSources: kotlinx.serialization.json.JsonElement? = null,
+                                           val counts: kotlinx.serialization.json.JsonElement? = null)

@@ -10,9 +10,11 @@
 #include "tilesource.h"
 #include "tray.h"
 #include "apiserver.h"
+#include "hubclient.h"
 #include "mapdb.h"
 #include "poiclassify.h"
 #include "ranging/rangingservice.h"
+#include "telegrambot.h"
 #include <QApplication>
 #include <QCommandLineParser>
 #include <QDBusConnection>
@@ -62,8 +64,15 @@ private:
     bool m_tty; QString m_file; int m_lastTen = -1;
 };
 
+int hubMain(int argc, char **argv);                         // hubmain.cpp: beaconfix --server (headless, QCoreApplication)
+int nodeMain(int argc, char **argv);                        // hubmain.cpp: beaconfix --node (headless node)
+
 int main(int argc, char **argv)
 {
+    for (int i = 1; i < argc; ++i) {
+        if (qstrcmp(argv[i], "--server") == 0) return hubMain(argc, argv);
+        if (qstrcmp(argv[i], "--node") == 0) return nodeMain(argc, argv);
+    }
     QApplication app(argc, argv);
     QCoreApplication::setOrganizationName(QStringLiteral("sworrl"));
     QCoreApplication::setApplicationName(QStringLiteral("beaconfix"));
@@ -138,6 +147,14 @@ int main(int argc, char **argv)
     QCommandLineOption rangingOpt(QStringLiteral("ranging"), QStringLiteral("Print the device ranging state (responder, BLE, every ranged device) as JSON, exit."));
     QCommandLineOption rangingCal(QStringLiteral("ranging-calibrate"), QStringLiteral("Calibrate ranging with a device lying at a known distance: <device>@<metres>[@<seconds>], e.g. \"Pixel 10@0.61\", exit."), QStringLiteral("device@metres"));
     p.addOptions({anchorsOpt, anchorSet, anchorRemove, grantControl, rangingOpt, rangingCal});
+    QCommandLineOption serverOpt(QStringLiteral("server"), QStringLiteral("Run as the hub: headless master database for every node, BFS3 API (see beaconfix --server --help)."));
+    QCommandLineOption enrollOpt(QStringLiteral("enroll"), QStringLiteral("Enrol this computer with a hub: --enroll 'bfs3:…' (the invite from beaconfix --server --invite); the tray then syncs with it, exit."), QStringLiteral("invite"));
+    QCommandLineOption enrollName(QStringLiteral("enroll-name"), QStringLiteral("With --enroll: the name the hub knows us by (default: the hostname, which is also what our synced rows carry)."), QStringLiteral("name"));
+    QCommandLineOption hubOpt(QStringLiteral("hub"), QStringLiteral("Print this node's hub link (url, fingerprint, device id, last sync) as JSON, exit."));
+    QCommandLineOption hubSyncOpt(QStringLiteral("hub-sync"), QStringLiteral("Sync with the hub now (push ours, pull every node's), exit."));
+    QCommandLineOption hubForget(QStringLiteral("hub-forget"), QStringLiteral("Forget the hub enrolment (revoke the device on the hub too), exit."));
+    QCommandLineOption nodeOpt(QStringLiteral("node"), QStringLiteral("Run as a headless node (no window, no tray; syncs with and computes for the hub; see beaconfix --node --help)."));
+    p.addOptions({serverOpt, nodeOpt, enrollOpt, enrollName, hubOpt, hubSyncOpt, hubForget});
     p.addOptions({tray, once, json, refresh, snapshot, gpx, copy, newTrip, prefetch, apiStatus, devices, approve, deny, revoke, token, control, pairing,
                   homeAdd, homeRemove, homeList, homeSync, homeToken, homeImport, knownImport, knownList, knownAdd, knownName, knownRemove, dbStats, dbExport, dbImport, importOpt, importFrom, importTo, importWhat, refit, estimatorOpt, sync, syncToken, noMdns, peers, scan, allPeers,
                   identity, identityNew, identityExport, identityFile, identityWords, identityPass, identityImport, identityLinkQr, identitySelftest, tz, applyOs, dryRun, nearby, radius});
@@ -386,7 +403,11 @@ int main(int argc, char **argv)
         win.resize(1100, 720);
         win.show();
         const QString file = p.value(snapshot);
-        QObject::connect(&loc, &Locator::probeFinished, &app, [&, file](bool, const QString &) {
+        // Docs hooks: BEACONFIX_SNAPSHOT_NOPROBE=1 renders the database as it is (no Wi-Fi scan, no fix: screenshots that
+        // must not show where the machine really is); BEACONFIX_SNAPSHOT_CENTER="lat,lon,zoom"; BEACONFIX_SNAPSHOT_TAB=sightings
+        // (+ BEACONFIX_SNAPSHOT_EVENT=<uid> opens its dialog); BEACONFIX_SNAPSHOT_HOLD=<s> keeps running after the grab
+        // (for capturing dialogs from the X server); BEACONFIX_SNAPSHOT_ZOOM=17, BEACONFIX_SNAPSHOT_LAYER=0..3 as before.
+        auto shoot = [&, file] {
             // Let tiles, the place name and nearby places arrive (places can take a while)
             auto *poll = new QTimer(&app);
             auto *waited = new int(0);
@@ -394,20 +415,26 @@ int main(int argc, char **argv)
                 *waited += 500;
                 if (*waited < 7000 || (loc.poisLoading() && *waited < 45000)) return;
                 poll->stop();
-                // Test hooks: BEACONFIX_SNAPSHOT_ZOOM=17 BEACONFIX_SNAPSHOT_LAYER=0..3
                 bool ok = false;
                 const double z = qEnvironmentVariable("BEACONFIX_SNAPSHOT_ZOOM").toDouble(&ok);
                 if (ok && loc.fix().valid) win.map()->focusOn(loc.fix().lat, loc.fix().lon, z);
+                const QStringList c = qEnvironmentVariable("BEACONFIX_SNAPSHOT_CENTER").split(QLatin1Char(','));
+                if (c.size() == 3) win.map()->focusOn(c[0].toDouble(), c[1].toDouble(), c[2].toDouble());
                 const int layer = qEnvironmentVariable("BEACONFIX_SNAPSHOT_LAYER").toInt(&ok);
                 if (ok) win.map()->setLayer(BeaconView::Layer(layer));
-                QTimer::singleShot(ok || qEnvironmentVariableIsSet("BEACONFIX_SNAPSHOT_ZOOM") ? 9000 : 4000, &app, [&, file] {  // tiles for the final view
+                if (qEnvironmentVariable("BEACONFIX_SNAPSHOT_TAB") == QLatin1String("sightings")) win.showPlateEvent(qEnvironmentVariable("BEACONFIX_SNAPSHOT_EVENT"));
+                const bool moved = ok || qEnvironmentVariableIsSet("BEACONFIX_SNAPSHOT_ZOOM") || c.size() == 3;
+                QTimer::singleShot(moved ? 9000 : 4000, &app, [&, file] {  // tiles for the final view
                     win.grab().save(file);
-                    QCoreApplication::quit();
+                    const int hold = qEnvironmentVariable("BEACONFIX_SNAPSHOT_HOLD").toInt();
+                    QTimer::singleShot(qMax(0, hold) * 1000, &app, &QCoreApplication::quit);
                 });
             });
             poll->start(500);
-        });
-        loc.Refresh();
+        };
+        QObject::connect(&loc, &Locator::probeFinished, &app, [shoot](bool, const QString &) { shoot(); });
+        if (qEnvironmentVariableIsSet("BEACONFIX_SNAPSHOT_NOPROBE")) QTimer::singleShot(500, &app, shoot);
+        else loc.Refresh();
         return app.exec();
     }
 
@@ -684,6 +711,31 @@ int main(int argc, char **argv)
         return rc;
     }
 
+    // ── the hub link (docs/SECURE-API.md): through the running tray, which owns the database ──
+    if (p.isSet(enrollOpt) || p.isSet(hubOpt) || p.isSet(hubSyncOpt) || p.isSet(hubForget)) {
+        QDBusInterface iface(SVC, PATH, SVC, bus);
+        if (!iface.isValid()) { fprintf(stderr, "beaconfix: no running instance and D-Bus activation failed\n"); return 1; }
+        iface.setTimeout(320000);
+        int rc = 0;
+        if (p.isSet(hubForget)) { QDBusReply<bool> r = iface.call(QStringLiteral("HubForget")); out << (r.isValid() && r.value() ? "hub enrolment forgotten\n" : "failed\n"); rc = r.isValid() && r.value() ? 0 : 1; }
+        if (p.isSet(enrollOpt)) {
+            QDBusReply<QString> r = iface.call(QStringLiteral("HubEnroll"), p.value(enrollOpt).trimmed(), p.value(enrollName).trimmed());
+            const QJsonObject o = QJsonDocument::fromJson(r.value().toUtf8()).object();
+            if (!r.isValid() || !o["ok"].toBool()) { fprintf(stderr, "beaconfix: enrolment failed: %s\n", qPrintable(r.isValid() ? o["error"].toString() : r.error().message())); return 1; }
+            out << "Enrolled with " << o["url"].toString() << " as " << o["name"].toString() << " (" << o["kind"].toString() << ")\n  device   " << o["deviceId"].toString()
+                << "\n  hub key  " << o["fingerprint"].toString() << " (pinned)\nThe tray syncs with it from now on (beaconfix --hub shows the state).\n";
+        }
+        if (p.isSet(hubSyncOpt)) {
+            QDBusReply<QString> r = iface.call(QStringLiteral("HubSync"));
+            const QJsonObject o = QJsonDocument::fromJson(r.value().toUtf8()).object();
+            if (!r.isValid() || !o["ok"].toBool()) { fprintf(stderr, "beaconfix: hub sync failed: %s\n", qPrintable(r.isValid() ? o["message"].toString() : r.error().message())); rc = 1; }
+            else out << "Synced with the hub: " << o["message"].toString() << "\n";
+        }
+        if (p.isSet(hubOpt)) { QDBusReply<QString> r = iface.call(QStringLiteral("HubStatus")); out << QJsonDocument::fromJson(r.value().toUtf8()).toJson(QJsonDocument::Indented); }
+        out.flush();
+        return rc;
+    }
+
     if (p.isSet(refresh)) {
         QDBusInterface iface(SVC, PATH, SVC, bus);   // D-Bus activation starts the tray if needed
         if (iface.isValid()) { iface.call(QStringLiteral("Refresh")); return 0; }
@@ -704,10 +756,18 @@ int main(int argc, char **argv)
 
     auto *tiles = new TileSource(&app);
     if (tiles->listen()) loc->setTileBase(tiles->baseUrl());   // the Plasma widget fetches its map from here
+    tiles->setHeatFeed([loc](quint64 have) {                     // the widget's route heat map, drawn as tiles
+        TileSource::HeatInput in; in.gen = loc->routeGeneration();
+        if (in.gen != have) { in.lines = loc->routeLinesMerc(); in.points = loc->routePointsMerc(); }
+        return in;
+    });
     auto *api = new ApiServer(loc, &app);                       // LAN API for other devices (frame, phone, laptop)
     loc->setApiServer(api);
+    loc->setHubClient(new HubClient(loc, &app));               // the hub link (enrolled with beaconfix --enroll): sync + every node's position
     auto *ranging = new RangingService(loc, &app);              // device ranging: BLE advert + scan, RTT reports, fusion (docs/RANGING.md)
     loc->setRanging(ranging);
+    auto *telegram = new TelegramBot(loc, &app);               // idle until the owner sets a token; paired by a one-time code
+    api->setProperty("telegramBot", QVariant::fromValue<QObject *>(telegram));   // POST /api/v1/telegram drives the live bot
     MainWindow win(loc, tiles);
     Tray trayIcon(loc, &app);
     auto showWin = [&win] { win.show(); win.raise(); win.activateWindow(); };
@@ -715,12 +775,10 @@ int main(int argc, char **argv)
     QObject::connect(&trayIcon, &Tray::openIdentityRequested, &app, [&win] { win.showIdentity(); });
     QObject::connect(&trayIcon, &Tray::openEmergencyRequested, &app, [&win] { win.showEmergency(); });
     QObject::connect(loc, &Locator::showWindowRequested, &app, showWin);
-    // Pairing: a request opens its picture-match dialog; the notification's buttons land there too
-    QObject::connect(loc, &Locator::pairingRequested, &app, [&win](const QString &json) {
-        const QJsonObject o = QJsonDocument::fromJson(json.toUtf8()).object();
-        if (o["status"].toString() == QLatin1String("pending")) win.showPairRequest(o["id"].toString());
-    });
-    QObject::connect(loc, &Locator::pairingOpenRequested, &app, [&win](const QString &id) { win.showPairRequest(id); });
+    QObject::connect(loc, &Locator::plateEventOpenRequested, &app, [&win](const QString &uid) { win.showPlateEvent(uid); });   // a sighting's Details
+    // Linking (docs/LINKING.md): the tray / Devices entry and every mDNS request open the Link dialog (code + Link / Reject)
+    QObject::connect(&trayIcon, &Tray::openLinkRequested, &app, [&win] { win.showLink(); });
+    QObject::connect(api, &ApiServer::linkRequested, &app, [&win](const QString &) { win.showLink(); });
     QObject::connect(&trayIcon, &Tray::quitRequested, &app, &QCoreApplication::quit);
     // Offline map: warm the tile cache around every new stop (and on request)
     auto doPrefetch = [loc, tiles](bool force) {

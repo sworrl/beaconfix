@@ -71,6 +71,15 @@ QString baseCategory(const QJsonObject &t)
     const QString le = t["leisure"].toString(), hc = t["healthcare"].toString(), off = t["office"].toString(), gov = t["government"].toString();
     const QString name = t["name"].toString().toLower();
     // Emergency & civic
+    const QString mm = t["man_made"].toString(), surv = t["surveillance"].toString();
+    const QString st = t["surveillance:type"].toString(), brand = t["brand"].toString().toLower();
+    const QString ct = t["camera:type"].toString(), cm = t["camera:model"].toString().toLower();
+    const QString oper = t["operator"].toString().toLower();
+    const QString manuf = t["manufacturer"].toString().toLower();
+    if (mm == "surveillance" || surv == "camera" || surv == "outdoor" || st.contains(QLatin1String("alpr"), Qt::CaseInsensitive) ||
+        ct.contains(QLatin1String("alpr"), Qt::CaseInsensitive) || cm.contains(QLatin1String("falcon")) || cm.contains(QLatin1String("condor")) || cm.contains(QLatin1String("sparrow")) ||
+        brand.contains("flock") || oper.contains("flock") || manuf.contains("flock") || name.contains("flock safety") || name.contains("flock camera"))
+        return "surveillance";
     if (am == "police") return "police";
     if (am == "fire_station") return "fire";
     if (am == "hospital" || hc == "hospital") return "health";

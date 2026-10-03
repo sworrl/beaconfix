@@ -4,6 +4,62 @@ All notable changes to BeaconFix are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [3.10.0] — 2026-10-03
+
+Desktop 3.10.0, Plasma widget 3.10.0, Android 1.6.0 and the hub. BeaconFix is now **Apache-2.0**
+(relicensed from GPL-2.0-or-later by its sole author; [docs/LICENSING.md](docs/LICENSING.md)).
+
+### Positioning and estimation
+- **Estimator 4** (desktop and Android, identical, golden-vector checked): per-device, per-AP level
+  deviations δ (σ 10 dB; places never mix devices), an explicit fit of the mirror solution across the
+  places' axis with the mirror mixture folded into the covariance (one-sided data: R95 coverage 70 % →
+  96 % in Monte Carlo), device offsets in the incremental update, and a floor on robust weights that
+  stopped a NaN posterior from silently dropping an AP. Measured on surveyed ground truth:
+  [docs/GRADING.md](docs/GRADING.md).
+- Estimator 3: a scaled-inverse-χ² noise scale over effectively independent places, a sandwich
+  covariance for correlated shadowing, a local-posterior R95, adaptive place radius.
+- Site lock, Wi-Fi fingerprinting, provider-accuracy calibration, a Kalman/RTS track smoother with a
+  Gauss–Markov GPS bias, and Wi-Fi RTT (802.11mc/az) ranges to access points.
+
+### Map
+- Satellite hybrid by default with the newest free imagery (Esri Clarity, USGS, NASA VIIRS), road and
+  label overlays, contour lines in feet from elevation tiles, zoom to z23, a cm/ft scale bar, area
+  grouping and decluttered labels on desktop, widget and phone. Render caching and partial repaints
+  (desktop frames 700–1200 ms → 5–12 ms); the widget zooms at 60 fps; a heat layer of every route.
+
+### ALPR cameras and plate events (new: [docs/SIGHTINGS.md](docs/SIGHTINGS.md), [docs/DETECTION.md](docs/DETECTION.md))
+- Camera map from DeFlock's daily ALPR-only dataset (with real directions and edit dates) plus community
+  reports; every camera classified (ALPR, webcam, PTZ, CCTV, enforcement, not a camera). Non-ALPRs no
+  longer raise "plate read" alerts (a traffic webcam used to).
+- Camera passes on the track polyline with vendor field-of-view cones, P(read) integrating the fix
+  error, road snapping (parallel roads, overpasses, the opposite carriageway), and log-odds camera trust
+  with "it's there / not there" verdicts. Backfilled over all route history, incremental afterwards.
+- Plate searches from released Flock audit logs (HaveIBeenFlocked), checked with 8-hex SHA-256
+  prefixes on an adaptive schedule; agency context from Eyes on Flock.
+- Images in the smallest lossless form (JPEG XL recompression / lossless JXL or WebP): camera photos
+  (OSM, Wikimedia Commons, Panoramax), dash-cam frames, opt-in traffic-webcam stills.
+- Sightings tab and event dialog (metrics, images, raw record, View source, Show on map); honest alerts.
+- One shared, tiered surveillance-signature file for desktop and phone; generic ESP32 and consumer OUIs
+  that caused false alerts removed; Flock's own OUI added.
+- Camera-avoidance routing through OpenRouteService or GraphHopper (your key).
+
+### Android 1.6.0
+- Sightings screens, live pass detection, dash-cam pass frames, the phone-side plate watcher, plate
+  events over the LAN and through the hub (Room v8), Open-source licenses screen.
+- ALPR engine: per-vehicle tracking and multi-frame fusion, hotlist matching on the per-character
+  candidate lattice, short-shutter capture, bilinear crop sampling (40 px plates read 21 % → 83 %),
+  US plate-format rules with a GPS state prior, 416 px detector tiles, thermal-headroom steps, an
+  optional larger OCR model, ONNX Runtime 1.30. The plate detector is downloaded on first use (its
+  weights' license is unclear); a clean retraining pipeline is in `tools/train-plate-detector/`.
+- Estimator 4, the desktop's calibration (κ, path-loss, device offsets, misses), AP RTT ranging.
+
+### Hub, linking and security
+- The hub (`beaconfix --server`): master database, device registry, live positions and a job queue;
+  nodes do the processing. BFS3 sealed API (X25519, HKDF-SHA512 ratchet, ChaCha20-Poly1305).
+- Linking v3: QR or LAN discovery with a six-digit numeric comparison and a key commitment; one link
+  gives the phone a LAN token and a hub enrolment. Nothing to type.
+- LAN API: a CSRF guard on loopback scopes; authenticated traffic no longer counts against the rate limit.
+
 ## [3.9.0] — 2026-09-28
 
 Desktop 3.9.0, Plasma widget 3.9.0 and Android 1.5.0: every access point BeaconFix positions

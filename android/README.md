@@ -27,9 +27,20 @@ ways with every BeaconFix desktop or laptop that shares your identity.
 - **Adjacency first.** Onboarding, linking and pairing start from the BeaconFix instances found
   on the LAN (mDNS `_beaconfix._tcp`, `/api/v1/peers`, a subnet probe): "That's me — import" and
   "Link my identity with it" are one tap each.
-- **Pairing v2.** X25519 ephemeral keys → three pictures that must match on both screens, a
-  proximity verdict (shared beacons, fixes, and the measured range), cancel from either side;
-  older desktops fall back to the 4-digit code automatically.
+- **Link a PC, nothing to type.** Scan the QR the desktop shows, or tap the PC in the list found on
+  the LAN: both screens show the same six-digit code (X25519 numeric comparison with a key
+  commitment). One link gives the phone a LAN token and enrols it with the hub
+  ([docs/LINKING.md](../docs/LINKING.md)).
+- **Hub.** With the self-hosted hub (WireGuard only, end-to-end sealed BFS3 API) the phone syncs
+  observations, fixes and plate events while it is away from the RV's LAN.
+- **Sightings.** Every ALPR camera you pass is detected live on the phone (field-of-view cone,
+  P(read)), every public record of your plate being searched is checked on an adaptive schedule
+  (hashed prefixes only), and both appear under *More → Sightings* with their metrics, images and a
+  *View source* link; notifications open the event ([docs/SIGHTINGS.md](../docs/SIGHTINGS.md)).
+- **ALPR dash cam.** On-device plate detection and OCR (ONNX Runtime), per-vehicle tracking and
+  multi-frame fusion, short-shutter capture, US plate-format rules, offline hotlist matching for
+  AMBER / Silver / Blue alerts; a lossless frame is kept when you pass a camera. Runs while charging
+  by default.
 - **Device ranging.** Wi-Fi RTT (802.11mc) to the desktop's responder, BLE advertisements in both
   directions, shared-AP fingerprints, barometer and motion — fused by the desktop and on the
   phone (`docs/RANGING.md`) into "Desktop · 0.6 m (Wi-Fi RTT ±0.3 m)" on the Home card, the
@@ -57,12 +68,12 @@ ways with every BeaconFix desktop or laptop that shares your identity.
   buttons (the lock screen shows only "BeaconFix · running") — it cannot be swiped away for good
   (Android 14+ lets you try; it comes straight back).
 - **Units**: metric, imperial, or automatic (the desktop trip's country, else the phone's region).
-- **Honest positions.** A beacon gets a position only after samples from at least two places
-  (robust weighted least squares on a log-distance path-loss model, Huber weights); the phone
+- **Honest positions.** The phone runs the desktop's estimator line for line (grid posterior,
+  robust fit, per-device calibration, graded A–F with a 95 % region — [docs/GRADING.md](../docs/GRADING.md)),
   locates itself from known beacons when GPS is silent, and says so. Refits are animated on the map.
-- No analytics, no crash reporting, no servers other than your desktops, OpenStreetMap tiles and,
-  for Help with no desktop in reach, OpenStreetMap's Overpass (places); the address for the
-  dispatcher comes from the system geocoder, else one Nominatim lookup.
+- No analytics, no crash reporting, no BeaconFix servers. What the app can contact (map tiles,
+  OpenStreetMap services, the plate check's hashed prefixes, the opt-in services) is listed in the
+  main [README's privacy table](../README.md#privacy). Open-source licenses: *Settings → Open-source licenses*.
 
 ## Screens
 
@@ -157,4 +168,4 @@ off *Developer options → Networking → Wi-Fi scan throttling*.
 
 ## License
 
-GPL-2.0-or-later, like the desktop app.
+Apache-2.0, like the desktop app (see ../LICENSE and ../docs/LICENSING.md).

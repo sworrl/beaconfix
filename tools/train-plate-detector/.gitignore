@@ -1,0 +1,12 @@
+.venv/
+third_party/
+data/
+runs/
+models/
+weights/
+outputs/
+*.onnx
+*.ckpt
+*.pt
+*.pache
+__pycache__/

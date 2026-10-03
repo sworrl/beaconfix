@@ -435,6 +435,26 @@ void BleLink::consider(const QString &path, const QVariantMap &props, bool)
     ++m_advertsSeen;
     m_scanQuietMs = 0;                                          // the scanner hears (any device counts)
     if (m_scanStalled) { m_scanStalled = false; qInfo("beaconfix: BLE scan hears adverts again"); emit scanStalledChanged(false); }
+
+    const QString addr = props.value(QStringLiteral("Address")).toString().isEmpty()
+        ? path.section(QLatin1Char('/'), -1).mid(4).replace(QLatin1Char('_'), QLatin1Char(':'))
+        : props.value(QStringLiteral("Address")).toString();
+    const QString devName = props.value(QStringLiteral("Name")).toString();
+    const QStringList devUuids = props.value(QStringLiteral("UUIDs")).toStringList();
+    int mfrId = -1;
+    QByteArray mfrData;
+    if (props.contains(QStringLiteral("ManufacturerData"))) {
+        const QVariant md = props.value(QStringLiteral("ManufacturerData"));
+        if (md.canConvert<QVariantMap>()) {
+            const QVariantMap m = md.toMap();
+            if (!m.isEmpty()) {
+                mfrId = m.firstKey().toInt();
+                mfrData = m.first().toByteArray();
+            }
+        }
+    }
+    emit advertHeard(addr, devName, devUuids, mfrId, mfrData, d.rssi);
+
     if (!d.ours) return;
     const RangeMath::BleAdvert a = RangeMath::parseServiceData(d.serviceData);
     if (!a.valid) return;

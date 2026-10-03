@@ -83,12 +83,13 @@ static Fit fitFrom(const QJsonObject &j)
 }
 static QJsonObject optJson(const Options &o)
 {
-    return QJsonObject{{"defaultN", o.defaultN}, {"nSd", o.nSd}, {"p0Mean", o.p0Mean}, {"p0Sd", o.p0Sd}, {"kappa", o.kappa}, {"bootstrap", o.bootstrap}};
+    return QJsonObject{{"defaultN", o.defaultN}, {"nSd", o.nSd}, {"p0Mean", o.p0Mean}, {"p0Sd", o.p0Sd}, {"kappa", o.kappa}, {"bootstrap", o.bootstrap}, {"devOffsetSd", o.devOffsetSd}};
 }
 static Options optFrom(const QJsonObject &j)
 {
     Options o; o.defaultN = j["defaultN"].toDouble(o.defaultN); o.nSd = j["nSd"].toDouble(o.nSd); o.p0Mean = j["p0Mean"].toDouble(o.p0Mean);
     o.p0Sd = j["p0Sd"].toDouble(o.p0Sd); o.kappa = j["kappa"].toDouble(o.kappa); o.bootstrap = j["bootstrap"].toInt(o.bootstrap);
+    o.devOffsetSd = j["devOffsetSd"].toDouble(o.devOffsetSd);
     return o;
 }
 static QJsonObject ctxJson(const Context &c)
@@ -132,6 +133,21 @@ static QList<Case> scenarios()
     { Case c; c.name = "outliers"; c.obs = ringOf(20, 50, 40, 8, 3); for (int i = 0; i < 3; ++i) { Obs o; o.lat = AP_LAT + 0.0027; o.lon = AP_LON + 0.0005 * i; o.acc = 8; o.dbm = -40; o.t = T0; c.obs << o; } cs << c; }
     { Case c; c.name = "two-devices-offset"; for (int i = 0; i < 16; ++i) { const double a = i * 2 * M_PI / 16, r = 60 + (i % 3) * 40; c.obs << at(r * std::cos(a), r * std::sin(a), 8, 2.5, T0 - (i % 5) * 86400, i % 2 ? QStringLiteral("phone") : QString(), i % 2 ? 7.0 : 0.0); }
       c.ctx.deviceOffset.insert(QStringLiteral("phone"), 7.0); cs << c; }
+    // per-AP device deviations δ: the phone is the reference (most places), the tablet hears this AP 7 dB quieter than its
+    // calibration, the host is calibrated; places never mix devices
+    { Case c; c.name = "three-devices-deviation";
+      for (int i = 0; i < 21; ++i) { const double a = i * 2 * M_PI / 21, r = 45 + (i % 4) * 30;
+          const QString dev = i % 3 == 0 ? QStringLiteral("tablet") : i % 3 == 1 ? QStringLiteral("phone") : (i % 2 ? QStringLiteral("phone") : QString());
+          const double off = dev == QLatin1String("tablet") ? -4.0 - 7.0 : dev == QLatin1String("phone") ? 3.0 : 0.0;
+          c.obs << at(r * std::cos(a), r * std::sin(a), 6, 3, T0 - (i % 3) * 86400, dev, off); }
+      c.obs << at(20, 25, 6, 3, T0, QStringLiteral("tablet"), -11.0) << at(22, 27, 6, 3, T0, QStringLiteral("phone"), 3.0);   // two devices at one spot
+      c.ctx.deviceOffset.insert(QStringLiteral("phone"), 3.0); c.ctx.deviceOffset.insert(QStringLiteral("tablet"), -4.0); cs << c; }
+    // more devices than δ slots: the four with the fewest places beyond the reference … the sixth stays pinned; a tighter prior
+    { Case c; c.name = "six-devices-cap"; c.opt.devOffsetSd = 6;
+      const char *names[6] = {"phone", "tablet", "deck", "laptop", "pi", "watch"};
+      for (int i = 0; i < 30; ++i) { const double a = i * 2 * M_PI / 30, r = 50 + (i % 4) * 20; const int d = i % 3 == 0 ? 0 : 1 + (i % 5);
+          c.obs << at(r * std::cos(a), r * std::sin(a), 8, 3, T0, QString::fromLatin1(names[d]), (d - 2) * 2.5); }
+      cs << c; }
     { Case c; c.name = "rtt"; for (int i = 0; i < 4; ++i) { const double a = i * 2 * M_PI / 4 + 0.4; Obs o = at(70 * std::cos(a), 70 * std::sin(a), 8, 4); o.rangeM = std::sqrt(std::pow(distanceM(o.lat, o.lon, AP_LAT, AP_LON), 2) + 9) + 1.5; o.rangeSd = 2; c.obs << o; } cs << c; }
     { Case c; c.name = "moved"; for (int i = 0; i < 10; ++i) { const double a = i * 2 * M_PI / 10; Obs o = at(80 * std::cos(a), 80 * std::sin(a) + 300, 8, 2, T0 - 200 * 86400);
           o.dbm = int(std::lround(modelDbm(P0, N, std::sqrt(std::pow(distanceM(o.lat, o.lon, AP_LAT + mLat(300), AP_LON), 2) + 9)))); c.obs << o; }
@@ -223,6 +239,12 @@ int main(int argc, char **argv)
             for (const Obs &o : updateStream()) { f = update(f, o); stream.append(obsJson(o)); steps.append(fitJson(f)); }
             updates.append(QJsonObject{{"fromCase", 1}, {"stream", stream}, {"expect", steps}});
         }
+        {   // the same stream heard by a device 6 dB louder than this host, with its calibrated offset passed to update()
+            Fit f = fitAp(cs[1].obs, cs[1].now, cs[1].opt, cs[1].ctx);
+            QJsonArray stream, steps;
+            for (Obs o : updateStream()) { o.device = QStringLiteral("phone"); o.dbm += 6; f = update(f, o, Options(), 6.0); QJsonObject j = obsJson(o); j["offsetDb"] = 6.0; stream.append(j); steps.append(fitJson(f)); }
+            updates.append(QJsonObject{{"fromCase", 1}, {"stream", stream}, {"expect", steps}});
+        }
         for (bool moved : {false, true}) {
             const QList<Known> k = selfScenario(moved);
             QJsonArray ka; for (const Known &x : k) ka.append(knownJson(x));
@@ -252,7 +274,10 @@ int main(int argc, char **argv)
     for (const QJsonValue &v : root["updates"].toArray()) {
         Fit f = fits.value(v["fromCase"].toInt());
         const QJsonArray stream = v["stream"].toArray(), steps = v["expect"].toArray();
-        for (int i = 0; i < stream.size(); ++i) { f = update(f, obsFrom(stream[i].toObject())); cmp(QStringLiteral("update[%1]").arg(i), steps[i].toObject(), fitJson(f)); }
+        for (int i = 0; i < stream.size(); ++i) {
+            f = update(f, obsFrom(stream[i].toObject()), Options(), stream[i].toObject()["offsetDb"].toDouble(0));
+            cmp(QStringLiteral("update[%1]").arg(i), steps[i].toObject(), fitJson(f));
+        }
     }
     int si = 0;
     for (const QJsonValue &v : root["self"].toArray()) {

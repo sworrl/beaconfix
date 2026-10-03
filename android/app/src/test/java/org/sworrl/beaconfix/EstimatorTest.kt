@@ -67,7 +67,8 @@ class EstimatorTest {
         assertTrue("R95 ${f.r95} covers the error ${err(f)}", f.r95 >= err(f))
         assertTrue("grade ${f.grade} (${f.score})", f.grade == "A" || f.grade == "B")
         assertTrue("geometry: inHull ${f.inHull} rbar ${f.rbar} lin ${f.linRatio} modes ${f.modes}", f.inHull && f.rbar < 0.2 && f.linRatio > 0.5 && f.modes == 1 && !f.ambiguous)
-        assertTrue("DOP ${f.rssDop}, CRLB R95 ${f.crlbR95} ≤ R95 ${f.r95}", f.rssDop > 0 && f.rssDop < 200 && f.crlbR95 > 0 && f.crlbR95 <= f.r95 + 1e-6)
+        // the noise scale is estimated now (σ0 = 6 dB is only its prior): a clean ring fits tighter than the bound at σ0
+        assertTrue("DOP ${f.rssDop}, R95 ${f.r95} < CRLB R95 at σ0 ${f.crlbR95} (σ ${f.sigmaDb} dB)", f.rssDop > 0 && f.rssDop < 200 && f.crlbR95 > 0 && f.r95 < f.crlbR95)
         assertTrue("Spearman ${f.spearman}", f.spearman < -0.5)
         assertEquals("good", f.quality)
     }
@@ -159,11 +160,41 @@ class EstimatorTest {
         assertTrue("moved ${f.moved}, error ${err(f)}", f.valid && f.moved && err(f) < 25)
     }
 
-    @Test fun aKnownDeviceOffsetRestoresTheFit() {
+    /** A second device hearing 8 dB louder: its per-AP deviation δ absorbs the offset even before it is calibrated. */
+    @Test fun anUncalibratedDeviceOffsetIsAbsorbed() {
         val obs = (0 until 24).map { i -> val ang = i * 2 * PI / 24; val rad = 60.0 + (i % 3) * 40; at(rad * cos(ang), rad * sin(ang), 8.0, 2.5, t0, if (i % 2 != 0) "phone" else "", if (i % 2 != 0) 8.0 else 0.0) }
         val raw = Estimator.fitAp(obs, t0)
         val fixed = Estimator.fitAp(obs, t0, Options(), Context(deviceOffset = mapOf("phone" to 8.0)))
-        assertTrue("rms ${raw.rms} → ${fixed.rms}, devices ${fixed.devices}", fixed.valid && fixed.rms < raw.rms && fixed.devices == 2)
+        assertTrue("device offset absorbed: rms ${raw.rms} vs ${fixed.rms} dB, error ${err(raw)} vs ${err(fixed)} m, devices ${fixed.devices}",
+            fixed.valid && raw.valid && abs(raw.rms - fixed.rms) < 0.5 && err(raw) < err(fixed) + 3 && fixed.devices == 2)
+    }
+
+    /** A device that hears THIS AP 7 dB quieter than its calibration, at a third of the places: δ takes it, the fit stays. */
+    @Test fun aQuieterSecondDeviceDoesNotDragTheFit() {
+        val e0 = ArrayList<Double>(); val e1 = ArrayList<Double>()
+        for (trial in 0 until 20) {
+            val one = ArrayList<Obs>(); val two = ArrayList<Obs>()
+            for (i in 0 until 24) {
+                val ang = i * 2 * PI / 24; val rad = 40.0 + (i % 4) * 30
+                val deck = i % 3 == 0
+                one.add(at(rad * cos(ang), rad * sin(ang), 6.0, 4.0, t0, "phone"))
+                two.add(at(rad * cos(ang), rad * sin(ang), 6.0, 4.0, t0, if (deck) "deck" else "phone", if (deck) -7.0 else 0.0))
+            }
+            e0.add(err(Estimator.fitAp(one, t0))); e1.add(err(Estimator.fitAp(two, t0)))
+        }
+        e0.sort(); e1.sort()
+        assertTrue("median error ${e1[10]} m with the quieter device (one device ${e0[10]} m)", e1[10] < e0[10] + 4)
+    }
+
+    /** update() removes a device's calibrated offset from its level, as the batch fit does. */
+    @Test fun anUpdateTakesTheDeviceOffset() {
+        val base = Estimator.fitAp(ring(), t0)
+        assertTrue("base fit ${base.kind}", base.valid)
+        val o = at(100.0, 0.0, 5.0, 0.0, t0, "phone", 8.0)                 // heard 8 dB louder than this device would
+        val raw = Estimator.update(base, o, Options(), 0.0); val cal = Estimator.update(base, o, Options(), 8.0)
+        val host = Estimator.update(base, o.copy(device = "", dbm = o.dbm - 8), Options(), 0.0)
+        assertTrue("calibrated update equals this device's (uncorrected differs by ${Estimator.distanceM(raw.lat, raw.lon, host.lat, host.lon)} m)",
+            Estimator.distanceM(cal.lat, cal.lon, host.lat, host.lon) < 1e-6 && Estimator.distanceM(raw.lat, raw.lon, host.lat, host.lon) > 0.01)
     }
 
     @Test fun rttRangesTightenAThinFit() {
@@ -206,12 +237,38 @@ class EstimatorTest {
         assertTrue("R95 coverage $inside / $total", total >= 20 && inside >= 0.85 * total)
     }
 
+    /** One road 30 m off: the AP and its mirror explain the levels equally; R95 must reach whichever is the AP. */
+    @Test fun aRoadsMirrorIsInsideR95() {
+        var inside = 0; var total = 0
+        for (trial in 0 until 60) {
+            val obs = (0 until 30).map { at(-150 + rng.nextDouble() * 300, -30.0, 5.0, 5.0) }
+            val f = Estimator.fitAp(obs, t0)
+            if (f.kind != "fix") continue
+            ++total; if (err(f) <= f.r95) ++inside
+        }
+        assertTrue("one road: R95 covers $inside / $total", total >= 20 && inside >= 0.85 * total)
+    }
+
+    /** One absurd reading (+60 dBm) among exact ones: its robust weight underflowed to 0 and voided the region (NaN). */
+    @Test fun anAbsurdReadingDoesNotVoidARegion() {
+        val obs = ArrayList<Obs>()
+        for (i in 0 until 4) {
+            val x = -30.0 + i * 20; val y = 40.0; val d = sqrt(x * x + y * y + 9.0)
+            obs.add(Obs(lat = apLat + mLat(y), lon = apLon + mLon(x), acc = 6.0, t = t0, dbm = Estimator.lround(Estimator.modelDbm(p0, n, d)).toInt()))
+        }
+        obs.add(Obs(lat = apLat + mLat(340.0), lon = apLon, acc = 6.0, t = t0, dbm = 60))
+        val f = Estimator.fitAp(obs, t0)
+        assertTrue("a +60 dBm reading: still a ${f.kind} (valid ${f.valid}, R95 ${f.r95})", f.valid && f.kind == "region" && f.lat.isFinite() && f.lon.isFinite())
+    }
+
     @Test fun bandPriorsAndGradeWeights() {
-        val o24 = EstimateRepository.optionsFor(2437, "2.4"); val o5 = EstimateRepository.optionsFor(5180, "5"); val o6 = EstimateRepository.optionsFor(5975, "6")
+        val o24 = EstimateRepository.optionsFor(2437); val o5 = EstimateRepository.optionsFor(5180); val o6 = EstimateRepository.optionsFor(5975)
         assertEquals(-40.0, o24.p0Mean, 0.0); assertEquals(2.4, o24.defaultN, 0.0)
         assertEquals(-47.0, o5.p0Mean, 0.0); assertEquals(2.7, o5.defaultN, 0.0)
         assertEquals(-48.0, o6.p0Mean, 0.0); assertEquals(2.7, o6.defaultN, 0.0)
-        assertEquals(-47.0, EstimateRepository.optionsFor(0, "5").p0Mean, 0.0)
+        // unknown band (as the desktop): wide enough for 2.4 and 5 GHz
+        val o0 = EstimateRepository.optionsFor(0)
+        assertEquals(-42.0, o0.p0Mean, 0.0); assertEquals(10.0, o0.p0Sd, 0.0); assertEquals(2.5, o0.defaultN, 0.0)
         assertEquals(1.0, EstimateRepository.weightFor("A"), 0.0); assertEquals(0.8, EstimateRepository.weightFor("C"), 0.0)
         assertEquals(0.6, EstimateRepository.weightFor("D"), 0.0); assertEquals(0.4, EstimateRepository.weightFor("R"), 0.0); assertEquals(0.3, EstimateRepository.weightFor("F"), 0.0)
     }

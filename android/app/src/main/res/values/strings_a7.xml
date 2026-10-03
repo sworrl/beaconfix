@@ -11,7 +11,10 @@
     <string name="map_style_streets">Streets</string>
     <string name="map_style_dark">Dark</string>
     <string name="map_style_topo">Topo</string>
-    <string name="map_style_satellite">Satellite</string>
+    <string name="map_style_satellite">Satellite (Esri, newest high-res)</string>
+    <string name="map_style_sat_clarity">Satellite (Esri Clarity, sharper)</string>
+    <string name="map_style_sat_usgs">Satellite (USGS, US public domain)</string>
+    <string name="map_style_sat_viirs">Satellite (NASA, yesterday, coarse)</string>
     <string name="map_style_cd">Map style: %1$s</string>
 
     <string name="map_prefetch">Ask the RV to save map tiles here</string>

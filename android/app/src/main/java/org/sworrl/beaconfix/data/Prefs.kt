@@ -4,6 +4,7 @@ import android.content.Context
 import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.booleanPreferencesKey
+import androidx.datastore.preferences.core.doublePreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.longPreferencesKey
@@ -48,6 +49,17 @@ class Prefs @Inject constructor(@ApplicationContext private val ctx: Context) {
         val helpAlertState = stringPreferencesKey("help_alert_state")
         // 1.5
         val estimatorVersion = intPreferencesKey("estimator_version")
+        val rttOffset = doublePreferencesKey("rtt_offset_m")
+        val rttOffsetSd = doublePreferencesKey("rtt_offset_sd_m")
+        // 1.6
+        val estimatorCalibration = stringPreferencesKey("estimator_calibration")
+        // sightings (docs/SIGHTINGS.md)
+        val plateEventCursors = stringPreferencesKey("plate_event_cursors")
+        val hibfWatch = stringPreferencesKey("hibf_watch")
+        val lastDrivingAt = longPreferencesKey("last_driving_at")
+        val registeredPlates = stringPreferencesKey("registered_plates")
+        val hibfSources = stringPreferencesKey("hibf_sources")
+        val webcamStills = booleanPreferencesKey("webcam_stills")
     }
     val collectorOn: Flow<Boolean> = ctx.store.data.map { it[K.collectorOn] ?: false }
     val collectIntervalSec: Flow<Int> = ctx.store.data.map { it[K.collectInterval] ?: 60 }
@@ -76,7 +88,7 @@ class Prefs @Inject constructor(@ApplicationContext private val ctx: Context) {
     val simNoDesktop: Flow<Boolean> = ctx.store.data.map { it[K.simNoDesktop] ?: false }
     /** home patterns were edited on the phone and still have to be pushed to a desktop */
     val homeDirty: Flow<Boolean> = ctx.store.data.map { it[K.homeDirty] ?: false }
-    val mapStyle: Flow<String> = ctx.store.data.map { it[K.mapStyle] ?: "streets" }
+    val mapStyle: Flow<String> = ctx.store.data.map { it[K.mapStyle] ?: "satellite" }   // the hybrid: APs read against the real world
     val mapPoiFilter: Flow<String> = ctx.store.data.map { it[K.mapPoiFilter] ?: "all" }
     val lastBackupAt: Flow<Long> = ctx.store.data.map { it[K.lastBackupAt] ?: 0L }
     /** JSON {lat, lon, at} of the last nearest-help heads-up */
@@ -108,6 +120,36 @@ class Prefs @Inject constructor(@ApplicationContext private val ctx: Context) {
     suspend fun setLastBackupAt(ms: Long) = ctx.store.edit { it[K.lastBackupAt] = ms }
     suspend fun setHelpAlertState(json: String) = ctx.store.edit { it[K.helpAlertState] = json }
     suspend fun setEstimatorVersion(v: Int) = ctx.store.edit { it[K.estimatorVersion] = v }
+    /** The paired desktop's estimator calibration in this phone's frame (estimate.EstimatorCalibration JSON), "" when none yet. */
+    val estimatorCalibration: Flow<String> = ctx.store.data.map { it[K.estimatorCalibration] ?: "" }
+    suspend fun setEstimatorCalibration(json: String) = ctx.store.edit { it[K.estimatorCalibration] = json }
+    /**
+     * The last calibrated Wi-Fi RTT offset (m) and its 1-σ a desktop reported for this phone (RangingRepository), null
+     * when none or stale. It is a pair offset (this phone + that desktop's responder): ranging.ApRttMath.usableOffset
+     * decides whether it can stand for the phone alone when ranging other APs.
+     */
+    val rttOffset: Flow<Pair<Double, Double>?> = ctx.store.data.map { p -> p[K.rttOffset]?.let { it to (p[K.rttOffsetSd] ?: 0.0) } }
+    suspend fun setRttOffset(v: Pair<Double, Double>?) = ctx.store.edit { if (v == null) { it.remove(K.rttOffset); it.remove(K.rttOffsetSd) } else { it[K.rttOffset] = v.first; it[K.rttOffsetSd] = v.second } }
+
+    /** `GET /plate-events` cursors per desktop: a JSON object {desktopId: seq}. */
+    val plateEventCursors: Flow<String> = ctx.store.data.map { it[K.plateEventCursors] ?: "" }
+    suspend fun setPlateEventCursors(json: String) = ctx.store.edit { it[K.plateEventCursors] = json }
+    /** The HaveIBeenFlocked watcher's state (sightings.Hibf.WatchState JSON). */
+    val hibfWatch: Flow<String> = ctx.store.data.map { it[K.hibfWatch] ?: "" }
+    suspend fun setHibfWatch(json: String) = ctx.store.edit { it[K.hibfWatch] = json }
+    /** The last time this phone was driving (in a vehicle, or > 20 km/h), ms; 0 never. */
+    val lastDrivingAt: Flow<Long> = ctx.store.data.map { it[K.lastDrivingAt] ?: 0L }
+    suspend fun setLastDrivingAt(ms: Long) = ctx.store.edit { it[K.lastDrivingAt] = ms }
+    /** The registered plates the desktop serves (`GET /api/v1/plates` body as received), "" none yet. */
+    val registeredPlates: Flow<String> = ctx.store.data.map { it[K.registeredPlates] ?: "" }
+    suspend fun setRegisteredPlates(json: String) = ctx.store.edit { it[K.registeredPlates] = json }
+    /** The desktop's leaky-agency list (`/plate-events/status` → `hibfSources`), as received. */
+    val hibfSources: Flow<String> = ctx.store.data.map { it[K.hibfSources] ?: "" }
+    suspend fun setHibfSources(json: String) = ctx.store.edit { it[K.hibfSources] = json }
+
+    /** Keep a public webcam's still with a live pass (docs/SIGHTINGS.md §2.0). Off by default: providers such as WV511 forbid storing their images; on, stills stay on this phone. */
+    val webcamStills: Flow<Boolean> = ctx.store.data.map { it[K.webcamStills] ?: false }
+    suspend fun setWebcamStills(v: Boolean) = ctx.store.edit { it[K.webcamStills] = v }
 
     companion object {
         val UNITS = setOf("auto", "metric", "imperial")

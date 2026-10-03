@@ -1,5 +1,6 @@
 package org.sworrl.beaconfix.data.db
 
+import androidx.room.ColumnInfo
 import androidx.room.Entity
 import androidx.room.Index
 import androidx.room.PrimaryKey
@@ -93,7 +94,18 @@ data class ObservationEntity(
     val synced: Boolean = false,
     /** true for rows that came from a desktop (never pushed back) */
     val remote: Boolean = false,
+    // ── v6 (1.6): Wi-Fi RTT (802.11mc / az) range to this AP at this time and place, null when it did not answer ──
+    /** metres, offset-corrected (ranging.ApRttMath.combine) */
+    val rangeM: Double? = null,
+    /** 1-σ of [rangeM], metres */
+    val rangeSd: Double? = null,
 )
+
+/** The newest RTT range of one AP (ObservationDao.latestRanges). */
+data class ApRangeRow(val bssid: String, val rangeM: Double, val rangeSd: Double?, val time: Long)
+
+/** One of this phone's own observation rows, as a scan (ObservationDao.ownScanRows → estimate.ScanCells). */
+data class ScanRow(val id: Long, val time: Long, val lat: Double, val lon: Double, val acc: Double)
 
 @Entity(tableName = "fixes", indices = [Index("time")])
 data class FixEntity(
@@ -212,3 +224,102 @@ data class AnchorEntity(
 /** A link that is not complete yet: the other identity's offer (id, pub, name, ts) and our half-signed statement, if any. */
 @Entity(tableName = "pending_links")
 data class PendingLinkEntity(@PrimaryKey val id: String, val pub: String, val name: String, val ts: String, val statementJson: String = "")
+
+/**
+ * A plate event (schema v7, docs/SIGHTINGS.md §1): a `camera_pass` (our route passed close to a known camera) or a
+ * `plate_search` (an agency searched our plate in Flock, from a released audit log). [uid] is the merge key between the
+ * desktop, this phone and the hub (§1.1). Columns mirror the desktop's `plate_events`; [timeMs], [dirty] and
+ * [notified] are the phone's own bookkeeping (when, whether it still has to be pushed, whether it was alerted).
+ */
+@Entity(tableName = "plate_events", indices = [Index(value = ["uid"], unique = true), Index("time_ms"), Index(value = ["camera_id", "time_ms"])])
+data class PlateEventEntity(
+    @PrimaryKey(autoGenerate = true) val id: Long = 0,
+    val uid: String,
+    /** camera_pass | plate_search */
+    val kind: String,
+    /** display plate ("ABC-1234"); "" when unknown */
+    val plate: String? = null,
+    /** local ISO (the desktop's MapDb::localIso convention): the closest approach / the search time */
+    val time: String,
+    @ColumnInfo(name = "time_ms") val timeMs: Long,
+    val lat: Double? = null,
+    val lon: Double? = null,
+    val acc: Double? = null,
+    @ColumnInfo(name = "camera_id") val cameraId: String? = null,
+    @ColumnInfo(name = "camera_lat") val cameraLat: Double? = null,
+    @ColumnInfo(name = "camera_lon") val cameraLon: Double? = null,
+    @ColumnInfo(name = "distance_m") val distanceM: Double? = null,
+    @ColumnInfo(name = "speed_kmh") val speedKmh: Double? = null,
+    @ColumnInfo(name = "heading_deg") val headingDeg: Double? = null,
+    /** bearing camera → us at the closest approach */
+    @ColumnInfo(name = "approach_bearing_deg") val approachBearingDeg: Double? = null,
+    /** the camera's facing (OSM direction / camera:direction), null unknown */
+    @ColumnInfo(name = "camera_dir_deg") val cameraDirDeg: Double? = null,
+    /** 1 the camera saw our front or rear plate, 0 it did not, null unknown */
+    val facing: Int? = null,
+    val operator: String? = null,
+    val agency: String? = null,
+    val model: String? = null,
+    /** alpr | camera: only an ALPR reads plates */
+    @ColumnInfo(name = "camera_type") val cameraType: String? = null,
+    /** live_route | route_backfill | phone_live | dashcam | haveibeenflocked */
+    val source: String,
+    @ColumnInfo(name = "source_url") val sourceUrl: String? = null,
+    @ColumnInfo(name = "source_name") val sourceName: String? = null,
+    /** 0–100 */
+    val confidence: Int? = null,
+    @ColumnInfo(defaultValue = "0") val leaky: Int = 0,
+    /** one honest sentence */
+    val details: String? = null,
+    /** JSON object: every other number */
+    val metrics: String? = null,
+    /** JSON: the source record as received */
+    val raw: String? = null,
+    /** who recorded it: "" the desktop itself, else the device name */
+    val device: String? = null,
+    @ColumnInfo(name = "created_at") val createdAt: String? = null,
+    @ColumnInfo(name = "updated_at") val updatedAt: String? = null,
+    /** the desktop's sync-feed sequence (0 = never seen on a desktop) */
+    @ColumnInfo(defaultValue = "0") val seq: Long = 0,
+    /** recorded or changed here and not yet accepted by a LAN desktop (the only place its images can go) */
+    @ColumnInfo(defaultValue = "0") val dirty: Boolean = false,
+    /** an alert (or the backfill summary) already covered it */
+    @ColumnInfo(defaultValue = "0") val notified: Boolean = false,
+    /** recorded or changed here and not yet accepted by the hub (`/api/v3` `db/sync`, records only; schema v8) */
+    @ColumnInfo(name = "hub_dirty", defaultValue = "0") val hubDirty: Boolean = false,
+)
+
+/**
+ * An image of a plate event (schema v7, docs/SIGHTINGS.md §1, §3). The desktop keeps the bytes in a BLOB; the phone keeps
+ * its own dash-cam frames as files under noBackupFilesDir ([path]) until the desktop has them, and knows the desktop's
+ * images by uid only ([path] null, [remote] true), fetching them for display on demand.
+ */
+@Entity(tableName = "plate_event_media", indices = [Index(value = ["uid"], unique = true), Index("event_uid"), Index("camera_id")])
+data class PlateEventMediaEntity(
+    @PrimaryKey(autoGenerate = true) val id: Long = 0,
+    /** first 32 hex of SHA-256 of the stored bytes */
+    val uid: String,
+    @ColumnInfo(name = "event_uid") val eventUid: String? = null,
+    @ColumnInfo(name = "camera_id") val cameraId: String? = null,
+    /** dashcam | camera_photo | webcam */
+    val kind: String,
+    /** image/webp | image/png | image/jxl | image/jpeg */
+    val mime: String,
+    /** the local file (this phone's own frame), null when the image lives on the desktop only */
+    val path: String? = null,
+    val width: Int? = null,
+    val height: Int? = null,
+    val bytes: Long? = null,
+    @ColumnInfo(name = "original_url") val originalUrl: String? = null,
+    @ColumnInfo(name = "original_mime") val originalMime: String? = null,
+    @ColumnInfo(name = "original_bytes") val originalBytes: Long? = null,
+    @ColumnInfo(name = "original_sha256") val originalSha256: String? = null,
+    @ColumnInfo(name = "jpeg_reconstructible", defaultValue = "0") val jpegReconstructible: Boolean = false,
+    val attribution: String? = null,
+    val license: String? = null,
+    /** what [captured_at] says: when the frame was taken (local ISO) */
+    @ColumnInfo(name = "captured_at") val capturedAt: String? = null,
+    @ColumnInfo(name = "created_at") val createdAt: String? = null,
+    /** the desktop holds it (uploaded from here, or listed in its feed) */
+    @ColumnInfo(defaultValue = "0") val remote: Boolean = false,
+)

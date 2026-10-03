@@ -2,33 +2,33 @@
 #include "locator.h"
 #include "identity.h"
 #include "apiserver.h"
+#include "hubclient.h"
 #include "mdns.h"
 #include "osintegration.h"
+#include "appicon.h"
 #include <QActionGroup>
 #include <QApplication>
 #include <QClipboard>
 #include <QDesktopServices>
 #include <QFileDialog>
+#include <QInputDialog>
+#include <QJsonObject>
 #include <QStandardPaths>
 #include <QUrl>
 #include <QPainter>
-#include <QRadialGradient>
 
-// Theme-independent beacon icon: dark disc, rings, a dot coloured by source
+// The BeaconFix icon (appicon.h) with a status dot coloured by the fix source, dimmed while a check runs
 static QIcon beaconIcon(const QColor &dot, bool busy)
 {
     QIcon icon;
     for (int sz : {16, 22, 24, 32, 48, 64}) {
         QPixmap px(sz, sz); px.fill(Qt::transparent);
-        QPainter p(&px); p.setRenderHint(QPainter::Antialiasing);
-        const QPointF c(sz / 2.0, sz / 2.0); const double R = sz / 2.0;
-        p.setPen(Qt::NoPen); p.setBrush(QColor(11, 16, 26)); p.drawEllipse(c, R, R);
-        QRadialGradient g(c, R * 0.9); QColor t = dot; t.setAlpha(130); g.setColorAt(0, t); t.setAlpha(0); g.setColorAt(1, t);
-        p.setBrush(g); p.drawEllipse(c, R * 0.9, R * 0.9);
-        p.setBrush(Qt::NoBrush);
-        QColor ring = dot; ring.setAlpha(busy ? 70 : 150); p.setPen(QPen(ring, qMax(1.0, sz / 20.0)));
-        p.drawEllipse(c, R * 0.68, R * 0.68); p.drawEllipse(c, R * 0.42, R * 0.42);
-        p.setPen(QPen(Qt::white, qMax(1.0, sz / 24.0))); p.setBrush(dot); p.drawEllipse(c, R * 0.2, R * 0.2);
+        QPainter p(&px); p.setRenderHint(QPainter::Antialiasing); p.setRenderHint(QPainter::SmoothPixmapTransform);
+        p.setOpacity(busy ? 0.55 : 1.0);
+        p.drawPixmap(0, 0, QPixmap(appIconPath(sz)));
+        p.setOpacity(1.0);
+        const double r = qMax(2.5, sz * 0.17), c = sz - r - qMax(0.5, sz / 32.0);
+        p.setPen(QPen(QColor(11, 16, 26), qMax(1.0, sz / 20.0))); p.setBrush(dot); p.drawEllipse(QPointF(c, c), r, r);
         icon.addPixmap(px);
     }
     return icon;
@@ -36,6 +36,7 @@ static QIcon beaconIcon(const QColor &dot, bool busy)
 
 Tray::Tray(Locator *loc, QObject *parent) : QObject(parent), m_loc(loc)
 {
+    QApplication::setWindowIcon(appIcon());
     m_icon.setIcon(beaconIcon(QColor(0x35, 0xd6, 0xff), false));
 
     m_placeAct = m_menu.addAction(QString());
@@ -54,8 +55,7 @@ Tray::Tray(Locator *loc, QObject *parent) : QObject(parent), m_loc(loc)
     connect(m_refreshAct, &QAction::triggered, m_loc, &Locator::Refresh);
     QAction *osm = m_menu.addAction(QIcon::fromTheme(QStringLiteral("internet-web-browser")), QStringLiteral("Open in OpenStreetMap"));
     connect(osm, &QAction::triggered, this, [this] {
-        const Fix &f = m_loc->fix();
-        if (f.valid) QDesktopServices::openUrl(QUrl(QStringLiteral("https://www.openstreetmap.org/?mlat=%1&mlon=%2#map=15/%1/%2").arg(f.lat).arg(f.lon)));
+        if (m_loc->fix().valid) QDesktopServices::openUrl(QUrl(m_loc->osmUrl()));   // fixed 6 decimals: arg(double) alone can give "1e-05"
     });
     m_shareMenu = m_menu.addMenu(QIcon::fromTheme(QStringLiteral("document-share")), QStringLiteral("Share"));
     const std::pair<const char *, const char *> shares[] = {{"coords", "Copy coordinates"}, {"geo", "Copy geo: URI"}, {"text", "Copy place + link"},
@@ -80,11 +80,44 @@ Tray::Tray(Locator *loc, QObject *parent) : QObject(parent), m_loc(loc)
     connect(emerg, &QAction::triggered, this, &Tray::openEmergencyRequested);
     m_identityAct = m_menu.addAction(QIcon::fromTheme(QStringLiteral("user-identity")), QStringLiteral("Identity…"));
     connect(m_identityAct, &QAction::triggered, this, &Tray::openIdentityRequested);
+    // The hub (docs/SECURE-API.md): connect with an invite, then the entry shows the link's state and syncs on click
+    QAction *hubAct = m_menu.addAction(QIcon::fromTheme(QStringLiteral("network-server")), QStringLiteral("Connect to a hub…"));
+    auto hubText = [this, hubAct] {
+        HubClient *h = m_loc->hubClient();
+        hubAct->setVisible(h != nullptr);
+        if (!h) return;
+        if (!h->enrolled()) { hubAct->setText(QStringLiteral("Connect to a hub…")); return; }
+        const QJsonObject st = h->statusJson();
+        const QDateTime last = QDateTime::fromString(st["lastSync"].toString(), Qt::ISODate);
+        const QString host = QUrl(st["url"].toString()).host();
+        if (!st["lastError"].toString().isEmpty() && !st["lastOk"].toBool()) hubAct->setText(QStringLiteral("Hub %1: offline, retrying (sync now)").arg(host));
+        else if (last.isValid()) hubAct->setText(QStringLiteral("Hub %1: synced %2 (sync now)").arg(host, last.secsTo(QDateTime::currentDateTime()) < 90 ? QStringLiteral("just now") : QStringLiteral("%1 min ago").arg(last.secsTo(QDateTime::currentDateTime()) / 60)));
+        else hubAct->setText(QStringLiteral("Hub %1: connecting… (sync now)").arg(host));
+        hubAct->setToolTip(st["lastError"].toString().isEmpty() ? st["lastResult"].toString() : st["lastError"].toString());
+    };
+    connect(hubAct, &QAction::triggered, this, [this] {
+        HubClient *h = m_loc->hubClient();
+        if (!h) return;
+        if (h->enrolled()) {
+            h->syncNow([this](bool ok, const QString &msg) { m_icon.showMessage(QStringLiteral("BeaconFix hub"), (ok ? QStringLiteral("Synced: ") : QStringLiteral("Sync failed: ")) + msg, ok ? QSystemTrayIcon::Information : QSystemTrayIcon::Warning, 5000); });
+            return;
+        }
+        bool ok = false;
+        const QString inv = QInputDialog::getMultiLineText(nullptr, QStringLiteral("Connect to a BeaconFix hub"),
+                                                           QStringLiteral("Paste the invite (bfs3:…) printed by\n  beaconfix --server --invite \"%1\"\non the hub:").arg(Locator::deviceName()), QString(), &ok);
+        if (!ok || inv.trimmed().isEmpty()) return;
+        h->enroll(inv.trimmed(), QString(), [this](bool ok, const QJsonObject &o) {
+            m_icon.showMessage(QStringLiteral("BeaconFix hub"), ok ? QStringLiteral("Enrolled with %1 (hub key %2). Syncing now.").arg(o["url"].toString(), o["fingerprint"].toString())
+                                                                   : QStringLiteral("Not enrolled: ") + o["error"].toString(), ok ? QSystemTrayIcon::Information : QSystemTrayIcon::Warning, 8000);
+        });
+    });
+    if (HubClient *h = m_loc->hubClient()) connect(h, &HubClient::changed, this, hubText);
+    connect(&m_ageTimer, &QTimer::timeout, this, hubText);
+    hubText();
     QAction *trip = m_menu.addAction(QIcon::fromTheme(QStringLiteral("flag")), QStringLiteral("Start a new trip here"));
     connect(trip, &QAction::triggered, m_loc, &Locator::StartTrip);
-    QAction *pair = m_menu.addAction(QIcon::fromTheme(QStringLiteral("list-add-user")), QStringLiteral("Allow a device to pair (10 min)"));
-    connect(pair, &QAction::triggered, m_loc, [this] { m_loc->OpenPairing(10); m_icon.showMessage(QStringLiteral("BeaconFix"), QStringLiteral("Pairing open for 10 minutes — approve requests in Devices"), QSystemTrayIcon::Information, 4000); });
-    connect(m_loc, &Locator::pairingRequested, this, [this] { emit openWindowRequested(); });
+    QAction *link = m_menu.addAction(QIcon::fromTheme(QStringLiteral("insert-link")), QStringLiteral("Link a device…"));   // QR / mDNS, nothing typed (docs/LINKING.md)
+    connect(link, &QAction::triggered, this, &Tray::openLinkRequested);
 
     m_intervalMenu = m_menu.addMenu(QIcon::fromTheme(QStringLiteral("chronometer")), QStringLiteral("Check every"));
     auto *grp = new QActionGroup(this);

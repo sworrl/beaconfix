@@ -1,9 +1,18 @@
 #include "beaconview.h"
+#include "plateevents.h"
 #include "locator.h"
 #include "tilesource.h"
 #include "anchordialog.h"
 #include "ranging/rangingservice.h"
 #include "fitjson.h"
+#include "platewatch.h"
+#include "routeplanner.h"
+#include <QDialogButtonBox>
+#include <QPushButton>
+#include <QHeaderView>
+#include <QLabel>
+#include <QTableWidget>
+#include <QVBoxLayout>
 #include <QMessageBox>
 #include <QFontMetrics>
 #include <QActionGroup>
@@ -11,6 +20,7 @@
 #include <QClipboard>
 #include <QContextMenuEvent>
 #include <QDesktopServices>
+#include <QElapsedTimer>
 #include <QIcon>
 #include <QJsonDocument>
 #include <QJsonArray>
@@ -23,6 +33,7 @@
 #include <QSettings>
 #include <QUrl>
 #include <QWheelEvent>
+#include <QWindow>
 #include <QtMath>
 #include <algorithm>
 
@@ -82,7 +93,7 @@ static QString gradeLead(const ApEstimate &e)
 
 BeaconView::BeaconView(Locator *loc, TileSource *tiles, QWidget *parent) : QWidget(parent), m_loc(loc), m_src(tiles)
 {
-    m_tiles.setMaxCost(700);
+    m_tiles.setMaxCost(512);                                // 256 × 256 × 4 B each: ~128 MB at most
     setMinimumSize(360, 260);
     setMouseTracking(true);
     setFocusPolicy(Qt::StrongFocus);
@@ -96,26 +107,65 @@ BeaconView::BeaconView(Locator *loc, TileSource *tiles, QWidget *parent) : QWidg
         });
     }
     QSettings s;
-    m_layer = Layer(qBound(0, s.value("map/layer", int(Dark)).toInt(), int(Topo)));
+    m_layer = Layer(qBound(0, s.value("map/layer", int(Satellite)).toInt(), int(Topo)));   // the hybrid by default: APs read against the real world
+    m_satSource = qBound(0, s.value("map/satSource", 0).toInt(), int(TileSource::SatNasaViirs));
+    m_showContours = s.value("map/showContours", true).toBool();
     const QStringList hidden = s.value("map/hiddenCategories", QStringList{QStringLiteral("toilets")}).toStringList();
     m_hiddenCats = QSet<QString>(hidden.begin(), hidden.end());
     m_showNames = s.value("map/showNames", true).toBool();
     m_showDevices = s.value("map/showDevices", true).toBool();
     m_showImported = s.value("map/showImported", true).toBool();
     m_showLegend = s.value("map/showLegend", false).toBool();
+    m_showHeatmap = s.value("map/showHeatmap", true).toBool();
+    m_showFlockCameras = s.value("map/showFlockCameras", true).toBool();
+    m_showApCircles = s.value("map/showApCircles", true).toBool();
+    m_camKick.setSingleShot(true);
+    m_camKick.setInterval(150);
+    connect(&m_camKick, &QTimer::timeout, this, &BeaconView::loadFlockCameras);
+    connect(m_loc, &Locator::flockCamerasUpdated, this, [this] { m_camStale = true; update(); });   // the next paint reloads what's in view
+    // The heat map's source: reloaded at most every 30 s for live fixes, at once for an import
+    connect(m_loc, &Locator::probeFinished, this, [this](bool ok) {
+        if (ok) { m_routeFixesDirty = true; ++m_trackVersion; update(); }
+    });
+    connect(m_loc, &Locator::importProgress, this, [this] {
+        m_routeFixesDirty = true; m_routeLoadedAt.invalidate(); ++m_trackVersion;
+        update();
+    });
+    connect(m_loc, &Locator::FixChanged, this, [this] {
+        m_routeFixesDirty = true; ++m_trackVersion;
+        update();
+    });
+    m_pool.setMaxThreadCount(1);
+    m_heatKick.setSingleShot(true);
+    m_heatKick.setInterval(60);                                // coalesce a burst of view changes into one render
+    connect(&m_heatKick, &QTimer::timeout, this, &BeaconView::startHeat);
 
+    // 30 fps while something moves. The pulse and the radar sweep only touch the area around us, so
+    // that's all a plain tick repaints; zooming, event animations and (once a second) the ticker's
+    // ages and fades get the whole widget. Nothing at all while the window isn't on screen.
     m_anim.setInterval(33);
     connect(&m_anim, &QTimer::timeout, this, [this] {
+        const QWindow *w = window()->windowHandle();
+        if (!isVisible() || (w && !w->isExposed())) return;
         m_phase = std::fmod(m_phase + 0.010, 1.0);
         m_sweep = std::fmod(m_sweep + 1.4, 360.0);
+        bool full = !m_anims.isEmpty() || !m_labelBorn.isEmpty();
         if (std::abs(m_zoomTarget - m_zoom) > 0.002) {
             const double z = std::abs(m_zoomTarget - m_zoom) < 0.01 ? m_zoomTarget : m_zoom + (m_zoomTarget - m_zoom) * 0.3;
             applyZoom(z, m_zoomAnchor);
+            full = true;
         }
-        update();
+        const qint64 now = QDateTime::currentMSecsSinceEpoch();
+        if (full || now - m_fullAt >= 1000) { m_fullAt = now; update(); return; }
+        const Fix &fix = m_loc->fix();
+        if (!fix.valid) return;
+        const QPointF me = toScreen(fix.lat, fix.lon);
+        const double acc = fix.accuracy > 0 ? qBound(8.0, fix.accuracy / metersPerPixel(fix.lat), 20000.0) : 0;
+        const double r = qMax(40.0, acc < 3000 ? acc + 3 : 0.0);   // pulse ≤ 36 px; the sweep fills the ring
+        update(QRectF(me.x() - r, me.y() - r, 2 * r, 2 * r).toAlignedRect() & rect());
     });
     connect(m_loc, &Locator::FixChanged, this, [this] { if (m_follow) recenter(); update(); });
-    connect(m_loc, &Locator::scanUpdated, this, [this] { rebuildLabelCache(); if (m_follow && m_autoZoom) fitBeacons(); update(); });
+    connect(m_loc, &Locator::scanUpdated, this, [this] { m_apEstAt.invalidate(); rebuildLabelCache(); if (m_follow && m_autoZoom) fitBeacons(); update(); });
     connect(m_loc, &Locator::eventLogged, this, &BeaconView::onEvent);
     for (const BeaconEvent &e : m_loc->events())               // what happened before this view opened
         onEvent(QString::fromUtf8(QJsonDocument(e.toJson()).toJson(QJsonDocument::Compact)));
@@ -201,7 +251,7 @@ void BeaconView::focusOn(double lat, double lon, double zoom)
 {
     m_center = merc(lat, lon);
     m_follow = false; m_autoZoom = false;
-    m_zoom = m_zoomTarget = qBound(3.0, zoom, 20.0);
+    m_zoom = m_zoomTarget = qBound(3.0, zoom, double(MAX_VIEW_ZOOM));
     update();
 }
 
@@ -215,7 +265,7 @@ void BeaconView::selectPoi(int index)
     update();
 }
 
-void BeaconView::setZoom(int z) { m_autoZoom = false; m_zoom = m_zoomTarget = qBound(3, z, 20); update(); }
+void BeaconView::setZoom(int z) { m_autoZoom = false; m_zoom = m_zoomTarget = qBound(3, z, MAX_VIEW_ZOOM); update(); }
 
 void BeaconView::applyZoom(double z, const QPointF &anchor)
 {
@@ -231,7 +281,7 @@ void BeaconView::zoomAt(double delta, const QPointF &anchor, bool animate)
 {
     m_autoZoom = false;
     if (anchor != QPointF(width() / 2.0, height() / 2.0)) m_follow = false;
-    m_zoomTarget = qBound(3.0, m_zoomTarget + delta, 20.0);
+    m_zoomTarget = qBound(3.0, m_zoomTarget + delta, double(MAX_VIEW_ZOOM));
     m_zoomAnchor = anchor;
     if (!animate || !m_anim.isActive()) applyZoom(m_zoomTarget, anchor);
     update();
@@ -242,6 +292,22 @@ void BeaconView::setLayer(Layer l)
     m_layer = l;
     QSettings().setValue("map/layer", int(l));
     if (m_zoomTarget > maxZoom() + 2) { m_zoom = m_zoomTarget = maxZoom() + 2; }
+    update();
+}
+
+void BeaconView::setSatSource(int src)
+{
+    m_satSource = qBound(0, src, int(TileSource::SatNasaViirs));
+    QSettings().setValue("map/satSource", m_satSource);
+    ++m_tileVersion;                                            // a new source: the cached base image is stale
+    setLayer(Satellite);
+}
+
+void BeaconView::setShowContours(bool on)
+{
+    m_showContours = on;
+    QSettings().setValue("map/showContours", on);
+    ++m_tileVersion;
     update();
 }
 
@@ -293,32 +359,44 @@ bool BeaconView::beaconScreenPos(const QString &bssid, QPointF *out) const
 }
 
 // ── Tiles ────────────────────────────────────────────────────────────────────
-int BeaconView::maxZoom() const { return TileSource::maxZoom(TileSource::Layer(m_layer)); }
+int BeaconView::maxZoom() const { return TileSource::maxZoom(srcLayer(m_layer)); }
 
-QString BeaconView::tileKey(Layer l, int z, int x, int y, bool labels) const
+TileSource::Layer BeaconView::srcLayer(Layer l) const
 {
-    return QStringLiteral("%1%2/%3/%4/%5").arg(labels ? QStringLiteral("L") : QString()).arg(int(l)).arg(z).arg(x).arg(y);
+    return l == Satellite ? TileSource::satLayer(TileSource::SatSource(m_satSource)) : TileSource::Layer(l);
 }
 
-void BeaconView::ensureTile(Layer l, int z, int x, int y, bool labels)
+QString BeaconView::tileKey(Layer l, int z, int x, int y, int ov) const
 {
-    const QString k = tileKey(l, z, x, y, labels);
+    return ov ? QStringLiteral("O%1/%2/%3/%4").arg(ov).arg(z).arg(x).arg(y)
+              : QStringLiteral("%1/%2/%3/%4").arg(int(srcLayer(l))).arg(z).arg(x).arg(y);
+}
+
+void BeaconView::ensureTile(Layer l, int z, int x, int y, int ov)
+{
+    const QString k = tileKey(l, z, x, y, ov);
+    m_wanted.insert(k);
     if (m_tiles.contains(k) || m_pending.contains(k)) return;
     const auto failed = m_failed.constFind(k);
     if (failed != m_failed.constEnd() && failed->secsTo(QDateTime::currentDateTime()) < 60) return;
-    if (m_pending.size() > 24) return;                  // the next frame will ask again
-    m_pending.insert(k);
-    m_src->get(labels ? TileSource::Labels : TileSource::Layer(l), z, x, y, this, [this, k](const QImage &img) {
+    if (m_pending.size() > 24) return;                  // the next render will ask again
+    m_pending.insert(k, {l, z, x, y, ov});
+    m_src->get(ov ? TileSource::Layer(ov) : srcLayer(l), z, x, y, this, [this, k](const QImage &img) {
         m_pending.remove(k);
-        if (img.isNull()) m_failed.insert(k, QDateTime::currentDateTime());
-        else { m_tiles.insert(k, new QPixmap(QPixmap::fromImage(img))); m_failed.remove(k); }
+        if (img.isNull()) {
+            if (m_failed.size() > 4000) m_failed.clear();      // offline for a long drive: don't grow without bound
+            m_failed.insert(k, QDateTime::currentDateTime());
+        } else { m_tiles.insert(k, new QPixmap(QPixmap::fromImage(img))); m_failed.remove(k); }
+        ++m_tileVersion;
         update();
     });
 }
 
-void BeaconView::drawTiles(QPainter &p, bool labels)
+void BeaconView::drawTiles(QPainter &p, int ov)
 {
-    const int tz = qBound(2, int(std::floor(m_zoom + 0.5)), maxZoom());
+    // overlays have their own depth: labels and roads to 19, contours (drawn locally) to 22; deeper zooms scale them
+    const int maxZ = ov ? TileSource::maxZoom(TileSource::Layer(ov)) : maxZoom();
+    const int tz = qBound(2, int(std::floor(m_zoom + 0.5)), maxZ);
     const int n = 1 << tz;
     const double ts = TILE * std::pow(2.0, m_zoom - tz);      // on-screen tile size
     const QPointF tl = toMerc(QPointF(0, 0)), br = toMerc(QPointF(width(), height()));
@@ -331,23 +409,38 @@ void BeaconView::drawTiles(QPainter &p, bool labels)
     std::sort(want.begin(), want.end(), [](const T &a, const T &b) { return a.d < b.d; });   // centre first
 
     p.setRenderHint(QPainter::SmoothPixmapTransform, true);
-    int budget = 6;                                            // new downloads started per frame
+    const bool topoStandIn = !ov && m_layer != Topo && tz <= TileSource::maxZoom(TileSource::Topo);
+    int budget = 6;                                            // new downloads started per render
     for (const T &t : want) {
         const QPointF o = toScreen(QPointF(double(t.x) / n, double(t.y) / n));
         // snap to whole pixels so neighbouring tiles never leave hairline seams
         const QRectF dst(QPointF(std::floor(o.x()), std::floor(o.y())), QPointF(std::ceil(o.x() + ts), std::ceil(o.y() + ts)));
-        const QString k = tileKey(m_layer, tz, t.wx, t.y, labels);
+        const QString k = tileKey(m_layer, tz, t.wx, t.y, ov);
+        m_wanted.insert(k);
         if (QPixmap *pm = m_tiles.object(k)) { p.drawPixmap(dst, *pm, pm->rect()); continue; }
-        if (budget > 0 && !m_pending.contains(k)) { ensureTile(m_layer, tz, t.wx, t.y, labels); --budget; }
-        // Meanwhile, stretch the nearest cached ancestor so there's never a black hole
+        m_baseMissing = true;
+        if (budget > 0 && !m_pending.contains(k)) { ensureTile(m_layer, tz, t.wx, t.y, ov); --budget; }
+        // Meanwhile, stretch the nearest cached ancestor, then any cached children over it
+        // (zooming out), so there's never a black hole
         for (int up = 1; up <= 6 && tz - up >= 0; ++up) {
-            const QString ak = tileKey(m_layer, tz - up, t.wx >> up, t.y >> up, labels);
+            const QString ak = tileKey(m_layer, tz - up, t.wx >> up, t.y >> up, ov);
             if (QPixmap *pm = m_tiles.object(ak)) {
                 const double sub = double(pm->width()) / (1 << up);
                 const QRectF src((t.wx - ((t.wx >> up) << up)) * sub, (t.y - ((t.y >> up) << up)) * sub, sub, sub);
                 p.drawPixmap(dst, *pm, src);
                 break;
             }
+        }
+        if (tz < maxZ)
+            for (int c = 0; c < 4; ++c)
+                if (QPixmap *pm = m_tiles.object(tileKey(m_layer, tz + 1, 2 * t.wx + (c & 1), 2 * t.y + (c >> 1), ov))) {
+                    const QPointF half(dst.width() / 2, dst.height() / 2);
+                    p.drawPixmap(QRectF(dst.topLeft() + QPointF((c & 1) * half.x(), (c >> 1) * half.y()), QSizeF(half.x(), half.y())), *pm, pm->rect());
+                }
+        // Offline (this layer failed to load): the OpenTopoMap tile TileSource::prefetch() saved stands in
+        if (topoStandIn && m_failed.contains(k)) {
+            if (QPixmap *pm = m_tiles.object(tileKey(Topo, tz, t.wx, t.y, 0))) { p.drawPixmap(dst, *pm, pm->rect()); m_baseTopo = true; }
+            else ensureTile(Topo, tz, t.wx, t.y, 0);
         }
     }
     p.setRenderHint(QPainter::SmoothPixmapTransform, false);
@@ -373,46 +466,156 @@ static void badge(QPainter &p, const QPointF &at, const QString &text, const QCo
     f.setBold(false); f.setPointSizeF(f.pointSizeF() / 0.75); p.setFont(f);
 }
 
-void BeaconView::paintEvent(QPaintEvent *)
-{
-    QPainter p(this);
-    p.fillRect(rect(), C_BG);
-    p.setRenderHint(QPainter::Antialiasing);
-    m_hits.clear();
-
-    drawTiles(p, false);
-    if (m_layer == Satellite) {
-        p.fillRect(rect(), QColor(0, 0, 0, 60));          // markers need contrast over imagery
-        drawTiles(p, true);
+// BEACONFIX_PAINT_PROFILE=1: average time per paint layer (and the heat map worker's), to stderr every 2 s
+namespace {
+struct PaintProfile {
+    static constexpr int N = 16;
+    const bool on = qEnvironmentVariableIsSet("BEACONFIX_PAINT_PROFILE");
+    const char *names[N] = {}; double ms[N] = {}; int frames = 0, n = 0, partial = 0;
+    QElapsedTimer t, window;
+    void begin() { if (on) { t.start(); if (!window.isValid()) window.start(); } }
+    void lap(const char *name) {
+        if (!on) return;
+        int i = 0;
+        while (i < n && names[i] != name) ++i;
+        if (i == N) return;
+        if (i == n) names[n++] = name;
+        ms[i] += t.nsecsElapsed() / 1e6; t.start();
     }
-    QRadialGradient v(rect().center(), qMax(width(), height()) * 0.75);   // vignette so panels read well
-    v.setColorAt(0.6, QColor(0, 0, 0, 0)); v.setColorAt(1.0, QColor(0, 0, 0, m_layer == Streets ? 70 : 130));
-    p.fillRect(rect(), v);
+    void end(bool whole, const QSize &sz, const QString &note) {
+        if (!on) return;
+        ++frames; if (!whole) ++partial;
+        if (window.elapsed() < 2000) return;
+        double total = 0; QString s;
+        for (int i = 0; i < n; ++i) { total += ms[i]; s += QStringLiteral(" %1 %2").arg(QLatin1String(names[i])).arg(ms[i] / frames, 0, 'f', 2); }
+        fprintf(stderr, "paint %dx%d: %d frames (%d partial) in %.1f s, avg %.2f ms:%s ·%s\n", sz.width(), sz.height(), frames, partial,
+                window.elapsed() / 1000.0, total / frames, qPrintable(s), qPrintable(note));
+        std::fill(std::begin(ms), std::end(ms), 0.0); frames = partial = 0; window.start();
+    }
+};
+}
+
+void BeaconView::paintEvent(QPaintEvent *e)
+{
+    static PaintProfile prof;
+    prof.begin();
+    QPainter p(this);
+    m_hits.clear();
+    m_paintClip = QRectF(e->rect()).adjusted(-1, -1, 1, 1);
+    drawBase(p);
+    prof.lap("base");
+    p.setRenderHint(QPainter::Antialiasing);
 
     const Fix &fix = m_loc->fix();
     if (fix.valid) {
-        if (m_showImported) drawImportedTrack(p);
-        drawTrack(p);
         drawPois(p);
+        prof.lap("pois");
         drawBeacons(p);
+        prof.lap("beacons");
+        if (m_showFlockCameras) drawFlockCameras(p);
+        drawAvoidRoute(p);
         drawAnchors(p);
+        prof.lap("cams");
         drawMe(p);
+        prof.lap("me");
         drawLabels(p);
+        prof.lap("labels");
         if (m_showDevices) drawDevices(p);
         drawEvents(p);
+        prof.lap("events");
     } else {
+        if (m_showFlockCameras) drawFlockCameras(p);
+        drawAvoidRoute(p);
         p.setPen(C_TEXT);
         QFont f = p.font(); f.setPointSizeF(f.pointSizeF() * 1.4); p.setFont(f);
         p.drawText(rect(), Qt::AlignCenter, QStringLiteral("Listening for beacons…"));
         p.setFont(font());
     }
     drawHud(p);
+    prof.lap("hud");
     drawControls(p);
     drawScale(p);
     drawTicker(p);
     drawAttribution(p);
     if (m_showLegend) drawLegend(p);
     drawCard(p);
+    prof.lap("chrome");
+    if (prof.on) prof.end(e->rect() == rect(), size(), QStringLiteral(" z%1 route %2 cams %3 aps %4 pois %5 hist %6 imported %7").arg(m_zoom, 0, 'f', 1).arg(m_routeFixes.size()).arg(m_flockCameras.size())
+                                  .arg(m_loc->accessPoints().size()).arg(m_loc->pois().size()).arg(m_loc->history().size()).arg(m_loc->importedHistory().size()));
+}
+
+// Basemap, satellite dimming, vignette, heat map and tracks: no hits, and they change only with
+// the view or the data, so they're rendered once into m_base and blitted while the pulse runs.
+void BeaconView::drawBase(QPainter &p)
+{
+    const Fix &fix = m_loc->fix();
+    if (m_showHeatmap) loadRouteFixes();
+    const BaseKey key{size(), devicePixelRatioF(), m_center, m_zoom, int(m_layer), m_tileVersion, m_heatSerial, m_heatVersion, m_trackVersion,
+                      m_showHeatmap, m_showImported, fix.valid, m_loc->history().size(), m_loc->importedHistory().size()};
+    // Tiles still missing: look again now and then (a failure's back-off runs out, a download slot frees up)
+    const bool retry = m_baseMissing && m_baseAt.isValid() && m_baseAt.elapsed() > 1000;
+    if (!(key == m_baseKey) || m_base.isNull() || retry) {
+        m_baseKey = key; m_baseMissing = m_baseTopo = false; m_baseAt.start(); m_wanted.clear();
+        const qreal dpr = devicePixelRatioF();
+        if (m_base.size() != size() * dpr) m_base = QPixmap(size() * dpr);
+        m_base.setDevicePixelRatio(dpr);
+        m_base.fill(C_BG);
+        QPainter bp(&m_base);
+        bp.setRenderHint(QPainter::Antialiasing);
+        drawTiles(bp, 0);
+        if (m_layer == Satellite) {                           // the hybrid: imagery, contours, roads, place labels
+            bp.fillRect(rect(), QColor(0, 0, 0, 45));         // markers need contrast over imagery
+            if (m_showContours) drawTiles(bp, TileSource::Contours);
+            drawTiles(bp, TileSource::Roads);
+            drawTiles(bp, TileSource::Labels);
+        }
+        QRadialGradient v(rect().center(), qMax(width(), height()) * 0.75);   // vignette so panels read well
+        v.setColorAt(0.6, QColor(0, 0, 0, 0)); v.setColorAt(1.0, QColor(0, 0, 0, m_layer == Streets ? 70 : 130));
+        bp.fillRect(rect(), v);
+        if (m_showHeatmap) drawHeatmap(bp);
+        if (fix.valid) {
+            if (m_showImported) drawImportedTrack(bp);
+            drawTrack(bp);
+        }
+        // Downloads for tiles that have scrolled or zoomed out of view: let them go, the ones in view come sooner
+        for (auto it = m_pending.begin(); it != m_pending.end();) {
+            if (m_wanted.contains(it.key())) { ++it; continue; }
+            const TileReq r = it.value();
+            it = m_pending.erase(it);
+            m_src->cancel(r.ov ? TileSource::Layer(r.ov) : srcLayer(r.l), r.z, r.x, r.y, this);
+        }
+    }
+    p.drawPixmap(0, 0, m_base);
+}
+
+// Liang–Barsky: shrink a→b to the part inside r; false when none of it is. *t0 = how far along a
+// moved (0..1), to keep a dash pattern in place. Without it a long off-screen segment (an IP fix
+// jumping across the country, seen at z17) costs the dasher every pixel of its full length.
+static bool clipLine(QPointF &a, QPointF &b, const QRectF &r, double *t0out = nullptr)
+{
+    const double dx = b.x() - a.x(), dy = b.y() - a.y();
+    const double pp[4] = {-dx, dx, -dy, dy}, q[4] = {a.x() - r.left(), r.right() - a.x(), a.y() - r.top(), r.bottom() - a.y()};
+    double t0 = 0, t1 = 1;
+    for (int i = 0; i < 4; ++i) {
+        if (pp[i] == 0) { if (q[i] < 0) return false; continue; }
+        const double t = q[i] / pp[i];
+        if (pp[i] < 0) { if (t > t1) return false; t0 = qMax(t0, t); }
+        else           { if (t < t0) return false; t1 = qMin(t1, t); }
+    }
+    const QPointF a0 = a;
+    a = a0 + QPointF(dx, dy) * t0; b = a0 + QPointF(dx, dy) * t1;
+    if (t0out) *t0out = t0;
+    return true;
+}
+
+// Does a circle's outline cross the view? One that encloses the whole view needs only its fill;
+// stroking it (dashed, 20 000 px across) is what made coarse fixes slow to pan.
+static bool ringCrosses(const QPointF &c, double r, const QRectF &view)
+{
+    const double fx = qMax(qAbs(view.left() - c.x()), qAbs(view.right() - c.x())), fy = qMax(qAbs(view.top() - c.y()), qAbs(view.bottom() - c.y()));
+    if (fx * fx + fy * fy < r * r) return false;              // the view is inside it
+    const double nx = qMax(0.0, qMax(view.left() - c.x(), c.x() - view.right())), ny = qMax(0.0, qMax(view.top() - c.y(), c.y() - view.bottom()));
+    return nx * nx + ny * ny <= r * r;                         // else: wholly outside
 }
 
 // Where you have been according to an imported export: a thin dotted trail under the live
@@ -433,7 +636,10 @@ void BeaconView::drawImportedTrack(QPainter &p)
         const qint64 t = f.time.toSecsSinceEpoch();
         if (haveLast) {
             const bool gap = t - lastT > 6 * 3600;           // a new day / a flight: don't join across it
-            if (!gap && (view.contains(s) || view.contains(last)) && QLineF(last, s).length() >= 2) p.drawLine(last, s);
+            if (!gap && (view.contains(s) || view.contains(last)) && QLineF(last, s).length() >= 2) {
+                QPointF a = last, b = s; double t0 = 0;
+                if (clipLine(a, b, view, &t0)) { pen.setDashOffset(QLineF(last, s).length() * t0 / pen.widthF()); p.setPen(pen); p.drawLine(a, b); }
+            }
             else if (!gap && QLineF(last, s).length() < 2) continue;   // same pixel: keep the earlier anchor
         }
         last = s; lastT = t; haveLast = true;
@@ -446,13 +652,17 @@ void BeaconView::drawTrack(QPainter &p)
 {
     const auto &h = m_loc->history();
     if (h.size() < 2) return;
+    const QRectF view = QRectF(rect()).adjusted(-10, -10, 10, 10);
     for (int i = 1; i < h.size(); ++i) {
         const bool coarse = h[i - 1].source == QLatin1String("ip") || h[i].source == QLatin1String("ip");
         const QPointF a = toScreen(h[i - 1].lat, h[i - 1].lon), b = toScreen(h[i].lat, h[i].lon);
         if (QLineF(a, b).length() < 1) continue;
+        QPointF ca = a, cb = b; double t0 = 0;
+        if (!clipLine(ca, cb, view, &t0)) continue;
         QPen pen(coarse ? QColor(0x9f, 0xb0, 0xc8, 110) : QColor(C_ME.red(), C_ME.green(), C_ME.blue(), 150), coarse ? 1.6 : 2.6,
                  coarse ? Qt::DashLine : Qt::SolidLine, Qt::RoundCap);
-        p.setPen(pen); p.drawLine(a, b);
+        if (coarse) pen.setDashOffset(QLineF(a, b).length() * t0 / pen.widthF());   // dashes stay put while panning
+        p.setPen(pen); p.drawLine(ca, cb);
     }
     for (int i = 0; i + 1 < h.size(); ++i) {
         const QPointF s = toScreen(h[i].lat, h[i].lon);
@@ -487,6 +697,7 @@ void BeaconView::drawPois(QPainter &p)
     QFont emoji = font(); emoji.setPointSizeF(font().pointSizeF() * 1.05);
     auto pin = [&](const QPointF &s, const PoiCategory *c, bool hot, bool wifi) {
         const double r = hot ? 14 : 11.5;
+        if (!m_paintClip.intersects(QRectF(s.x() - r - 3, s.y() - r - 3, 2 * r + 6, 2 * r + 8))) return;   // outside this repaint
         QColor ring = c ? c->color : C_DIM;
         p.setPen(Qt::NoPen); p.setBrush(QColor(0, 0, 0, 90)); p.drawEllipse(s + QPointF(0, 1.5), r + 1, r + 1);
         p.setBrush(QColor(12, 17, 28, 235)); p.setPen(QPen(ring, hot ? 2.6 : 2.0)); p.drawEllipse(s, r, r);
@@ -524,7 +735,7 @@ void BeaconView::drawPois(QPainter &p)
             const int hitIdx = m_hits.size();
             const bool hot = m_hover == hitIdx;
             pin(c, Locator::poiCategory(top), hot, false);
-            if (ids.size() > 1) badge(p, c + QPointF(11, -11), QString::number(ids.size()), counts.size() > 1 ? C_TEXT : Locator::poiCategory(top)->color);
+            if (ids.size() > 1 && m_paintClip.intersects(QRectF(c.x() - 20, c.y() - 30, 60, 50))) badge(p, c + QPointF(11, -11), QString::number(ids.size()), counts.size() > 1 ? C_TEXT : Locator::poiCategory(top)->color);
             for (int i : ids) m_poiPos[i] = c;
             m_hits.append({ids.size() > 1 ? HitCluster : HitPoi, c, 13, ids});
         }
@@ -553,13 +764,20 @@ void BeaconView::drawBeacons(QPainter &p)
     const double mpp = metersPerPixel(fix.lat);
     m_beaconPos = QList<QPointF>(aps.size());
 
+    // Estimates and statuses (pattern matches, centroids over every sample) come from a cache that
+    // follows the scan and refits, not recomputed 30 times a second
+    if (m_apEst.size() != aps.size() || !m_apEstAt.isValid() || m_apEstAt.elapsed() >= 1000) {
+        m_apEst.resize(aps.size()); m_apStatus.resize(aps.size());
+        for (int i = 0; i < aps.size(); ++i) { m_apEst[i] = m_loc->estimateFor(aps[i]); m_apStatus[i] = m_loc->apStatus(aps[i]); }
+        m_apEstAt.start();
+    }
     struct Item { int i; ApEstimate e; QColor col; QString st; QPointF pos; };
     QList<Item> items;
     QList<int> atMe;                                           // too close to draw apart at this zoom
     for (int i = 0; i < aps.size(); ++i) {
-        const ApEstimate e = m_loc->estimateFor(aps[i]);
+        const ApEstimate &e = m_apEst[i];
         if (e.kind == ApEstimate::None) continue;
-        const QString st = m_loc->apStatus(aps[i]);
+        const QString &st = m_apStatus[i];
         QColor col = st == QLatin1String("used") ? C_USED
                    : st == QLatin1String("home") ? C_HOME
                    : st == QLatin1String("active") ? C_ACTIVE
@@ -570,59 +788,61 @@ void BeaconView::drawBeacons(QPainter &p)
         items.append({i, e, col, st, pos});
     }
     // RSSI distance orbits first (faint), then uncertainty rings, then dots so nothing is buried
+    const QRectF screen(rect());
     for (const Item &it : items) {
-        if (it.e.kind != ApEstimate::Ring) continue;
+        if (it.e.kind != ApEstimate::Ring || !ringCrosses(me, it.e.radiusM / mpp, screen)) continue;
         QColor c = it.col; c.setAlpha(26);
         p.setPen(QPen(c, 1, Qt::DotLine)); p.setBrush(Qt::NoBrush);
         p.drawEllipse(me, it.e.radiusM / mpp, it.e.radiusM / mpp);
     }
     const QRectF view = QRectF(rect()).adjusted(-40, -40, 40, 40);
-    // Regions first (grade R: only an area is known): faint discs of radius R95, cheap enough for hundreds
-    {
-        QColor rc = gradeColor(QStringLiteral("R")), rf = rc;
-        rc.setAlpha(70); rf.setAlpha(18);
-        p.setPen(QPen(rc, 1)); p.setBrush(rf);
+    if (m_showApCircles) {
+        // Regions first (grade R: only an area is known): faint discs of radius R95, cheap enough for hundreds
+        {
+            QColor rc = gradeColor(QStringLiteral("R"));
+            rc.setAlpha(60);
+            p.setPen(QPen(rc, 1)); p.setBrush(Qt::NoBrush);
+            for (const Item &it : items) {
+                if (it.e.kind != ApEstimate::Region) continue;
+                const double r = it.e.radiusM / mpp;
+                if (r < 4 || !view.intersects(QRectF(it.pos.x() - r, it.pos.y() - r, 2 * r, 2 * r))) continue;
+                p.drawEllipse(it.pos, r, r);
+            }
+        }
         for (const Item &it : items) {
-            if (it.e.kind != ApEstimate::Region) continue;
+            if (it.e.kind == ApEstimate::Ring || it.e.kind == ApEstimate::Region || it.e.kind == ApEstimate::Mobile) continue;
+            const Estimator::Fit &f = it.e.fit;
+            if (it.e.kind == ApEstimate::Trilat && gradedFix(f) && f.semiMajor > 0) {
+                // The 95 % error ellipse: semi-axes × √χ²₂(0.95) = 2.4477, major axis along the bearing orientDeg.
+                // Screen y points south, so rotating by +bearing (clockwise on screen) turns "up" (north) onto it.
+                const double fm = metersPerPixel(it.e.lat);
+                const double a = f.semiMajor * 2.4477 / fm, b = qMax(f.semiMinor, 0.0) * 2.4477 / fm;
+                if (!view.intersects(QRectF(it.pos.x() - a, it.pos.y() - a, 2 * a, 2 * a))) continue;
+                const bool doubtful = !f.inHull || f.ambiguous || f.modes >= 2;   // Estimator::flags(): extrapolated / ambiguous
+                const QColor gc = gradeColor(f.grade);
+                if (a >= 3) {
+                    QPen pen(gc, 1.2, doubtful ? Qt::DashLine : Qt::SolidLine);
+                    p.save();
+                    p.translate(it.pos); p.rotate(f.orientDeg);
+                    p.setPen(pen); p.setBrush(Qt::NoBrush);
+                    p.drawEllipse(QRectF(-qMax(b, 1.0), -a, 2 * qMax(b, 1.0), 2 * a));
+                    p.restore();
+                }
+                if ((f.ambiguous || f.modes >= 2) && (f.altLat != 0 || f.altLon != 0)) {   // the mirror / second mode: a hollow ghost
+                    const QPointF ghost = toScreen(f.altLat, f.altLon);
+                    QColor lc = gc; lc.setAlpha(110);
+                    p.setPen(QPen(lc, 1, Qt::DotLine)); p.setBrush(Qt::NoBrush);
+                    p.drawLine(it.pos, ghost);
+                    p.setPen(QPen(gc, 1.6, Qt::DashLine)); p.drawEllipse(ghost, 5.5, 5.5);
+                }
+                continue;
+            }
             const double r = it.e.radiusM / mpp;
-            if (r < 4 || !view.intersects(QRectF(it.pos.x() - r, it.pos.y() - r, 2 * r, 2 * r))) continue;
+            if (r < 6 || !ringCrosses(it.pos, r, screen)) continue;
+            QColor c = it.col; c.setAlpha(60);
+            p.setPen(QPen(c, 1, Qt::DashLine)); p.setBrush(Qt::NoBrush);
             p.drawEllipse(it.pos, r, r);
         }
-    }
-    for (const Item &it : items) {
-        if (it.e.kind == ApEstimate::Ring || it.e.kind == ApEstimate::Region || it.e.kind == ApEstimate::Mobile) continue;
-        const Estimator::Fit &f = it.e.fit;
-        if (it.e.kind == ApEstimate::Trilat && gradedFix(f) && f.semiMajor > 0) {
-            // The 95 % error ellipse: semi-axes × √χ²₂(0.95) = 2.4477, major axis along the bearing orientDeg.
-            // Screen y points south, so rotating by +bearing (clockwise on screen) turns "up" (north) onto it.
-            const double fm = metersPerPixel(it.e.lat);
-            const double a = f.semiMajor * 2.4477 / fm, b = qMax(f.semiMinor, 0.0) * 2.4477 / fm;
-            if (!view.intersects(QRectF(it.pos.x() - a, it.pos.y() - a, 2 * a, 2 * a))) continue;
-            const bool doubtful = !f.inHull || f.ambiguous || f.modes >= 2;   // Estimator::flags(): extrapolated / ambiguous
-            const QColor gc = gradeColor(f.grade);
-            if (a >= 3) {
-                QColor fill = gc; fill.setAlpha(34);
-                QPen pen(gc, 1.4, doubtful ? Qt::DashLine : Qt::SolidLine);
-                p.save();
-                p.translate(it.pos); p.rotate(f.orientDeg);
-                p.setPen(pen); p.setBrush(fill);
-                p.drawEllipse(QRectF(-qMax(b, 1.0), -a, 2 * qMax(b, 1.0), 2 * a));
-                p.restore();
-            }
-            if ((f.ambiguous || f.modes >= 2) && (f.altLat != 0 || f.altLon != 0)) {   // the mirror / second mode: a hollow ghost
-                const QPointF ghost = toScreen(f.altLat, f.altLon);
-                QColor lc = gc; lc.setAlpha(110);
-                p.setPen(QPen(lc, 1, Qt::DotLine)); p.setBrush(Qt::NoBrush);
-                p.drawLine(it.pos, ghost);
-                p.setPen(QPen(gc, 1.6, Qt::DashLine)); p.drawEllipse(ghost, 5.5, 5.5);
-            }
-            continue;
-        }
-        const double r = it.e.radiusM / mpp;
-        if (r < 6) continue;
-        QColor c = it.col; c.setAlpha(55);
-        p.setPen(QPen(c, 1, Qt::DashLine)); c.setAlpha(14); p.setBrush(c);
-        p.drawEllipse(it.pos, r, r);
     }
     // Group markers that land on the same spot into one with a count
     QList<QList<int>> groups;                                  // indices into items
@@ -639,7 +859,9 @@ void BeaconView::drawBeacons(QPainter &p)
         const int hitIdx = m_hits.size();
         const bool hot = m_hover == hitIdx || (m_selKind == HitBeacon && g.size() == 1 && m_selItem == it.i);
         const double dot = it.st == QLatin1String("used") || it.st == QLatin1String("active") ? 5.0 : 3.5;
-        if (it.e.kind == ApEstimate::Observed) {              // hollow diamond = from the internal map (heard here before)
+        if (!m_paintClip.intersects(QRectF(it.pos.x() - 30, it.pos.y() - 30, 60, 60))) {
+            // outside this repaint (the pulse's): only the hit below
+        } else if (it.e.kind == ApEstimate::Observed) {              // hollow diamond = from the internal map (heard here before)
             const double d = hot ? 8 : 6;
             QPainterPath path; path.moveTo(it.pos.x(), it.pos.y() - d); path.lineTo(it.pos.x() + d, it.pos.y());
             path.lineTo(it.pos.x(), it.pos.y() + d); path.lineTo(it.pos.x() - d, it.pos.y()); path.closeSubpath();
@@ -662,7 +884,7 @@ void BeaconView::drawBeacons(QPainter &p)
         if (hot && g.size() == 1) focus = k0;
         QList<int> apIdx;
         for (int k : g) { apIdx << items[k].i; m_beaconPos[items[k].i] = it.pos; }
-        if (g.size() > 1) badge(p, it.pos + QPointF(9, -9), QString::number(g.size()), it.col);
+        if (g.size() > 1 && m_paintClip.intersects(QRectF(it.pos.x() - 20, it.pos.y() - 30, 60, 50))) badge(p, it.pos + QPointF(9, -9), QString::number(g.size()), it.col);
         m_hits.append({HitBeacon, it.pos, 9, apIdx});
     }
     if (focus >= 0) drawSuggestion(p, items[focus].i, items[focus].pos);
@@ -707,15 +929,19 @@ void BeaconView::drawMe(QPainter &p)
     const bool coarse = fix.source == QLatin1String("ip");
     if (fix.accuracy > 0) {
         const double r = qBound(8.0, fix.accuracy / mpp, 20000.0);
-        p.setPen(QPen(QColor(C_ME.red(), C_ME.green(), C_ME.blue(), coarse ? 90 : 130), 1.5, coarse ? Qt::DashLine : Qt::SolidLine));
-        p.setBrush(QColor(C_ME.red(), C_ME.green(), C_ME.blue(), coarse ? 12 : 22));
-        p.drawEllipse(me, r, r);
+        const QColor fill(C_ME.red(), C_ME.green(), C_ME.blue(), coarse ? 12 : 22);
+        if (ringCrosses(me, r, QRectF(rect()).adjusted(-4, -4, 4, 4))) {
+            p.setPen(QPen(QColor(C_ME.red(), C_ME.green(), C_ME.blue(), coarse ? 90 : 130), 1.5, coarse ? Qt::DashLine : Qt::SolidLine));
+            p.setBrush(fill);
+            p.drawEllipse(me, r, r);
+        } else if (QLineF(me, rect().center()).length() < r) p.fillRect(rect(), fill);   // the whole view is inside it
         if (r < 3000) {                                        // radar sweep inside the accuracy ring
             QConicalGradient sweep(me, -m_sweep);
             sweep.setColorAt(0.0, QColor(C_ME.red(), C_ME.green(), C_ME.blue(), 80));
             sweep.setColorAt(0.16, QColor(C_ME.red(), C_ME.green(), C_ME.blue(), 0));
             sweep.setColorAt(1.0, QColor(C_ME.red(), C_ME.green(), C_ME.blue(), 0));
-            p.setPen(Qt::NoPen); p.setBrush(sweep); p.drawEllipse(me, r, r);
+            // only the leading 16 % of the cone has colour: fill just that wedge (a quarter of the pixels)
+            p.setPen(Qt::NoPen); p.setBrush(sweep); p.drawPie(QRectF(me.x() - r, me.y() - r, 2 * r, 2 * r), qRound(-m_sweep * 16), qRound(0.17 * 360 * 16));
         }
     }
     const double pr = 10 + 26 * m_phase;
@@ -770,6 +996,7 @@ void BeaconView::drawLabels(QPainter &p)
         const QSizeF sz(p.fontMetrics().horizontalAdvance(text) + 10, lh);
         QRectF box;
         if (!place(l.at, sz, &box)) continue;
+        if (!m_paintClip.intersects(box)) { ++shown; continue; }
         p.setPen(Qt::NoPen); p.setBrush(QColor(8, 12, 20, 185)); p.drawRoundedRect(box, 4, 4);
         p.setBrush(l.col); p.drawRoundedRect(QRectF(box.left(), box.top() + 3, 2.5, box.height() - 6), 1, 1);
         p.setPen(QColor(C_TEXT.red(), C_TEXT.green(), C_TEXT.blue(), 225));
@@ -805,6 +1032,7 @@ void BeaconView::drawLabels(QPainter &p)
             const QSizeF sz(tw + 12 + (bands ? bw + 4 : 0), lh);
             QRectF box;
             if (!place(nl.at, sz, &box)) continue;
+            if (!m_paintClip.intersects(box.adjusted(-16, 0, 16, 0))) { ++n; continue; }   // placed, but outside this repaint
             // a beacon that just appeared slides its name in from the marker
             double alpha = 1.0, slide = 0.0;
             const auto born = m_labelBorn.constFind(aps[nl.i].bssid);
@@ -873,6 +1101,7 @@ static QColor eventColor(const QString &type)
 
 void BeaconView::onEvent(const QString &json)
 {
+    m_apEstAt.invalidate();                                    // a refit / placement moves an estimate
     const QJsonObject o = QJsonDocument::fromJson(json.toUtf8()).object();
     Anim a;
     a.type = o["type"].toString(); a.bssid = o["bssid"].toString(); a.ssid = o["ssid"].toString(); a.text = o["text"].toString();
@@ -1061,7 +1290,7 @@ void BeaconView::drawTicker(QPainter &p)
 
 void BeaconView::drawHud(QPainter &p)
 {
-    const Stats st = m_loc->stats();
+    const Stats &st = stats();
     const Fix &fix = m_loc->fix();
     QFont base = font();
     QFont title = base; title.setPointSizeF(base.pointSizeF() * 1.25); title.setBold(true);
@@ -1132,7 +1361,8 @@ void BeaconView::drawControls(QPainter &p)
         p.setPen(QPen(on ? C_ME : QColor(C_ME.red(), C_ME.green(), C_ME.blue(), hot ? 180 : 80), on ? 1.6 : 1));
         p.setBrush(hot ? QColor(24, 34, 52, 235) : C_PANEL);
         p.drawRoundedRect(r, 8, 8);
-        const QIcon ic = QIcon::fromTheme(QString::fromLatin1(icons[b]));
+        static const QList<QIcon> themed = [] { QList<QIcon> l; for (const char *n : icons) l << QIcon::fromTheme(QString::fromLatin1(n)); return l; }();
+        const QIcon &ic = themed[b];
         if (!ic.isNull()) ic.paint(&p, r.adjusted(8, 8, -8, -8).toRect());
         else { p.setPen(C_TEXT); p.drawText(r, Qt::AlignCenter, QString::fromUtf8(fallback[b])); }
         m_hits.append({HitButton, r.center(), s / 2, {}, b});
@@ -1146,12 +1376,16 @@ void BeaconView::drawScale(QPainter &p)
     Q_UNUSED(fix);
     const double mpp = metersPerPixel(lat);
     const double maxPx = 110;
-    static const double steps[] = {5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000, 100000, 200000, 500000, 1000000};
+    static const double steps[] = {0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000, 100000, 200000, 500000, 1000000};
     double m = steps[0];
     for (double s : steps) if (s / mpp <= maxPx) m = s;
     const double px = m / mpp;
     QFont f = font(); f.setPointSizeF(f.pointSizeF() * 0.8); p.setFont(f);
-    const QString t = m >= 1000 ? QStringLiteral("%1 km").arg(m / 1000) : QStringLiteral("%1 m").arg(m);
+    // metric and US units side by side: pinpointing is done in both (1 ft = 30.48 cm)
+    const QString metric = m >= 1000 ? QStringLiteral("%1 km").arg(m / 1000) : m >= 1 ? QStringLiteral("%1 m").arg(m) : QStringLiteral("%1 cm").arg(qRound(m * 100));
+    const QString us = m >= 1609.344 ? QStringLiteral("%1 mi").arg(m / 1609.344, 0, 'f', m >= 16093 ? 0 : 1)
+                     : m >= 0.3048 ? QStringLiteral("%1 ft").arg(qRound(m / 0.3048 * 10) / 10.0) : QStringLiteral("%1 in").arg(m / 0.0254, 0, 'f', 1);
+    const QString t = metric + QStringLiteral(" · ") + us;
     const QRectF box(12, height() - 34, px + 20 + p.fontMetrics().horizontalAdvance(t) + 8, 22);
     p.setPen(Qt::NoPen); p.setBrush(C_PANEL); p.drawRoundedRect(box, 5, 5);
     const double y = box.center().y() + 3, x0 = box.left() + 10;
@@ -1162,16 +1396,26 @@ void BeaconView::drawScale(QPainter &p)
     p.setFont(font());
 }
 
+// What each tile source asks for (checked 2026-10; Esri's from the services' copyrightText). The
+// places and cameras are OpenStreetMap data too, so OSM is credited on every layer.
 void BeaconView::drawAttribution(QPainter &p)
 {
     QFont f = font(); f.setPointSizeF(f.pointSizeF() * 0.75); p.setFont(f);
-    const QString src = m_layer == Satellite ? QStringLiteral("Imagery © Esri, Maxar, Earthstar")
-                      : m_layer == Topo ? QStringLiteral("© OpenTopoMap (CC-BY-SA) · SRTM") : QStringLiteral("tiles © OSM");
-    const QString attr = QStringLiteral("© OpenStreetMap contributors · %1 · z%2").arg(src).arg(m_zoom, 0, 'f', 1);
-    const QRect tr = p.fontMetrics().boundingRect(attr).adjusted(-6, -2, 6, 2);
+    const QString satLabels = QStringLiteral(" · Labels: Esri, HERE, Garmin · © OpenStreetMap contributors");
+    QString src = m_layer == Satellite && m_satSource == TileSource::SatUsgsNaip ? QStringLiteral("Imagery: USGS The National Map (public domain)") + satLabels
+                : m_layer == Satellite && m_satSource == TileSource::SatNasaViirs ? QStringLiteral("Imagery: NASA EOSDIS GIBS, VIIRS NOAA-20, %1").arg(QDateTime::currentDateTimeUtc().addDays(-1).date().toString(Qt::ISODate)) + satLabels
+                : m_layer == Satellite ? QStringLiteral("Powered by Esri · Imagery: Esri, Vantor, Earthstar Geographics, GIS User Community · Labels: Esri, HERE, Garmin · © OpenStreetMap contributors")
+                : m_layer == Topo ? QStringLiteral("Map data: © OpenStreetMap contributors, SRTM · Map style: © OpenTopoMap (CC-BY-SA)")
+                : QStringLiteral("© OpenStreetMap contributors");
+    if (m_baseTopo) src += QStringLiteral(" · offline: © OpenTopoMap (CC-BY-SA)");
+    // the camera layer's data: DeFlock (OpenStreetMap-derived, ODbL) and flocklocations.com community reports (CC BY 4.0)
+    if (m_showFlockCameras && !m_flockCameras.isEmpty()) src += QStringLiteral(" · Cameras: DeFlock / OSM (ODbL), flocklocations.com (CC BY 4.0)");
+    const QString attr = QStringLiteral("%1 · z%2").arg(src).arg(m_zoom, 0, 'f', 1);
+    const int maxW = qMax(120, width() - 24);                  // wraps rather than running off a narrow window
+    const QRect tr = p.fontMetrics().boundingRect(QRect(0, 0, maxW, 400), Qt::TextWordWrap | Qt::AlignRight, attr).adjusted(-6, -2, 6, 2);
     const QRect ab(width() - tr.width() - 8, height() - tr.height() - 8, tr.width(), tr.height());
     p.setPen(Qt::NoPen); p.setBrush(QColor(8, 12, 20, 170)); p.drawRoundedRect(ab, 4, 4);
-    p.setPen(QColor(C_TEXT.red(), C_TEXT.green(), C_TEXT.blue(), 170)); p.drawText(ab, Qt::AlignCenter, attr);
+    p.setPen(QColor(C_TEXT.red(), C_TEXT.green(), C_TEXT.blue(), 170)); p.drawText(ab.adjusted(6, 2, -6, -2), Qt::AlignRight | Qt::AlignVCenter | Qt::TextWordWrap, attr);
     p.setFont(font());
 }
 
@@ -1262,6 +1506,10 @@ void BeaconView::drawCard(QPainter &p)
         if (const PoiCategory *c = Locator::poiCategory(m_loc->pois()[h->items.first()].cat)) accent = c->color;
     } else if (h && h->kind == HitBeacon && h->items.size() == 1) {
         text = beaconCard(h->items.first()); anchor = h->pos; beaconAccent(h->items.first());
+    } else if (h && h->kind == HitCamera && !h->items.isEmpty()) {
+        text = cameraCard(h->items.first()); anchor = h->pos;
+        if (h->items.first() >= 0 && h->items.first() < m_flockCameras.size())
+            accent = m_flockCameras[h->items.first()].vetted ? QColor(0, 220, 255) : QColor(255, 175, 40);
     } else if (h && (h->kind == HitCluster || h->kind == HitBeacon)) {
         QStringList l;
         const bool poi = h->kind == HitCluster;
@@ -1285,6 +1533,10 @@ void BeaconView::drawCard(QPainter &p)
         if (const PoiCategory *c = Locator::poiCategory(m_loc->pois()[m_selItem].cat)) accent = c->color;
     } else if (m_selKind == HitBeacon && m_selItem >= 0 && m_selItem < m_beaconPos.size() && !m_beaconPos[m_selItem].isNull()) {
         text = beaconCard(m_selItem); anchor = m_beaconPos[m_selItem]; beaconAccent(m_selItem);
+    } else if (m_selKind == HitCamera && m_cameraPos.contains(m_selItem)) {
+        text = cameraCard(m_selItem); anchor = m_cameraPos.value(m_selItem);
+        if (m_selItem >= 0 && m_selItem < m_flockCameras.size())
+            accent = m_flockCameras[m_selItem].vetted ? QColor(0, 220, 255) : QColor(255, 175, 40);
     }
     if (text.isEmpty()) return;
 
@@ -1416,6 +1668,379 @@ void BeaconView::drawLegend(QPainter &p)
 void BeaconView::setShowImported(bool on)
 {
     m_showImported = on; QSettings().setValue("map/showImported", on); update();
+}
+
+void BeaconView::setShowHeatmap(bool on)
+{
+    if (m_showHeatmap == on) return;
+    m_showHeatmap = on;
+    QSettings().setValue("map/showHeatmap", on);
+    if (on) m_routeFixesDirty = true;
+    update();
+}
+
+void BeaconView::setShowFlockCameras(bool on)
+{
+    if (m_showFlockCameras == on) return;
+    m_showFlockCameras = on;
+    QSettings().setValue("map/showFlockCameras", on);
+    m_camStale = true;
+    if (!on) {                                                 // paint stops drawing them, so nothing else drops the pinned card
+        m_cameraPos.clear();
+        if (m_selKind == HitCamera) m_selKind = HitNone;
+    }
+    update();
+}
+
+void BeaconView::setShowApCircles(bool on)
+{
+    if (m_showApCircles == on) return;
+    m_showApCircles = on;
+    QSettings().setValue("map/showApCircles", on);
+    update();
+}
+
+// The route heat map. Rasterising thousands of fixes took most of a second, so it never happens
+// in a paint: startHeat() renders an area a quarter larger than the view on every side on m_pool,
+// and this draws the latest result moved and scaled to the view, asking for a fresh one when the
+// data, the zoom or the coverage no longer match.
+void BeaconView::drawHeatmap(QPainter &p)
+{
+    if (m_routeFixes.size() < 2) return;
+    const double ws = TILE * std::pow(2.0, m_heat.zoom);
+    const QRectF have(m_heat.tl, QSizeF(m_heat.img.width() / ws, m_heat.img.height() / ws));
+    if (m_heat.img.isNull() || m_heat.version != m_heatVersion || std::abs(m_heat.zoom - m_zoom) > 1e-6
+        || !have.contains(QRectF(toMerc(QPointF(0, 0)), toMerc(QPointF(width(), height())))))
+        if (!m_heatKick.isActive()) m_heatKick.start();
+    if (m_heat.img.isNull()) return;
+    const double scale = std::pow(2.0, m_zoom - m_heat.zoom);
+    p.save();
+    p.setRenderHint(QPainter::SmoothPixmapTransform, std::abs(scale - 1) > 1e-6);
+    p.drawImage(QRectF(toScreen(m_heat.tl), QSizeF(m_heat.img.width() * scale, m_heat.img.height() * scale)), m_heat.img);
+    p.restore();
+}
+
+void BeaconView::loadRouteFixes()
+{
+    if (!m_routeFixesDirty) return;
+    if (m_routeLoadedAt.isValid() && m_routeLoadedAt.elapsed() < 30000) return;   // a live fix every few seconds: twice a minute is plenty
+    QElapsedTimer t; t.start();
+    m_routeFixes = m_loc->allRouteFixes();
+    if (qEnvironmentVariableIsSet("BEACONFIX_PAINT_PROFILE")) fprintf(stderr, "route fixes: %d in %.1f ms\n", int(m_routeFixes.size()), t.nsecsElapsed() / 1e6);
+    m_routeFixesDirty = false; m_routeLoadedAt.start();
+    ++m_heatVersion;
+}
+
+void BeaconView::startHeat()
+{
+    if (m_heatBusy || !m_showHeatmap || m_routeFixes.size() < 2 || width() < 2) return;   // a busy worker looks again when it lands
+    Heat job;
+    job.zoom = m_zoom; job.version = m_heatVersion;
+    job.tl = toMerc(QPointF(-width() * 0.25, -height() * 0.25));
+    const QSize sz(qRound(width() * 1.5), qRound(height() * 1.5));
+    m_heatBusy = true;
+    m_pool.start([this, job, fixes = m_routeFixes, sz]() mutable {
+        QElapsedTimer t; t.start();
+        job.img = renderHeat(fixes, job.tl, job.zoom, sz);
+        if (qEnvironmentVariableIsSet("BEACONFIX_PAINT_PROFILE")) fprintf(stderr, "heat %dx%d from %d fixes: %.1f ms (worker)\n", sz.width(), sz.height(), int(fixes.size()), t.nsecsElapsed() / 1e6);
+        QMetaObject::invokeMethod(this, [this, job] {
+            m_heatBusy = false; m_heat = job; ++m_heatSerial;
+            update();                                          // the base redraws with it, and asks again if the view has moved on
+        }, Qt::QueuedConnection);
+    });
+}
+
+// Adds a round-capped, antialiased stroke (half-width hw, value v) to an Alpha8 image with saturation:
+// what QPainter's CompositionMode_Plus would leave, at a fraction of the stroker's cost (it spent
+// ~0.3 s on a few thousand route segments).
+static void addStroke(QImage &img, const QPointF &a, const QPointF &b, double hw, int v)
+{
+    const int W = img.width(), H = img.height();
+    const double dx = b.x() - a.x(), dy = b.y() - a.y(), len2 = dx * dx + dy * dy, m = hw + 1;
+    const int y0 = qMax(0, int(std::floor(qMin(a.y(), b.y()) - m))), y1 = qMin(H - 1, int(std::ceil(qMax(a.y(), b.y()) + m)));
+    for (int y = y0; y <= y1; ++y) {
+        const double py = y + 0.5;
+        double xa = qMin(a.x(), b.x()), xb = qMax(a.x(), b.x());
+        if (std::abs(dy) > 1e-9) {                             // the stretch of the segment within reach of this row
+            const double t0 = qBound(0.0, (py - m - a.y()) / dy, 1.0), t1 = qBound(0.0, (py + m - a.y()) / dy, 1.0);
+            xa = qMin(a.x() + dx * t0, a.x() + dx * t1); xb = qMax(a.x() + dx * t0, a.x() + dx * t1);
+        }
+        const int x0 = qMax(0, int(std::floor(xa - m))), x1 = qMin(W - 1, int(std::ceil(xb + m)));
+        uchar *row = img.scanLine(y);
+        for (int x = x0; x <= x1; ++x) {
+            const double px = x + 0.5;
+            const double t = len2 > 0 ? qBound(0.0, ((px - a.x()) * dx + (py - a.y()) * dy) / len2, 1.0) : 0.0;
+            const double ex = a.x() + t * dx - px, ey = a.y() + t * dy - py;
+            const double cov = hw + 0.5 - std::sqrt(ex * ex + ey * ey);
+            if (cov > 0) row[x] = uchar(qMin(255, row[x] + int(v * qMin(cov, 1.0) + 0.5)));
+        }
+    }
+}
+
+// Thread-safe: plain data in, an image out. tl = mercator of the image's top-left corner.
+QImage BeaconView::renderHeat(const QList<Fix> &fixes, const QPointF &tl, double zoom, const QSize &sz)
+{
+    const double ws = TILE * std::pow(2.0, zoom);
+    const double cx = tl.x() + sz.width() / 2.0 / ws;           // longitudes wrap around the image centre
+    auto px = [&](const Fix &f) {
+        const QPointF m = merc(f.lat, f.lon);
+        double dx = m.x() - cx;
+        if (dx > 0.5) dx -= 1.0; else if (dx < -0.5) dx += 1.0;
+        return QPointF((cx + dx - tl.x()) * ws, (m.y() - tl.y()) * ws);
+    };
+    const QRectF vp = QRectF(QPointF(0, 0), QSizeF(sz)).adjusted(-60, -60, 60, 60);
+    QImage alphaMap(sz, QImage::Format_Alpha8);
+    alphaMap.fill(0);
+    QList<QPoint> dots;
+    {
+        QPointF prevPt;
+        QDateTime prevTime;
+        double prevLat = 0, prevLon = 0;
+        bool hasPrev = false;
+        for (const Fix &f : fixes) {
+            if (!f.valid) { hasPrev = false; continue; }
+            const QPointF pt = px(f);
+            const bool inVp = vp.contains(pt);
+            if (hasPrev) {
+                const qint64 dt = prevTime.isValid() && f.time.isValid() ? std::abs(prevTime.secsTo(f.time)) : 0;
+                const double d = Locator::distanceM(prevLat, prevLon, f.lat, f.lon);
+                const bool timeOk = dt > 0 && dt <= 900;
+                const bool speedOk = dt == 0 || (d / dt) <= 38.0;
+                QPointF a = prevPt, b = pt;
+                if (timeOk && speedOk && d <= 4000.0 && (inVp || vp.contains(prevPt)) && clipLine(a, b, vp)) addStroke(alphaMap, a, b, 4.0, 20);
+            }
+            if (inVp) dots << pt.toPoint();
+            prevPt = pt; prevTime = f.time; prevLat = f.lat; prevLon = f.lon;
+            hasPrev = true;
+        }
+    }
+    // Each fix's glow (35 at the centre, 15 at 0.6 r, nothing at the rim) is one precomputed stamp
+    // added with saturation, as CompositionMode_Plus would, instead of a QRadialGradient per fix
+    const double r = qBound(12.0, 30.0 - zoom * 0.5, 28.0);
+    const int R = int(std::ceil(r)), side = 2 * R + 1, W = sz.width(), H = sz.height();
+    QList<uchar> stamp(side * side);
+    for (int dy = -R; dy <= R; ++dy)
+        for (int dx = -R; dx <= R; ++dx) {
+            const double d = std::hypot(dx, dy) / r;
+            stamp[(dy + R) * side + dx + R] = uchar(qRound(d < 0.6 ? 35 - 20 * d / 0.6 : d < 1 ? 15 * (1 - d) / 0.4 : 0.0));
+        }
+    for (const QPoint &c : dots) {
+        const int x0 = qMax(0, c.x() - R), x1 = qMin(W - 1, c.x() + R);
+        for (int y = qMax(0, c.y() - R); y <= qMin(H - 1, c.y() + R); ++y) {
+            uchar *row = alphaMap.scanLine(y);
+            const uchar *k = stamp.constData() + (y - c.y() + R) * side + (x0 - c.x() + R);
+            for (int x = x0; x <= x1; ++x, ++k) row[x] = uchar(qMin(255, row[x] + *k));
+        }
+    }
+
+    static const QVector<QRgb> kRamp = []{
+        QVector<QRgb> r(256);
+        for (int i = 0; i < 256; ++i) {
+            if (i == 0) {
+                r[i] = 0;
+            } else if (i < 40) {
+                const double t = i / 40.0;
+                r[i] = qRgba(0, int(80 * t), int(220 * t + 35), int(140 * t));
+            } else if (i < 100) {
+                const double t = (i - 40) / 60.0;
+                r[i] = qRgba(int(40 * t), int(80 * (1 - t) + 210 * t), int(255 * (1 - t) + 120 * t), int(140 + 40 * t));
+            } else if (i < 170) {
+                const double t = (i - 100) / 70.0;
+                r[i] = qRgba(int(40 * (1 - t) + 255 * t), int(210 * (1 - t) + 230 * t), int(120 * (1 - t)), int(180 + 35 * t));
+            } else {
+                const double t = (i - 170) / 85.0;
+                r[i] = qRgba(255, int(230 * (1 - t) + 70 * t), int(200 * t * t), int(215 + 40 * t));
+            }
+            r[i] = qPremultiply(r[i]);                         // the image is premultiplied: straight colour above alpha wraps when blended
+        }
+        return r;
+    }();
+
+    QImage colorized(sz, QImage::Format_ARGB32_Premultiplied);
+    for (int y = 0; y < H; ++y) {
+        const uchar *src = alphaMap.constScanLine(y);
+        QRgb *dst = reinterpret_cast<QRgb *>(colorized.scanLine(y));
+        for (int x = 0; x < W; ++x) dst[x] = kRamp[src[x]];
+    }
+    return colorized;
+}
+
+const Stats &BeaconView::stats()
+{
+    if (!m_statsAt.isValid() || m_statsAt.elapsed() >= 1000) { m_stats = m_loc->stats(); m_statsAt.start(); }   // walks every stop: not per frame
+    return m_stats;
+}
+
+// Surveillance cameras: ~140 k after a flocklocations sync, so the view holds only those around
+// what's on screen (the view plus half again on every side, nearest first, capped), reloaded
+// when the view leaves that box. Zoomed out past CAM_MIN_ZOOM they're not shown at all.
+static const double CAM_MIN_ZOOM = 9;
+static const int CAM_CAP = 5000;
+
+void BeaconView::setFlockCameras(const QList<FlockCamera> &cams)
+{
+    const QString sel = m_selKind == HitCamera && m_selItem >= 0 && m_selItem < m_flockCameras.size() ? m_flockCameras[m_selItem].id : QString();
+    m_flockCameras = cams;
+    m_cameraMerc.resize(cams.size());
+    for (int i = 0; i < cams.size(); ++i) m_cameraMerc[i] = merc(cams[i].lat, cams[i].lon);
+    m_cameraPos.clear();
+    if (!sel.isEmpty()) {                                      // the pinned card follows its camera into the new list
+        m_selItem = -1;
+        for (int i = 0; i < cams.size() && m_selItem < 0; ++i) if (cams[i].id == sel) m_selItem = i;
+        if (m_selItem < 0) m_selKind = HitNone;
+    }
+}
+
+void BeaconView::loadFlockCameras()
+{
+    if (!m_showFlockCameras || m_zoom < CAM_MIN_ZOOM || width() < 2) return;
+    double latN, lonW, latS, lonE;
+    unmerc(toMerc(QPointF(-width() * 0.5, -height() * 0.5)), &latN, &lonW);
+    unmerc(toMerc(QPointF(width() * 1.5, height() * 1.5)), &latS, &lonE);
+    lonW = qMax(-180.0, lonW); lonE = qMin(180.0, lonE);
+    QElapsedTimer t; t.start();
+    const QList<FlockCamera> cams = m_loc->flockCamerasIn(latS, latN, lonW, lonE, CAM_CAP);
+    if (qEnvironmentVariableIsSet("BEACONFIX_PAINT_PROFILE")) fprintf(stderr, "cameras: %d around the view in %.1f ms\n", int(cams.size()), t.nsecsElapsed() / 1e6);
+    m_camBox = QRectF(QPointF(lonW, latS), QPointF(lonE, latN));
+    m_camZoom = m_zoom; m_camCapped = cams.size() >= CAM_CAP; m_camStale = false;
+    // Capped, the rows are the nearest to the box centre (MapDb's metric): a disc out to the farthest one, not the box
+    m_camCentre = m_camBox.center(); m_camK = std::cos(qDegreesToRadians(m_camCentre.y())); m_camR2 = 0;
+    if (m_camCapped)
+        for (const FlockCamera &c : cams) {
+            const double dy = c.lat - m_camCentre.y(), dx = (c.lon - m_camCentre.x()) * m_camK;
+            m_camR2 = qMax(m_camR2, dy * dy + dx * dx);
+        }
+    setFlockCameras(cams);
+    update();
+}
+
+void BeaconView::drawFlockCameras(QPainter &p)
+{
+    m_cameraPos.clear();
+    if (!m_showFlockCameras || m_zoom < CAM_MIN_ZOOM) return;
+    double latN, lonW, latS, lonE;
+    unmerc(toMerc(QPointF(0, 0)), &latN, &lonW);
+    unmerc(toMerc(QPointF(width(), height())), &latS, &lonE);
+    const QRectF view(QPointF(qMax(-180.0, lonW), latS), QPointF(qMin(180.0, lonE), latN));
+    bool reload = m_camStale || !m_camBox.contains(view) || (m_camCapped && m_zoom > m_camZoom + 0.9);
+    if (!reload && m_camCapped) {                              // a corner past the disc has cameras not loaded; when the disc
+        const auto d2 = [this](QPointF ll) {                   // can't hold the view at all, only once the centre is r/4 off
+            const double dy = ll.y() - m_camCentre.y(), dx = (ll.x() - m_camCentre.x()) * m_camK;
+            return dy * dy + dx * dx;
+        };
+        const bool out = d2(view.topLeft()) > m_camR2 || d2(view.topRight()) > m_camR2
+                      || d2(view.bottomLeft()) > m_camR2 || d2(view.bottomRight()) > m_camR2;
+        reload = out && d2(view.center()) > m_camR2 / 16;   // (each load is ~50 ms on this thread)
+    }
+    if (reload && !m_camKick.isActive()) m_camKick.start();
+    if (m_flockCameras.isEmpty()) return;
+
+    const QRectF vp = rect().adjusted(-40, -40, 40, 40);
+    // Zoomed out, thousands can share the screen: plain dots, one per few pixels, no cones
+    const bool simple = m_zoom < 13;
+    const double cell = m_zoom < 11 ? 6 : simple ? 4 : 0;
+    const int gw = cell > 0 ? int(vp.width() / cell) + 1 : 0, gh = cell > 0 ? int(vp.height() / cell) + 1 : 0;
+    QList<bool> taken(gw * gh, false);
+    p.save();
+    p.setRenderHint(QPainter::Antialiasing);
+
+    for (int i = 0; i < m_flockCameras.size(); ++i) {
+        const FlockCamera &c = m_flockCameras[i];
+        const QPointF at = toScreen(m_cameraMerc[i]);
+        if (!vp.contains(at)) continue;
+        const bool vetted = c.vetted;
+        const QColor mainCol = vetted ? QColor(0, 220, 255) : QColor(255, 175, 40);
+        if (cell > 0) {
+            const int g = int((at.y() - vp.top()) / cell) * gw + int((at.x() - vp.left()) / cell);
+            if (taken[g]) continue;
+            taken[g] = true;
+        }
+        if (!m_paintClip.intersects(QRectF(at.x() - 26, at.y() - 26, 52, 52))) {   // outside this repaint: hit only
+            m_cameraPos.insert(i, at);
+            m_hits.append({HitCamera, at, simple ? 4.0 : 12.0, {i}});
+            continue;
+        }
+        if (simple) {
+            p.setPen(Qt::NoPen); p.setBrush(mainCol); p.drawEllipse(at, 2.6, 2.6);
+            m_cameraPos.insert(i, at);
+            m_hits.append({HitCamera, at, 4, {i}});
+            continue;
+        }
+        const QColor glowCol = vetted ? QColor(0, 220, 255, 60) : QColor(255, 175, 40, 50);
+
+        if (!c.direction.isEmpty()) {
+            bool ok = false;
+            double heading = c.direction.toDouble(&ok);
+            if (!ok) {
+                const QString d = c.direction.trimmed().toUpper();
+                if (d == QLatin1String("N") || d == QLatin1String("NB")) { heading = 0; ok = true; }
+                else if (d == QLatin1String("NE")) { heading = 45; ok = true; }
+                else if (d == QLatin1String("E") || d == QLatin1String("EB")) { heading = 90; ok = true; }
+                else if (d == QLatin1String("SE")) { heading = 135; ok = true; }
+                else if (d == QLatin1String("S") || d == QLatin1String("SB")) { heading = 180; ok = true; }
+                else if (d == QLatin1String("SW")) { heading = 225; ok = true; }
+                else if (d == QLatin1String("W") || d == QLatin1String("WB")) { heading = 270; ok = true; }
+                else if (d == QLatin1String("NW")) { heading = 315; ok = true; }
+            }
+            if (ok) {
+                const double rad = (heading - 90.0) * M_PI / 180.0;
+                const double spread = 25.0 * M_PI / 180.0;
+                const double len = 24.0;
+                QPainterPath cone;
+                cone.moveTo(at);
+                cone.lineTo(at.x() + len * std::cos(rad - spread), at.y() + len * std::sin(rad - spread));
+                cone.arcTo(QRectF(at.x() - len, at.y() - len, len * 2, len * 2), -heading + 90 - 25, 50);
+                cone.closeSubpath();
+                p.setPen(Qt::NoPen);
+                p.setBrush(QColor(mainCol.red(), mainCol.green(), mainCol.blue(), 45));
+                p.drawPath(cone);
+            }
+        }
+
+        const double r = 8.0;
+        p.setPen(Qt::NoPen);
+        p.setBrush(glowCol);
+        p.drawEllipse(at, r + 4, r + 4);
+
+        p.setPen(QPen(Qt::white, 1.2));
+        p.setBrush(mainCol);
+        p.drawEllipse(at, r, r);
+
+        p.setPen(Qt::NoPen);
+        p.setBrush(QColor(15, 20, 30));
+        p.drawEllipse(at, 3.2, 3.2);
+
+        if (vetted) {
+            p.setPen(QPen(QColor(0, 255, 180), 1.5));
+            p.drawPoint(at);
+        }
+
+        m_cameraPos.insert(i, at);
+        m_hits.append({HitCamera, at, r + 4, {i}});
+    }
+
+    p.restore();
+}
+
+QString BeaconView::cameraCard(int camIndex) const
+{
+    if (camIndex < 0 || camIndex >= m_flockCameras.size()) return {};
+    const FlockCamera &c = m_flockCameras[camIndex];
+    QStringList lines;
+    // only what the source says (docs/SIGHTINGS.md §2.0): no invented "Flock Safety" / "Falcon"
+    const QString what = !c.model.isEmpty() ? c.model : !c.manufacturer.isEmpty() ? QStringLiteral("%1 %2").arg(c.manufacturer, PlateEvents::typeLabel(c.cameraType))
+                                                                                  : PlateEvents::typeLabel(c.cameraType);
+    lines << QStringLiteral("%1 · %2").arg(what, c.operatorName.isEmpty() ? QStringLiteral("operator unknown") : c.operatorName);
+    if (!c.model.isEmpty() && !c.manufacturer.isEmpty()) lines << QStringLiteral("Made by %1").arg(c.manufacturer);
+    lines << QStringLiteral("Status: %1").arg(c.stale ? QStringLiteral("No longer listed by its source (kept for your passes)")
+                                             : c.vetted ? QStringLiteral("Field Vetted (Active RF)") : QStringLiteral("Candidate Location"));
+    if (c.osmVersion > 0) lines << QStringLiteral("OpenStreetMap v%1 · %2").arg(c.osmVersion).arg(c.osmTimestamp.left(10));
+    if (!c.direction.isEmpty()) lines << QStringLiteral("Direction: %1").arg(c.direction);
+    if (!c.bssid.isEmpty()) lines << QStringLiteral("Wi-Fi BSSID: %1").arg(c.bssid);
+    if (!c.bleMac.isEmpty()) lines << QStringLiteral("BLE MAC: %1").arg(c.bleMac);
+    if (c.sightingCount > 1) lines << QStringLiteral("Sightings: %1 · Last: %2").arg(c.sightingCount).arg(c.lastSeen.toString(QStringLiteral("yyyy-MM-dd hh:mm")));
+    if (!c.notes.isEmpty()) lines << c.notes;
+    return lines.join('\n');
 }
 
 void BeaconView::replayLastRefit()
@@ -1636,6 +2261,7 @@ void BeaconView::mouseReleaseEvent(QMouseEvent *e)
         if (h.items.size() == 1) { m_selKind = HitBeacon; m_selItem = h.items.first(); }
         else if (m_zoom < 18) zoomAt(2, h.pos);
         break;
+    case HitCamera: m_selKind = HitCamera; m_selItem = h.items.first(); break;
     case HitAnchor: break;
     case HitNone: break;
     }
@@ -1665,6 +2291,25 @@ void BeaconView::buttonClicked(int b, const QPoint &globalPos)
             a->setCheckable(true); a->setChecked(m_layer == l.first); grp->addAction(a);
             connect(a, &QAction::triggered, this, [this, l] { setLayer(l.first); });
         }
+        // Free, keyless imagery (TileSource::SatSource): the newest high-res is Esri's; NASA's is yesterday's, coarse
+        QMenu *sat = menu.addMenu(QIcon::fromTheme(QStringLiteral("internet-services")), QStringLiteral("Satellite imagery"));
+        sat->setToolTipsVisible(true);
+        auto *sgrp = new QActionGroup(sat);
+        const std::pair<TileSource::SatSource, const char *> tips[] = {
+            {TileSource::SatEsri, "Vantor/Maxar 30–50 cm: the newest high-resolution imagery served free"},
+            {TileSource::SatEsriClarity, "The same imagery, sharper processing; can be an older capture"},
+            {TileSource::SatUsgsNaip, "US only, public domain (USDA NAIP and others), to zoom 16"},
+            {TileSource::SatNasaViirs, "Yesterday's global VIIRS pass (~375 m): the newest, but coarse — smoke, snow, clouds"}};
+        for (const auto &t : tips) {
+            QAction *a = sat->addAction(TileSource::satName(t.first));
+            a->setToolTip(QString::fromUtf8(t.second));
+            a->setCheckable(true); a->setChecked(m_layer == Satellite && m_satSource == int(t.first)); sgrp->addAction(a);
+            connect(a, &QAction::triggered, this, [this, t] { setSatSource(int(t.first)); });
+        }
+        QAction *cont = menu.addAction(QStringLiteral("Contour lines over satellite"));
+        cont->setToolTip(QStringLiteral("Elevation contours in feet, drawn from the free AWS Terrain Tiles (USGS 3DEP in the US)"));
+        cont->setCheckable(true); cont->setChecked(m_showContours);
+        connect(cont, &QAction::toggled, this, &BeaconView::setShowContours);
         menu.exec(globalPos);
         break;
     }
@@ -1733,6 +2378,14 @@ void BeaconView::contextMenuEvent(QContextMenuEvent *e)
         QDesktopServices::openUrl(QUrl(QStringLiteral("https://www.openstreetmap.org/?mlat=%1&mlon=%2#map=17/%1/%2").arg(lat).arg(lon))); });
     menu.addAction(QIcon::fromTheme(QStringLiteral("mark-location")), QStringLiteral("Centre here"), this, [this, lat, lon] { focusOn(lat, lon, m_zoom); });
     menu.addAction(QIcon::fromTheme(QStringLiteral("network-wireless")), QStringLiteral("Place an antenna here…"), this, [this, lat, lon] { placeAnchorAt(lat, lon); });
+    {   // docs/SIGHTINGS.md §8
+        QMenu *route = menu.addMenu(QIcon::fromTheme(QStringLiteral("routeplanning"), QIcon::fromTheme(QStringLiteral("go-jump"))), QStringLiteral("Route avoiding ALPRs"));
+        route->addAction(QStringLiteral("To here (from %1)").arg(m_haveRouteStart ? QStringLiteral("the chosen start") : QStringLiteral("my position")), this,
+                         [this, lat, lon] { routeAvoidingAlprs(lat, lon); });
+        route->addAction(QStringLiteral("Start from here"), this, [this, lat, lon] { setRouteStart(lat, lon); });
+        QAction *clr = route->addAction(QStringLiteral("Clear the route"), this, &BeaconView::clearAvoidRoute);
+        clr->setEnabled(!m_avoidRoute.isEmpty() || m_haveRouteStart);
+    }
     QAction *names = menu.addAction(QStringLiteral("Show Wi-Fi names"));
     names->setCheckable(true); names->setChecked(m_showNames);
     connect(names, &QAction::toggled, this, &BeaconView::setShowNames);
@@ -1747,6 +2400,16 @@ void BeaconView::contextMenuEvent(QContextMenuEvent *e)
     QAction *legend = menu.addAction(QStringLiteral("Show grade legend"));
     legend->setCheckable(true); legend->setChecked(m_showLegend);
     connect(legend, &QAction::toggled, this, &BeaconView::setShowLegend);
+    QAction *heat = menu.addAction(QStringLiteral("Show route heat map"));
+    heat->setCheckable(true); heat->setChecked(m_showHeatmap);
+    connect(heat, &QAction::toggled, this, &BeaconView::setShowHeatmap);
+    QAction *cams = menu.addAction(QStringLiteral("Show surveillance cameras"));
+    cams->setCheckable(true); cams->setChecked(m_showFlockCameras);
+    connect(cams, &QAction::toggled, this, &BeaconView::setShowFlockCameras);
+    QAction *apCirc = menu.addAction(QStringLiteral("Show beacon uncertainty circles"));
+    apCirc->setCheckable(true); apCirc->setChecked(m_showApCircles);
+    connect(apCirc, &QAction::toggled, this, &BeaconView::setShowApCircles);
+    menu.addAction(QIcon::fromTheme(QStringLiteral("view-refresh")), QStringLiteral("Refresh surveillance cameras"), this, [this] { m_loc->refreshFlockCameras(true); });
     QAction *replay = menu.addAction(QIcon::fromTheme(QStringLiteral("media-playback-start")), QStringLiteral("Replay last refit"));
     replay->setEnabled(m_haveRefit);
     connect(replay, &QAction::triggered, this, &BeaconView::replayLastRefit);
@@ -1756,7 +2419,12 @@ void BeaconView::contextMenuEvent(QContextMenuEvent *e)
         const std::pair<const char *, const char *> shares[] = {{"coords", "Copy coordinates"}, {"geo", "Copy geo: URI"}, {"text", "Copy place + link"},
                                                                 {"osm", "Copy OpenStreetMap link"}, {"google", "Copy Google Maps link"}, {"apple", "Copy Apple Maps link"}};
         for (const auto &sh : shares) { const QString what = QString::fromLatin1(sh.first); share->addAction(QString::fromLatin1(sh.second), this, [this, what] { m_loc->CopyToClipboard(what); }); }
-        menu.addAction(QIcon::fromTheme(QStringLiteral("document-save")), QStringLiteral("Save map around here for offline"), m_loc, &Locator::PrefetchTiles);
+        // OSM and Esri tiles may not be saved ahead (their tile policies); TileSource::prefetch() saves OpenTopoMap,
+        // which stands in for the chosen layer when it can't load
+        QAction *save = menu.addAction(QIcon::fromTheme(QStringLiteral("document-save")), QStringLiteral("Save map around here for offline (topographic)"), m_loc, &Locator::PrefetchTiles);
+        save->setToolTip(QStringLiteral("OpenStreetMap and Esri don't allow saving their tiles ahead of time. OpenTopoMap tiles are saved instead "
+                                        "and shown when the chosen map can't load; areas you have viewed stay cached in any style."));
+        menu.setToolTipsVisible(true);
     }
     menu.exec(e->globalPos());
 }
@@ -1765,6 +2433,26 @@ void BeaconView::showItemMenu(const Hit &h, const QPoint &globalPos)
 {
     QMenu menu(this);
     const Fix &fix = m_loc->fix();
+    if (h.kind == HitCamera) {
+        const int idx = h.items.first();
+        if (idx < 0 || idx >= m_flockCameras.size()) return;
+        const FlockCamera c = m_flockCameras[idx];
+        const QString coords = QStringLiteral("%1, %2").arg(c.lat, 0, 'f', 6).arg(c.lon, 0, 'f', 6);
+        menu.addSection(c.model.isEmpty() ? QStringLiteral("Flock Camera") : c.model);
+        menu.addAction(QIcon::fromTheme(QStringLiteral("edit-copy")), QStringLiteral("Copy %1").arg(coords), this, [coords] { QApplication::clipboard()->setText(coords); });
+        if (c.source == QLatin1String("osm") && c.id.startsWith(QLatin1String("osm:"))) {
+            const QString osmPath = c.id.mid(4);
+            menu.addAction(QIcon::fromTheme(QStringLiteral("internet-web-browser")), QStringLiteral("View on OpenStreetMap"), this, [osmPath] {
+                QDesktopServices::openUrl(QUrl(QStringLiteral("https://www.openstreetmap.org/%1").arg(osmPath)));
+            });
+        }
+        if (!c.bssid.isEmpty())
+            menu.addAction(QIcon::fromTheme(QStringLiteral("edit-copy")), QStringLiteral("Copy BSSID %1").arg(c.bssid), this, [c] { QApplication::clipboard()->setText(c.bssid); });
+        if (!c.bleMac.isEmpty())
+            menu.addAction(QIcon::fromTheme(QStringLiteral("edit-copy")), QStringLiteral("Copy BLE MAC %1").arg(c.bleMac), this, [c] { QApplication::clipboard()->setText(c.bleMac); });
+        menu.exec(globalPos);
+        return;
+    }
     if (h.kind == HitAnchor) {
         const int idx = h.items.first();
         const QList<BfAnchor> all = m_loc->anchors();
@@ -1821,6 +2509,7 @@ void BeaconView::showItemMenu(const Hit &h, const QPoint &globalPos)
         return;
     }
     menu.exec(globalPos);
+    m_apEstAt.invalidate();                                    // home / travelling / ignored may have changed
 }
 
 // ── Anchors + measured ranges (docs/RANGING.md) ──────────────────────────────
@@ -1928,4 +2617,137 @@ void BeaconView::placeAnchorAt(double lat, double lon)
     m_loc->setAnchor(d.anchor(), QStringLiteral("desktop"), &ok, &err);
     if (!ok) QMessageBox::warning(this, QStringLiteral("Anchor"), err);
     update();
+}
+
+// ── the ALPR-avoiding route (docs/SIGHTINGS.md §8) ─────────────────────────────────
+void BeaconView::setRouteStart(double lat, double lon)
+{
+    m_haveRouteStart = true; m_routeStartLat = lat; m_routeStartLon = lon;
+    update();
+}
+
+void BeaconView::clearAvoidRoute()
+{
+    m_haveRouteStart = false;
+    m_avoidRoute.clear(); m_avoidPassed.clear();
+    if (m_routeDialog) m_routeDialog->close();
+    update();
+}
+
+void BeaconView::routeAvoidingAlprs(double toLat, double toLon)
+{
+    PlateWatch *pw = m_loc->plateWatch();
+    RoutePlanner *rp = pw ? pw->routePlanner() : nullptr;
+    if (!rp) return;
+    if (!rp->status().value(QLatin1String("ready")).toBool()) {
+        QMessageBox::information(this, QStringLiteral("Route avoiding ALPRs"),
+            QStringLiteral("Routing around ALPR cameras needs your own free API key from OpenRouteService (openrouteservice.org/dev) or "
+                           "GraphHopper (graphhopper.com).\n\nSet one in Settings → Routing (avoid ALPRs). Without a key nothing is sent anywhere."));
+        return;
+    }
+    AvoidRoute::LatLon from;
+    if (m_haveRouteStart) from = {m_routeStartLat, m_routeStartLon};
+    else if (m_loc->fix().valid) from = {m_loc->fix().lat, m_loc->fix().lon};
+    else { QMessageBox::information(this, QStringLiteral("Route avoiding ALPRs"), QStringLiteral("No position yet: right-click → Route avoiding ALPRs → Start from here first.")); return; }
+    if (m_routing) return;
+    m_routing = true;
+    update();
+    QPointer<BeaconView> self(this);
+    rp->route(from, {toLat, toLon}, QString(), [self](int code, const QJsonObject &o) {
+        if (!self) return;
+        self->m_routing = false;
+        if (code != 200) {
+            QMessageBox::warning(self, QStringLiteral("Route avoiding ALPRs"), o.value(QLatin1String("error")).toString(QStringLiteral("No route (HTTP %1)").arg(code)));
+            self->update();
+            return;
+        }
+        self->m_avoidRoute.clear(); self->m_avoidPassed.clear();
+        for (const QJsonValue &v : o.value(QLatin1String("route")).toObject().value(QLatin1String("coordinates")).toArray()) {
+            const QJsonArray c = v.toArray();
+            if (c.size() >= 2) self->m_avoidRoute << merc(c[1].toDouble(), c[0].toDouble());
+        }
+        for (const QJsonValue &v : o.value(QLatin1String("passes")).toArray())
+            if (v.toObject().value(QLatin1String("inCone")).toBool()) self->m_avoidPassed << merc(v.toObject().value(QLatin1String("lat")).toDouble(), v.toObject().value(QLatin1String("lon")).toDouble());
+        self->update();
+        self->showRouteResult(o);
+    });
+}
+
+void BeaconView::drawAvoidRoute(QPainter &p)
+{
+    if (m_avoidRoute.size() < 2 && !m_haveRouteStart && !m_routing) return;
+    p.save();
+    p.setRenderHint(QPainter::Antialiasing);
+    if (m_avoidRoute.size() >= 2) {
+        QPolygonF line;
+        for (const QPointF &m : std::as_const(m_avoidRoute)) line << toScreen(m);
+        p.setBrush(Qt::NoBrush);
+        p.setPen(QPen(QColor(20, 20, 30, 200), 7, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+        p.drawPolyline(line);
+        p.setPen(QPen(QColor(230, 60, 230), 4, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+        p.drawPolyline(line);
+        p.setPen(QPen(QColor(255, 60, 60), 3));
+        for (const QPointF &m : std::as_const(m_avoidPassed)) p.drawEllipse(toScreen(m), 11, 11);   // ALPRs it still passes
+        p.setPen(QPen(Qt::white, 2)); p.setBrush(QColor(230, 60, 230));
+        p.drawEllipse(line.last(), 6, 6);
+    }
+    if (m_haveRouteStart) { p.setPen(QPen(Qt::white, 2)); p.setBrush(QColor(40, 200, 90)); p.drawEllipse(toScreen(m_routeStartLat, m_routeStartLon), 6, 6); }
+    if (m_routing) {
+        p.setPen(C_TEXT);
+        p.drawText(QRectF(0, height() - 60, width(), 24), Qt::AlignCenter, QStringLiteral("Routing around ALPR cameras…"));
+    }
+    p.restore();
+}
+
+void BeaconView::showRouteResult(const QJsonObject &o)
+{
+    if (m_routeDialog) m_routeDialog->close();
+    auto *d = new QDialog(this);
+    d->setAttribute(Qt::WA_DeleteOnClose);
+    d->setWindowTitle(QStringLiteral("Route avoiding ALPRs"));
+    d->resize(620, 380);
+    auto *v = new QVBoxLayout(d);
+    const QJsonObject av = o.value(QLatin1String("avoided")).toObject();
+    const QJsonArray passes = o.value(QLatin1String("passes")).toArray();
+    const int inCone = o.value(QLatin1String("passesInCone")).toInt();
+    QString head = QStringLiteral("<b>%1 km, %2 min</b> via %3. Avoided %4 camera(s) (%5 polygons) in the corridor")
+                       .arg(o.value(QLatin1String("distanceM")).toDouble() / 1000.0, 0, 'f', 1).arg(qRound(o.value(QLatin1String("durationS")).toDouble() / 60.0))
+                       .arg(o.value(QLatin1String("providerName")).toString()).arg(av.value(QLatin1String("cameras")).toInt()).arg(av.value(QLatin1String("areas")).toInt());
+    if (av.value(QLatin1String("capped")).toInt() > 0) head += QStringLiteral("; %1 more left out (the provider's polygon limits)").arg(av.value(QLatin1String("capped")).toInt());
+    head += QStringLiteral(".<br>");
+    head += inCone == 0 ? QStringLiteral("The route passes no known ALPR's field of view.")
+                        : QStringLiteral("<span style='color:#d33'>It still passes %1 ALPR(s)</span> — there was no way around them.").arg(inCone);
+    head += QStringLiteral("<br><small>%1</small>").arg(o.value(QLatin1String("attribution")).toString().toHtmlEscaped());
+    auto *l = new QLabel(head); l->setWordWrap(true); l->setTextFormat(Qt::RichText);
+    v->addWidget(l);
+    auto *t = new QTableWidget(int(passes.size()), 4);
+    t->setHorizontalHeaderLabels({QStringLiteral("Camera"), QStringLiteral("Operator"), QStringLiteral("Off the route"), QStringLiteral("")});
+    t->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    t->setSelectionBehavior(QAbstractItemView::SelectRows);
+    t->verticalHeader()->setVisible(false);
+    t->horizontalHeader()->setStretchLastSection(true);
+    for (int i = 0; i < int(passes.size()); ++i) {
+        const QJsonObject c = passes[i].toObject();
+        const QStringList cells{c.value(QLatin1String("id")).toString(), QStringList{c.value(QLatin1String("operator")).toString(), c.value(QLatin1String("model")).toString()}.join(QLatin1Char(' ')).simplified(),
+                                QStringLiteral("%1 m").arg(qRound(c.value(QLatin1String("distanceM")).toDouble())),
+                                c.value(QLatin1String("inCone")).toBool() ? QStringLiteral("passes through its field of view") : QStringLiteral("near, not facing the route")};
+        for (int k = 0; k < 4; ++k) {
+            auto *it = new QTableWidgetItem(cells[k]);
+            if (k == 0) it->setData(Qt::UserRole, QPointF(c.value(QLatin1String("lat")).toDouble(), c.value(QLatin1String("lon")).toDouble()));
+            t->setItem(i, k, it);
+        }
+    }
+    t->resizeColumnsToContents();
+    connect(t, &QTableWidget::cellDoubleClicked, this, [this, t](int row, int) {
+        const QPointF ll = t->item(row, 0)->data(Qt::UserRole).toPointF();
+        focusOn(ll.x(), ll.y(), 18);
+    });
+    v->addWidget(t, 1);
+    auto *bb = new QDialogButtonBox(QDialogButtonBox::Close);
+    QPushButton *clr = bb->addButton(QStringLiteral("Clear the route"), QDialogButtonBox::ResetRole);
+    connect(clr, &QPushButton::clicked, this, &BeaconView::clearAvoidRoute);
+    connect(bb, &QDialogButtonBox::rejected, d, &QDialog::close);
+    v->addWidget(bb);
+    m_routeDialog = d;
+    d->show();
 }

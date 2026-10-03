@@ -2,6 +2,7 @@
 #include <QMainWindow>
 #include <QJsonObject>
 #include <QHash>
+#include <QPointer>
 
 class Locator;
 class BeaconView;
@@ -40,15 +41,15 @@ private:
 public:
     void showIdentity();
     void showEmergency();
-    void showPairRequest(const QString &id);   // the pairing dialog for one pending request (raised if already open)
+    void showPlateEvent(const QString &uid);   // a notification's Details ("" = the Sightings tab)
+    void showLink();                          // the "Link a device" dialog (QR + mDNS requests), raised if open
     void importHistoryDialog();               // Settings → Map database → Import…
 private:
 
     Locator *m_loc;
     TileSource *m_tiles = nullptr;
     BeaconView *m_map;
-    QHash<QString, class PairDialog *> m_pairDialogs;
-    class QComboBox *m_pairPolicy = nullptr;
+    QPointer<class LinkDialog> m_linkDialog;
     QLabel *m_place, *m_coords, *m_meta, *m_status, *m_chip;
     QPushButton *m_refresh;
     QTableWidget *m_aps, *m_history, *m_pois;
@@ -64,7 +65,7 @@ private:
     QTableWidget *m_stops;
     class QListWidget *m_achList;
     // Devices (LAN API)
-    QCheckBox *m_apiEnabled; QSpinBox *m_apiPort; QLabel *m_apiStatus, *m_pairLabel; QPushButton *m_pairBtn;
+    QCheckBox *m_apiEnabled; QSpinBox *m_apiPort; QLabel *m_apiStatus; QPushButton *m_linkBtn;
     QTableWidget *m_pendingTable, *m_devTable, *m_knownTable; QPlainTextEdit *m_accessLog; class QTimer *m_devTimer; QCheckBox *m_knownOnly;
     QTableWidget *m_linkTable = nullptr;
     // System (OS integration)
@@ -75,4 +76,5 @@ private:
     void refreshPeers();
     void linkWithPeer(const QJsonObject &peer);
     QLabel *m_emergency = nullptr;
+    class SightingsView *m_sightings = nullptr;
 };

@@ -26,11 +26,15 @@ ambiguous), regions as quiet discs of radius R95, mobile APs as an "M".
 ## 1. The model and the fit
 
 ### 1.1 Signal model
-Samples taken within a few metres of each other are one **place** (cluster, radius
-`max(15 m, median fix accuracy)`); a place's level is the median of its samples.
+Samples taken within a few metres of each other are one **place**: a sample joins the first
+place whose seed is within `max(5 m, 1.5 × the better fix accuracy of the two)`; a place's level
+is the median of its samples. Two precise vantage points (a smoothed walk, 4–8 m) a few metres
+apart stay apart, so a walk around a building keeps its geometry; poor fixes (a phone indoors,
+20–40 m) still merge, since their separation is noise. (Until estimator 3 one radius,
+`max(15 m, median accuracy)`, collapsed a 60–120 m walk around a building to 6–8 places.)
 
 ```
-y_k = P0 + g_dev − 10·n·log10(d_k),   d_k = √(|p − q_k|² + h²)
+y_k = P0 + g_dev + δ_dev − 10·n·log10(d_k),   d_k = √(|p − q_k|² + h²)
 ```
 
 * `P0` level at 1 m, Gaussian prior per band (2.4 GHz −40 ± 8 dBm; 5 GHz −47; 6 GHz −48:
@@ -39,6 +43,16 @@ y_k = P0 + g_dev − 10·n·log10(d_k),   d_k = √(|p − q_k|² + h²)
   environment calibration (docs/RANGING.md §4.3.3) replaces the mean when it exists.
 * `h` = 3 m, the AP's height above the observer: no 1/d² blow-up for a sample under the AP.
 * `g_dev` the hearing device's level offset (§3.3); this host is 0.
+* `δ_dev` that device's deviation for *this* AP (estimator 4): antennas, a body in the way, or simply
+  where the device sits make one device hear one AP very differently from its average offset —
+  measured: the Steam Deck hears the RV's hidden AP 7 dB quieter than its calibration, and the RV's
+  UniFi ~30 dB louder than the phone at the "same" GPS spot (it sits next to it). The device with the
+  most places is the reference (`δ = 0`, it carries `P0`); the next four by places (ties: name order)
+  each get `δ ~ N(0, 10²) dB`, integrated out on the grid (§1.3) and fitted by LM (§1.4); any further
+  device stays at its calibrated offset. A second device therefore informs through how its levels
+  *vary* between its places, not through their absolute level, and **places never mix devices**.
+  (Until estimator 3 `g_dev` was taken as exact and devices were pooled into one place's median: the
+  Deck's 11 readings of the hidden AP dragged it 12 m — 16.9 m → 8.9 m with δ.)
 * `ε_k` shadowing, σ0 = 6 dB ([typical 4–8 dB](https://ieeexplore.ieee.org/document/8409563)).
 
 ### 1.2 Per-place variance, including the observer's own error (errors-in-variables)
@@ -70,27 +84,85 @@ grid is recomputed with each place weighted as the robust fit weighted it.
 ### 1.4 Robust Levenberg–Marquardt
 From every grid maximum, the signal-weighted, plain and loudest-quarter centroids, and the
 **mirror** of the best seed across the places' principal axis (the classic drive-by
-ambiguity), Levenberg–Marquardt on `(x, y, P0, n)` with the priors as pseudo-observations.
+ambiguity), Levenberg–Marquardt on `(x, y, P0, n, δ…)` with the priors as pseudo-observations.
 The loss is the negative log-likelihood of a **Gaussian + uniform outlier mixture**
 (10 % outliers over 80 dB): the IRLS weights are the EM responsibilities, a gross outlier
 costs a constant. First at the nominal scale, then at the pooled robust scale
 `τ² = (4 + K·MAD²)/(4 + K)` (MAD of the standardised residuals, four pseudo-observations of 1).
-The lowest cost wins. ([Student-t / mixture losses](https://www.emergentmind.com/topics/student-s-t-distribution-induced-loss-function),
+The lowest cost wins. Then the **mirror of that solution** is fitted too (estimator 4): from places
+along a line the AP and its reflection explain the levels equally, and no seed need have started on the
+other side — before, half the drive-by fits sat on the mirror and only half of those were flagged. ([Student-t / mixture losses](https://www.emergentmind.com/topics/student-s-t-distribution-induced-loss-function),
 [LOS/NLOS mixtures](https://jwcn-eurasipjournals.springeropen.com/articles/10.1186/s13638-018-1335-7))
 
 ### 1.5 Covariance
-In order, each step only ever widens:
-1. Laplace: `(JᵀWJ + prior)⁻¹` at `τ_eff = max(1, τ)` (never narrower than σ0 allows).
-2. × **design effect** of spatially correlated shadowing, `K / N_eff`, `N_eff = 1ᵀR⁻¹1`,
-   `R_ij = exp(−|q_i − q_j| / 30 m)` ([Gudmundson](https://www.researchgate.net/publication/3376340_Correlation_model_for_shadow_fading_in_mobile_radio_channels)).
-3. + **correlated fix error**: `(median acc/1.515)² / sessions` on both axes (GNSS error is
-   shared within a trip; a session is one device on one day).
-4. ⊕ the **Cramér–Rao bound** with the nominal σ0 (§2.1).
+1. **Noise scale** `τ² = σ²/σ0²`: the posterior mean under a scaled-inverse-χ² prior of
+   `ν0 = 6` pseudo-dof, centred so that `E[σ²] = σ0²` without data, updated by the robust-weighted
+   residual sum of squares `SS = Σ W_k u_k z_k²` (`z_k = r_k/σ_k`, `u_k` the EM weight) over the
+   *effectively independent places*:
+   `τ² = (ν0 − 2 + SS·N_eff/K) / (ν0 − 2 + ν_d)`, `ν_d = (K_in − p_eff)·N_eff/K`,
+   `K_in = Σ W_k u_k`, `p_eff` the trace of the hat matrix (the P0/n priors count fractionally),
+   `N_eff = 1ᵀR⁻¹1` with `R_ij = exp(−|q_i − q_j| / 8 m)` ([Gudmundson](https://www.researchgate.net/publication/3376340_Correlation_model_for_shadow_fading_in_mobile_radio_channels)).
+   Samples never count as degrees of freedom, places only as far as they decorrelate: many
+   well-fitting places shrink σ, a handful (or one tight cluster) leave it near σ0, a poor fit
+   widens it. (Until estimator 3: `max(1, τ²)`, so a good fit could never shrink below σ0.)
+2. **Sandwich** Laplace at that scale: `A⁻¹ B A⁻¹`, `A = JᵀΨJ + prior` (the fit weighs places as
+   independent), `B = A + Σ_{k≠l} ψ_k ψ_l τ²σ0²ρ_in R_kl J_k J_lᵀ` (their shared shadowing). This
+   replaces the scalar design effect `K/N_eff` — the variance inflation of a *mean* — which
+   double-counted: the common part of correlated shadowing falls into P0 and does not move the
+   position; what moves it is the contrast between places, which the sandwich weighs correctly.
+3. **Local posterior R95**: RSS ranging is log-normal — towards the places the likelihood is steep,
+   away from them flat — so the curvature at the optimum understates the far side. The marginal
+   likelihood of §1.3 (P0, n integrated) at the fitted scale, tempered by the sandwich/Laplace
+   variance ratio for the correlation, is evaluated on a 41 × 41 grid over ±4 σ of the major axis;
+   when the radius about the estimate holding 95 % of it exceeds the ellipse's R95, the ellipse is
+   scaled up (shape kept). Beyond ±4 σ lies the far-field degeneracy (P0 and n trade against
+   distance), left to the coarse grid, the region test and `ambiguous`.
+4. + **correlated fix error**: `(median acc/1.515)² / sessions` on both axes (GNSS error is
+   shared within a trip; a session is one device on one day). The per-place errors-in-variables
+   term (§1.2) counts the same variance as independent between places; both are kept on purpose:
+   the split between common (a smoothed track: mostly the bias) and independent (raw fixes) is not
+   known per sample, and either term alone under-covers the other kind of track.
 5. ⊕ the **leave-one-place-out jackknife** `(K−1)/K Σ(p₋ₖ − p̄)(p₋ₖ − p̄)ᵀ` (4 ≤ K ≤ 60).
 6. ⊕ a **cluster bootstrap** (24 replicates, K ≥ 6, deterministic xorshift64*).
 7. × **κ²**, the anchor calibration (§2.3).
 
-`⊕` keeps, along each principal axis of the current matrix, the larger variance of the two.
+`⊕` keeps, along each principal axis of the current matrix, the larger variance of the two. The
+jackknife and bootstrap are empirical floors (a maximum, not a sum: no double counting). The
+Cramér–Rao bound at σ0 is no longer a floor (at the fitted scale it is the Laplace without the
+robust down-weights, never wider than step 2); it remains the geometry figure `crlbR95` (§2.1).
+
+**Where the constants come from** (the user's data, 2026-10-01, and a synthetic study):
+* `d_c = 8 m` (was 30 m): residuals of 15 APs' fits, averaged in 3 m cells of the phone's
+  smoothed track, correlate 0.27 at 4.5 m, 0.06 at 7.5 m and ≤ 0 beyond (the fit absorbs part of
+  the long-range structure, so the true distance is somewhat longer than the 3.5 m this implies).
+  A too long `d_c` is not conservative here: it claims neighbouring contrasts are cleaner than
+  they are.
+* `ρ_in = 0.6` kept: the same cells split the variance 5.2 dB between / 8.6 dB within (ρ ≈ 0.3),
+  but the within-cell part includes the observer's body and orientation, which a single pass
+  shares; 0.6 does not let a long dwell at one spot count as many independent looks.
+* Synthetic study (300 trials per scenario: a building 12–30 × 8–20 m, the AP inside; a loop
+  3–12 m out at 1.2 m/s, a scan every 3 s; P0 −38 ± 4, n 2–3, correlated shadowing 4–7 dB with
+  `d_c` 4–15 m, fading 4–9 dB, a wall 3–12 dB lossier on each side with p ½, a smoothed-GPS
+  Gauss–Markov bias 1.5–4 m with τ 20 min, its accuracy misreported × 0.8–1.25):
+
+  | scenario | median error (m) 2 → 3 | median R95 (m) 2 → 3 | R95 coverage 2 → 3 | mean NEES 2 → 3 |
+  |---|---|---|---|---|
+  | one loop | 12.2 → 10.5 | 34.3 → 23.1 | 1.00 → 0.95 | 1.04 → 1.74 |
+  | two loops | 12.5 → 9.3 | 38.4 → 20.0 | 1.00 → 0.95 | 0.92 → 1.79 |
+  | loop + 60–120 m up a hill | 19.7 → 15.5 | 47.8 → 27.6 | 1.00 → 0.96 | 1.38 → 2.31 |
+  | loop + hours indoors (fixes 15–30 m) | 16.8 → 10.0 | 70.0 → 46.1 | 1.00 → 1.00 | 0.42 → 0.39 |
+  | a 40–80 m street loop | 12.6 → 12.5 | 45.3 → 27.1 | 0.97 → 0.92 | 1.06 → 2.18 |
+
+  Coverage near the nominal 95 % and NEES near 2 (it was over-conservative: R95 three times the
+  median error). The error itself is limited by the physics: with 4–7 dB of correlated shadowing
+  and lossy walls, 15–35 % of loops still put the AP outside the walked loop (the P0/n/distance
+  trade-off), and the median stays near 10 m — building-level, not metre-level.
+
+**Mirror mixture** (estimator 4): when an alternative solution outside the places' hull costs less than
+2 nats more than the best (§1.4), either may be the AP. The covariance about the reported one becomes the
+mixture's second moment `C + p·d·dᵀ`, `d` the vector to the alternative, `p = 1/(1 + e^Δcost)` its
+probability — also when the ghost lies within 2σ (within 2σ is not within R95; only the ghost marker needs
+> 2σ). Monte Carlo, places along a road 30 m from the AP: R95 coverage 70 % → 96 %, NEES 1.81 → 0.91.
 
 ### 1.6 Ellipse, CEP, R95
 Eigen-decomposition → the 1-σ ellipse (`semiMajor`, `semiMinor`, `orient` = bearing of the
@@ -131,12 +203,12 @@ heard nothing. ([censored detectors](https://arxiv.org/pdf/1505.04512))
 | `r95`, `cep50`, `pWithin25` | §1.6 | precision |
 | `cxx cxy cyy` | §1.5 (m², x east, y north) | the full uncertainty |
 | `rssDop` | `√tr(M⁻¹)`, `M = Σ W_k (v_k − v̄)(v_k − v̄)ᵀ`, `v_k = (p − q_k)/d_k²` | geometry-only dilution of precision (m) |
-| `crlbR95` | R95 of the CRLB with σ0 | the best this geometry allows |
+| `crlbR95` | R95 of the CRLB with σ0 | the best this geometry allows at the nominal noise (the fix test) |
 | `rbar` | `|Σ W_k e^{iθ_k}| / Σ W_k`, θ the bearing AP → place | 0 surrounded, 1 all on one side |
 | `maxGapDeg` | largest gap between those bearings | > 180° = extrapolated |
 | `inHull` | estimate inside the convex hull of the places | extrapolation |
 | `linRatio` | μ2/μ1 of the places' weighted scatter | 0 = a straight road |
-| `ambiguous`, `altLat/altLon` | an alternative outside the hull with Δcost < 2 and > 2σ away | mirror ambiguity |
+| `ambiguous`, `altLat/altLon` | an alternative outside the hull with Δcost < 2 and > 2σ away (the ellipse already includes it, §1.5) | mirror ambiguity |
 | `modes` | §1.3 | multimodality |
 | `chi2nu` | `Σ W r²/σ² / (K_in − 2)` over inliers | goodness of fit |
 | `sigmaDb` | `τ·σ0` | robust residual scale |
@@ -162,8 +234,9 @@ With P0 unknown the position information is (Schur complement)
 informs, so places all on one side or on one line give almost nothing
 ([Patwari et al.](https://www.researchgate.net/publication/4187109_Cramer-Rao_Bound_Analysis_of_Quantized_RSSI_Based_Localization_in_Wireless_Sensor_Networks),
 [unknown transmit power](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC5038730/)). Four places
-surrounding an AP at 50 m: RSS-DOP 50 m, σ/b ≈ 0.58, DRMS ≥ 29 m. The CRLB used as a floor
-(§1.5) is the full 4-parameter bound with the priors.
+surrounding an AP at 50 m: RSS-DOP 50 m, σ/b ≈ 0.58, DRMS ≥ 29 m. `crlbR95` is the full
+4-parameter bound with the priors at the nominal σ0: a geometry figure for the fix test (§1.8),
+not a floor — a fit whose places agree better than σ0 may claim less (§1.5).
 
 ### 2.2 Score
 Components in [0, 1]:

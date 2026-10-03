@@ -95,9 +95,24 @@ class MapLayerTest {
     }
 
     @Test fun stylesNormalise() {
-        assertEquals(TileStyles.STREETS, TileStyles.normalize(null))
-        assertEquals(TileStyles.STREETS, TileStyles.normalize("sat"))
+        assertEquals(TileStyles.SATELLITE, TileStyles.normalize(null))   // the hybrid is the default
+        assertEquals(TileStyles.SATELLITE, TileStyles.normalize("sat"))
         assertEquals(TileStyles.SATELLITE, TileStyles.normalize("satellite"))
-        assertEquals(listOf("streets", "dark", "topo", "satellite"), TileStyles.KEYS)
+        assertEquals(listOf("streets", "dark", "topo", "satellite", "satellite_clarity", "satellite_usgs", "satellite_viirs"), TileStyles.KEYS)
+        assertTrue(TileStyles.KEYS.drop(3).all { TileStyles.isSatellite(it) && TileStyles.isDark(it) } && !TileStyles.isSatellite("topo"))
+        assertEquals(16, TileStyles.source("satellite_usgs").maximumZoomLevel)
+        assertEquals(9, TileStyles.source("satellite_viirs").maximumZoomLevel)
+    }
+
+    @Test fun creditsWrapInsteadOfRunningOffScreen() {
+        val w: (String) -> Float = { it.length.toFloat() }          // one unit per character
+        val esri = "Powered by Esri · Source: Esri, Maxar, Earthstar Geographics, and the GIS User Community"
+        assertEquals(listOf(esri), TileStyles.wrapCredits(listOf(esri), 200f, w))
+        assertEquals(listOf("Powered by Esri", "Source: Esri, Maxar, Earthstar Geographics, and the GIS User Community", TileStyles.ROUTING_CREDIT),
+            TileStyles.wrapCredits(listOf(esri, TileStyles.ROUTING_CREDIT), 75f, w))
+        assertEquals(listOf("© OpenStreetMap contributors · Routes: OSRM"), TileStyles.wrapCredits(listOf("© OpenStreetMap contributors", TileStyles.ROUTING_CREDIT), 75f, w))
+        assertEquals(emptyList<String>(), TileStyles.wrapCredits(listOf(""), 75f, w))
+        assertTrue(TileStyles.isDark("satellite") && TileStyles.isDark("dark") && !TileStyles.isDark("topo") && !TileStyles.isDark("streets"))
+        assertTrue(TileStyles.isDark(null))                          // unset = the satellite hybrid (the default)
     }
 }

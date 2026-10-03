@@ -31,7 +31,7 @@ import javax.inject.Singleton
 data class SyncReport(val desktop: String, val ok: Boolean, val pushed: Int = 0, val pulledAps: Int = 0, val pulledObs: Int = 0, val pulledFixes: Int = 0, val refit: Int = 0, val message: String = "")
 
 /**
- * Two-way sync with every paired desktop.
+ * Two-way sync with the hub when enrolled ([HubSync]), else with every paired desktop.
  * Push: our unsynced observations, in body-size-limited batches (the desktop caps request bodies at 4 KB).
  * Pull: the desktop's beacons (positions, security, home flags), its location/track, its places, and — with the
  * control scope — the full database export (or, when the desktop advertises the "sync" feature, incremental changes).
@@ -49,8 +49,25 @@ class SyncRepository @Inject constructor(
     private val widgets: org.sworrl.beaconfix.widget.WidgetUpdater,
     private val anchors: org.sworrl.beaconfix.anchors.AnchorRepository,
     private val cache: DesktopCache,
+    private val hubSync: HubSync,
+    private val plateEvents: org.sworrl.beaconfix.sightings.PlateEventRepository,
 ) {
+    /**
+     * The hub (when this phone is enrolled with one) is the sync target: it holds the master database, and every
+     * desktop syncs with it too. Without a hub, every paired LAN desktop is synced as before.
+     */
     suspend fun syncAll(): List<SyncReport> {
+        if (hubSync.enrolled()) {
+            val r = hubSync.sync()
+            runCatching { db.fixes().dedupeDesktop() }
+            // plate-event records went with the hub sync; their images go to a LAN desktop (a node) only, so any
+            // reachable desktop still gets the records and the frames (docs/SIGHTINGS.md §5)
+            runCatching { plateEvents.syncAll() }
+            prefs.setLastSync("hub: " + if (r.ok) r.message else "failed — ${r.message}")
+            widgets.note(if (r.ok) "sync hub: pushed ${r.pushed}, pulled ${r.pulledAps}" else "sync hub failed: ${r.message.take(60)}")
+            widgets.touch("sync")
+            return listOf(r)
+        }
         val paired = desktops.paired()
         if (org.sworrl.beaconfix.data.DevFlags.desktopBlocked()) return paired.map { SyncReport(it.name, false, message = "offline (simulated)") }
         val out = ArrayList<SyncReport>()
@@ -79,11 +96,15 @@ class SyncRepository @Inject constructor(
             val features = hello.body()?.features ?: emptyList()
             // The scopes stored at pairing go stale: `beaconfix --grant-control` upgrades a token on the desktop. Ask it
             // what this token may do now (desktops with the "whoami" feature), so push, backup send and prefetch light up.
+            var meName = ""
             if ("whoami" in features) runCatching { Mirror.bodyOf { api.me(auth) } }.getOrNull()?.let { me ->
+                meName = me.name
                 val sc = Mirror.scopesText(me.scopes)
                 if (sc.isNotEmpty() && sc != d.scopes) { d = d.copy(scopes = sc); desktops.upsert(d) }
             }
             val canControl = desktops.hasScope(d, "control")
+            // the estimator's calibration (κ, device offsets, environment) for this phone's fits; never fails the sync
+            fetchEstimatorCalibration(api, auth, meName)
 
             // ── push ────────────────────────────────────────────────────────
             if (canControl) {
@@ -92,7 +113,7 @@ class SyncRepository @Inject constructor(
                     if (batch.isEmpty()) break
                     val chunk = sizeLimited(batch)
                     val myId = identity.currentNow()?.id
-                    val body = ObservationsBody(chunk.map { ObservationDto(it.bssid, "", it.dbm, it.lat, it.lon, it.acc, iso(it.time), "android", myId) }, myId, identity.deviceName)
+                    val body = ObservationsBody(chunk.map { dtoOf(it, myId) }, myId, identity.deviceName)
                     val r = api.pushObservations(auth, body)
                     when (r.outcome()) {
                         ApiOutcome.Ok -> { db.observations().markSynced(chunk.map { it.id }); pushed += chunk.size }
@@ -101,36 +122,32 @@ class SyncRepository @Inject constructor(
                         else -> return fail(d, "push failed: ${(r.outcome() as? ApiOutcome.Failed)?.message ?: r.code()}")
                     }
                 }
+
+                // ── push fixes ──────────────────────────────────────────────────
+                runCatching { db.fixes().backfillFromObservations() }
+                var fixCursor = 0L
+                while (true) {
+                    val fixBatch = db.fixes().phoneFixesSince(fixCursor, 200)
+                    if (fixBatch.isEmpty()) break
+                    val myId = identity.currentNow()?.id
+                    val body = org.sworrl.beaconfix.data.api.FixesBody(
+                        fixes = fixBatch.map { org.sworrl.beaconfix.data.api.FixDto(it.lat, it.lon, it.acc, iso(it.time), it.source, it.provider, it.place) },
+                        device = identity.deviceName,
+                        identity = myId
+                    )
+                    val r = runCatching { api.pushFixes(auth, body) }.getOrNull()
+                    if (r != null && r.isSuccessful) {
+                        pulledFixes += fixBatch.size
+                    } else break
+                    fixCursor = fixBatch.last().time
+                    if (fixBatch.size < 200) break
+                }
             }
 
             // ── pull: beacons the desktop knows ──────────────────────────────
             val aps = api.aps(auth)
             when (aps.outcome()) {
-                ApiOutcome.Ok -> {
-                    val list = aps.body()?.aps ?: emptyList()
-                    val now = System.currentTimeMillis()
-                    for (a in list) {
-                        if (a.bssid.length != 17) continue
-                        val old = db.aps().get(a.bssid)
-                        val hasPos = a.lat != null && a.lon != null && a.kind != "ring" && a.kind != "none" && a.kind != "mobile"
-                        val theirAcc = a.r ?: 100.0
-                        val fit = Mirror.fitOfPosition(a)       // the desktop's fit, when it is what placed this position
-                        // compare like with like: R95 where both sides have one (graded fits), else the accuracy radius
-                        val theirR95 = fit?.r95 ?: theirAcc * 2.45
-                        val ourR95 = old?.r95 ?: (old?.acc ?: 1e9) * 2.45
-                        val takePos = hasPos && old?.posSource != "anchor" && (old?.lat == null || old.posSource != "observed" || ourR95 > theirR95)
-                        val base = (old ?: ApEntity(bssid = a.bssid, firstSeen = now)).copy(
-                            ssid = a.ssid.ifEmpty { old?.ssid ?: "" }, freq = if (a.freq > 0) a.freq else old?.freq ?: 0, band = a.band.ifEmpty { old?.band ?: "" }, ch = if (a.ch > 0) a.ch else old?.ch ?: 0,
-                            lastSeen = maxOf(old?.lastSeen ?: 0, now),
-                            lat = if (takePos) a.lat else old?.lat, lon = if (takePos) a.lon else old?.lon, acc = if (takePos) theirAcc else old?.acc,
-                            posSource = if (takePos) (if (a.kind == "wigle" || a.kind == "observed") "placed" else "desktop") else old?.posSource ?: "",
-                            home = a.home || (old?.home ?: false), travelling = a.status == "travelling" || (old?.travelling ?: false),
-                            security = a.security.ifEmpty { old?.security ?: "" }, rsnFlags = a.rsnFlags, wpaFlags = a.wpaFlags)
-                        // the desktop's fit becomes the row's grade along with its position (none sent: the old grade no longer applies)
-                        db.aps().upsert(if (takePos) Mirror.withDesktopFit(base, fit, now) else base)
-                        pulledAps++
-                    }
-                }
+                ApiOutcome.Ok -> pulledAps += mergeAps(aps.body()?.aps ?: emptyList())
                 ApiOutcome.Unauthorized -> { desktops.forgetToken(d.id); return fail(d, "token rejected — pair again") }
                 else -> {}
             }
@@ -198,6 +215,8 @@ class SyncRepository @Inject constructor(
                     }
                 }
             }
+            // ── plate events: push ours + upload frames (control), pull the feed, cache the plates and leaky list ──
+            runCatching { plateEvents.sync(d) }
             val touched = db.observations().touchedSince(0).take(400)   // refit what we have data for (bounded)
             val refit = estimates.refit(touched, force = true)
             runCatching { anchors.applyToAps() }
@@ -206,6 +225,39 @@ class SyncRepository @Inject constructor(
         } catch (e: Exception) {
             return fail(d, e.message ?: e.toString())
         }
+    }
+
+    /**
+     * Beacons from a desktop or the hub merged into ours; returns how many rows were written. A position (and the fit
+     * that placed it) is taken when ours is not an anchor and theirs is better (R95 against R95, else the accuracy
+     * radius). [heardNow]: the list is what the sender hears now (LAN `/aps`), so every row's lastSeen moves to now;
+     * the hub's change feed is not, so only new rows get now.
+     */
+    suspend fun mergeAps(list: List<org.sworrl.beaconfix.data.api.ApDto>, heardNow: Boolean = true): Int {
+        var n = 0
+        val now = System.currentTimeMillis()
+        for (a in list) {
+            if (a.bssid.length != 17) continue
+            val old = db.aps().get(a.bssid)
+            val hasPos = a.lat != null && a.lon != null && a.kind != "ring" && a.kind != "none" && a.kind != "mobile"
+            val theirAcc = a.r ?: 100.0
+            val fit = Mirror.fitOfPosition(a)       // the desktop's fit, when it is what placed this position
+            // compare like with like: R95 where both sides have one (graded fits), else the accuracy radius
+            val theirR95 = fit?.r95 ?: theirAcc * 2.45
+            val ourR95 = old?.r95 ?: (old?.acc ?: 1e9) * 2.45
+            val takePos = hasPos && old?.posSource != "anchor" && (old?.lat == null || old.posSource != "observed" || ourR95 > theirR95)
+            val base = (old ?: ApEntity(bssid = a.bssid, firstSeen = now)).copy(
+                ssid = a.ssid.ifEmpty { old?.ssid ?: "" }, freq = if (a.freq > 0) a.freq else old?.freq ?: 0, band = a.band.ifEmpty { old?.band ?: "" }, ch = if (a.ch > 0) a.ch else old?.ch ?: 0,
+                lastSeen = if (heardNow || old == null) maxOf(old?.lastSeen ?: 0, now) else old.lastSeen,
+                lat = if (takePos) a.lat else old?.lat, lon = if (takePos) a.lon else old?.lon, acc = if (takePos) theirAcc else old?.acc,
+                posSource = if (takePos) (if (a.kind == "wigle" || a.kind == "observed") "placed" else "desktop") else old?.posSource ?: "",
+                home = a.home || (old?.home ?: false), travelling = a.status == "travelling" || (old?.travelling ?: false),
+                security = a.security.ifEmpty { old?.security ?: "" }, rsnFlags = if (heardNow || a.rsnFlags != 0) a.rsnFlags else old?.rsnFlags ?: 0, wpaFlags = if (heardNow || a.wpaFlags != 0) a.wpaFlags else old?.wpaFlags ?: 0)
+            // the desktop's fit becomes the row's grade along with its position (none sent: the old grade no longer applies)
+            db.aps().upsert(if (takePos) Mirror.withDesktopFit(base, fit, now) else base)
+            n++
+        }
+        return n
     }
 
     /** Desktop rows → local observations, skipping duplicates; returns the number added. */
@@ -218,11 +270,29 @@ class SyncRepository @Inject constructor(
             val acc = o.num("acc") ?: 100.0; if (acc <= 0 || acc > 2000) continue
             val t = o.str("time")?.let { parseIso(it) } ?: continue
             if (db.observations().duplicates(bssid, t, lat, lon) > 0) continue
-            batch += ObservationEntity(bssid = bssid, time = t, lat = lat, lon = lon, acc = acc, dbm = o.int("dbm") ?: -80, source = o.str("fix_source") ?: o.str("source") ?: "desktop", synced = true, remote = true)
+            val rangeM = o.num("rangeM")?.takeIf { it > 0 && it.isFinite() }
+            batch += ObservationEntity(bssid = bssid, time = t, lat = lat, lon = lon, acc = acc, dbm = o.int("dbm") ?: -80, source = o.str("fix_source") ?: o.str("source") ?: "desktop", synced = true, remote = true,
+                rangeM = rangeM, rangeSd = if (rangeM != null) o.num("rangeSd")?.takeIf { it >= 0 && it.isFinite() } else null)
             if (batch.size >= 500) { n += db.observations().insertAll(batch).count { it > 0 }; batch.clear() }
         }
         if (batch.isNotEmpty()) n += db.observations().insertAll(batch).count { it > 0 }
         return n
+    }
+
+    /**
+     * `GET /api/v1/estimator` → Prefs (estimate.EstimatorCalibration), in this phone's frame: the desktop knows the phone by
+     * the device name it pushes observations under, else by its token's name ([meName], from /devices/me). A desktop
+     * without the endpoint, or any failure, keeps the calibration already cached.
+     */
+    private suspend fun fetchEstimatorCalibration(api: org.sworrl.beaconfix.data.api.BeaconFixApi, auth: String, meName: String) {
+        try {
+            val dto = Mirror.bodyOf { api.estimator(auth) } ?: return
+            val cal = org.sworrl.beaconfix.estimate.EstimatorCalibration.fromDesktop(dto, listOf(identity.deviceName, meName), System.currentTimeMillis())
+            prefs.setEstimatorCalibration(cal.encode())
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (_: Exception) {
+        }
     }
 
     private suspend fun fail(d: DesktopEntity, msg: String): SyncReport { desktops.upsert(d.copy(lastError = msg)); return SyncReport(d.name, false, message = msg) }
@@ -231,9 +301,12 @@ class SyncRepository @Inject constructor(
         /** The desktop refuses bodies over 4 KB: ~28 observations per request. */
         fun sizeLimited(rows: List<ObservationEntity>, limitBytes: Int = 3600): List<ObservationEntity> {
             var size = 30; val out = ArrayList<ObservationEntity>()
-            for (r in rows) { size += 120; if (size > limitBytes) break; out += r }
+            for (r in rows) { size += if (r.rangeM != null) 160 else 120; if (size > limitBytes) break; out += r }
             return out.ifEmpty { rows.take(1) }
         }
+        /** One observation as pushed: `rangeM` / `rangeSd` (m) only when the AP answered Wi-Fi RTT (null → omitted, explicitNulls = false). */
+        fun dtoOf(o: ObservationEntity, identity: String?): ObservationDto = ObservationDto(o.bssid, "", o.dbm, o.lat, o.lon, o.acc, iso(o.time), "android", identity,
+            rangeM = o.rangeM?.takeIf { it > 0 && it.isFinite() }, rangeSd = o.rangeSd?.takeIf { o.rangeM != null && o.rangeM > 0 && it >= 0 && it.isFinite() })
         private val fmt: DateTimeFormatter = DateTimeFormatter.ISO_LOCAL_DATE_TIME
         fun iso(ms: Long): String = LocalDateTime.ofInstant(Instant.ofEpochMilli(ms), ZoneId.systemDefault()).withNano(0).format(fmt)
         fun parseIso(s: String): Long = runCatching { LocalDateTime.parse(s.take(19), fmt).atZone(ZoneId.systemDefault()).toInstant().toEpochMilli() }.getOrElse { System.currentTimeMillis() }

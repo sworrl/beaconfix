@@ -1,0 +1,17 @@
+# What the MIT YOLO code and these scripts import (torch/torchvision are installed by setup.sh from the PyTorch index).
+# All permissive: MIT / BSD / Apache-2.0. Training-time tools only; nothing here ships in the app.
+einops==0.8.2
+hydra-core==1.3.7
+lightning==2.6.6
+torchmetrics==1.9.0
+loguru==0.7.3
+numpy==2.5.2
+Pillow==12.3.0
+pycocotools==2.0.11
+faster-coco-eval==1.8.0
+requests==2.34.2
+rich==15.0.0
+wandb==0.30.0
+onnx==1.23.1
+onnxruntime==1.30.0
+onnxscript==0.7.2

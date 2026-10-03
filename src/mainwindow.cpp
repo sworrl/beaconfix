@@ -5,13 +5,15 @@
 #include "beaconview.h"
 #include "apiserver.h"
 #include "mdns.h"
-#include "pairdialog.h"
-#include "pairing.h"
+#include "linkdialog.h"
+#include "linking.h"
 #include <QComboBox>
 #include "mapdb.h"
+#include "routeplanner.h"
 #include "fitjson.h"
 #include "identity.h"
 #include "osintegration.h"
+#include "appicon.h"
 #include <QProcess>
 #include <QEventLoop>
 #include <QNetworkReply>
@@ -54,6 +56,7 @@
 #include <QUrl>
 #include <QVBoxLayout>
 #include <cmath>
+#include "sightingsview.h"
 
 // Sorts by the number in Qt::UserRole rather than the display text
 struct NumericItem : QTableWidgetItem {
@@ -70,12 +73,12 @@ static QString sourceName(const Fix &f)
     return QStringLiteral("—");
 }
 
-static QPixmap qrPixmap(const QString &text, int scale = 5);   // qrencode → pixmap (defined with the identity tab)
+static QPixmap qrPixmap(const QString &text, int scale = 5) { return QPixmap::fromImage(LinkDialog::qrImage(text, scale * 80)); }   // qrcodegen, compiled in
 
 MainWindow::MainWindow(Locator *loc, TileSource *tiles, QWidget *parent) : QMainWindow(parent), m_loc(loc), m_tiles(tiles)
 {
     setWindowTitle(QStringLiteral("BeaconFix"));
-    setWindowIcon(QIcon::fromTheme(QStringLiteral("beaconfix"), QIcon::fromTheme(QStringLiteral("mark-location"))));
+    setWindowIcon(appIcon());
     resize(1100, 720);
 
     auto *central = new QWidget(this);
@@ -104,8 +107,7 @@ MainWindow::MainWindow(Locator *loc, TileSource *tiles, QWidget *parent) : QMain
     });
     auto *osm = new QPushButton(QIcon::fromTheme(QStringLiteral("internet-web-browser")), QStringLiteral("Open in OpenStreetMap"));
     connect(osm, &QPushButton::clicked, this, [this] {
-        const Fix &f = m_loc->fix();
-        if (f.valid) QDesktopServices::openUrl(QUrl(QStringLiteral("https://www.openstreetmap.org/?mlat=%1&mlon=%2#map=15/%1/%2").arg(f.lat).arg(f.lon)));
+        if (m_loc->fix().valid) QDesktopServices::openUrl(QUrl(m_loc->osmUrl()));   // fixed 6 decimals: arg(double) alone can give "1e-05"
     });
     auto *share = new QPushButton(QIcon::fromTheme(QStringLiteral("document-share")), QStringLiteral("Share ▾"));
     auto *shareMenu = new QMenu(share);
@@ -181,7 +183,7 @@ MainWindow::MainWindow(Locator *loc, TileSource *tiles, QWidget *parent) : QMain
         else if (ch == cpPhone) QApplication::clipboard()->setText(pt.phone);
         else if (ch == cpAddr) QApplication::clipboard()->setText(pt.address);
         else if (ch == web) QDesktopServices::openUrl(QUrl(pt.website));
-        else if (ch == dir && m_loc->fix().valid) QDesktopServices::openUrl(QUrl(QStringLiteral("https://www.openstreetmap.org/directions?engine=fossgis_osrm_car&route=%1,%2;%3,%4").arg(m_loc->fix().lat).arg(m_loc->fix().lon).arg(pt.lat).arg(pt.lon)));
+        else if (ch == dir && m_loc->fix().valid) QDesktopServices::openUrl(QUrl(QStringLiteral("https://www.openstreetmap.org/directions?engine=fossgis_osrm_car&route=%1,%2;%3,%4").arg(m_loc->fix().lat, 0, 'f', 6).arg(m_loc->fix().lon, 0, 'f', 6).arg(pt.lat, 0, 'f', 6).arg(pt.lon, 0, 'f', 6)));
         else if (ch == osm) QDesktopServices::openUrl(QUrl(QStringLiteral("https://www.openstreetmap.org/%1/%2").arg(pt.osmType).arg(pt.osmId)));
     });
     m_pois->setEditTriggers(QAbstractItemView::NoEditTriggers);
@@ -219,6 +221,14 @@ MainWindow::MainWindow(Locator *loc, TileSource *tiles, QWidget *parent) : QMain
     m_history->verticalHeader()->hide();
     tabs->addTab(buildTrip(), QIcon::fromTheme(QStringLiteral("flag")), QStringLiteral("Trip"));
     tabs->addTab(m_history, QIcon::fromTheme(QStringLiteral("view-history")), QStringLiteral("Trip log"));
+    // Plate events (docs/SIGHTINGS.md): ALPR / traffic-camera passes and plate searches
+    m_sightings = new SightingsView(m_loc);
+    tabs->addTab(m_sightings, QIcon::fromTheme(QStringLiteral("camera-web")), QStringLiteral("Sightings"));
+    connect(m_sightings, &SightingsView::showOnMap, this, [this](double lat, double lon) {
+        m_tabs->setCurrentWidget(m_map);
+        m_map->focusOn(lat, lon, 18);
+        show(); raise(); activateWindow();
+    });
 
     tabs->addTab(buildSettings(), QIcon::fromTheme(QStringLiteral("configure")), QStringLiteral("Settings"));
     if (m_loc->apiServer()) tabs->addTab(buildDevices(), QIcon::fromTheme(QStringLiteral("network-connect")), QStringLiteral("Devices"));
@@ -411,6 +421,28 @@ QWidget *MainWindow::buildSettings()
     m_wigle->setToolTip(QStringLiteral("With a WiGLE API token, beacons you hear are looked up one by one (1.5 s apart, cached) and drawn at their real mapped position as gold diamonds."));
     connect(m_wigle, &QLineEdit::editingFinished, this, [this] { m_loc->setWigleToken(m_wigle->text()); });
     form->addRow(QStringLiteral("WiGLE API token:"), m_wigle);
+    {   // docs/SIGHTINGS.md §8: routing around ALPR cameras needs the user's own free key from one of the providers
+        auto *prov = new QComboBox;
+        prov->addItem(QStringLiteral("OpenRouteService"), QStringLiteral("ors"));
+        prov->addItem(QStringLiteral("GraphHopper"), QStringLiteral("graphhopper"));
+        prov->setCurrentIndex(RoutePlanner::defaultProvider() == QLatin1String("graphhopper") ? 1 : 0);
+        connect(prov, &QComboBox::currentIndexChanged, this, [prov] { RoutePlanner::setDefaultProvider(prov->currentData().toString()); });
+        form->addRow(QStringLiteral("Routing (avoid ALPRs):"), prov);
+        auto *ors = new QLineEdit(RoutePlanner::storedKey(AvoidRoute::Provider::Ors));
+        ors->setEchoMode(QLineEdit::Password);
+        ors->setPlaceholderText(QStringLiteral("free key from openrouteservice.org/dev — needed for routes around ALPR cameras"));
+        ors->setToolTip(QStringLiteral("OpenRouteService directions with avoid_polygons (the ALPR cones along the way). Free plan: about 2 000 routes a day.\n"
+                                       "Your start, destination and the camera polygons are sent to openrouteservice.org (HeiGIT) under its terms."));
+        connect(ors, &QLineEdit::editingFinished, this, [ors] { RoutePlanner::storeKey(AvoidRoute::Provider::Ors, ors->text()); });
+        form->addRow(QStringLiteral("OpenRouteService key:"), ors);
+        auto *gh = new QLineEdit(RoutePlanner::storedKey(AvoidRoute::Provider::GraphHopper));
+        gh->setEchoMode(QLineEdit::Password);
+        gh->setPlaceholderText(QStringLiteral("free key from graphhopper.com — the alternative provider"));
+        gh->setToolTip(QStringLiteral("GraphHopper Directions API with a custom model whose areas are the ALPR cones (priority × 0).\n"
+                                      "Your start, destination and the camera polygons are sent to graphhopper.com under its terms."));
+        connect(gh, &QLineEdit::editingFinished, this, [gh] { RoutePlanner::storeKey(AvoidRoute::Provider::GraphHopper, gh->text()); });
+        form->addRow(QStringLiteral("GraphHopper key:"), gh);
+    }
 
     m_notifyStops = new QCheckBox(QStringLiteral("Notify when a new stop is logged"));
     m_notifyStops->setChecked(m_loc->notifyStops()); connect(m_notifyStops, &QCheckBox::toggled, m_loc, &Locator::setNotifyStops);
@@ -581,7 +613,7 @@ QWidget *MainWindow::buildSettings()
         form->addRow(QStringLiteral("System:"), box);
     }
 
-    m_prefetch = new QCheckBox(QStringLiteral("Save map tiles around each new stop for offline use (~10 km, zoom 10–15, ≤400 tiles)"));
+    m_prefetch = new QCheckBox(QStringLiteral("Save OpenTopoMap tiles around each new stop for offline use (~10 km, zoom 10–15, ≤300 tiles; shown where the chosen layer can't load)"));
     m_prefetch->setChecked(m_loc->prefetchTiles()); connect(m_prefetch, &QCheckBox::toggled, m_loc, &Locator::setPrefetchTiles);
     form->addRow(QStringLiteral("Offline:"), m_prefetch);
     m_elev = new QCheckBox(QStringLiteral("Look up elevation at each precise stop (Open Topo Data, SRTM 30 m)"));
@@ -696,8 +728,10 @@ void MainWindow::refreshFix()
         m_chip->setText(QStringLiteral("NO FIX")); m_chip->setStyleSheet(QStringLiteral("QLabel { color: white; background: #ff4f4f; border-radius: 9px; padding: 2px 10px; font-weight: 600; }"));
         return;
     }
-    const QString chipBg = f.source == QLatin1String("starlink") ? QStringLiteral("#6cff8a") : f.source == QLatin1String("wifi") ? QStringLiteral("#35d6ff") : QStringLiteral("#ffd166");
-    m_chip->setText(f.source == QLatin1String("starlink") ? QStringLiteral("GPS") : f.source == QLatin1String("wifi") ? QStringLiteral("WI-FI") : QStringLiteral("IP"));
+    const QString chipBg = f.source == QLatin1String("starlink") || f.source == QLatin1String("gnss") ? QStringLiteral("#6cff8a")
+                         : f.source == QLatin1String("anchor") ? QStringLiteral("#c9a0ff") : f.source == QLatin1String("wifi") ? QStringLiteral("#35d6ff") : QStringLiteral("#ffd166");
+    m_chip->setText(f.source == QLatin1String("starlink") || f.source == QLatin1String("gnss") ? QStringLiteral("GPS")
+                    : f.source == QLatin1String("anchor") ? QStringLiteral("SURVEYED") : f.source == QLatin1String("wifi") ? QStringLiteral("WI-FI") : QStringLiteral("IP"));
     m_chip->setStyleSheet(QStringLiteral("QLabel { color: #0b101a; background: %1; border-radius: 9px; padding: 2px 10px; font-weight: 600; }").arg(chipBg));
     m_place->setText(f.place);
     m_coords->setText(QStringLiteral("%1, %2").arg(f.lat, 0, 'f', 6).arg(f.lon, 0, 'f', 6));
@@ -1043,17 +1077,10 @@ QWidget *MainWindow::buildDevices()
     v->addLayout(top);
 
     auto *pairRow = new QHBoxLayout;
-    m_pairBtn = new QPushButton(QIcon::fromTheme(QStringLiteral("list-add-user")), QStringLiteral("Allow pairing for 10 minutes"));
-    m_pairBtn->setToolTip(QStringLiteral("While pairing is open, a device can POST /api/v1/pair. Each request shows up below with a 4-digit code that the device also displays — approve the one whose code matches."));
-    connect(m_pairBtn, &QPushButton::clicked, this, [api] { if (api->pairingOpen()) api->closePairing(); else api->openPairing(10); });
-    m_pairLabel = new QLabel;
-    m_pairPolicy = new QComboBox;
-    m_pairPolicy->addItem(QStringLiteral("Proximity required (only adjacent / nearby devices can pair)"), QStringLiteral("required"));
-    m_pairPolicy->addItem(QStringLiteral("Proximity warns only"), QStringLiteral("warn"));
-    m_pairPolicy->addItem(QStringLiteral("Proximity off"), QStringLiteral("off"));
-    m_pairPolicy->setCurrentIndex(qMax(0, m_pairPolicy->findData(api->pairPolicy())));
-    m_pairPolicy->setToolTip(QStringLiteral("A device asking to pair sends the Wi-Fi beacons it hears and its position. \"Adjacent\" = it hears mostly the same beacons at similar levels; \"near\" = a few shared beacons or within 150 m; \"far\" = nothing in common. With \"required\", far/unknown devices need the explicit override in the dialog."));
-    connect(m_pairPolicy, &QComboBox::currentIndexChanged, this, [this, api](int i) { api->setPairPolicy(m_pairPolicy->itemData(i).toString()); });
+    m_linkBtn = new QPushButton(QIcon::fromTheme(QStringLiteral("insert-link")), QStringLiteral("Link a device…"));
+    m_linkBtn->setToolTip(QStringLiteral("Show a QR for the phone to scan (or let it pick this PC from its list): both screens show the same code, nothing to type. The phone also gets a hub invite when this PC is enrolled with one (docs/LINKING.md)."));
+    { QFont f = m_linkBtn->font(); f.setBold(true); m_linkBtn->setFont(f); }
+    connect(m_linkBtn, &QPushButton::clicked, this, &MainWindow::showLink);
     auto *tokenBtn = new QPushButton(QIcon::fromTheme(QStringLiteral("dialog-password")), QStringLiteral("Create token…"));
     tokenBtn->setToolTip(QStringLiteral("For devices that cannot pair on their own (scripts, curl): make a token now and paste it into them."));
     connect(tokenBtn, &QPushButton::clicked, this, [this, api] {
@@ -1078,13 +1105,12 @@ QWidget *MainWindow::buildDevices()
         sv->addWidget(sb);
         show.exec();
     });
-    pairRow->addWidget(m_pairBtn); pairRow->addWidget(m_pairLabel, 1); pairRow->addWidget(tokenBtn);
-    pairRow->addWidget(m_pairPolicy);
+    pairRow->addWidget(m_linkBtn); pairRow->addStretch(1); pairRow->addWidget(tokenBtn);
     v->addLayout(pairRow);
 
-    v->addWidget(new QLabel(QStringLiteral("<b>Pending requests</b> — the device shows the same code; approve only a code you recognise")));
+    v->addWidget(new QLabel(QStringLiteral("<b>Link requests</b> — a phone that picked this PC; Link only if it shows the same code")));
     m_pendingTable = new QTableWidget(0, 6);
-    m_pendingTable->setHorizontalHeaderLabels({QStringLiteral("Device"), QStringLiteral("Address"), QStringLiteral("Code"), QStringLiteral("Asks for"), QStringLiteral("Requested"), QString()});
+    m_pendingTable->setHorizontalHeaderLabels({QStringLiteral("Device"), QStringLiteral("Address"), QStringLiteral("Code"), QStringLiteral("Distance (info)"), QStringLiteral("State"), QString()});
     m_pendingTable->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
     m_pendingTable->verticalHeader()->hide(); m_pendingTable->setSelectionMode(QAbstractItemView::NoSelection);
     m_pendingTable->setMaximumHeight(150);
@@ -1096,7 +1122,7 @@ QWidget *MainWindow::buildDevices()
     m_linkTable->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
     m_linkTable->verticalHeader()->hide(); m_linkTable->setSelectionMode(QAbstractItemView::NoSelection); m_linkTable->setMaximumHeight(120);
     v->addWidget(m_linkTable);
-    v->addWidget(new QLabel(QStringLiteral("<b>Paired devices</b>")));
+    v->addWidget(new QLabel(QStringLiteral("<b>Linked devices</b> — tokens (revoke one to unlink that device)")));
     m_devTable = new QTableWidget(0, 6);
     m_devTable->setHorizontalHeaderLabels({QStringLiteral("Device"), QStringLiteral("Scopes"), QStringLiteral("Created"), QStringLiteral("Last seen"), QStringLiteral("From"), QString()});
     m_devTable->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
@@ -1107,7 +1133,7 @@ QWidget *MainWindow::buildDevices()
     knownHead->addWidget(new QLabel(QStringLiteral("<b>Known devices (ours)</b> — from the UniFi export; pairing from these is approved automatically")));
     m_knownOnly = new QCheckBox(QStringLiteral("Only known devices may use tokens"));
     m_knownOnly->setChecked(api->knownOnly());
-    m_knownOnly->setToolTip(QStringLiteral("Peers are matched by MAC (kernel neighbour table) or by their known / fixed IP. Unknown peers can still ask to pair while pairing is open — you approve them by hand."));
+    m_knownOnly->setToolTip(QStringLiteral("Peers are matched by MAC (kernel neighbour table) or by their known / fixed IP. A device you link (Link a device…) is added here automatically."));
     connect(m_knownOnly, &QCheckBox::toggled, this, [api](bool on) { api->setKnownOnly(on); });
     knownHead->addStretch(); knownHead->addWidget(m_knownOnly);
     v->addLayout(knownHead);
@@ -1149,14 +1175,8 @@ QWidget *MainWindow::buildDevices()
         const ApiServer::AccessEntry e = api->accessLog().last();
         m_accessLog->appendPlainText(QStringLiteral("%1  %2  %3 %4 → %5").arg(e.time.toString(QStringLiteral("HH:mm:ss")), e.ip.leftJustified(15), e.method.leftJustified(4), e.path).arg(e.status));
     });
-    m_devTimer = new QTimer(this); m_devTimer->setInterval(1000);
-    connect(m_devTimer, &QTimer::timeout, this, [this, api] {
-        if (api->pairingOpen()) {
-            const qint64 left = QDateTime::currentDateTime().secsTo(api->pairingUntil());
-            m_pairLabel->setText(QStringLiteral("Pairing OPEN — %1:%2 left. A device can pair now.").arg(left / 60).arg(left % 60, 2, 10, QLatin1Char('0')));
-        }
-    });
-    m_devTimer->start();
+    connect(api, &ApiServer::linkChanged, this, &MainWindow::refreshDevices);
+    m_devTimer = nullptr;
     for (const ApiServer::AccessEntry &e : api->accessLog())
         m_accessLog->appendPlainText(QStringLiteral("%1  %2  %3 %4 → %5").arg(e.time.toString(QStringLiteral("HH:mm:ss")), e.ip.leftJustified(15), e.method.leftJustified(4), e.path).arg(e.status));
     refreshDevices();
@@ -1173,32 +1193,45 @@ void MainWindow::refreshDevices()
         ? QStringLiteral("%1 http%2://%3  ·  devices discover it as _beaconfix._tcp").arg(api->tls() ? QStringLiteral("TLS") : QStringLiteral("HTTP"), api->tls() ? QStringLiteral("s") : QString(), addrs.isEmpty() ? QStringLiteral("<no LAN address>") : addrs.join(QStringLiteral("  ")))
         : (api->enabled() ? QStringLiteral("Not listening: %1").arg(api->error()) : QStringLiteral("Disabled")));
     m_apiEnabled->setChecked(api->enabled());
-    m_pairBtn->setText(api->pairingOpen() ? QStringLiteral("Close pairing") : QStringLiteral("Allow pairing for 10 minutes"));
-    m_pairBtn->setEnabled(api->listening());
-    if (!api->pairingOpen()) m_pairLabel->setText(QStringLiteral("Pairing closed — devices cannot ask for access until you open it."));
+    m_linkBtn->setEnabled(api->listening());
 
+    // Link requests (mDNS path, docs/LINKING.md); old-app pairing requests (v2) can only be denied — the app should be updated
+    QList<Link::Session> links;
+    for (const Link::Session &l : api->linkSessions()) if (l.origin == Link::Session::Mdns && l.state != Link::Session::Committed) links << l;
     const QList<ApiServer::Pending> pend = api->pending();
-    m_pendingTable->setRowCount(pend.size());
-    for (int i = 0; i < pend.size(); ++i) {
-        const ApiServer::Pending &p = pend[i];
-        m_pendingTable->setItem(i, 0, new QTableWidgetItem(p.name));
-        m_pendingTable->setItem(i, 1, new QTableWidgetItem(p.ip));
-        auto *code = new QTableWidgetItem(p.code); { QFont b = code->font(); b.setBold(true); b.setPointSizeF(b.pointSizeF() * 1.2); code->setFont(b); }
+    m_pendingTable->setRowCount(links.size() + pend.size());
+    for (int i = 0; i < links.size(); ++i) {
+        const Link::Session &l = links[i];
+        m_pendingTable->setItem(i, 0, new QTableWidgetItem(QStringLiteral("%1 (%2)").arg(l.name, l.kind.isEmpty() ? QStringLiteral("device") : l.kind)));
+        m_pendingTable->setItem(i, 1, new QTableWidgetItem(l.ip));
+        auto *code = new QTableWidgetItem(Link::codeText(l.code)); { QFont b = code->font(); b.setBold(true); b.setPointSizeF(b.pointSizeF() * 1.3); code->setFont(b); }
         m_pendingTable->setItem(i, 2, code);
-        m_pendingTable->setItem(i, 3, new QTableWidgetItem(p.scopes.join(QStringLiteral(", "))));
-        m_pendingTable->setItem(i, 4, new QTableWidgetItem(p.state == ApiServer::Pending::Waiting ? p.created.toString(QStringLiteral("HH:mm:ss")) : p.state == ApiServer::Pending::Approved ? QStringLiteral("approved — waiting for the device to fetch its token") : QStringLiteral("denied")));
+        m_pendingTable->setItem(i, 3, new QTableWidgetItem(l.proximity["label"].toString(QStringLiteral("unknown"))));
+        m_pendingTable->setItem(i, 4, new QTableWidgetItem(l.state == Link::Session::Pending ? QStringLiteral("waiting for you") : l.state == Link::Session::Denied ? QStringLiteral("rejected") : QStringLiteral("linking…")));
+        auto *cell = new QWidget; auto *h = new QHBoxLayout(cell); h->setContentsMargins(2, 0, 2, 0);
+        if (l.state == Link::Session::Pending) {
+            const QString sid = l.sid;
+            auto *ok = new QPushButton(QIcon::fromTheme(QStringLiteral("dialog-ok")), QStringLiteral("Link"));
+            auto *no = new QPushButton(QIcon::fromTheme(QStringLiteral("dialog-cancel")), QStringLiteral("Reject"));
+            connect(ok, &QPushButton::clicked, this, [api, sid] { api->linkApprove(sid); });
+            connect(no, &QPushButton::clicked, this, [api, sid] { api->linkReject(sid); });
+            h->addWidget(ok); h->addWidget(no);
+        }
+        m_pendingTable->setCellWidget(i, 5, cell);
+    }
+    for (int j = 0; j < pend.size(); ++j) {
+        const ApiServer::Pending &p = pend[j]; const int i = links.size() + j;
+        m_pendingTable->setItem(i, 0, new QTableWidgetItem(QStringLiteral("%1 (old app: update it to link by QR)").arg(p.name)));
+        m_pendingTable->setItem(i, 1, new QTableWidgetItem(p.ip));
+        m_pendingTable->setItem(i, 2, new QTableWidgetItem(QStringLiteral("—")));
+        m_pendingTable->setItem(i, 3, new QTableWidgetItem(p.proximity["verdict"].toString()));
+        m_pendingTable->setItem(i, 4, new QTableWidgetItem(p.state == ApiServer::Pending::Waiting ? QStringLiteral("pairing v2") : p.state == ApiServer::Pending::Approved ? QStringLiteral("approved") : QStringLiteral("denied")));
         auto *cell = new QWidget; auto *h = new QHBoxLayout(cell); h->setContentsMargins(2, 0, 2, 0);
         if (p.state == ApiServer::Pending::Waiting) {
             const QString id = p.id;
-            auto *pics = new QPushButton(QIcon::fromTheme(QStringLiteral("view-preview")), QStringLiteral("Pictures…"));
-            pics->setToolTip(QStringLiteral("Match the three pictures the device shows (with its position and the beacons it hears)"));
-            connect(pics, &QPushButton::clicked, this, [this, id] { showPairRequest(id); });
-            auto *ok = new QPushButton(QIcon::fromTheme(QStringLiteral("dialog-ok")), QStringLiteral("Approve by code"));
-            ok->setEnabled(p.lifted || Pairing::verdictAllowed(p.proximity["verdict"].toString(), api->pairPolicy()));
             auto *no = new QPushButton(QIcon::fromTheme(QStringLiteral("dialog-cancel")), QStringLiteral("Deny"));
-            connect(ok, &QPushButton::clicked, this, [api, id] { api->approve(id); });
             connect(no, &QPushButton::clicked, this, [api, id] { api->deny(id); });
-            h->addWidget(pics); h->addWidget(ok); h->addWidget(no);
+            h->addWidget(no);
         }
         m_pendingTable->setCellWidget(i, 5, cell);
     }
@@ -1228,7 +1261,7 @@ void MainWindow::refreshDevices()
                 auto *lbl = new QLabel(QStringLiteral("On <b>%1</b>, open Identity → Link and scan this QR (or paste the text). That device signs the link and sends it back here; both identities then become one owner set.<br>"
                                                       "This QR is valid for 10 minutes and links only with the device that scans it.").arg(devName.toHtmlEscaped()));
                 lbl->setWordWrap(true); lay->addWidget(lbl);
-                auto *img = new QLabel; img->setAlignment(Qt::AlignCenter); img->setPixmap(qrPixmap(payload, 4)); if (img->pixmap().isNull()) img->setText(QStringLiteral("(install qrencode for a QR code)")); lay->addWidget(img);
+                auto *img = new QLabel; img->setAlignment(Qt::AlignCenter); img->setPixmap(qrPixmap(payload, 4)); if (img->pixmap().isNull()) img->setText(QStringLiteral("(too long for a QR code)")); lay->addWidget(img);
                 auto *ed = new QPlainTextEdit(payload); ed->setReadOnly(true); ed->setMaximumHeight(80); lay->addWidget(ed);
                 auto *bb = new QDialogButtonBox(QDialogButtonBox::Close); auto *cp = bb->addButton(QStringLiteral("Copy"), QDialogButtonBox::ActionRole);
                 connect(cp, &QPushButton::clicked, &dlg, [payload] { QApplication::clipboard()->setText(payload); }); connect(bb, &QDialogButtonBox::rejected, &dlg, &QDialog::reject); lay->addWidget(bb);
@@ -1279,17 +1312,6 @@ void MainWindow::refreshDevices()
 }
 
 // ── Identity tab (docs/IDENTITY.md) ────────────────────────────────────────────
-static QPixmap qrPixmap(const QString &text, int scale)
-{
-    const QString bin = QStandardPaths::findExecutable(QStringLiteral("qrencode"));
-    QPixmap px;
-    if (bin.isEmpty() || text.isEmpty()) return px;
-    QProcess q; q.start(bin, {QStringLiteral("-o"), QStringLiteral("-"), QStringLiteral("-t"), QStringLiteral("PNG"), QStringLiteral("-s"), QString::number(scale), QStringLiteral("-m"), QStringLiteral("2"), text});
-    q.waitForFinished(8000);
-    px.loadFromData(q.readAllStandardOutput(), "PNG");
-    return px;
-}
-
 QWidget *MainWindow::buildIdentity()
 {
     auto *w = new QWidget;
@@ -1423,7 +1445,7 @@ QWidget *MainWindow::buildIdentity()
         auto *sv = new QVBoxLayout(&show);
         if (words->isChecked()) { auto *wl = new QLabel(QStringLiteral("<b>Word code (shown once, needed on the other device):</b><br><span style='font-size:16pt'>%1</span>").arg(secret.toHtmlEscaped())); wl->setTextInteractionFlags(Qt::TextSelectableByMouse); sv->addWidget(wl); }
         if (!code.isEmpty()) { auto *cl = new QLabel(QStringLiteral("On the same network: the other BeaconFix can fetch it from <b>%1:%2</b> with code <b style='font-size:16pt'>%3</b> for the next 10 minutes.").arg(QHostInfo::localHostName()).arg(m_loc->apiServer()->boundPort()).arg(code)); cl->setWordWrap(true); sv->addWidget(cl); }
-        auto *img = new QLabel; img->setAlignment(Qt::AlignCenter); img->setPixmap(qrPixmap(bundle, 4)); if (img->pixmap().isNull()) img->setText(QStringLiteral("(install qrencode for a QR code)")); sv->addWidget(img);
+        auto *img = new QLabel; img->setAlignment(Qt::AlignCenter); img->setPixmap(qrPixmap(bundle, 4)); if (img->pixmap().isNull()) img->setText(QStringLiteral("(too long for a QR code)")); sv->addWidget(img);
         auto *ed = new QPlainTextEdit(bundle); ed->setReadOnly(true); ed->setMaximumHeight(100); sv->addWidget(ed);
         auto *sb = new QDialogButtonBox(QDialogButtonBox::Close);
         auto *cp = sb->addButton(QStringLiteral("Copy text"), QDialogButtonBox::ActionRole); auto *sf = sb->addButton(QStringLiteral("Save to file…"), QDialogButtonBox::ActionRole);
@@ -1635,19 +1657,19 @@ void MainWindow::importHistoryDialog()
     if (ok) statusBar()->showMessage(QStringLiteral("Imported %1: %2 samples, %3 positions, %4 visits").arg(QFileInfo(path).fileName()).arg(summary["observations"].toInt()).arg(summary["positions"].toInt() + summary["tracks"].toInt()).arg(summary["visits"].toInt()), 8000);
 }
 
-void MainWindow::showPairRequest(const QString &id)
+void MainWindow::showLink()
 {
-    ApiServer *api = m_loc->apiServer();
-    if (!api || id.isEmpty()) return;
-    // Land on the Devices tab too, so the request is visible even after the dialog closes
-    for (int i = 0; i < m_tabs->count(); ++i) if (m_tabs->tabText(i).startsWith(QStringLiteral("Devices"))) m_tabs->setCurrentIndex(i);
-    show(); raise(); activateWindow();
-    PairDialog *dlg = m_pairDialogs.value(id);
-    if (!dlg) {
-        dlg = new PairDialog(api, m_loc, m_tiles, id, this);
-        m_pairDialogs.insert(id, dlg);
-        connect(dlg, &QObject::destroyed, this, [this, id] { m_pairDialogs.remove(id); });
-    }
-    dlg->show(); dlg->raise(); dlg->activateWindow();
+    if (!m_loc->apiServer()) return;
+    if (!m_linkDialog) m_linkDialog = new LinkDialog(m_loc->apiServer(), this);
+    m_linkDialog->show(); m_linkDialog->raise(); m_linkDialog->activateWindow();
 }
+void MainWindow::showPlateEvent(const QString &uid)
+{
+    if (!m_sightings) return;
+    m_tabs->setCurrentWidget(m_sightings);
+    show(); raise(); activateWindow();
+    m_sightings->refresh();
+    if (!uid.isEmpty()) m_sightings->openEvent(uid);
+}
+
 void MainWindow::showEmergency() { m_tabs->setCurrentIndex(1); show(); raise(); activateWindow(); }

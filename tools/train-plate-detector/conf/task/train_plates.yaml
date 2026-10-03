@@ -1,0 +1,73 @@
+# YOLOv9-t, 640, one class (plates), dash-cam augmentation. Based on the YOLO repo's task/train.yaml.
+# The batch/epoch numbers are for the full run on a 24-32 GB GPU; train.sh's smoke mode overrides them.
+task: train
+
+defaults:
+  - validation: ../validation
+
+epoch: 300
+
+data:
+  batch_size: 64
+  equivalent_batch_size: 64
+  image_size: ${image_size}
+  cpu_num: ${cpu_num}
+  shuffle: True
+  pin_memory: True
+  # applied in this order (each with its probability); the classes beyond the YOLO repo's own
+  # (Mosaic, RandomCrop, HorizontalFlip, RemoveOutliers) are in plate_augment.py
+  data_augment:
+    PlateMosaic: 0.5        # 4 images around a random centre, a 1-2x window of it: more plates, 1/4..1 scale
+    RandomCrop: 0.25        # half-size crop: large plates
+    ZoomOut: 0.25           # shrink to 35-90 % onto a grey canvas: distant plates
+    HorizontalFlip: 0.5
+    ColorJitter: 0.8        # brightness / contrast / saturation / hue
+    LowLight: 0.25          # night: darker, gamma, sensor noise
+    MotionBlur: 0.25        # moving camera / moving car
+    GaussianBlur: 0.1       # out of focus, dirty windscreen
+    JpegArtifacts: 0.3      # dash-cam / phone compression
+    ClipBoxes: 1            # clip to the image, drop slivers
+    RemoveOutliers: 1e-8
+
+optimizer:
+  type: SGD
+  args:
+    lr: 0.01
+    weight_decay: 0.0005
+    momentum: 0.937
+    nesterov: true
+
+loss:
+  objective:
+    BCELoss: 0.5
+    BoxLoss: 7.5
+    DFLoss: 1.5
+  aux:
+    0.25
+  matcher:
+    iou: CIoU
+    topk: 10
+    factor:
+      iou: 6.0
+      cls: 0.5
+
+scheduler:
+  type: LinearLR
+  warmup:
+    epochs: 3.0
+  args:
+    total_iters: ${task.epoch}
+    start_factor: 1
+    end_factor: 0.01
+
+ema:
+  enable: true
+  decay: 0.9999
+
+validation:
+  data:
+    batch_size: 32
+  nms:
+    min_confidence: 0.001
+    min_iou: 0.45
+    max_bbox: 100

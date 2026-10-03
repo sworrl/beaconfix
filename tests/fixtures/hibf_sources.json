@@ -1,0 +1,93 @@
+{
+ "sources": [
+  {
+   "upload_id": 2,
+   "filename": "Chehalis WA PD_Network_Audit_12_1_2024_1_1_2025 (1).csv",
+   "source_url": "https://www.muckrock.com/foi/chehalis-8312/flock-safety-search-audits-network-sharing-and-general-order-chehalis-police-department-187700/",
+   "earliest_search_time": "2024-12-01T08:00:07.000Z",
+   "latest_search_time": "2025-01-01T06:10:30.000Z",
+   "total_records": 282161
+  },
+  {
+   "upload_id": 67911,
+   "filename": "10_16_2024-10_31_2024-Bryan TX PD-Network-Audit_clean.csv",
+   "source_url": "https://haveibeenflocked.com/news/bryan-tx-jul2026",
+   "earliest_search_time": "2024-10-16T05:00:00.000Z",
+   "latest_search_time": "2024-11-01T04:59:55.000Z",
+   "total_records": 292417
+  },
+  {
+   "upload_id": 41862,
+   "filename": "10_1_2025-10_31_2025-Beecher IL PD-Network-Audit(in)_clean.csv",
+   "source_url": "https://haveibeenflocked.com/news/beecher-il-apr2026",
+   "earliest_search_time": "2025-10-01T05:00:09.000Z",
+   "latest_search_time": "2025-11-01T04:59:50.000Z",
+   "total_records": 530662
+  },
+  {
+   "upload_id": 46,
+   "filename": "Mount_Prospect_IL_PD_Network_Audit_10_1_2024_11_1_2024.csv",
+   "source_url": "https://www.muckrock.com/foi/mount-prospect-8189/flock-safety-alpr-audits-2025-mount-prospect-police-department-186694/files/",
+   "earliest_search_time": "2024-10-01T05:00:00.000Z",
+   "latest_search_time": "2024-11-01T04:59:44.000Z",
+   "total_records": 508602
+  },
+  {
+   "upload_id": 56215,
+   "filename": "10_11_2024-11_10_2024-Salem MA PD -Network-Audit_clean.csv",
+   "source_url": "https://www.muckrock.com/foi/salem-88/public-records-request-flock-audits-salem-police-department-210049/",
+   "earliest_search_time": "2024-10-11T04:00:06.000Z",
+   "latest_search_time": "2024-11-11T04:59:17.000Z",
+   "total_records": 377860
+  },
+  {
+   "upload_id": 0,
+   "filename": "Transparency Portal",
+   "source_url": "https://transparency.flocksafety.com/",
+   "earliest_search_time": "2025-05-30T00:00:06.000Z",
+   "latest_search_time": "2026-09-22T23:59:49.000Z",
+   "total_records": 1408185
+  },
+  {
+   "upload_id": 61819,
+   "filename": "February 2026_clean.csv",
+   "source_url": "https://www.muckrock.com/foi/ventura-3487/cpra-ventura-county-flock-safety-documents-ventura-police-department-208492/",
+   "earliest_search_time": "2026-02-01T08:36:55.000Z",
+   "latest_search_time": "2026-03-01T07:19:55.000Z",
+   "total_records": 2943
+  },
+  {
+   "upload_id": 45448,
+   "filename": "10_1_2023-10_31_2023-El_Cerrito_CA_PD-Audit_Redacted_clean.csv",
+   "source_url": "https://haveibeenflocked.com/news/el-cerrito-ca-feb2026",
+   "earliest_search_time": "2023-10-02T15:03:56.000Z",
+   "latest_search_time": "2023-11-01T03:39:14.000Z",
+   "total_records": 1034
+  },
+  {
+   "upload_id": 80362,
+   "filename": "01-Rolling_Meadows_IL_PD_network_Apr_2025.-G-Removed-csv_clean.csv",
+   "source_url": "https://haveibeenflocked.com/news/rolling-meadows-il-jul2026",
+   "earliest_search_time": "2025-04-01T06:00:18.000Z",
+   "latest_search_time": "2025-05-01T05:59:58.000Z",
+   "total_records": 503927
+  },
+  {
+   "upload_id": 61305,
+   "filename": "1_1_2022-1_31_2022-Santa Clara_clean.csv",
+   "source_url": "https://haveibeenflocked.com/news/santa-clara-co-ca-jun2026",
+   "earliest_search_time": "2022-01-01T17:07:37.000Z",
+   "latest_search_time": "2022-01-31T23:06:31.000Z",
+   "total_records": 444
+  },
+  {
+   "upload_id": 85719,
+   "filename": "17-November-2025-Redacted-Org-Audit_clean.csv",
+   "source_url": "https://haveibeenflocked.com/news/navajo-county-az-jan2025-jul2026",
+   "earliest_search_time": "2025-11-01T16:11:49.000Z",
+   "latest_search_time": "2025-11-28T02:01:21.000Z",
+   "total_records": 645
+  }
+ ],
+ "updatedAt": "2026-10-02T19:10:00.009Z"
+}

@@ -8,7 +8,7 @@
     android:targetCellHeight="2"
     android:resizeMode="horizontal|vertical"
     android:updatePeriodMillis="0"
-    android:widgetCategory="home_screen"
+    android:widgetCategory="home_screen|keyguard"
     android:description="@string/widget_beacons_desc"
     android:previewLayout="@layout/widget_preview_beacons"
     android:previewImage="@drawable/widget_preview_beacons"

@@ -20,7 +20,14 @@ SECURITY.md): `~/.local/state/beaconfix/beaconfix.db`.
 | `scan_cells` | `cell` PK (`y:x` of a ~15 m grid), `lat`, `lon`, `count`, `first`, `last` (epoch s) | 3.9: where this host scanned from, so the estimator knows where an AP was *not* heard |
 | `elevation` | `cell`, `elev`, `time` | elevation cache per ~100 m cell |
 | `achievements` | `key`, `unlocked` | milestones |
-| `kv` | `key`, `value` | misc: `poi_lat`/`poi_lon`/`poi_radius`/`poi_time` (where and when the places were fetched), `peds_lat`/`peds_lon`/`peds_radius`/`peds_time` (the same for the pediatric ER search), `countryCode`, `environment`, `sync:<peer>:pulled`/`pushed`, `seq`, `schema`, `created`; 3.9: `estimator_version`, `estimator_kappa`, `estimator_calibration` (JSON), `device_offsets` (JSON, device → dB) |
+| `flock_cameras` | `id` PK (`osm:<node\|way>/<n>`, `flock:<n>`, `det:<mac>`), `lat`, `lon`, `source` (`deflock`, `osm` = Overpass, `community` / `3rd Party / Suspected` = flocklocations community reports, `wifi_scan` / `ble_scan`), `model` (the source's, "" unknown), `operator` (the agency, "" unknown), `direction` (the tag text; DeFlock's directions joined with `;`), `bssid`, `ble_mac`, `confidence`, `detection_method`, `first_seen`, `last_seen`, `sighting_count`, `vetted`, `vetted_at`, `notes`, `seq`, `pass_count`; 3.10: `camera_type` (`alpr` · `webcam` · `ptz` · `cctv` · `enforcement` · `not_camera`), `tags` (the raw OSM tags, compact JSON, when known); 2026-10: `manufacturer` (OSM `manufacturer` / `brand`, DeFlock's `brand`), `osm_version`, `osm_timestamp` (the OSM element's, from DeFlock or Overpass meta), `stale` (1: no longer confirmed by its source, kept only for its passes); Phase D: `trust` (0–1, NULL = not computed yet; [SIGHTINGS.md](SIGHTINGS.md) §2.7), `trust_detail` (JSON: logit, terms, computed), `verdict` (`present` · `absent` · ''), `verdict_at`, `watched_way` (the OSM way id the camera reads, §2.6), `watched_detail` (JSON: basis, distance, bearing, layer, oneway, the camera position it was chosen for), `ways_fetched` (when its roads were fetched; refetched after 90 days), `agency_portal` (the Eyes on Flock portal slug, `~slug` when the state was not verified, §4.6). These columns survive the `INSERT OR REPLACE` of a camera refresh | the surveillance-camera map ([SIGHTINGS.md](SIGHTINGS.md) §2.0: DeFlock, Overpass, flocklocations community reports, our own RF detections, [DETECTION.md](DETECTION.md)). `camera_type` is decided at import from the tags; every row is reclassified once per classifier version (kv `camera_type_v3`); an OSM row without stored tags is `alpr` when DeFlock listed it, else classified from its model until a pass fetches its node. `pass_count` = its camera passes. A stale camera gets no new passes |
+| `plate_events` | `id`, `uid` UNIQUE, `kind`, `plate`, `time`, `lat`, `lon`, `acc`, `camera_id`, `camera_lat`, `camera_lon`, `distance_m`, `speed_kmh`, `heading_deg`, `approach_bearing_deg`, `camera_dir_deg`, `facing`, `operator`, `agency`, `model`, `camera_type`, `source`, `source_url`, `source_name`, `confidence`, `leaky`, `details`, `metrics` (JSON), `raw` (JSON), `device`, `created_at`, `updated_at`, `seq` | 3.10: ALPR / camera passes and plate searches ([SIGHTINGS.md](SIGHTINGS.md) §1); synced through `/db/changes` (records only) |
+| `plate_event_media` | `id`, `uid` UNIQUE (32 hex of SHA-256 of `data`), `event_uid`, `camera_id`, `kind` (`dashcam` · `camera_photo` · `webcam`), `mime` (`image/jxl` · `image/webp`), `data` BLOB, `width`, `height`, `bytes`, `original_url`, `original_mime`, `original_bytes`, `original_sha256`, `jpeg_reconstructible`, `attribution`, `license`, `captured_at`, `created_at` | 3.10: the images, stored losslessly (§3.1); never synced (they stay on the node that has them); `webcam` stills never leave the device |
+| `plate_event_alias` | `uid` PK, `target` | 3.10: a pass uid merged into another (§1.1) → the survivor, so a phone's later media upload under its own uid lands on the right event |
+| `osm_ways` | `id` PK (the OSM way id), `highway`, `name`, `ref`, `layer`, `bridge`, `tunnel`, `oneway` (0 · 1 along the node order · −1), `nodes` (JSON ids), `geom` (JSON `[[lat, lon]…]`), `min_lat`, `max_lat`, `min_lon`, `max_lon`, `fetched` | the drivable OSM ways within 80 m of passed cameras, from Overpass (ODbL), for road snapping ([SIGHTINGS.md](SIGHTINGS.md) §2.6); cached 90 days; not synced |
+| `eof_portals` | `slug` PK, `url`, `city`, `county`, `state`, `type` (`PD` · `SD`), `population`, `cameras`, `searches`, `retention_days`, `vehicles`, `hotlist_hits`, `hotlist_rate`, `shared_with`, `received_from` (counts), `prohibited_uses`, `public_audit`, `updated`, `tokens` (the place-name tokens of the join), `fetched` | Eyes on Flock's Flock transparency portals (**CC BY-SA 4.0**, kept apart and attributed; [SIGHTINGS.md](SIGHTINGS.md) §4.6), replaced by the weekly fetch; not synced |
+| `plate_audits`, `camera_encounters` | (3.9) | no longer written; `/flock/audits` and `/flock/encounters` are fed from `plate_events` |
+| `kv` | `key`, `value` | misc: `poi_lat`/`poi_lon`/`poi_radius`/`poi_time` (where and when the places were fetched), `peds_lat`/`peds_lon`/`peds_radius`/`peds_time` (the same for the pediatric ER search), `countryCode`, `environment`, `sync:<peer>:pulled`/`pushed`, `seq`, `schema`, `created`; 3.9: `estimator_version`, `estimator_kappa`, `estimator_calibration` (JSON), `device_offsets` (JSON, device → dB); 3.10 ([SIGHTINGS.md](SIGHTINGS.md)): `plate_events_backfill` (the backfill's progress), `hibf_watch` (the plate-search watcher's schedule), `hibf_sources` (the leaky-agency list), `camera_photo_checked:<camera_id>` (`{"checked","found"}`), `camera_type_v2`; 2026-10: `camera_type_v3`, `camera_clean_v1` (the one-time camera cleanup's summary), `camera_source_deflock` (when DeFlock last replaced the bulk rows), `camera_sync` (the last camera sync: counts before / after, DeFlock added / updated / unchanged, reconcile deleted / stale, community rows added); Phase D: `eyesonflock` (the Eyes on Flock fetch: status `ok` · `error` · `blocked`, error, fetched, lastAttempt, portals, bytes, summary, camerasMatched, license, attribution) |
 
 ## Migration
 
@@ -29,6 +36,28 @@ On the first start of 3.3 or later the pre-existing JSON state (`aps.json`, `his
 `*.migrated`. `state.json` (the current fix) stays a plain file so `beaconfix --json` can
 answer without the tray. If the database cannot be opened (no key), the tray keeps working
 without persistence and says so in the fix card and the log.
+
+### The camera map (2026-10)
+The nationwide camera sync (Telegram `/sync`, `POST /api/v1/flock/sync-us`, D-Bus `SyncNationwideUsCameras`; once by
+itself, two minutes after the first start, when the old bulk import's rows are present) runs three steps:
+1. **DeFlock** — `https://data.dontgetflocked.com/cameras.geojson.gz` (plain JSON, ~38 MB, ~143k ALPRs; data ODbL,
+   pipeline MIT) is streamed to `~/.cache/sworrl/beaconfix/cameras/` and read one feature at a time on a worker
+   (`src/cameraimport.cpp`); rows are upserted in batches of 5000. A row with OSM tags (from Overpass) keeps them
+   and only gains the OSM version / timestamp / manufacturer; a tagless row takes DeFlock's values.
+2. **Reconcile** — only after a complete DeFlock list (≥ 10 000 cameras): the old bulk import's OSM rows (`source`
+   `3rd Party / Suspected`, `openstreetmap`, `flocklocations`) and earlier DeFlock rows that DeFlock no longer
+   lists — deleted nodes, gunshot detectors, anything not an ALPR — are **deleted**, or only marked **stale** when
+   `plate_events` has a pass at them. Overpass rows, community reports and RF detections are not touched.
+3. **flocklocations.com** — only its community submissions (no `osm_id`, CC BY 4.0) are added; its OSM-derived rows
+   are DeFlock's.
+
+If DeFlock cannot be downloaded or read, the sync falls back to Overpass, US sector by sector (ALPRs only).
+
+Once, on the first start with this change (kv `camera_clean_v1`): rows with OSM tags take operator / manufacturer /
+model from them; "Flock Safety" as the operator of a tagless row (written by the old bulk import and the RF detector,
+never data) is cleared — `manufacturer` keeps Flock where the model or the detection said so; RF detections made with
+the retracted signatures are re-checked against the current rules and deleted (or marked stale when they have
+passes). Then every row is reclassified (`camera_type_v3`).
 
 ## Self-location
 

@@ -33,7 +33,7 @@ system-wide widget install (the per-user installer does this and uses `kpackaget
 | `src/beaconview.{h,cpp}` | the QPainter map (no GL, no WebEngine) |
 | `src/mainwindow.{h,cpp}`, `src/tray.{h,cpp}` | the window and the tray |
 | `plasmoid/org.kde.plasma.beaconfix/` | the Plasma widget (QML + `security.js`) |
-| `data/` | desktop entries, D-Bus service template, icon |
+| `data/` | desktop entries, D-Bus service template; `data/icons/` the three icon masters (`beaconfix_low/medium/high.png`: low detail for ≤ 32 px, medium for 48–192 px, high for ≥ 256 px) and the hicolor sizes rendered from them |
 
 ## How a position check works
 

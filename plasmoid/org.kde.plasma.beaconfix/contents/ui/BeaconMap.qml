@@ -2,6 +2,7 @@ pragma ComponentBehavior: Bound
 import QtQuick
 import QtQuick.Controls as QQC2
 import QtQuick.Layouts
+import QtQuick.Window
 import org.kde.plasma.components as PC3
 import "security.js" as Sec
 import org.kde.kirigami as Kirigami
@@ -15,10 +16,30 @@ Item {
 
     required property var src                  // the PlasmoidItem holding the data
     property int  layerIndex: 0                // 0 dark · 1 streets · 2 satellite · 3 topo
+    property int  satSource: 0                 // satellite imagery: 0 Esri · 1 Esri Clarity · 2 USGS (US) · 3 NASA VIIRS (yesterday)
+    signal satSourcePicked(int index)
+    property bool showContours: true           // satellite hybrid: USGS contour lines (US; elevation in feet)
+    signal contoursToggled(bool on)
+    // Pinpointing an AP to under a foot needs zoom 22-23 (~2.3-4.6 cm a pixel here): the imagery stops at its own
+    // deepest level (19 for Esri) and is scaled past it; the overlay, heat tiles and the scale bar stay sharp
+    readonly property int maxZoomView: 23
+    // The tray draws the route heat map as tiles (off the shell's thread, GPU-scaled while zooming); the Canvas
+    // heat map is only the fallback for a tray without them
+    readonly property bool heatTiles: !!tileBase && !!(src && src.heatGen)
     property var  hiddenCats: []
     property real phase: 0
     property bool showSsids: true              // Wi-Fi names beside the beacons
     property bool showEvents: true             // event animations + ticker
+    property bool showHeatmap: true            // cumulative route heatmap
+    property bool showCameras: true            // Flock Safety & surveillance cameras
+    property var  routeSegments: []            // precomputed route polylines: fast, stutter-free, spike-free
+                                               // (rebuilt by the src Connections below: routeFixes, else the track)
+    // Cameras in a spatial grid, rebuilt only when the list changes (the desktop sends every camera it knows,
+    // 100k+ nationwide): a paint walks the cells around the view instead of projecting every camera.
+    property var  camIndex: null               // {levels: {6, 8, 10, 12: {n, cells: {key: cell}, keys: [...]}}, count}
+    // On screen: the map tab is current and its window (the panel popup, the desktop) is shown. A collapsed
+    // popup keeps its items `visible`; only the window says it is hidden.
+    readonly property bool onScreen: visible && Window.visibility !== Window.Hidden
     signal layerPicked(int index)
     signal categoryToggled(string key, bool visible)
     function groupToggled(group, visible) { var cats = map.src.poiCategories || []; for (var i = 0; i < cats.length; i++) if ((cats[i].group || "services") === group) map.categoryToggled(cats[i].key, visible) }
@@ -163,7 +184,8 @@ Item {
     }
     property bool autoZoom: true
     readonly property string tileBase: src.tileBase || ""     // tray's localhost tile server
-    readonly property int  maxZ: tileBase ? (layerIndex === 3 ? 17 : 19) : (layerIndex === 0 ? 16 : 19)
+    readonly property int  maxZ: layerIndex === 2 ? [19, 19, 16, 9][satSource] || 19
+                               : tileBase ? (layerIndex === 3 ? 17 : 19) : (layerIndex === 0 ? 16 : 19)
     readonly property real ws: 256 * Math.pow(2, zoom)
 
     // ── view pipeline ───────────────────────────────────────────────────────
@@ -208,7 +230,9 @@ Item {
     }
     function applyXforms() {
         var x = camXform(iref, width, height)          // the items' bindings already use the current size
-        if (Math.abs(zoom - iref.zoom) > 0.3 || Math.abs(iref.cx - cx) > 0.25 || Math.abs(x.tx) > 2 * width || Math.abs(x.ty) > 2 * height) rebaseItems()
+        // Re-laying-out every tile and marker costs 30-80 ms: mid-gesture the transform carries them further (the
+        // settle rebases anyway); at rest a 0.3-level drift already rebases, for crisp, pixel-snapped tiles
+        if (Math.abs(zoom - iref.zoom) > (lite ? 2.5 : 0.3) || Math.abs(iref.cx - cx) > 0.25 || Math.abs(x.tx) > 4 * width || Math.abs(x.ty) > 4 * height) rebaseItems()
         else { iX = x; setMatrix(itemM, x); var inv = 1 / x.s; if (Math.abs(invS - inv) > 1e-9) invS = inv }
         pX = camXform(pref, pref.w || width, pref.h || height); setMatrix(paintM, pX)
     }
@@ -232,10 +256,16 @@ Item {
         settleTimer.restart()
         applyXforms()
         if (now - _tilesAt >= 120) { _tilesAt = now; refreshTiles() }
-        // Throttled to 4 paints a second, except when a fast zoom has scaled the painted texture out of [0.8, 1.25]:
-        // zoomed out further it would stop covering the view (edges popping in late), zoomed in it turns blurry
-        if (overlayStale() && (now - _paintAt >= 250 || pX.s < 0.8 || pX.s > 1.25)) overlay.requestPaint()
-        if (fxActive()) fx.requestPaint()
+        // While a zoom is in progress (wheel glide, pinch, a zooming flight) the painted texture is only scaled by
+        // the GPU: a Canvas re-render rasterises on this thread (40-130 ms for the overlay, the heat-map strokes
+        // most of it), which held a zoom to ~7 fps. One full paint lands when it settles; only a zoom-out deep
+        // enough to bare the margins' edges (scale < 0.45) repaints mid-gesture. Pans: 4 paints a second, and at
+        // once when the scale leaves [0.8, 1.25] (edges popping in late / blurry).
+        if (overlayStale()) {
+            if (lite) { if (pX.s < 0.45 || pX.s > 6) overlay.requestPaint() }
+            else if (now - _paintAt >= 250 || pX.s < 0.8 || pX.s > 1.25) overlay.requestPaint()
+        }
+        if (fxAnimating() || (fxActive() && !lite)) fx.requestPaint()   // static marks are hidden mid-gesture (onLiteChanged)
         if (_zoomDirty) { _zoomDirty = false; clusterTimer.restart() }
     }
     // The painted overlay still covers the view: same zoom, and the pan has not eaten most of the margin
@@ -301,10 +331,10 @@ Item {
         var m = merc(src.lat, src.lon), z = zoom, now = Date.now()
         if (autoZoom) {
             var vz = rezoomVote(now)
-            if (vz !== zoom && cinematic && (!visible || (mayAutoMove() && now - _autoAt >= autoGapMs))) z = vz
+            if (vz !== zoom && cinematic && (!onScreen || (mayAutoMove() && now - _autoAt >= autoGapMs))) z = vz
         } else _fitVote = null
-        if (z !== zoom) { _fitVote = null; _fitAt = {lat: src.lat, lon: src.lon}; _settleSpent = true; if (visible) _autoAt = now }
-        if (!visible) { cx = m.x; cy = m.y; if (z !== zoom) zoom = zoomTarget = z; return }   // another tab / closed popup: just be there
+        if (z !== zoom) { _fitVote = null; _fitAt = {lat: src.lat, lon: src.lon}; _settleSpent = true; if (onScreen) _autoAt = now }
+        if (!onScreen) { cx = m.x; cy = m.y; if (z !== zoom) zoom = zoomTarget = z; return }   // another tab / closed popup: just be there
         var dx = m.x - cx; if (dx > 0.5) dx -= 1; else if (dx < -0.5) dx += 1
         var dpx = Math.hypot(dx * ws, (m.y - cy) * ws)
         if (z === zoom && dpx <= followDeadPx()) return
@@ -346,7 +376,7 @@ Item {
     function pointerOver() { return mapHover.hovered || hostHovered }
     function mayAutoMove() {
         var now = Date.now()
-        return follow && visible && src.valid && !editAnchor && !draggingAnchor && !secPanel && !ctxMenu.visible
+        return follow && onScreen && src.valid && !editAnchor && !draggingAnchor && !secPanel && !ctxMenu.visible
                && !pointerOver() && now - _hoverEndAt > 20000
                && now - lastUserInput > 180000 && !pan.pressed && !pinch.active
     }
@@ -490,7 +520,7 @@ Item {
         userTouched()
         var m = merc(lat, lon); cx = m.x; cy = m.y
         follow = false; autoZoom = false
-        zoom = zoomTarget = Math.max(3, Math.min(20, z))
+        zoom = zoomTarget = Math.max(3, Math.min(maxZoomView, z))
     }
     function applyZoom(z, ax, ay) {
         var m = toMerc(ax, ay)
@@ -503,7 +533,7 @@ Item {
         userTouched()
         autoZoom = false
         if (Math.abs(ax - width / 2) > 1 || Math.abs(ay - height / 2) > 1) follow = false
-        zoomTarget = Math.max(3, Math.min(20, zoomTarget + delta))
+        zoomTarget = Math.max(3, Math.min(maxZoomView, zoomTarget + delta))
         zoomAnchor = Qt.point(ax, ay)
     }
     function haversine(la1, lo1, la2, lo2) {
@@ -511,6 +541,157 @@ Item {
         var dLa = (la2 - la1) * d2r, dLo = (lo2 - lo1) * d2r
         var a = Math.sin(dLa / 2) * Math.sin(dLa / 2) + Math.cos(la1 * d2r) * Math.cos(la2 * d2r) * Math.sin(dLo / 2) * Math.sin(dLo / 2)
         return 2 * R * Math.asin(Math.sqrt(a))
+    }
+    function updateRouteSegments() {
+        var raw = (src && src.routeFixes && src.routeFixes.length) ? src.routeFixes : ((src && src.track) || [])
+        if (!raw || raw.length === 0) {
+            routeSegments = []
+            return
+        }
+        var segments = []
+        var curPts = []
+        var minMx = 1, maxMx = 0, minMy = 1, maxMy = 0
+        var lastValid = null
+        var lastAdded = null
+
+        for (var i = 0; i < raw.length; i++) {
+            var pt = raw[i]
+            if (!pt || pt.lat === undefined || pt.lon === undefined) continue
+            if (pt.lat === 0 && pt.lon === 0) continue
+            var pAcc = pt.acc !== undefined ? pt.acc : pt.accuracy      // routeFixes / track carry "acc"
+            if (pAcc !== undefined && pAcc > 500) continue
+
+            var t = pt.time ? Date.parse(pt.time) : NaN
+
+            // Lookahead: drop single-point spike jumps (jump > 30m out and back within 18m)
+            if (lastValid && i < raw.length - 1) {
+                var nextPt = raw[i + 1]
+                if (nextPt && nextPt.lat !== undefined && nextPt.lon !== undefined && nextPt.lat !== 0) {
+                    var d1 = haversine(lastValid.lat, lastValid.lon, pt.lat, pt.lon)
+                    var d2 = haversine(pt.lat, pt.lon, nextPt.lat, nextPt.lon)
+                    var dChord = haversine(lastValid.lat, lastValid.lon, nextPt.lat, nextPt.lon)
+                    if (d1 > 30 && d2 > 30 && dChord < 18) {
+                        continue
+                    }
+                }
+            }
+
+            if (lastValid) {
+                var dtSec = (!isNaN(t) && !isNaN(lastValid.t)) ? Math.abs((t - lastValid.t) / 1000) : 0
+                var dist = haversine(lastValid.lat, lastValid.lon, pt.lat, pt.lon)
+
+                // Skip false Wi-Fi / teleportation spikes (>35 m/s or ~78 mph within 300s)
+                if (dtSec > 0 && dtSec < 300) {
+                    var speed = dist / dtSec
+                    if (speed > 35.0 && dist > 200) continue
+                }
+
+                // Break discontinuous trips (>15 min gap or >4000m distance gap)
+                if (dtSec > 900 || dist > 4000) {
+                    if (curPts.length > 1) {
+                        segments.push({ minMx: minMx, maxMx: maxMx, minMy: minMy, maxMy: maxMy, pts: curPts })
+                    }
+                    curPts = []
+                    minMx = 1; maxMx = 0; minMy = 1; maxMy = 0
+                    lastAdded = null
+                } else if (lastAdded) {
+                    // Compress stationary points within 20 meters (or tagged phone-stationary)
+                    var isStationary = (pt.source === "phone-stationary")
+                    var dFromLast = haversine(lastAdded.lat, lastAdded.lon, pt.lat, pt.lon)
+                    if ((dFromLast < 20 || (isStationary && dFromLast < 35)) && i < raw.length - 1) {
+                        lastValid = {lat: pt.lat, lon: pt.lon, t: t}
+                        continue
+                    }
+                }
+            }
+
+            // merc() inlined: a Qt.point per fix is the slow part of this loop in V4
+            var pr = Math.max(-85.0511, Math.min(85.0511, pt.lat)) * Math.PI / 180
+            var pmx = (pt.lon + 180) / 360, pmy = (1 - Math.log(Math.tan(pr) + 1 / Math.cos(pr)) / Math.PI) / 2
+            if (pmx < minMx) minMx = pmx
+            if (pmx > maxMx) maxMx = pmx
+            if (pmy < minMy) minMy = pmy
+            if (pmy > maxMy) maxMy = pmy
+
+            curPts.push({mx: pmx, my: pmy})
+            lastValid = {lat: pt.lat, lon: pt.lon, t: t}
+            lastAdded = {lat: pt.lat, lon: pt.lon}
+        }
+
+        if (curPts.length > 1) {
+            segments.push({ minMx: minMx, maxMx: maxMx, minMy: minMy, maxMy: maxMy, pts: curPts })
+        }
+        routeSegments = segments
+    }
+    // ── cameras: projected once per list, bucketed per grid level (cells of 2^-L of the world) ──
+    readonly property var camLevels: [6, 8, 10, 12]
+    readonly property var _compassDeg: ({N: 0, NB: 0, NE: 45, E: 90, EB: 90, SE: 135, S: 180, SB: 180, SW: 225, W: 270, WB: 270, NW: 315})
+    // "121", "NB", "SW", "338-23" → degrees clockwise from north, else NaN (the dashed ring). Whole-string
+    // numbers only: parseFloat read "0-360" as 0 and "338-23" as 338. A range is its circular midpoint
+    // unless it spans more than half the compass (near-omni); a ";" list (several heads) has no one heading.
+    function camHeading(dir, named) {
+        var d = String(dir || "").trim().toUpperCase()
+        if (!d) return NaN
+        if (/^-?\d+(\.\d+)?$/.test(d)) return ((parseFloat(d) % 360) + 360) % 360
+        var r = /^(-?\d+(?:\.\d+)?)\s*-\s*(-?\d+(?:\.\d+)?)$/.exec(d)
+        if (r) {
+            var a = parseFloat(r[1]), b = parseFloat(r[2])
+            if (Math.abs(b - a) >= 360) return NaN
+            var span = ((b - a) % 360 + 360) % 360
+            return span > 180 ? NaN : ((a + span / 2) % 360 + 360) % 360
+        }
+        return named[d] !== undefined ? named[d] : NaN
+    }
+    // One pass, the projection inlined: merc() returns a Qt.point, and 136k of those took 1.7 s in V4
+    // (inlined: ~0.1 s). Integer cell keys in plain objects (a Map was 20x slower in V4).
+    function updateCameraIndex() {
+        var cams = (src && src.flockCameras) || []
+        if (!cams.length) { camIndex = null; return }
+        var levels = camLevels, nL = levels.length, lv = {}, gs = [], L, i
+        for (L = 0; L < nL; L++) { var g0 = {n: 1 << levels[L], cells: {}, keys: []}; lv[levels[L]] = g0; gs.push(g0) }
+        var d2r = Math.PI / 180, count = 0
+        for (i = 0; i < cams.length; i++) {
+            var c = cams[i]
+            if (!c) continue
+            var la = c.lat, lo = c.lon
+            if (la === undefined || lo === undefined || (la === 0 && lo === 0)) continue
+            var r = Math.max(-85.0511, Math.min(85.0511, la)) * d2r
+            var mx = (lo + 180) / 360, my = (1 - Math.log(Math.tan(r) + 1 / Math.cos(r)) / Math.PI) / 2
+            mx = mx - Math.floor(mx)
+            var passes = c.passCount > 0 ? c.passCount : 0, vetted = !!c.vetted
+            // rank: 2 passed (red) > 1 vetted (cyan) > 0 other (orange): the colour a cell's dot takes
+            var it = {mx: mx, my: my, cam: c, heading: undefined, passes: passes, vetted: vetted, rank: passes > 0 ? 2 : vetted ? 1 : 0}
+            count++
+            for (L = 0; L < nL; L++) {
+                var g = gs[L], n = g.n, gx = Math.min(n - 1, Math.floor(mx * n)), gy = Math.max(0, Math.min(n - 1, Math.floor(my * n)))
+                var key = gx * n + gy, cell = g.cells[key]
+                if (!cell) { cell = g.cells[key] = {gx: gx, gy: gy, rep: it, items: L === nL - 1 ? [] : null}; g.keys.push(key) }
+                else if (it.rank > cell.rep.rank) cell.rep = it
+                if (cell.items) cell.items.push(it)
+            }
+        }
+        camIndex = count ? {levels: lv, count: count} : null
+    }
+    // The cells of one level that intersect the mercator box [x0, x1] × [y0, y1] (x may run past 0 or 1: wraps)
+    function camCells(L, x0, x1, y0, y1) {
+        var g = camIndex.levels[L], n = g.n, out = []
+        var cx0 = Math.floor(x0 * n), cx1 = Math.floor(x1 * n), cy0 = Math.max(0, Math.floor(y0 * n)), cy1 = Math.min(n - 1, Math.floor(y1 * n))
+        if (cx1 - cx0 >= n) { cx0 = 0; cx1 = n - 1 }
+        if ((cx1 - cx0 + 1) * (cy1 - cy0 + 1) > g.keys.length) {      // a wide view: walk the occupied cells instead
+            for (var k = 0; k < g.keys.length; k++) {
+                var c = g.cells[g.keys[k]]
+                if (c.gy < cy0 || c.gy > cy1) continue
+                var inX = false
+                for (var w = -1; w <= 1 && !inX; w++) if (c.gx + w * n >= cx0 && c.gx + w * n <= cx1) inX = true
+                if (inX) out.push(c)
+            }
+            return out
+        }
+        for (var x = cx0; x <= cx1; x++) {
+            var wx = ((x % n) + n) % n
+            for (var y = cy0; y <= cy1; y++) { var cc = g.cells[wx * n + y]; if (cc) out.push(cc) }
+        }
+        return out
     }
     function bandOf(ap) { return ap.band ? ap.band : ap.freq >= 5925 ? "6" : ap.freq >= 4900 ? "5" : ap.freq > 0 ? "2.4" : "" }
 
@@ -604,7 +785,7 @@ Item {
         default: return e.type || "event"
         }
     }
-    function ageText(s) { return s < 5 ? "now" : s < 60 ? Math.floor(s) + " s" : Math.floor(s / 60) + " min" }
+    function ageText(s) { return s < 5 ? "now" : s < 60 ? Math.floor(s) + " s" : s < 3600 ? Math.floor(s / 60) + " min" : s < 172800 ? Math.floor(s / 3600) + " h" : Math.floor(s / 86400) + " d" }
     function onEvents(list, animate) {
         var t = Date.now(), pushed = 0, spot = null
         if (animate) for (var s = 0; s < list.length; s++) if (spotWorthy(list[s])) spot = list[s]   // the newest significant one
@@ -614,6 +795,9 @@ Item {
         // While the camera flies (the glide that just started, a tour leg, a follow glide) the animations wait
         // for it to land: they then play in a still view, instead of repainting the fx layer every flight frame.
         var start = flying && _fly ? Math.max(t, _fly.t0 + _fly.dur + 150) : t
+        // animClock (the only other pruner) stops off screen, e.g. a collapsed popup: drop what has played,
+        // and queue nothing new there, or a panel left shut for hours piles up every poll's events
+        if (anims.length) { animNow = t; anims = anims.filter(x => progress(x) < 1) }
         for (var i = 0; i < list.length; i++) {
             var e = list[i] || {}, type = e.type || ""
             var when = e.time ? (Date.parse(e.time) || t) : t
@@ -645,6 +829,7 @@ Item {
                 continue
             default: continue
             }
+            if (!onScreen) continue
             anims.push(a); pushed++
         }
         if (spotted && pushed) {                // linger until the batch has played (at most 6 s), then glide back
@@ -657,15 +842,20 @@ Item {
         if (fxActive()) fx.requestPaint()
     }
     function fxActive() {                       // anything for the fx layer to draw now (animations waiting for a glide do not count)
-        if (selectedBeacon || sugTarget) return true
+        return !!(selectedBeacon || sugTarget) || fxAnimating()
+    }
+    function fxAnimating() {
         var now = Date.now()
         for (var i = 0; i < anims.length; i++) if (anims[i].t0 <= now) return true
         return false
     }
-    Timer {                                     // one clock for every animation (and the selected-beacon pulse)
-        id: animClock
-        interval: 33; repeat: true                  // 30 fps for ripples and chevrons
-        running: (map.animCount > 0 || map.selectedBeacon !== "") && map.visible
+    // Mid-gesture the fx layer drops its static marks (selection ring, "sample here") rather than re-render each
+    // frame to follow the camera; they come back with the settle paint
+    onLiteChanged: if (selectedBeacon || sugTarget) fx.requestPaint()
+    Timer {                                     // one clock for every event animation; idle otherwise
+        id: animClock                           // (a selected beacon's ring is static: pulsing it repainted the whole fx
+        interval: 33; repeat: true              // canvas 30×/s for as long as anything was selected — on the desktop, forever)
+        running: map.animCount > 0 && map.onScreen
         onTriggered: {
             map.animNow = Date.now()
             var changed = false
@@ -688,9 +878,9 @@ Item {
     ListModel { id: tickerModel }
     ListModel { id: toastModel }
 
-    Timer {                                     // cinematic flight: 60 fps target, only while flying;
-        id: flyTimer                            // the view pipeline moves the layers, the overlay re-renders lite
-        interval: 16; repeat: true; running: false
+    FrameAnimation {                            // cinematic flight: one step per rendered frame, only while flying;
+        id: flyTimer                            // the view pipeline moves the layers (the overlay is only scaled)
+        running: false
         onTriggered: {
             var f = map._fly
             if (!f) { stop(); map.flying = false; return }
@@ -705,7 +895,7 @@ Item {
     Timer { id: holdTimer; property var then: null; onTriggered: { map.holding = false; var t = then; then = null; if (t) t() } }
     Timer {                                     // tour scheduler: an overview every tourMinutes, alternating city / city+state
         id: tourTimer                           // (not while anyone is at the widget, nor within 3 min of input or autoGapMs of another automatic zoom)
-        interval: 5000; repeat: true; running: map.cinematic && map.visible && map.tourMinutes > 0
+        interval: 5000; repeat: true; running: map.cinematic && map.onScreen && map.tourMinutes > 0
         property real nextAt: 0
         property int  variant: 0
         onRunningChanged: nextAt = 0
@@ -718,52 +908,71 @@ Item {
             map.overview(variant++ % 2)
         }
     }
-    Timer {                                     // eased, cursor-anchored zoom
-        interval: 16; repeat: true
-        running: !map.flying && Math.abs(map.zoomTarget - map.zoom) > 0.002
-        onTriggered: {
-            var d = map.zoomTarget - map.zoom
-            map.applyZoom(Math.abs(d) < 0.006 ? map.zoomTarget : map.zoom + d * 0.22, map.zoomAnchor.x, map.zoomAnchor.y)
+    FrameAnimation {                            // eased, cursor-anchored zoom: stepped once per rendered frame (vsync), the
+        running: !map.flying && Math.abs(map.zoomTarget - map.zoom) > 0.002   // easing scaled by the frame time
+        onTriggered: {                          // (0.22 of the gap per 60 Hz frame, whatever the refresh rate)
+            var d = map.zoomTarget - map.zoom, k = 1 - Math.pow(0.78, Math.min(4, frameTime * 60))
+            map.applyZoom(Math.abs(d) < 0.006 ? map.zoomTarget : map.zoom + d * k, map.zoomAnchor.x, map.zoomAnchor.y)
         }
     }
 
     // ── tiles ───────────────────────────────────────────────────────────────
     function tileUrl(z, x, y, labels) {
-        // OSM blocks QML's generic User-Agent, so OSM-based layers come through the tray
-        if (tileBase) return `${tileBase}/t/${labels ? "L" : layerIndex}/${z}/${x}/${y}.png`
+        // OSM blocks QML's generic User-Agent, so OSM-based layers come through the tray (tileBase, from
+        // `beaconfix --json`). Without the tray (not running, or an old desktop) the widget falls back to Esri's
+        // keyless raster services directly, which accept any client: the same imagery and labels the tray
+        // proxies, and Esri's own street / topographic / dark-grey basemaps in place of OSM and OpenTopoMap.
+        // (Esri keeps those three raster basemaps in mature support, no updates, until their retirement,
+        // announced for December 2029; World_Imagery and the reference labels are current.)
+        if (tileBase) return `${tileBase}/t/${labels ? labels : layerIndex === 2 ? ["2", "C", "U", "V"][satSource] || "2" : layerIndex}/${z}/${x}/${y}.png`
+        if (labels === "R") return `https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Transportation/MapServer/tile/${z}/${y}/${x}`
+        if (labels === "K") {                   // USGS contours: a dynamic service, asked for the tile's Web-Mercator box
+            var R = 20037508.342789244, w = 2 * R / Math.pow(2, z)
+            return `https://carto.nationalmap.gov/arcgis/rest/services/contours/MapServer/export?bbox=${(-R + x * w).toFixed(2)},${(R - (y + 1) * w).toFixed(2)},${(-R + (x + 1) * w).toFixed(2)},${(R - y * w).toFixed(2)}&bboxSR=3857&imageSR=3857&size=256,256&format=png32&transparent=true&f=image`
+        }
         if (labels) return `https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/${z}/${y}/${x}`
+        if (layerIndex === 2 && satSource === 1) return `https://clarity.maptiles.arcgis.com/arcgis/rest/services/World_Imagery/MapServer/tile/${z}/${y}/${x}`
+        if (layerIndex === 2 && satSource === 2) return `https://basemap.nationalmap.gov/arcgis/rest/services/USGSImageryOnly/MapServer/tile/${z}/${y}/${x}`
+        if (layerIndex === 2 && satSource === 3) return `https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/VIIRS_NOAA20_CorrectedReflectance_TrueColor/default/${viirsDate()}/GoogleMapsCompatible_Level9/${z}/${y}/${x}.jpg`
         if (layerIndex === 2) return `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${z}/${y}/${x}`
         if (layerIndex === 3) return `https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/${z}/${y}/${x}`
         if (layerIndex === 1) return `https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/${z}/${y}/${x}`
         return `https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/${z}/${y}/${x}`
     }
 
+    function viirsDate() { return new Date(Date.now() - 86400000).toISOString().slice(0, 10) }   // yesterday (UTC): today's pass is incomplete
+    function heatUrl(z, x, y) { return `${tileBase}/h/${src.heatGen}/${z}/${x}/${y}.png` }
+
     component TileLayer: Item {
         id: tl
         property int  zOffset: 0
         property bool labels: false
+        property string ovKey: labels ? "L" : ""   // satellite hybrid overlays: L labels, R roads, K contours
+        property bool heat: false
         property string rangeKey: ""
         anchors.fill: parent
         function refresh() {
             if (map.width <= 0 || map.height <= 0) return
-            if (labels && map.layerIndex !== 2) { if (tiles.count) tiles.clear(); rangeKey = ""; return }   // hidden: load nothing
-            var z = Math.max(1, Math.min(map.maxZ, Math.round(map.zoom)) - zOffset)
+            if ((ovKey && map.layerIndex !== 2) || (ovKey === "K" && !map.showContours)
+                || (heat && !(map.showHeatmap && map.heatTiles))) { if (tiles.count) tiles.clear(); rangeKey = ""; return }   // hidden: load nothing
+            // heat tiles are drawn for any zoom (sharp to 22); the overlays exist to 19; imagery to its source's depth
+            var z = Math.max(1, Math.min(heat || ovKey === "K" ? 22 : ovKey ? 19 : map.maxZ, Math.round(map.zoom)) - zOffset)
             var n = 1 << z
             var a = map.toMerc(0, 0), b = map.toMerc(map.width, map.height)
             var x0 = Math.floor(a.x * n), x1 = Math.floor(b.x * n)
             var y0 = Math.max(0, Math.floor(a.y * n)), y1 = Math.min(n - 1, Math.floor(b.y * n))
-            var key = [map.layerIndex, map.tileBase, z, x0, x1, y0, y1].join(",")
+            var lk = heat ? "h" + map.src.heatGen : ovKey ? ovKey + "," + map.tileBase : map.layerIndex + "," + map.satSource + "," + map.tileBase
+            var key = [lk, z, x0, x1, y0, y1].join(",")
             if (key === rangeKey) return
             rangeKey = key
             var need = {}, have = {}                // `have` instead of deleting from `need` (see Radar.qml's flashes)
             for (var x = x0; x <= x1; x++)
                 for (var y = y0; y <= y1; y++) need[z + "/" + x + "/" + y] = [x, y]
-            var lk = map.layerIndex + "," + map.tileBase
             // Tiles of another zoom level stay (marked stale, underneath) until every tile of
             // the new level has loaded, so a zoom step no longer flashes to the coarse layer.
             for (var i = tiles.count - 1; i >= 0; i--) {
                 var t = tiles.get(i)
-                if (t.lk !== lk) { tiles.remove(i); continue }
+                if (t.lk !== lk) { if (heat) tiles.setProperty(i, "stale", true); else tiles.remove(i); continue }   // a new route: the old heat stays until the new loads
                 // a tile of this level marked stale by a zoom step that was undone is current again: prune() would
                 // otherwise drop it, and with the same view refresh() stops early, so the map stayed blank
                 if (t.tz === z) { if (need[t.k] !== undefined) { have[t.k] = true; if (t.stale) tiles.setProperty(i, "stale", false) } else tiles.remove(i) }
@@ -776,7 +985,8 @@ Item {
             for (var k in need) {
                 if (have[k]) continue
                 var tx = need[k][0], ty = need[k][1]
-                tiles.append({k: k, lk: lk, tz: z, tx: tx, ty: ty, stale: false, ready: false, url: map.tileUrl(z, ((tx % n) + n) % n, ty, labels)})
+                tiles.append({k: k, lk: lk, tz: z, tx: tx, ty: ty, stale: false, ready: false,
+                              url: heat ? map.heatUrl(z, ((tx % n) + n) % n, ty) : map.tileUrl(z, ((tx % n) + n) % n, ty, ovKey)})
             }
             tl.currentZ = z
             prune()
@@ -812,13 +1022,19 @@ Item {
             }
         }
     }
-    function refreshTiles() { bgTiles.refresh(); fgTiles.refresh(); labelTiles.refresh() }
+    function refreshTiles() { bgTiles.refresh(); fgTiles.refresh(); contourTiles.refresh(); roadTiles.refresh(); labelTiles.refresh(); heatLayer.refresh() }
     onCxChanged: viewChanged(false)
     onCyChanged: viewChanged(false)
     onZoomChanged: viewChanged(true)
     onWidthChanged: { resized(); refreshTiles(); viewChanged(false); overlay.requestPaint() }
     onHeightChanged: { resized(); refreshTiles(); viewChanged(false); overlay.requestPaint() }
-    onLayerIndexChanged: { if (zoomTarget > maxZ + 2) zoom = zoomTarget = maxZ + 2; refreshTiles() }
+    // A coarse source (NASA VIIRS stops at 9) pulls the view out to where it still means something
+    onLayerIndexChanged: { if (maxZ < 15 && zoomTarget > maxZ + 3) zoom = zoomTarget = maxZ + 3; refreshTiles() }
+    onSatSourceChanged: { if (maxZ < 15 && zoomTarget > maxZ + 3) zoom = zoomTarget = maxZ + 3; refreshTiles() }
+    onShowContoursChanged: contourTiles.refresh()
+    onHeatTilesChanged: { heatLayer.refresh(); overlay.requestPaint() }
+    onShowHeatmapChanged: heatLayer.refresh()
+    Connections { target: map.src; function onHeatGenChanged() { heatLayer.refresh() } }
     onTileBaseChanged: refreshTiles()
     onHiddenCatsChanged: cluster()
 
@@ -830,8 +1046,11 @@ Item {
         TileLayer { id: bgTiles; zOffset: 2 }      // coarse layer underneath: no black holes while loading
         TileLayer { id: fgTiles }
     }
-    Rectangle { anchors.fill: parent; color: "#000000"; opacity: 0.22; visible: map.layerIndex === 2 }
+    Rectangle { anchors.fill: parent; color: "#000000"; opacity: 0.15; visible: map.layerIndex === 2 }   // overlays and pills read on bright imagery
+    TileLayer { id: contourTiles; ovKey: "K"; visible: map.layerIndex === 2 && map.showContours; opacity: 0.7; transform: itemM }
+    TileLayer { id: roadTiles; ovKey: "R"; visible: map.layerIndex === 2; transform: itemM }
     TileLayer { id: labelTiles; labels: true; visible: map.layerIndex === 2; transform: itemM }
+    TileLayer { id: heatLayer; heat: true; visible: map.showHeatmap && map.heatTiles; transform: itemM }
 
     // ── overlay: track, accuracy ring, beacons ──────────────────────────────
     // Painted for the camera in `pref` (plus a margin beyond the edges) and carried along by paintM between
@@ -913,9 +1132,72 @@ Item {
                 var lite = map.lite
                 var mpp = map.mpp()
                 var me = map.merc(src.lat, src.lon), mx = map.sx(me.x), my = map.sy(me.y)
-                // trip track
-                var tr = src.track || []
-                for (var i = 1; i < tr.length; i++) {
+                // route density heatmap (precomputed segments, viewport culled). One path, built once and stroked
+                // twice (glow, then core); a point within ~1.5 px of the last one drawn is skipped, so a zoomed-out
+                // view of thousands of fixes is a few hundred segments, and nothing is allocated per point.
+                if (map.showHeatmap && !map.heatTiles && map.routeSegments.length > 0) {
+                    ctx.save()
+                    ctx.lineCap = "round"
+                    ctx.lineJoin = "round"
+
+                    var m0 = map.toMerc(-map.ovMarginX, -map.ovMarginY)
+                    var m1 = map.toMerc(map.width + map.ovMarginX, map.height + map.ovMarginY)
+                    var vMinX = Math.min(m0.x, m1.x), vMaxX = Math.max(m0.x, m1.x)
+                    var vMinY = Math.min(m0.y, m1.y), vMaxY = Math.max(m0.y, m1.y)
+
+                    // Lines wholly outside the painted area (one side of it, with the glow's half-width to spare) become
+                    // moveTo: zoomed in, a segment touching the view still spans kilometres off it, and the stroker
+                    // outlined all of that (the settle paint after a zoom took 60-300 ms, nearly all heat-map).
+                    var rSegs = map.routeSegments, nVis = 0
+                    var cL = -map.ovMarginX - 10, cR = map.width + map.ovMarginX + 10, cT = -map.ovMarginY - 10, cB = map.height + map.ovMarginY + 10
+                    ctx.beginPath()
+                    for (var rsi = 0; rsi < rSegs.length; rsi++) {
+                        var rs = rSegs[rsi], rpts = rs.pts
+                        if (rs.maxMx < vMinX || rs.minMx > vMaxX || rs.maxMy < vMinY || rs.minMy > vMaxY) continue
+                        if (!rpts || rpts.length < 2) continue
+                        var lx = map.sx(rpts[0].mx), ly = map.sy(rpts[0].my), down = false
+                        nVis++
+                        for (var rpi = 1; rpi < rpts.length; rpi++) {
+                            var qx = map.sx(rpts[rpi].mx), qy = map.sy(rpts[rpi].my)
+                            if (rpi < rpts.length - 1 && Math.abs(qx - lx) + Math.abs(qy - ly) < 2) continue
+                            if ((lx < cL && qx < cL) || (lx > cR && qx > cR) || (ly < cT && qy < cT) || (ly > cB && qy > cB)) down = false
+                            else { if (!down) { ctx.moveTo(lx, ly); down = true } ctx.lineTo(qx, qy) }
+                            lx = qx; ly = qy
+                        }
+                    }
+
+                    if (nVis > 0) {
+                        // Wide ambient heat glow, then the vibrant core travel route (the same path)
+                        ctx.strokeStyle = "rgba(255, 145, 0, 0.20)"; ctx.lineWidth = 14; ctx.stroke()
+                        ctx.strokeStyle = "rgba(255, 234, 0, 0.75)"; ctx.lineWidth = 3.5; ctx.stroke()
+
+                        // Subtle road nodes at medium-high zoom (single path for all dots, over the painted margin too)
+                        if (map.zoom >= 13) {
+                            var nMinX = -map.ovMarginX - 10, nMaxX = map.width + map.ovMarginX + 10
+                            var nMinY = -map.ovMarginY - 10, nMaxY = map.height + map.ovMarginY + 10
+                            ctx.beginPath()
+                            for (var nsi = 0; nsi < rSegs.length; nsi++) {
+                                var ns = rSegs[nsi], npts = ns.pts
+                                if (ns.maxMx < vMinX || ns.minMx > vMaxX || ns.maxMy < vMinY || ns.minMy > vMaxY) continue
+                                if (!npts || npts.length < 2) continue
+                                var nstep = Math.max(1, Math.floor(npts.length / 50))
+                                for (var nj = 0; nj < npts.length; nj += nstep) {
+                                    var nx = map.sx(npts[nj].mx), ny = map.sy(npts[nj].my)
+                                    if (nx < nMinX || nx > nMaxX || ny < nMinY || ny > nMaxY) continue
+                                    ctx.moveTo(nx + 2.5, ny)
+                                    ctx.arc(nx, ny, 2.5, 0, Math.PI * 2)
+                                }
+                            }
+                            ctx.fillStyle = "rgba(255, 255, 255, 0.45)"
+                            ctx.fill()
+                        }
+                    }
+                    ctx.restore()
+                }
+                // trip track: straight stop-to-stop lines cut across everything, so they only stand in for the route when
+                // the heat route is off; the stops themselves go in close-up work (zoom ≥ 17), where they hide beacons
+                var tr = map.zoom >= 17 ? [] : (src.track || [])
+                for (var i = (map.showHeatmap && map.heatTiles) ? tr.length : 1; i < tr.length; i++) {
                     var a = map.merc(tr[i - 1].lat, tr[i - 1].lon), b = map.merc(tr[i].lat, tr[i].lon)
                     var coarse = tr[i - 1].source === "ip" || tr[i].source === "ip"
                     ctx.strokeStyle = coarse ? "rgba(159,176,200,0.45)" : "rgba(53,214,255,0.6)"
@@ -926,7 +1208,7 @@ Item {
                 ctx.setLineDash([])
                 for (var j = 0; j + 1 < tr.length; j++) {
                     var s = map.merc(tr[j].lat, tr[j].lon)
-                    ctx.beginPath(); ctx.arc(map.sx(s.x), map.sy(s.y), 4, 0, Math.PI * 2)
+                    ctx.beginPath(); ctx.arc(map.sx(s.x), map.sy(s.y), 3, 0, Math.PI * 2)
                     ctx.strokeStyle = tr[j].source === "ip" ? "#9fb0c8" : "#ffffff"; ctx.lineWidth = 1.4; ctx.stroke()
                     if (tr[j].source !== "ip") { ctx.fillStyle = "#1e8fae"; ctx.fill() }
                 }
@@ -954,8 +1236,11 @@ Item {
                         ctx.beginPath(); ctx.arc(dx, dy, 7, 0, Math.PI * 2); ctx.fillStyle = "#0b101a"; ctx.fill(); ctx.strokeStyle = "#7cf2c4"; ctx.lineWidth = 1.5; ctx.stroke()
                         ctx.globalAlpha = 1
                         marks.push({x: dx, y: dy + 0.5, t: map.deviceGlyph(dv.kind), c: "#e6edf7", px: 10, h: 1, a: dAlpha})
-                        var dl = (dv.device || dv.identityName || "device") + (dist < 2000 ? " · " + map.distText(dist) : "") + (dv.ageS !== undefined ? " · " + map.ageText(dv.ageS) : "")
-                        umarks.push({x: dx + 10, y: dy - 9, t: dl, c: "#7cf2c4", px: 10, b: 1, o: 1, a: dAlpha})
+                        // name and how old (the distance is on its card): a device not heard for 6 h keeps a faint marker, no name
+                        if (!stale || (dv.ageS || 0) < 21600) {
+                            var dl = (dv.device || dv.identityName || "device") + (dv.ageS !== undefined && dv.ageS >= 600 ? " · " + map.ageText(dv.ageS) : "")
+                            umarks.push({x: dx + 10, y: dy - 9, t: dl, c: "#7cf2c4", px: 10, b: 1, o: 1, a: dAlpha})
+                        }
                     }
                 }
                 // surveyed antenna anchors: crosshair pins (the one being edited is white and draggable)
@@ -979,6 +1264,10 @@ Item {
                 }
                 // beacons: RSSI orbits, uncertainty rings, dots (grouped when they coincide)
                 var aps = src.aps || [], pts = [], atMe = [], posBy = {}, last = map._lastAp
+                // Area grouping: beacons this close on screen share one marker with a count, so a street-level view
+                // shows where they are by the block, not a heap of overlapping dots; it splits as you zoom in (one
+                // marker per beacon from zoom 19). A click on a group zooms into it.
+                var groupPx = map.zoom < 15 ? 44 : map.zoom < 17 ? 30 : map.zoom < 19 ? 18 : 9
                 var selIdx = -1
                 map.selPos = null
                 // "region" beacons (grade R): one faint disc of radius R95 each, underneath everything else. There can
@@ -995,8 +1284,7 @@ Item {
                     nReg++
                 }
                 if (nReg) {
-                    ctx.globalAlpha = map.secFocus ? 0.03 : 0.07; ctx.fillStyle = map.gradeColors.R; ctx.fill()
-                    if (!lite) { ctx.globalAlpha = map.secFocus ? 0.08 : 0.22; ctx.strokeStyle = map.gradeColors.R; ctx.lineWidth = 0.8; ctx.stroke() }
+                    if (!lite) { ctx.globalAlpha = map.secFocus ? 0.08 : 0.40; ctx.strokeStyle = map.gradeColors.R; ctx.lineWidth = 0.8; ctx.stroke() }
                     ctx.globalAlpha = 1
                 }
                 for (var k = 0; k < aps.length; k++) {
@@ -1037,9 +1325,12 @@ Item {
                                     if (es === 0) ctx.moveTo(ex, ey); else ctx.lineTo(ex, ey)
                                 }
                                 ctx.closePath()
-                                ctx.globalAlpha = map.secFocus ? 0.04 : 0.12; ctx.fillStyle = gcol; ctx.fill()
-                                ctx.globalAlpha = map.secFocus ? 0.25 : 0.85; ctx.strokeStyle = gcol; ctx.lineWidth = 1.3
-                                if (dashed) ctx.setLineDash([5, 4])
+                                var isSel = selIdx >= 0 && k === selIdx
+                                if (isSel) { ctx.globalAlpha = 0.30; ctx.fillStyle = gcol; ctx.fill() }
+                                ctx.globalAlpha = isSel ? 0.95 : (map.secFocus ? 0.16 : 0.22)
+                                ctx.strokeStyle = gcol
+                                ctx.lineWidth = isSel ? 2.0 : 0.9
+                                if (dashed || !isSel) ctx.setLineDash(isSel ? [5, 4] : [3, 3])
                                 ctx.stroke(); ctx.setLineDash([])
                                 ctx.globalAlpha = 1
                             }
@@ -1047,13 +1338,19 @@ Item {
                             if (map.hasFlag(apFit, "ambiguous") && mt && mt.altLat !== undefined && mt.altLon !== undefined) {
                                 // the other solution the data allows (mirror ambiguity): a hollow ghost, faintly tied to the estimate
                                 var am = map.merc(mt.altLat, mt.altLon), gx2 = map.sx(am.x), gy2 = map.sy(am.y)
-                                ctx.globalAlpha = 0.45; ctx.strokeStyle = gcol; ctx.lineWidth = 1; ctx.setLineDash([2, 3])
+                                ctx.globalAlpha = 0.35; ctx.strokeStyle = gcol; ctx.lineWidth = 1; ctx.setLineDash([2, 3])
                                 ctx.beginPath(); ctx.moveTo(px, py); ctx.lineTo(gx2, gy2); ctx.stroke()
-                                ctx.globalAlpha = 0.9; ctx.setLineDash([2, 2]); ctx.lineWidth = 1.4
+                                ctx.globalAlpha = 0.8; ctx.setLineDash([2, 2]); ctx.lineWidth = 1.2
                                 ctx.beginPath(); ctx.arc(gx2, gy2, 4.5, 0, Math.PI * 2); ctx.stroke(); ctx.setLineDash([])
                                 ctx.globalAlpha = 1
                             }
-                        } else if (ur > 6 && ap.kind !== "region" && ap.kind !== "mobile") { ctx.beginPath(); ctx.arc(px, py, ur, 0, Math.PI * 2); ctx.strokeStyle = "rgba(255,209,102,0.3)"; ctx.setLineDash([4, 4]); ctx.stroke(); ctx.setLineDash([]) }
+                        } else if (ur > 6 && ap.kind !== "region" && ap.kind !== "mobile") {
+                            var isSelCirc = selIdx >= 0 && k === selIdx
+                            ctx.beginPath(); ctx.arc(px, py, ur, 0, Math.PI * 2)
+                            ctx.strokeStyle = isSelCirc ? "rgba(255,209,102,0.90)" : "rgba(255,209,102,0.18)"
+                            ctx.lineWidth = isSelCirc ? 2.0 : 0.9
+                            ctx.setLineDash([3, 3]); ctx.stroke(); ctx.setLineDash([])
+                        }
                         last[ap.bssid] = {kind: ap.kind, lat: ap.lat, lon: ap.lon, r: ap.r, ssid: ap.ssid, col: col, status: ap.status, dbm: ap.dbm}
                     }
                     // A beacon just placed on the map is drawn where it now is: this canvas is not repainted by the
@@ -1063,7 +1360,7 @@ Item {
                     var sc = map.secOf(ap)
                     var merged = false, mob = ap.kind === "mobile"     // a mobile beacon keeps its own "M" marker
                     for (var q = 0; q < pts.length && !mob; q++)
-                        if (!pts[q].mob && Math.abs(pts[q].x - px) < 9 && Math.abs(pts[q].y - py) < 9) {
+                        if (!pts[q].mob && Math.abs(pts[q].x - px) < groupPx && Math.abs(pts[q].y - py) < groupPx) {
                             pts[q].ids.push(k)
                             if (sc.rank > pts[q].secRank) { pts[q].secRank = sc.rank; pts[q].secCol = sc.color; pts[q].secGlyph = sc.glyph }
                             if (ap.dbm > pts[q].dbm) { pts[q].ssid = ap.ssid; pts[q].dbm = ap.dbm; pts[q].status = ap.status; pts[q].bssid = ap.bssid; pts[q].band = map.bandOf(ap); pts[q].col = col }
@@ -1106,9 +1403,137 @@ Item {
                         marks.push({x: pt.x - 9, y: pt.y - 7, t: pt.secGlyph, c: pt.secCol, px: 10, b: 1, h: 1, v: 1})
                     }
                     ctx.globalAlpha = 1
-                    if (pt.ids.length > 1) {
+                    if (pt.ids.length > 1 && groupPx > 9) {   // an area group: a disc sized by its count, the count inside
+                        var gr = 8 + 2.5 * Math.log(pt.ids.length) / Math.LN2
+                        ctx.beginPath(); ctx.arc(pt.x, pt.y, gr, 0, Math.PI * 2); ctx.fillStyle = "rgba(8,13,20,0.82)"; ctx.fill()
+                        ctx.strokeStyle = pt.col; ctx.lineWidth = 2; ctx.stroke()
+                        marks.push({x: pt.x, y: pt.y + 3.5, t: String(pt.ids.length), c: "#ffffff", px: 10, b: 1, h: 1, v: 1})
+                        pt.area = true
+                    } else if (pt.ids.length > 1) {
                         ctx.fillStyle = pt.col; ctx.beginPath(); ctx.arc(pt.x + 8, pt.y - 8, 7, 0, Math.PI * 2); ctx.fill()
                         marks.push({x: pt.x + 8, y: pt.y - 5, t: String(pt.ids.length), c: "#0b101a", px: 9, b: 1, h: 1, v: 1})
+                    }
+                }
+
+                // surveillance & flock cameras, from the spatial index (camIndex): only the grid cells around the
+                // painted area are visited. From zoom 12 each camera in full (view wedge, rings, badge, pass count;
+                // its name from 13); zoomed out, a dot per camera, and below zoom 9 a dot per grid cell (~8-30 px)
+                // in the colour of the most notable camera in it (passed, else vetted, else other).
+                if (map.showCameras && map.camIndex) {
+                    var cMinX = -map.ovMarginX - 40, cMaxX = map.width + map.ovMarginX + 40
+                    var cMinY = -map.ovMarginY - 40, cMaxY = map.height + map.ovMarginY + 40
+                    var cb0 = map.toMerc(cMinX, cMinY), cb1 = map.toMerc(cMaxX, cMaxY)
+                    if (map.zoom < 12) {
+                        var camDot = ["rgba(255, 145, 0, 0.9)", "rgba(0, 229, 255, 0.9)", "rgba(255, 42, 75, 0.95)"]
+                        var perCell = map.zoom < 9
+                        var dotCells = map.camCells(!perCell || map.zoom >= 7 ? 12 : map.zoom >= 5 ? 10 : map.zoom >= 3 ? 8 : 6, cb0.x, cb1.x, cb0.y, cb1.y)   // a cell is 256·2^(zoom−L) px: 8–32
+                        for (var crk = 0; crk < 3; crk++) {     // one path per colour; the most notable drawn last (on top)
+                            var nDots = 0
+                            ctx.beginPath()
+                            for (var dci = 0; dci < dotCells.length; dci++) {
+                                var dcl = dotCells[dci], dlist = perCell ? [dcl.rep] : dcl.items
+                                for (var dli = 0; dli < dlist.length; dli++) {
+                                    var dit = dlist[dli]
+                                    if (dit.rank !== crk) continue
+                                    var dcx = map.sx(dit.mx), dcy = map.sy(dit.my)
+                                    if (dcx < cMinX || dcx > cMaxX || dcy < cMinY || dcy > cMaxY) continue
+                                    ctx.moveTo(dcx + 3, dcy); ctx.arc(dcx, dcy, 3, 0, Math.PI * 2); nDots++
+                                }
+                            }
+                            if (nDots) { ctx.strokeStyle = "rgba(12, 16, 23, 0.85)"; ctx.lineWidth = 1.5; ctx.stroke(); ctx.fillStyle = camDot[crk]; ctx.fill() }
+                        }
+                    } else {
+                        var vcells = map.camCells(12, cb0.x, cb1.x, cb0.y, cb1.y)
+                        for (var cci = 0; cci < vcells.length; cci++) {
+                            var citems = vcells[cci].items
+                            for (var ci = 0; ci < citems.length; ci++) {
+                                var cit = citems[ci], cam = cit.cam
+                                var camX = map.sx(cit.mx), camY = map.sy(cit.my)
+                                if (camX < cMinX || camX > cMaxX || camY < cMinY || camY > cMaxY) continue
+                                var isVetted = cit.vetted
+                                var passes = cit.passes
+                                var isPassed = passes > 0
+                                var camColor = isPassed ? "#ff2a4b" : isVetted ? "#00e5ff" : "#ff9100"
+
+                                // Directional FOV wedge on the road surface
+                                if (cit.heading === undefined) cit.heading = map.camHeading(cam.direction, map._compassDeg)   // parsed once, when first drawn
+                                var heading = cit.heading
+                                if (!isNaN(heading)) {
+                                    var hRad = (heading - 90) * Math.PI / 180
+                                    var spread = 24 * Math.PI / 180
+                                    var fovLen = 38
+                                    ctx.beginPath()
+                                    ctx.moveTo(camX, camY)
+                                    ctx.lineTo(camX + fovLen * Math.cos(hRad - spread), camY + fovLen * Math.sin(hRad - spread))
+                                    ctx.arc(camX, camY, fovLen, hRad - spread, hRad + spread)
+                                    ctx.closePath()
+                                    ctx.fillStyle = isPassed ? "rgba(255, 42, 75, 0.35)" : isVetted ? "rgba(0, 229, 255, 0.28)" : "rgba(255, 145, 0, 0.25)"
+                                    ctx.fill()
+                                    ctx.strokeStyle = camColor
+                                    ctx.lineWidth = isPassed ? 2.0 : 1.6
+                                    ctx.stroke()
+                                } else {
+                                    ctx.beginPath()
+                                    ctx.arc(camX, camY, 22, 0, Math.PI * 2)
+                                    ctx.strokeStyle = isPassed ? "rgba(255, 42, 75, 0.60)" : isVetted ? "rgba(0, 229, 255, 0.45)" : "rgba(255, 145, 0, 0.40)"
+                                    ctx.lineWidth = 1.2
+                                    ctx.setLineDash([4, 3])
+                                    ctx.stroke()
+                                    ctx.setLineDash([])
+                                }
+
+                                // Outer radar ring
+                                ctx.beginPath()
+                                ctx.arc(camX, camY, isPassed ? 18 : 14, 0, Math.PI * 2)
+                                ctx.fillStyle = isPassed ? "rgba(255, 42, 75, 0.25)" : isVetted ? "rgba(0, 229, 255, 0.20)" : "rgba(255, 145, 0, 0.20)"
+                                ctx.fill()
+                                ctx.strokeStyle = camColor
+                                ctx.lineWidth = isPassed ? 1.5 : 1
+                                ctx.stroke()
+
+                                // High-contrast shield badge
+                                ctx.beginPath()
+                                ctx.arc(camX, camY, 7, 0, Math.PI * 2)
+                                ctx.fillStyle = "#0c1017"
+                                ctx.fill()
+                                ctx.lineWidth = 2.0
+                                ctx.strokeStyle = camColor
+                                ctx.stroke()
+
+                                // Inner camera lens
+                                ctx.beginPath()
+                                ctx.arc(camX, camY, 3, 0, Math.PI * 2)
+                                ctx.fillStyle = camColor
+                                ctx.fill()
+
+                                // Pass count badge top-right of camera icon
+                                if (isPassed) {
+                                    ctx.beginPath()
+                                    ctx.arc(camX + 9, camY - 9, 7.5, 0, Math.PI * 2)
+                                    ctx.fillStyle = "#ff1744"
+                                    ctx.fill()
+                                    ctx.strokeStyle = "#ffffff"
+                                    ctx.lineWidth = 1.2
+                                    ctx.stroke()
+                                    marks.push({
+                                        x: camX + 9, y: camY - 6,
+                                        t: String(passes),
+                                        c: "#ffffff", px: 9, b: 1, h: 1, v: 1
+                                    })
+                                }
+
+                                if (map.zoom >= 13) {
+                                    var camLabel = "📷 " + (cam.model || "Flock")
+                                    if (isPassed) camLabel += " · " + passes + (passes === 1 ? " pass" : " passes")
+                                    else if (isVetted) camLabel += " [vetted]"
+                                    marks.push({
+                                        x: camX + 11, y: camY - 5,
+                                        t: camLabel,
+                                        c: camColor, px: 11, b: true, o: true
+                                    })
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -1117,8 +1542,8 @@ Item {
                 // (a new beacon's pill is drawn in its final state too; the fx layer highlights it while it is new)
                 var hits = [], pillBy = {}
                 if (!lite && map.showSsids && map.zoom >= 13) {
-                    var lbl = pts.slice().sort(function(a, b) { return b.dbm - a.dbm })
-                    var limit = map.zoom >= 15 ? lbl.length : 12, taken = [], made = 0, h = 16
+                    var lbl = pts.filter(function(p) { return !p.area }).sort(function(a, b) { return b.dbm - a.dbm })
+                    var limit = map.zoom >= 18 ? lbl.length : map.zoom >= 15 ? 24 : 12, taken = [], made = 0, h = 16
                     for (var li = 0; li < lbl.length && made < limit; li++) {
                         var L = lbl[li]
                         var name = L.ssid ? (L.ssid.length > 18 ? L.ssid.slice(0, 17) + "…" : L.ssid) : "(hidden)"
@@ -1220,13 +1645,14 @@ Item {
             if (!src.valid) { map.setFxMarks(fxText); return }
             var posBy = map.posBy || {}, now = map.animNow
             var me = map.merc(src.lat, src.lon)
-            if (map.selPos && map.selectedBeacon) {
+            if (map.selPos && map.selectedBeacon && !map.lite) {
                 var sp = map.paintToView(map.selPos)
-                ctx.beginPath(); ctx.arc(sp.x, sp.y, 10 + 3 * Math.sin(now / 250), 0, Math.PI * 2)
+                ctx.beginPath(); ctx.arc(sp.x, sp.y, 11, 0, Math.PI * 2)
+                ctx.strokeStyle = "rgba(0,0,0,0.55)"; ctx.lineWidth = 4; ctx.stroke()
                 ctx.strokeStyle = "#ffffff"; ctx.lineWidth = 2; ctx.stroke()
             }
             // "sample here next" for the hovered / pinned beacon: a dotted line from its estimate to a small target
-            var sg = map.sugTarget
+            var sg = map.lite ? null : map.sugTarget
             if (sg) {
                 var sa0 = map.merc(sg.lat, sg.lon), sa1 = map.merc(sg.slat, sg.slon)
                 var sx0 = map.sx(sa0.x), sy0 = map.sy(sa0.y), sx1 = map.sx(sa1.x), sy1 = map.sy(sa1.y)
@@ -1393,7 +1819,10 @@ Item {
         target: map.src
         // data changes: one coalesced, guarded follow step per poll (lat and lon arrive separately)
         function onApsChanged() { map.scheduleFollow(); overlay.requestPaint(); map.updateSuggest() }
-        function onTrackChanged() { overlay.requestPaint() }
+        // the heatmap draws routeFixes, else (an older desktop) the track: rebuilt once per change of either
+        function onTrackChanged() { if (!(map.src.routeFixes && map.src.routeFixes.length)) map.updateRouteSegments(); overlay.requestPaint() }
+        function onRouteFixesChanged() { map.updateRouteSegments(); overlay.requestPaint() }
+        function onFlockCamerasChanged() { map.updateCameraIndex(); overlay.requestPaint() }
         function onPoisChanged() { map.selected = -1; map.cluster() }
         function onValidChanged() { map.scheduleFollow(); overlay.requestPaint() }
         function onLatChanged() { map.scheduleFollow(); overlay.requestPaint() }
@@ -1402,6 +1831,7 @@ Item {
         function onNewEvents(list, animate) { map.onEvents(list, animate) }
     }
     onShowSsidsChanged: overlay.requestPaint()
+    onOnScreenChanged: if (onScreen) { refreshTiles(); overlay.requestPaint() }   // catch up after a hidden spell
     onLinkedChanged: overlay.requestPaint()
     onShowEventsChanged: if (!showEvents) { anims = []; animCount = 0; tickerModel.clear(); toastModel.clear(); overlay.requestPaint(); fx.requestPaint() }
 
@@ -1513,10 +1943,10 @@ Item {
         }
         var best = null, bd = 12 / pX.s
         for (var i = 0; i < beaconHits.length; i++) {
-            var h = beaconHits[i], d = Math.hypot(h.x - x, h.y - y)
-            if (d < bd) { bd = d; best = h }
+            var h = beaconHits[i], d = Math.hypot(h.x - x, h.y - y), reach = h.area ? Math.max(12, 8 + 2.5 * Math.log(h.ids.length) / Math.LN2 + 2) / pX.s : bd
+            if (d < Math.max(bd, reach) && d < (best ? best.d : Infinity)) { best = h; best.d = d }
         }
-        return best ? {kind: "beacon", ids: best.ids} : null
+        return best ? {kind: "beacon", ids: best.ids, area: !!best.area} : null
     }
     function pinBeacon(ids) {                   // pin the strongest of a group in the card
         var aps = src.aps || [], top = -1
@@ -1580,7 +2010,8 @@ Item {
             var anc = map.anchorAt(mouse.x, mouse.y)
             if (anc) { if (!(map.editAnchor && map.editAnchor.id === anc.id)) map.editExisting(anc); return }
             var hit = map.hitAt(mouse.x, mouse.y)
-            if (hit) map.pinBeacon(hit.ids)
+            if (hit && hit.area) map.zoomAt(2, mouse.x, mouse.y)      // an area group: zoom in until it splits
+            else if (hit) map.pinBeacon(hit.ids)
             else { map.selected = -1; if (map.selectedBeacon) { map.selectedBeacon = ""; overlay.requestPaint(); fx.requestPaint() } }
         }
         onDoubleClicked: mouse => { if (mouse.button === Qt.LeftButton) map.zoomAt(1, mouse.x, mouse.y) }
@@ -1596,7 +2027,7 @@ Item {
             property real z0: 15
             onActiveChanged: if (active) { map.userTouched(); z0 = map.zoom; map.autoZoom = false; map.follow = false }
             onActiveScaleChanged: if (active) {
-                var z = Math.max(3, Math.min(20, z0 + Math.log(activeScale) / Math.LN2))
+                var z = Math.max(3, Math.min(map.maxZoomView, z0 + Math.log(activeScale) / Math.LN2))
                 map.zoomTarget = z
                 map.applyZoom(z, centroid.position.x, centroid.position.y)
             }
@@ -1791,6 +2222,9 @@ Item {
                 clip: true; spacing: 6
                 onMovementStarted: map.userTouched()
                 model: {
+                    // Built only while the panel is open: a hidden ListView still re-creates its delegates
+                    // (each with its issue list) on every model reassignment, i.e. on every poll
+                    if (!map.secPanel) return []
                     var aps = map.src.aps || [], rows = []
                     for (var i = 0; i < aps.length; i++) {
                         var a = aps[i]; if (!a || a.kind === "none") continue
@@ -1943,7 +2377,7 @@ Item {
                 id: radioList
                 visible: anchorPanel.wantsRadios
                 Layout.fillWidth: true; Layout.preferredHeight: Math.min(150, contentHeight); clip: true
-                model: (map.src.aps || []).slice().sort(function(a, b) { return b.dbm - a.dbm }).slice(0, 40)
+                model: !anchorPanel.wantsRadios ? [] : (map.src.aps || []).slice().sort(function(a, b) { return b.dbm - a.dbm }).slice(0, 40)
                 delegate: QQC2.CheckDelegate {
                     required property var modelData
                     width: radioList.width; height: 24; padding: 2
@@ -2076,6 +2510,25 @@ Item {
             onObjectAdded: (index, object) => layerMenu.insertItem(index, object)
             onObjectRemoved: (index, object) => layerMenu.removeItem(object)
         }
+        PC3.MenuSeparator {}                    // satellite sources: flat items (a nested PC3.Menu warns in Plasma's delegate)
+        PC3.MenuItem { text: "Satellite · Esri World Imagery (newest high-res)"; checkable: true; checked: map.layerIndex === 2 && map.satSource === 0; onTriggered: map.satSourcePicked(0) }
+        PC3.MenuItem { text: "Satellite · Esri Clarity (sharper, can be older)"; checkable: true; checked: map.layerIndex === 2 && map.satSource === 1; onTriggered: map.satSourcePicked(1) }
+        PC3.MenuItem { text: "Satellite · USGS National Map (US, public domain)"; checkable: true; checked: map.layerIndex === 2 && map.satSource === 2; onTriggered: map.satSourcePicked(2) }
+        PC3.MenuItem { text: "Satellite · NASA VIIRS (yesterday's pass, coarse)"; checkable: true; checked: map.layerIndex === 2 && map.satSource === 3; onTriggered: map.satSourcePicked(3) }
+        PC3.MenuItem { text: "Contour lines (US)"; checkable: true; checked: map.showContours; enabled: map.layerIndex === 2; onTriggered: map.contoursToggled(!map.showContours) }
+        PC3.MenuSeparator {}
+        PC3.MenuItem {
+            text: "Route Heatmap"
+            checkable: true
+            checked: map.showHeatmap
+            onTriggered: { map.showHeatmap = !map.showHeatmap; overlay.requestPaint() }
+        }
+        PC3.MenuItem {
+            text: "Flock & Surveillance Cameras"
+            checkable: true
+            checked: map.showCameras
+            onTriggered: { map.showCameras = !map.showCameras; overlay.requestPaint() }
+        }
     }
     PC3.Menu {
         id: placesMenu
@@ -2127,7 +2580,7 @@ Item {
     Rectangle {
         id: scaleBox
         readonly property var step: {             // follows the layers' reference camera: not re-built every frame
-            var steps = [5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000, 100000, 200000, 500000]
+            var steps = [0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000, 100000, 200000, 500000]
             var m = map.rmpp(), best = steps[0]
             for (var i = 0; i < steps.length; i++) if (steps[i] / m <= 80) best = steps[i]
             return {m: best, px: best / m}
@@ -2141,14 +2594,60 @@ Item {
         PC3.Label {
             id: scaleText
             x: scaleBox.step.px + 12; anchors.verticalCenter: parent.verticalCenter
-            text: scaleBox.step.m >= 1000 ? scaleBox.step.m / 1000 + " km" : scaleBox.step.m + " m"
+            // metres and feet: pinpointing works in both (1 ft = 30.48 cm)
+            text: (scaleBox.step.m >= 1000 ? scaleBox.step.m / 1000 + " km" : scaleBox.step.m >= 1 ? scaleBox.step.m + " m" : Math.round(scaleBox.step.m * 100) + " cm")
+                  + " · " + (scaleBox.step.m >= 1609.344 ? (scaleBox.step.m / 1609.344).toFixed(scaleBox.step.m >= 16093 ? 0 : 1) + " mi"
+                           : scaleBox.step.m >= 0.3048 ? Math.round(scaleBox.step.m / 0.3048 * 10) / 10 + " ft" : (scaleBox.step.m / 0.0254).toFixed(1) + " in")
             color: "#e6edf7"; font.pixelSize: 10
         }
     }
+    // Attribution for the layer actually shown: short on the map, the providers' full credit lines (their
+    // services' copyrightText) on hover, a click opens the licence / terms page.
+    readonly property var attribution: {
+        var osm = "© OpenStreetMap contributors"
+        var esriLabels = "Labels: Esri, HERE, Garmin, © OpenStreetMap contributors, and the GIS user community"
+        var hybrid = "Roads: Esri, HERE, Garmin, © OpenStreetMap contributors" + (showContours ? "\nContours: USGS The National Map (public domain)" : "")
+        esriLabels += "\n" + hybrid
+        var imagery = {t: "Powered by Esri · Esri, Vantor, Earthstar Geographics" + (showContours ? " · USGS" : ""),
+                       full: "Imagery: Esri, Vantor, Earthstar Geographics, and the GIS User Community\n" + esriLabels,
+                       url: "https://developers.arcgis.com/documentation/esri-and-data-attribution/"}
+        if (layerIndex === 2 && satSource === 2) return {t: "USGS The National Map: orthoimagery (public domain)", full: "Imagery: U.S. Geological Survey, The National Map (USDA NAIP and others), public domain\n" + esriLabels,
+                                                         url: "https://www.usgs.gov/programs/national-geospatial-program/national-map"}
+        if (layerIndex === 2 && satSource === 3) return {t: "NASA EOSDIS GIBS · VIIRS NOAA-20, " + viirsDate(), full: "Imagery: NASA Worldview / GIBS, part of NASA's Earth Science Data and Information System (ESDIS); VIIRS on NOAA-20, corrected reflectance, " + viirsDate() + "\n" + esriLabels,
+                                                         url: "https://nasa-gibs.github.io/gibs-api-docs/"}
+        if (layerIndex === 2) return imagery
+        if (tileBase) {
+            if (layerIndex === 3) return {t: "© OpenStreetMap contributors, SRTM · © OpenTopoMap (CC-BY-SA)",
+                                          full: "Map data: © OpenStreetMap contributors, SRTM\nMap style: © OpenTopoMap (CC-BY-SA 3.0)",
+                                          url: "https://opentopomap.org/about"}
+            return {t: osm, full: "Map data © OpenStreetMap contributors (ODbL)" + (layerIndex === 0 ? ", night-filtered by BeaconFix" : ""),
+                    url: "https://www.openstreetmap.org/copyright"}
+        }
+        if (layerIndex === 3) return {t: "Powered by Esri · Esri, HERE, Garmin, USGS, © OpenStreetMap contributors",
+                                      full: "Sources: Esri, HERE, Garmin, Intermap, INCREMENT P, GEBCO, USGS, FAO, NPS, NRCAN, GeoBase, IGN, Kadaster NL, Ordnance Survey, Esri Japan, METI, Esri China (Hong Kong), © OpenStreetMap contributors, and the GIS User Community",
+                                      url: "https://developers.arcgis.com/documentation/esri-and-data-attribution/"}
+        if (layerIndex === 1) return {t: "Powered by Esri · Esri, HERE, Garmin, USGS, © OpenStreetMap contributors",
+                                      full: "Sources: Esri, HERE, Garmin, USGS, Intermap, INCREMENT P, NRCan, Esri Japan, METI, Esri China (Hong Kong), Esri Korea, Esri (Thailand), NGCC, © OpenStreetMap contributors, and the GIS User Community",
+                                      url: "https://developers.arcgis.com/documentation/esri-and-data-attribution/"}
+        return {t: "Powered by Esri · Esri, HERE, Garmin, © OpenStreetMap contributors",
+                full: "Sources: Esri, HERE, Garmin, © OpenStreetMap contributors, and the GIS User Community",
+                url: "https://developers.arcgis.com/documentation/esri-and-data-attribution/"}
+    }
     PC3.Label {
+        id: attrLabel
         anchors { right: parent.right; bottom: parent.bottom; margins: 3 }
-        text: !map.tileBase ? "© Esri · OpenStreetMap" : "© OpenStreetMap" + (map.layerIndex === 2 ? " · Esri" : map.layerIndex === 3 ? " · OpenTopoMap" : "")
-        color: Qt.rgba(0.9, 0.93, 0.97, 0.55); font.pixelSize: 9
+        width: Math.min(implicitWidth, Math.max(60, map.width - scaleBox.width - 3 * Kirigami.Units.smallSpacing))
+        horizontalAlignment: Text.AlignRight
+        elide: Text.ElideLeft
+        text: map.attribution.t
+        color: Qt.rgba(0.9, 0.93, 0.97, attrHover.containsMouse ? 0.9 : 0.55); font.pixelSize: 9
+        MouseArea {                             // takes the press itself: a (passive) TapHandler let the click through to pan too
+            id: attrHover
+            anchors.fill: parent
+            hoverEnabled: true; acceptedButtons: Qt.LeftButton; cursorShape: Qt.PointingHandCursor
+            onClicked: Qt.openUrlExternally(map.attribution.url)
+        }
+        QQC2.ToolTip.text: map.attribution.full; QQC2.ToolTip.visible: attrHover.containsMouse; QQC2.ToolTip.delay: 400
     }
 
     // ── info card: hovered marker / beacon, or the pinned place ─────────────
@@ -2201,15 +2700,23 @@ Item {
                 PC3.ToolButton {
                     icon.name: "go-next"; text: "Directions"
                     onPressed: map.userTouched()
-                    onClicked: Qt.openUrlExternally(`https://www.openstreetmap.org/directions?engine=fossgis_osrm_car&route=${map.src.lat},${map.src.lon};${card.info.poi.lat},${card.info.poi.lon}`)
+                    onClicked: Qt.openUrlExternally(map.directionsUrl(card.info.poi))
                 }
-                PC3.ToolButton { icon.name: "internet-web-browser"; text: "OSM"; onPressed: map.userTouched(); onClicked: Qt.openUrlExternally(card.info.poi.osm) }
+                PC3.ToolButton { visible: !!(card.info && card.info.poi && card.info.poi.osm); icon.name: "internet-web-browser"; text: "OSM"; onPressed: map.userTouched(); onClicked: Qt.openUrlExternally(card.info.poi.osm) }
                 PC3.ToolButton {
                     visible: !!(card.info && card.info.poi && card.info.poi.website)
                     icon.name: "globe"; text: "Website"; onPressed: map.userTouched(); onClicked: Qt.openUrlExternally(card.info.poi.website)
                 }
             }
         }
+    }
+    // openstreetmap.org directions from the fix to a place: route=<lat>,<lon>;<lat>,<lon>, encoded as the site does
+    // itself (%2C, %3B). toFixed() never uses the locale's decimal comma; 6 decimals are ~0.1 m. Without a fix
+    // the start is left empty for the user to fill in (not 0,0 in the Gulf of Guinea).
+    function directionsUrl(p) {
+        var from = src.valid ? Number(src.lat).toFixed(6) + "," + Number(src.lon).toFixed(6) : ""
+        return "https://www.openstreetmap.org/directions?engine=fossgis_osrm_car&route="
+               + encodeURIComponent(from + ";" + Number(p.lat).toFixed(6) + "," + Number(p.lon).toFixed(6))
     }
     function beaconInfo(a, pinned) {
         if (!a) return null
@@ -2271,5 +2778,5 @@ Item {
         return {title: `${p.icon} ${p.name || p.label}`, lines: lines, color: p.color, poi: p, pinned: pinned}
     }
 
-    Component.onCompleted: { recenter(); cluster(); rebaseItems(); refreshTiles() }
+    Component.onCompleted: { updateRouteSegments(); updateCameraIndex(); recenter(); cluster(); rebaseItems(); refreshTiles() }
 }

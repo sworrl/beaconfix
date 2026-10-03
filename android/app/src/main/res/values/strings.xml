@@ -19,6 +19,9 @@
     <string name="widget_beacons_label">BeaconFix · Beacons</string>
     <string name="widget_sync_label">BeaconFix · Sync</string>
     <string name="widget_map_label">BeaconFix · Map</string>
+    <string name="widget_detector_desc">Radar detector for ALPR and surveillance cameras with proximity alerts.</string>
+    <string name="widget_detector_label">BeaconFix · ALPR Detector</string>
+    <string name="nav_detector">Detector</string>
     <string name="notif_channel_status">BeaconFix status</string>
     <string name="notif_channel_status_desc">Where you are, what BeaconFix hears, and what it is doing — silent, always available in the shade</string>
 </resources>

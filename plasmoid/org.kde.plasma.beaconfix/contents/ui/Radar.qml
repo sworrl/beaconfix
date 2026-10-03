@@ -28,7 +28,7 @@ Canvas {
         radar.flashes = f; radar.flashCount = n; radar.now = t
     }
     Timer {
-        interval: 33; repeat: true; running: radar.flashCount > 0
+        interval: 33; repeat: true; running: radar.flashCount > 0 && radar.visible   // another tab: no 30 fps repaints
         onTriggered: {
             radar.now = Date.now()
             var f = {}, live = 0, gone = 0

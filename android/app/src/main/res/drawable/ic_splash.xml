@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
-<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
-    <item android:drawable="@drawable/ic_launcher_background"/>
-    <item android:drawable="@drawable/ic_launcher_foreground"/>
-</layer-list>
+<!-- Splash icon (no icon background: 288 dp canvas, content within a 192 dp circle): the high-detail
+     BeaconFix emblem (data/icons/beaconfix_high.png), inset to 64 % of the canvas. -->
+<inset xmlns:android="http://schemas.android.com/apk/res/android"
+    android:drawable="@drawable/ic_splash_logo"
+    android:inset="18%" />

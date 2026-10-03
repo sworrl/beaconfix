@@ -5,6 +5,8 @@ import android.graphics.Canvas
 import android.graphics.Paint
 import android.graphics.Color as AColor
 import android.graphics.drawable.BitmapDrawable
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -24,7 +26,9 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -35,9 +39,12 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.hilt.navigation.compose.hiltViewModel
 import org.osmdroid.tileprovider.tilesource.TileSourceFactory
+import org.osmdroid.util.BoundingBox
 import org.osmdroid.util.GeoPoint
 import org.osmdroid.views.MapView
+import org.osmdroid.views.overlay.FolderOverlay
 import org.osmdroid.views.overlay.Marker
+import org.osmdroid.views.overlay.Overlay
 import org.osmdroid.views.overlay.Polygon
 import org.osmdroid.views.overlay.Polyline
 import org.osmdroid.events.MapEventsReceiver
@@ -64,19 +71,44 @@ import org.sworrl.beaconfix.ui.map.PlaceSheet
 import org.sworrl.beaconfix.ui.map.PlaceSheetModel
 import org.sworrl.beaconfix.ui.map.PlacesOverlay
 import org.sworrl.beaconfix.ui.map.TileStyler
+import org.sworrl.beaconfix.ui.map.MapAttribution
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 
-/** Beacons with SSID labels and security colours, uncertainty circles, both tracks, the cached places (every desktop and this phone), the RV, and a follow toggle. */
+/**
+ * Beacons with SSID labels and security colours, uncertainty circles, both tracks, the cached places (every desktop and this phone), the RV, and a follow toggle.
+ *
+ * The map is one osmdroid [MapView] whose overlays are a fixed stack of layers ([MapLayers]), set up once. Each layer
+ * is refilled by its own effect, keyed on exactly what it draws, so a ranging tick, a new GPS fix or a desktop event
+ * redraws the one or two small layers it touches instead of clearing and re-creating every circle, marker and track.
+ * Track splitting, road snapping and the beacons' ellipses are computed off the main thread.
+ */
 @Composable
-fun MapScreen(live: LiveViewModel = hiltViewModel(), anchorsVm: AnchorsViewModel = hiltViewModel(), placesVm: MapPlacesViewModel = hiltViewModel()) {
-    val aps by live.positioned.collectAsState(); val phone by live.phoneTrack.collectAsState(); val desk by live.desktopTrack.collectAsState()
+fun MapScreen(live: LiveViewModel = hiltViewModel(), anchorsVm: AnchorsViewModel = hiltViewModel(), placesVm: MapPlacesViewModel = hiltViewModel(), hubVm: org.sworrl.beaconfix.ui.vm.HubViewModel = hiltViewModel()) {
+    val aps by live.mapAps.collectAsState(); val track by live.phoneTrack.collectAsState(); val desk by live.desktopTrack.collectAsState()
     val views by live.views.collectAsState(); val me by live.phone.collectAsState()
     val anchorsList by anchorsVm.anchors.collectAsState(); val editing by anchorsVm.editing.collectAsState()
     val ranges by live.ranges.collectAsState()
+    val flockCameras by live.flockCameras.collectAsState()
     var anchorsLayer by remember { mutableStateOf(true) }
+    var heatmapLayer by remember { mutableStateOf(true) }
+    var camerasLayer by remember { mutableStateOf(true) }
+    var circlesLayer by rememberSaveable { mutableStateOf(true) }
+    var selectedApBssid by remember { mutableStateOf<String?>(null) }
+    // this phone's own route (the desktop's fixes are in the same table and have their own track below)
+    val phone = remember(track) { track.filter { it.source.startsWith("phone") } }
+    // road-snapped off the main thread; a fix that arrives while a pass runs waits for it (a StateFlow conflates)
+    @android.annotation.SuppressLint("ProduceStateDoesNotAssignValue")   // it does, per track, inside collect (lint only looks one lambda deep)
+    val routeSegments by produceState(initialValue = emptyList<org.sworrl.beaconfix.route.RouteSegment>(), live) {
+        live.phoneTrack.collect { t -> value = live.snapper.snapTrack(t.filter { it.source.startsWith("phone") }) }
+    }
     val anchorMarkers = remember { HashMap<String, Marker>() }
     val dragging = remember { HashSet<String>() }
-    var eventsOverlay by remember { mutableStateOf<MapEventsOverlay?>(null) }
-    var zoomTick by remember { mutableStateOf(0) }
+    var zoomBand by remember { mutableStateOf(bandOf(16.0)) }
+    // the area the camera layer covers: the view plus a margin, renewed only once the view leaves it; cones from zoom 13
+    var cullBox by remember { mutableStateOf<BoundingBox?>(null) }
+    var camDetail by remember { mutableStateOf(true) }
     var follow by remember { mutableStateOf(true) }; var labels by remember { mutableStateOf(true) }
     val ranged = ranges.values.mapNotNull { it.rangedFix }.filter { System.currentTimeMillis() - it.time < 30_000 }.minByOrNull { it.acc }
     val latest = ranged?.let { org.sworrl.beaconfix.data.db.FixEntity(time = it.time, lat = it.lat, lon = it.lon, acc = it.acc, source = "phone-range", provider = if (it.bearingDeg != null) "ranged" else "ring") }
@@ -86,16 +118,24 @@ fun MapScreen(live: LiveViewModel = hiltViewModel(), anchorsVm: AnchorsViewModel
     val prefetchTo by placesVm.prefetchTarget.collectAsState()
     var sheet by remember { mutableStateOf<org.sworrl.beaconfix.data.db.PoiEntity?>(null) }
     var sharedPin by remember { mutableStateOf<PlacesOverlay.Pin?>(null) }
-    val pois = MapFilter.apply(filter, cached).let { l -> sheet?.takeIf { s -> s.source.isNotEmpty() && l.none { it.key == s.key } }?.let { l + it } ?: l }
+    val pois = remember(filter, cached, sheet) { MapFilter.apply(filter, cached).let { l -> sheet?.takeIf { s -> s.source.isNotEmpty() && l.none { it.key == s.key } }?.let { l + it } ?: l } }
     val placesOverlay = remember { PlacesOverlay() }
     val styler = remember { TileStyler() }
     DisposableEffect(styler) { onDispose { styler.detach() } }
     var devicesLayer by remember { mutableStateOf(true) }
-    val devices = if (devicesLayer) views.flatMap { v -> v.devices + (v.location?.takeIf { it.valid }?.let { l -> listOf(org.sworrl.beaconfix.data.api.LinkedDevice(v.desktop.name.ifEmpty { v.desktop.hostname }, "desktop", "", "", l.lat, l.lon, l.accuracy, l.time, l.ageS, l.source, true)) } ?: emptyList()) }.distinctBy { it.device } else emptyList()
+    // every node the hub knows (desktop, Steam Deck, …) while the map is up; merged with the LAN desktops' answers, freshest per device
+    val hubDevices by hubVm.devices.collectAsState()
+    DisposableEffect(hubVm) { hubVm.live(true); onDispose { hubVm.live(false) } }
+    val devices = remember(views, hubDevices, devicesLayer) { if (devicesLayer) org.sworrl.beaconfix.net.HubLive.merge(views.flatMap { v -> v.devices + (v.location?.takeIf { it.valid }?.let { l -> listOf(org.sworrl.beaconfix.data.api.LinkedDevice(v.desktop.name.ifEmpty { v.desktop.hostname }, "desktop", "", "", l.lat, l.lon, l.accuracy, l.time, l.ageS, l.source, true)) } ?: emptyList()) }.distinctBy { it.device }, hubDevices) else emptyList() }
     // the RV = the desktop's last known fix (FixDao.lastDesktop(): the desktop track is newest first), when no live desktop position is drawn
     val rvLabel = desk.firstOrNull()?.let { stringResource(R.string.map_rv_pin, ago(it.time)) } ?: ""
     val rvPin = desk.firstOrNull()?.takeIf { devicesLayer && views.none { v -> v.location?.valid == true } }?.let { PlacesOverlay.RvPin(it.lat, it.lon, it.acc, rvLabel) }
-    val cache = remember { HashMap<String, BitmapDrawable>() }
+    // rendered labels; bounded, since range and age labels change text as they tick
+    val cache = remember { object : LinkedHashMap<String, BitmapDrawable>(64, 0.75f, true) { override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, BitmapDrawable>?) = size > 300 } }
+    // the beacon layer's own, larger than its working set (at most MAX_AP_LABELS names + the unnamed dots), so a refill hits
+    // every label instead of cycling an LRU, and camera / device labels never push beacon labels out
+    val apCache = remember { object : LinkedHashMap<String, BitmapDrawable>(64, 0.75f, true) { override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, BitmapDrawable>?) = size > MAX_AP_LABELS + 100 } }
+    val layers = remember { MapLayers() }
     var mapRef by remember { mutableStateOf<MapView?>(null) }
     var ticker by remember { mutableStateOf("") }
     var menu by remember { mutableStateOf(false) }
@@ -112,103 +152,318 @@ fun MapScreen(live: LiveViewModel = hiltViewModel(), anchorsVm: AnchorsViewModel
         else sharedPin = PlacesOverlay.Pin(t.lat, t.lon, t.label.ifBlank { sharedLabel })
         MapFocus.target.value = null
     }
+    val map = mapRef
+    LaunchedEffect(map, style) {
+        val m = map ?: return@LaunchedEffect
+        style?.let { styler.apply(m, it) }
+        layers.attribution?.style = style
+    }
+    // follow: glide to a new position (or when following is switched back on), not on every redraw
+    LaunchedEffect(map, follow, latest?.lat, latest?.lon) {
+        val m = map ?: return@LaunchedEffect
+        if (follow && latest != null) m.controller.animateTo(GeoPoint(latest.lat, latest.lon))
+    }
+    // Traveled routes: road-snapped vehicular tracks and natural footpaths, then the desktop's recent track
+    LaunchedEffect(map, routeSegments, if (routeSegments.isEmpty()) phone else null, desk, heatmapLayer) {
+        val m = map ?: return@LaunchedEffect
+        val (segments, deskSegs) = withContext(Dispatchers.Default) {
+            val s = if (routeSegments.isNotEmpty()) routeSegments.map { seg -> seg.mode to seg.points.map { GeoPoint(it.lat, it.lon) } }
+                else splitIntoSegments(phone).map { org.sworrl.beaconfix.collector.MotionMode.IN_VEHICLE to it }
+            s to splitIntoSegments(desk)
+        }
+        layers.attribution?.routing = routeSegments.any { s -> s.points.any { it.isSnapped } }
+        m.refill(layers.tracks) { out ->
+            // Route Heatmap overlay: ambient heat glow & vibrant core along discrete travel segments
+            if (heatmapLayer) {
+                for ((_, pts) in segments) {
+                    if (pts.size < 2) continue
+                    out.add(Polyline(m).apply {
+                        setPoints(pts)
+                        outlinePaint.color = AColor.parseColor("#33FF9100")
+                        outlinePaint.strokeWidth = 14f
+                    })
+                    out.add(Polyline(m).apply {
+                        setPoints(pts)
+                        outlinePaint.color = AColor.parseColor("#88FFEA00")
+                        outlinePaint.strokeWidth = 5f
+                    })
+                }
+            }
+
+            // Road-snapped vehicular centerlines and pedestrian footpaths
+            for ((mode, pts) in segments) {
+                if (pts.size < 2) continue
+                if (mode == org.sworrl.beaconfix.collector.MotionMode.IN_VEHICLE) {
+                    out.add(Polyline(m).apply {
+                        setPoints(pts)
+                        outlinePaint.color = AColor.parseColor("#00E5FF")
+                        outlinePaint.strokeWidth = 3.5f
+                    })
+                } else {
+                    out.add(Polyline(m).apply {
+                        setPoints(pts)
+                        outlinePaint.color = AColor.parseColor("#6CFF8A")
+                        outlinePaint.strokeWidth = 3.5f
+                        outlinePaint.pathEffect = android.graphics.DashPathEffect(floatArrayOf(10f, 8f), 0f)
+                    })
+                }
+            }
+
+            // Desktop recent track (segmented cleanly if moved)
+            for (pts in deskSegs) {
+                if (pts.size < 2) continue
+                out.add(Polyline(m).apply {
+                    setPoints(pts)
+                    outlinePaint.color = AColor.parseColor("#FFD166")
+                    outlinePaint.strokeWidth = 4f
+                    outlinePaint.pathEffect = android.graphics.DashPathEffect(floatArrayOf(8f, 6f), 0f)
+                })
+            }
+        }
+    }
+    // AP uncertainty circles (transparent fill so roads/basemap stay crystal clear, highlighted on tap); the rings are
+    // computed off the main thread once per beacon list, the layer redraws for the list, a tap, labels or the zoom band
+    @android.annotation.SuppressLint("ProduceStateDoesNotAssignValue")   // it does (below, after the off-thread compute): a lint false positive
+    val apShapes by produceState(ApShapes(emptyList(), emptyMap()), aps) {
+        val shapes = withContext(Dispatchers.Default) { ApShapes(aps, aps.mapNotNull { a -> apShape(a)?.let { a.bssid to it } }.toMap()) }
+        value = shapes
+    }
+    // where beacon names are drawn: the culled area once the view has settled (a glide re-culls on every frame)
+    var labelBox by remember { mutableStateOf<BoundingBox?>(null) }
+    LaunchedEffect(cullBox) { if (labelBox != null) delay(SETTLE_MS); labelBox = cullBox }
+    // The markers of the last full build, by bssid, and the names they show: a settled pan only swaps the icons whose
+    // name came or went, rather than rebuilding every Marker and Polygon (thousands in a city: a hitch after each pan)
+    val apMarkers = remember { HashMap<String, Marker>() }
+    var apNamed by remember { mutableStateOf<Set<String>>(emptySet()) }
+    LaunchedEffect(map, apShapes, circlesLayer, labels, zoomBand, selectedApBssid) {
+        val m = map ?: return@LaunchedEffect
+        val named = withContext(Dispatchers.Default) { apNamedIn(apShapes.aps, if (labels) labelBox else null, m.zoomLevelDouble) }
+        apMarkers.clear(); apNamed = named
+        m.refill(layers.aps) { out ->
+            for (a in apShapes.aps) {
+                val p = GeoPoint(a.lat!!, a.lon!!)
+                val g = SecurityText.grade(a.security)
+                val col = when { a.home -> "#FF4FD8"; g == "critical" -> "#FF4D4D"; g == "weak" && a.posSource != "placed" -> "#FF9F43"; a.posSource == "observed" -> "#35D6FF"; a.posSource == "placed" -> "#FFD166"; else -> "#9FB0C8" }
+                val graded = FixGrade.graded(a)
+                val mobile = graded && FixGrade.isMobile(a)
+                val isSelected = (selectedApBssid != null && a.bssid == selectedApBssid)
+                val shape = apShapes.shapes[a.bssid]
+                if (circlesLayer && shape != null) {
+                    when (shape.kind) {
+                        ApShape.REGION -> out.add(Polygon(m).apply {
+                            points = shape.points
+                            fillPaint.color = if (isSelected) FixGrade.argb(a.grade, 0x2E) else AColor.TRANSPARENT
+                            outlinePaint.color = FixGrade.argb(a.grade, if (isSelected) 0xDD else 0x55)
+                            outlinePaint.strokeWidth = if (isSelected) 2.5f else 1f
+                        })
+                        ApShape.ELLIPSE -> out.add(Polygon(m).apply {
+                            points = shape.points
+                            fillPaint.color = if (isSelected) FixGrade.argb(a.grade, 0x33) else AColor.TRANSPARENT
+                            outlinePaint.color = FixGrade.argb(a.grade, if (isSelected) 0xFF else 0x88)
+                            outlinePaint.strokeWidth = if (isSelected) 2.5f else 1.2f
+                            if (shape.dashed && !isSelected) outlinePaint.pathEffect = android.graphics.DashPathEffect(floatArrayOf(8f, 6f), 0f)
+                        })
+                        else -> out.add(Polygon(m).apply {
+                            points = shape.points
+                            fillPaint.color = if (isSelected) AColor.parseColor("#30" + col.drop(1)) else AColor.TRANSPARENT
+                            outlinePaint.color = AColor.parseColor(if (isSelected) col else "#66" + col.drop(1))
+                            outlinePaint.strokeWidth = if (isSelected) 2.2f else 1f
+                            outlinePaint.pathEffect = android.graphics.DashPathEffect(floatArrayOf(6f, 6f), 0f)
+                        })
+                    }
+                }
+                val gradeLine = when {
+                    !graded -> ""
+                    mobile -> "\n" + m.context.getString(R.string.fit_map_mobile)
+                    else -> "\n" + m.context.getString(R.string.fit_map_snippet, a.grade ?: "", (a.score ?: 0.0).toInt(), org.sworrl.beaconfix.ui.metres(a.r95 ?: (a.acc ?: 0.0) * 2.45), ((a.pWithin25 ?: 0.0) * 100).roundToInt())
+                }
+                out.add(Marker(m).apply {
+                    position = p; setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
+                    icon = apIcon(m, apCache, a, a.bssid in named)
+                    apMarkers[a.bssid] = this
+                    title = a.ssid.ifEmpty { "(hidden)" }
+                    snippet = "${a.bssid} · ${a.band} GHz ch ${a.ch}\n${secName(a.security)} · ${g}\n±${(a.acc ?: 0.0).toInt()} m (${a.posSource})" + (a.residual?.let { "\nfit ${it.toInt()} m" } ?: "") + gradeLine + (live.status.state.value.rttRanges[a.bssid]?.let { "\n" + it.text } ?: "") + "\n" + (SecurityText.forSecurity(a.security).firstOrNull()?.nerd ?: "")
+                    setOnMarkerClickListener { mk, _ ->
+                        selectedApBssid = a.bssid
+                        mk.showInfoWindow()
+                        true
+                    }
+                })
+            }
+        }
+    }
+    LaunchedEffect(if (labels) labelBox else null) {             // the view settled elsewhere: only the names move
+        val m = map ?: return@LaunchedEffect
+        val named = withContext(Dispatchers.Default) { apNamedIn(apShapes.aps, if (labels) labelBox else null, m.zoomLevelDouble) }
+        if (named == apNamed) return@LaunchedEffect
+        val byId = apShapes.aps.associateBy { it.bssid }
+        for (id in (named - apNamed) + (apNamed - named)) {
+            val a = byId[id] ?: continue
+            apMarkers[id]?.icon = apIcon(m, apCache, a, id in named)
+        }
+        apNamed = named
+        m.invalidate()
+    }
+    LaunchedEffect(map, pois, labels, zoomBand, rvPin, sharedPin) {
+        val m = map ?: return@LaunchedEffect
+        m.refill(layers.places) { out -> placesOverlay.draw(m, pois, labels, rvPin, sharedPin, onTap = { sheet = it }, onPin = { pin -> sheet = PlaceSheetModel.synthetic(MapFocus.Target(pin.lat, pin.lon, label = pin.label), pin.label) }, into = out) }
+    }
+    // the cameras for the area on screen: asked for again once the view is CAMERA_REFETCH_M from where they were last
+    // answered for, after it has stood still SETTLE_MS (a glide re-culls on every frame: each frame restarts this and
+    // cancels the wait); a failed fetch leaves camerasFrom alone, so the next pan, or the desktop answering again, retries
+    val camerasFrom by live.camerasFrom.collectAsState()
+    val desktopUp = views.any { it.error.isEmpty() && it.fetched > 0 }
+    LaunchedEffect(cullBox, camerasLayer, camerasFrom, desktopUp) {
+        val c = cullBox?.centerWithDateLine ?: return@LaunchedEffect
+        if (!camerasLayer || (c.latitude == 0.0 && c.longitude == 0.0)) return@LaunchedEffect
+        val last = camerasFrom
+        if (last != null && org.sworrl.beaconfix.estimate.Geo.distanceM(last.first, last.second, c.latitude, c.longitude) < CAMERA_REFETCH_M) return@LaunchedEffect
+        delay(SETTLE_MS)
+        live.refreshCameras(c.latitude, c.longitude, CAMERA_REFETCH_M)
+    }
+    // Surveillance & Flock camera pins (rendered above AP circles and places for clear visibility): only those in the
+    // culled area, at most MAX_CAMERAS nearest the middle of it, so thousands of cameras never become thousands of overlays
+    LaunchedEffect(map, flockCameras, camerasLayer, labels, cullBox, camDetail) {
+        val m = map ?: return@LaunchedEffect
+        val box = cullBox
+        val shown = if (!camerasLayer || box == null) emptyList() else withContext(Dispatchers.Default) {
+            val c = box.centerWithDateLine
+            flockCameras.filter { (it.lat != 0.0 || it.lon != 0.0) && box.contains(it.lat, it.lon) }
+                .sortedBy { org.sworrl.beaconfix.estimate.Geo.distanceM(c.latitude, c.longitude, it.lat, it.lon) }.take(MAX_CAMERAS)
+        }
+        layers.attribution?.cameras = shown.isNotEmpty()
+        m.refill(layers.cameras) { out ->
+            if (camerasLayer) {
+                for (cam in shown) {
+                    if (cam.lat == 0.0 && cam.lon == 0.0) continue
+                    val gp = GeoPoint(cam.lat, cam.lon)
+                    val isVetted = cam.vetted
+                    val isPassed = cam.passCount > 0
+                    val color = if (isPassed) "#FF2A4B" else if (isVetted) "#00E5FF" else "#FF9100"
+                    val glyph = if (isPassed) "🚨" else if (isVetted) "🛡" else "📷"
+                    val bearing = parseDirectionToDegrees(cam.direction, cam.notes)
+
+                    // Directional FOV cone on the road surface or 360-degree radar ring (a few pixels below zoom 13: left out)
+                    if (camDetail && bearing != null) {
+                        val conePoints = buildFovCone(gp, bearing, 55.0, 42.0)
+                        out.add(Polygon(m).apply {
+                            points = conePoints
+                            fillPaint.color = AColor.parseColor(if (isPassed) "#40FF2A4B" else if (isVetted) "#2800E5FF" else "#28FF9100")
+                            outlinePaint.color = AColor.parseColor(color)
+                            outlinePaint.strokeWidth = if (isPassed) 2.4f else 1.8f
+                            title = "${cam.model} FOV (${cam.direction})"
+                        })
+                    } else if (camDetail) {
+                        out.add(Polygon(m).apply {
+                            points = Polygon.pointsAsCircle(gp, if (isPassed) 32.0 else 25.0)
+                            fillPaint.color = AColor.parseColor(if (isPassed) "#30FF2A4B" else if (isVetted) "#1A00E5FF" else "#1AFF9100")
+                            outlinePaint.color = AColor.parseColor(color)
+                            outlinePaint.strokeWidth = if (isPassed) 1.8f else 1.2f
+                            outlinePaint.pathEffect = android.graphics.DashPathEffect(floatArrayOf(6f, 6f), 0f)
+                        })
+                    }
+
+                    // Glowing beacon halo (pulsing red if passed)
+                    if (camDetail) out.add(Polygon(m).apply {
+                        points = Polygon.pointsAsCircle(gp, if (isPassed) 16.0 else 12.0)
+                        fillPaint.color = AColor.parseColor(if (isPassed) "#66FF2A4B" else if (isVetted) "#4400E5FF" else "#44FF9100")
+                        outlinePaint.color = AColor.TRANSPARENT
+                    })
+
+                    // High-contrast shield marker with pass count badge
+                    val camLabel = if (labels) (if (isPassed) "${cam.model} [${cam.passCount}x]" else cam.model) else ""
+                    out.add(Marker(m).apply {
+                        position = gp
+                        setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
+                        icon = labelIcon(m, cache, glyph, camLabel, AColor.parseColor(color), false, big = true)
+                        title = "${cam.model} (${cam.operatorName.ifEmpty { "Flock Safety" }})"
+                        snippet = "Passes: ${cam.passCount}\nStatus: ${if (isVetted) "Field Vetted" else "Candidate Location"}\nDirection: ${cam.direction.ifEmpty { "Omni / Unspecified" }}\n${cam.notes}"
+                    })
+                }
+            }
+        }
+    }
+    // linked devices: glyph by kind, name + age, accuracy ring, dashed line + distance to this phone when close
+    LaunchedEffect(map, devices, latest) {
+        val m = map ?: return@LaunchedEffect
+        m.refill(layers.devices) { out ->
+            for (dv in devices) {
+                if (dv.lat == 0.0 && dv.lon == 0.0) continue
+                val gp = GeoPoint(dv.lat, dv.lon); val glyph = if (dv.kind == "android" || dv.kind == "phone") "📱" else "💻"
+                val age = dv.ageS?.let { a -> if (a < 90) "now" else if (a < 3600) "${(a / 60).toInt()} min" else "${(a / 3600).toInt()} h" } ?: ""
+                if (dv.acc > 0) out.add(Polygon(m).apply { points = Polygon.pointsAsCircle(gp, dv.acc.coerceIn(5.0, 2000.0)); fillPaint.color = AColor.parseColor("#1AFFD166"); outlinePaint.color = AColor.parseColor("#FFD166"); outlinePaint.strokeWidth = 1.2f })
+                latest?.let { me0 -> val dist = org.sworrl.beaconfix.estimate.Geo.distanceM(me0.lat, me0.lon, dv.lat, dv.lon); if (dist < 2000) out.add(Polyline(m).apply { setPoints(listOf(GeoPoint(me0.lat, me0.lon), gp)); outlinePaint.color = AColor.parseColor("#AAFFD166"); outlinePaint.strokeWidth = 3f; outlinePaint.pathEffect = android.graphics.DashPathEffect(floatArrayOf(12f, 10f), 0f); title = "${dist.toInt()} m to ${dv.device}" }) }
+                out.add(Marker(m).apply { position = gp; setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER); icon = labelIcon(m, cache, glyph, (dv.identityName.ifEmpty { dv.device }) + (if (age.isNotEmpty()) " · $age" else ""), AColor.parseColor(if (dv.online) "#FFD166" else "#9FB0C8"), false, big = true); title = dv.device; snippet = "${dv.kind}${if (dv.identityName.isNotEmpty()) " · ${dv.identityName}" else ""}\n±${dv.acc.toInt()} m · ${dv.source}${if (age.isNotEmpty()) " · $age ago" else ""}${if (dv.beacons > 0) "\nhears ${dv.beacons} beacons" else ""}" })
+            }
+        }
+    }
+    // anchors: ⌖ with the name, draggable (long-press the pin, then move), survey circle
+    LaunchedEffect(map, anchorsList, anchorsLayer) {
+        val m = map ?: return@LaunchedEffect
+        m.refill(layers.anchors) { out ->
+            if (anchorsLayer) for (an in anchorsList) {
+                val gp = GeoPoint(an.lat, an.lon)
+                out.add(Polygon(m).apply { points = Polygon.pointsAsCircle(gp, an.accM.coerceIn(0.3, 500.0)); fillPaint.color = AColor.parseColor("#22B388FF"); outlinePaint.color = AColor.parseColor("#B388FF"); outlinePaint.strokeWidth = 1.5f })
+                val mk = anchorMarkers.getOrPut(an.id) { Marker(m).apply {
+                    isDraggable = true; setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
+                    setOnMarkerDragListener(object : Marker.OnMarkerDragListener {
+                        override fun onMarkerDragStart(marker: Marker) { dragging += an.id }
+                        override fun onMarkerDrag(marker: Marker) {}
+                        override fun onMarkerDragEnd(marker: Marker) { dragging -= an.id; anchorsVm.move(an.id, marker.position.latitude, marker.position.longitude) }
+                    })
+                    setOnMarkerClickListener { mm, _ -> anchorsVm.anchors.value.firstOrNull { it.id == an.id }?.let { anchorsVm.edit(it) }; mm.showInfoWindow(); true }
+                } }
+                if (an.id !in dragging) mk.position = gp
+                mk.icon = labelIcon(m, cache, "⌖", an.name + (if (an.rv) " ·RV" else ""), AColor.parseColor(if (an.ref) "#FFD166" else "#B388FF"), false, big = true)
+                mk.title = an.name; mk.snippet = "${kindName(an.kind)} · ±${an.accM} m · ${an.source}" + (if (an.bssids.isNotEmpty()) "\n${an.bssids.joinToString(" ")}" else "") + "\nlong-press to drag · tap to edit"
+                out.add(mk)
+            }
+        }
+    }
+    // measured ranges: a ring (or a point at the bearing) around the desktop's anchor / position, labelled with the distance
+    LaunchedEffect(map, ranges, views) {
+        val m = map ?: return@LaunchedEffect
+        m.refill(layers.ranges) { out ->
+            for (rs in ranges.values) {
+                val b = rs.best ?: continue
+                val centre = rs.anchor?.let { GeoPoint(it.lat, it.lon) } ?: rs.desktop.let { d -> views.firstOrNull { it.desktop.id == d.id }?.location?.takeIf { it.valid }?.let { GeoPoint(it.lat, it.lon) } } ?: continue
+                val col = when (b.cls) { "adjacent" -> "#6CFF8A"; "room" -> "#35D6FF"; "near" -> "#FFD166"; else -> "#9FB0C8" }
+                out.add(Polygon(m).apply { points = Polygon.pointsAsCircle(centre, b.distanceM.coerceAtLeast(0.2)); fillPaint.color = AColor.TRANSPARENT; outlinePaint.color = AColor.parseColor(col); outlinePaint.strokeWidth = 3f; outlinePaint.pathEffect = android.graphics.DashPathEffect(floatArrayOf(10f, 8f), 0f); title = rs.line })
+                if (b.sigmaM > 0.05) { out.add(Polygon(m).apply { points = Polygon.pointsAsCircle(centre, (b.distanceM + b.sigmaM).coerceAtLeast(0.3)); fillPaint.color = AColor.parseColor("#14" + col.drop(1)); outlinePaint.color = AColor.TRANSPARENT }) }
+                rs.rangedFix?.let { rf -> out.add(Polyline(m).apply { setPoints(listOf(centre, GeoPoint(rf.lat, rf.lon))); outlinePaint.color = AColor.parseColor(col); outlinePaint.strokeWidth = 4f; title = rs.line }) }
+                out.add(Marker(m).apply { position = centre; setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER); icon = labelIcon(m, cache, "💻", "${rs.name} · ${org.sworrl.beaconfix.ranging.RangeSession.fmtM(b.distanceM)} ±${org.sworrl.beaconfix.ranging.RangeSession.fmtM(b.sigmaM)}", AColor.parseColor(col), false, big = true); title = rs.name; snippet = rs.line + "\n" + b.cls + " · " + b.method.joinToString("+") })
+            }
+        }
+    }
+    LaunchedEffect(map, latest) {
+        val m = map ?: return@LaunchedEffect
+        m.refill(layers.me) { out -> latest?.let { out.add(Marker(m).apply { position = GeoPoint(it.lat, it.lon); setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER); icon = labelIcon(m, cache, "⌖", if (it.source == "phone-range") "you (ranged)" else "you", AColor.WHITE, true, big = true); title = "You (${it.source})"; snippet = "±${it.acc.toInt()} m" }) } }
+    }
     Box(Modifier.fillMaxSize()) {
         AndroidView(
             modifier = Modifier.fillMaxSize().semantics { contentDescription = "Map of beacons and positions" },
             factory = { ctx -> MapView(ctx).apply {
-                setTileSource(TileSourceFactory.MAPNIK); setMultiTouchControls(true); maxZoomLevel = 22.0; controller.setZoom(16.0); latest?.let { controller.setCenter(GeoPoint(it.lat, it.lon)) }; mapRef = this
-                eventsOverlay = MapEventsOverlay(object : MapEventsReceiver {
+                setTileSource(TileSourceFactory.MAPNIK); setMultiTouchControls(true); maxZoomLevel = 23.0; controller.setZoom(16.0); latest?.let { controller.setCenter(GeoPoint(it.lat, it.lon)) }
+                val events = MapEventsOverlay(object : MapEventsReceiver {
                     override fun singleTapConfirmedHelper(p: GeoPoint?): Boolean = false
                     override fun longPressHelper(p: GeoPoint?): Boolean { if (p == null) return false; anchorsVm.newAt(p.latitude, p.longitude); return true }
                 })
-                var lastZ = -1
-                addMapListener(object : org.osmdroid.events.MapListener { override fun onScroll(e: org.osmdroid.events.ScrollEvent?) = false; override fun onZoom(e: org.osmdroid.events.ZoomEvent?): Boolean { val z = e?.zoomLevel?.toInt() ?: -1; if (z != lastZ) { lastZ = z; zoomTick++ }; return false } })
+                // bottom to top: (Satellite's labels, added by TileStyler), taps on the bare map, the layers, the credit line
+                overlays.add(events); overlays.addAll(layers.stack); overlays.add(MapAttribution(ctx).also { it.style = style; layers.attribution = it })
+                // the beacon and place labels change at zoom 11 and 15: only crossing one of those redraws them
+                fun recull() { val bb = boundingBox; val c = cullBox; if (c == null || !(c.contains(bb.latNorth, bb.lonWest) && c.contains(bb.latSouth, bb.lonEast))) cullBox = bb.increaseByScale(2f) }
+                addOnFirstLayoutListener { _, _, _, _, _ -> recull() }
+                addMapListener(object : org.osmdroid.events.MapListener {
+                    override fun onScroll(e: org.osmdroid.events.ScrollEvent?): Boolean { recull(); return false }
+                    override fun onZoom(e: org.osmdroid.events.ZoomEvent?): Boolean {
+                        val z = e?.zoomLevel ?: zoomLevelDouble
+                        val b = bandOf(z); if (b != zoomBand) zoomBand = b
+                        (z >= 13).let { d -> if (d != camDetail) camDetail = d }
+                        recull(); return false
+                    }
+                })
+                mapRef = this
             } },
-            update = { map ->
-                map.overlays.clear()
-                style?.let { styler.apply(map, it) }
-                map.overlays.add(org.osmdroid.views.overlay.CopyrightOverlay(map.context))
-                eventsOverlay?.let { map.overlays.add(it) }
-                @Suppress("UNUSED_EXPRESSION") zoomTick
-                if (follow && latest != null) map.controller.animateTo(GeoPoint(latest.lat, latest.lon))
-                if (desk.size > 1) map.overlays.add(Polyline(map).apply { setPoints(desk.map { GeoPoint(it.lat, it.lon) }); outlinePaint.color = AColor.parseColor("#FFD166"); outlinePaint.strokeWidth = 5f })
-                val pt = phone.filter { it.source.startsWith("phone") }
-                if (pt.size > 1) map.overlays.add(Polyline(map).apply { setPoints(pt.map { GeoPoint(it.lat, it.lon) }); outlinePaint.color = AColor.parseColor("#35D6FF"); outlinePaint.strokeWidth = 5f })
-                placesOverlay.draw(map, pois, labels, rvPin, sharedPin, onTap = { sheet = it }, onPin = { pin -> sheet = PlaceSheetModel.synthetic(MapFocus.Target(pin.lat, pin.lon, label = pin.label), pin.label) })
-                val zoomed = map.zoomLevelDouble
-                for (a in aps) {
-                    val p = GeoPoint(a.lat!!, a.lon!!)
-                    val g = SecurityText.grade(a.security)
-                    val col = when { a.home -> "#FF4FD8"; g == "critical" -> "#FF4D4D"; g == "weak" && a.posSource != "placed" -> "#FF9F43"; a.posSource == "observed" -> "#35D6FF"; a.posSource == "placed" -> "#FFD166"; else -> "#9FB0C8" }
-                    val graded = FixGrade.graded(a)
-                    val mobile = graded && FixGrade.isMobile(a)
-                    when {
-                        // travels with us: no uncertainty to draw, just a small "M"
-                        mobile -> {}
-                        // a region: a faint disc of radius R95
-                        graded && FixGrade.isRegion(a) && a.r95 != null -> map.overlays.add(Polygon(map).apply {
-                            points = Polygon.pointsAsCircle(p, a.r95.coerceIn(5.0, 3000.0)); fillPaint.color = FixGrade.argb(a.grade, 0x18)
-                            outlinePaint.color = FixGrade.argb(a.grade, 0x66); outlinePaint.strokeWidth = 1f })
-                        // a graded fix: the 95 % ellipse, coloured by grade, dashed when extrapolated or ambiguous
-                        graded && a.semiMajor != null && a.semiMajor > 0 -> map.overlays.add(Polygon(map).apply {
-                            points = FixGrade.ellipse95(a).map { GeoPoint(it.first, it.second) }
-                            fillPaint.color = FixGrade.argb(a.grade, 0x33); outlinePaint.color = FixGrade.argb(a.grade); outlinePaint.strokeWidth = 2f
-                            if (FixGrade.dashed(a)) outlinePaint.pathEffect = android.graphics.DashPathEffect(floatArrayOf(10f, 8f), 0f) })
-                        else -> map.overlays.add(Polygon(map).apply { points = Polygon.pointsAsCircle(p, (a.acc ?: 50.0).coerceIn(5.0, 1500.0)); fillPaint.color = AColor.parseColor("#22" + col.drop(1)); outlinePaint.color = AColor.parseColor(col); outlinePaint.strokeWidth = 1.5f })
-                    }
-                    val gradeLine = when {
-                        !graded -> ""
-                        mobile -> "\n" + map.context.getString(R.string.fit_map_mobile)
-                        else -> "\n" + map.context.getString(R.string.fit_map_snippet, a.grade ?: "", (a.score ?: 0.0).toInt(), org.sworrl.beaconfix.ui.metres(a.r95 ?: (a.acc ?: 0.0) * 2.45), ((a.pWithin25 ?: 0.0) * 100).roundToInt())
-                    }
-                    map.overlays.add(Marker(map).apply {
-                        position = p; setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
-                        icon = if (mobile) labelIcon(map, cache, "M", if (labels && zoomed >= 15) a.ssid.ifEmpty { "(hidden)" } else "", FixGrade.argb("M"), false)
-                            else labelIcon(map, cache, if (g == "critical" || g == "weak") gradeGlyph(g) else "", if (labels && (zoomed >= 15 || g == "critical")) a.ssid.ifEmpty { "(hidden)" } else "", AColor.parseColor(col), true)
-                        title = a.ssid.ifEmpty { "(hidden)" }
-                        snippet = "${a.bssid} · ${a.band} GHz ch ${a.ch}\n${secName(a.security)} · ${g}\n±${(a.acc ?: 0.0).toInt()} m (${a.posSource})" + (a.residual?.let { "\nfit ${it.toInt()} m" } ?: "") + gradeLine + "\n" + (SecurityText.forSecurity(a.security).firstOrNull()?.nerd ?: "")
-                    })
-                }
-                // linked devices: glyph by kind, name + age, accuracy ring, dashed line + distance to this phone when close
-                for (dv in devices) {
-                    if (dv.lat == 0.0 && dv.lon == 0.0) continue
-                    val gp = GeoPoint(dv.lat, dv.lon); val glyph = if (dv.kind == "android" || dv.kind == "phone") "📱" else "💻"
-                    val age = dv.ageS?.let { a -> if (a < 90) "now" else if (a < 3600) "${(a / 60).toInt()} min" else "${(a / 3600).toInt()} h" } ?: ""
-                    if (dv.acc > 0) map.overlays.add(Polygon(map).apply { points = Polygon.pointsAsCircle(gp, dv.acc.coerceIn(5.0, 2000.0)); fillPaint.color = AColor.parseColor("#1AFFD166"); outlinePaint.color = AColor.parseColor("#FFD166"); outlinePaint.strokeWidth = 1.2f })
-                    latest?.let { me0 -> val dist = org.sworrl.beaconfix.estimate.Geo.distanceM(me0.lat, me0.lon, dv.lat, dv.lon); if (dist < 2000) map.overlays.add(Polyline(map).apply { setPoints(listOf(GeoPoint(me0.lat, me0.lon), gp)); outlinePaint.color = AColor.parseColor("#AAFFD166"); outlinePaint.strokeWidth = 3f; outlinePaint.pathEffect = android.graphics.DashPathEffect(floatArrayOf(12f, 10f), 0f); title = "${dist.toInt()} m to ${dv.device}" }) }
-                    map.overlays.add(Marker(map).apply { position = gp; setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER); icon = labelIcon(map, cache, glyph, (dv.identityName.ifEmpty { dv.device }) + (if (age.isNotEmpty()) " · $age" else ""), AColor.parseColor(if (dv.online) "#FFD166" else "#9FB0C8"), false, big = true); title = dv.device; snippet = "${dv.kind}${if (dv.identityName.isNotEmpty()) " · ${dv.identityName}" else ""}\n±${dv.acc.toInt()} m · ${dv.source}${if (age.isNotEmpty()) " · $age ago" else ""}${if (dv.beacons > 0) "\nhears ${dv.beacons} beacons" else ""}" })
-                }
-                // anchors: ⌖ with the name, draggable (long-press the pin, then move), survey circle
-                if (anchorsLayer) for (an in anchorsList) {
-                    val gp = GeoPoint(an.lat, an.lon)
-                    map.overlays.add(Polygon(map).apply { points = Polygon.pointsAsCircle(gp, an.accM.coerceIn(0.3, 500.0)); fillPaint.color = AColor.parseColor("#22B388FF"); outlinePaint.color = AColor.parseColor("#B388FF"); outlinePaint.strokeWidth = 1.5f })
-                    val mk = anchorMarkers.getOrPut(an.id) { Marker(map).apply {
-                        isDraggable = true; setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
-                        setOnMarkerDragListener(object : Marker.OnMarkerDragListener {
-                            override fun onMarkerDragStart(marker: Marker) { dragging += an.id }
-                            override fun onMarkerDrag(marker: Marker) {}
-                            override fun onMarkerDragEnd(marker: Marker) { dragging -= an.id; anchorsVm.move(an.id, marker.position.latitude, marker.position.longitude) }
-                        })
-                        setOnMarkerClickListener { m, _ -> anchorsVm.anchors.value.firstOrNull { it.id == an.id }?.let { anchorsVm.edit(it) }; m.showInfoWindow(); true }
-                    } }
-                    if (an.id !in dragging) mk.position = gp
-                    mk.icon = labelIcon(map, cache, "⌖", an.name + (if (an.rv) " ·RV" else ""), AColor.parseColor(if (an.ref) "#FFD166" else "#B388FF"), false, big = true)
-                    mk.title = an.name; mk.snippet = "${kindName(an.kind)} · ±${an.accM} m · ${an.source}" + (if (an.bssids.isNotEmpty()) "\n${an.bssids.joinToString(" ")}" else "") + "\nlong-press to drag · tap to edit"
-                    map.overlays.add(mk)
-                }
-                // measured ranges: a ring (or a point at the bearing) around the desktop's anchor / position, labelled with the distance
-                for (rs in ranges.values) {
-                    val b = rs.best ?: continue
-                    val centre = rs.anchor?.let { GeoPoint(it.lat, it.lon) } ?: rs.desktop.let { d -> views.firstOrNull { it.desktop.id == d.id }?.location?.takeIf { it.valid }?.let { GeoPoint(it.lat, it.lon) } } ?: continue
-                    val col = when (b.cls) { "adjacent" -> "#6CFF8A"; "room" -> "#35D6FF"; "near" -> "#FFD166"; else -> "#9FB0C8" }
-                    map.overlays.add(Polygon(map).apply { points = Polygon.pointsAsCircle(centre, b.distanceM.coerceAtLeast(0.2)); fillPaint.color = AColor.TRANSPARENT; outlinePaint.color = AColor.parseColor(col); outlinePaint.strokeWidth = 3f; outlinePaint.pathEffect = android.graphics.DashPathEffect(floatArrayOf(10f, 8f), 0f); title = rs.line })
-                    if (b.sigmaM > 0.05) { map.overlays.add(Polygon(map).apply { points = Polygon.pointsAsCircle(centre, (b.distanceM + b.sigmaM).coerceAtLeast(0.3)); fillPaint.color = AColor.parseColor("#14" + col.drop(1)); outlinePaint.color = AColor.TRANSPARENT }) }
-                    rs.rangedFix?.let { rf -> map.overlays.add(Polyline(map).apply { setPoints(listOf(centre, GeoPoint(rf.lat, rf.lon))); outlinePaint.color = AColor.parseColor(col); outlinePaint.strokeWidth = 4f; title = rs.line }) }
-                    map.overlays.add(Marker(map).apply { position = centre; setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER); icon = labelIcon(map, cache, "💻", "${rs.name} · ${org.sworrl.beaconfix.ranging.RangeSession.fmtM(b.distanceM)} ±${org.sworrl.beaconfix.ranging.RangeSession.fmtM(b.sigmaM)}", AColor.parseColor(col), false, big = true); title = rs.name; snippet = rs.line + "\n" + b.cls + " · " + b.method.joinToString("+") })
-                }
-                latest?.let { map.overlays.add(Marker(map).apply { position = GeoPoint(it.lat, it.lon); setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER); icon = labelIcon(map, cache, "⌖", if (it.source == "phone-range") "you (ranged)" else "you", AColor.WHITE, true, big = true); title = "You (${it.source})"; snippet = "±${it.acc.toInt()} m" }) }
-                map.invalidate()
-            },
         )
         Column(Modifier.align(Alignment.TopStart).padding(8.dp)) {
             Surface(tonalElevation = 3.dp, shape = MaterialTheme.shapes.small) {
@@ -217,7 +472,15 @@ fun MapScreen(live: LiveViewModel = hiltViewModel(), anchorsVm: AnchorsViewModel
                     if (aps.any { FixGrade.graded(it) }) Text("  " + stringResource(R.string.fit_map_legend) + "  ", style = MaterialTheme.typography.labelSmall)
                 }
             }
-            Row { FilterChip(selected = labels, onClick = { labels = !labels }, label = { Text("Aa") }); FilterChip(selected = devicesLayer, onClick = { devicesLayer = !devicesLayer }, label = { Text("Devices") }, modifier = Modifier.padding(start = 6.dp)); MapStyleChip(style, { placesVm.setStyle(it) }, Modifier.padding(start = 6.dp)); FilterChip(selected = anchorsLayer, onClick = { anchorsLayer = !anchorsLayer }, label = { Text("⌖") }, modifier = Modifier.padding(start = 6.dp)) }
+            Row(modifier = Modifier.horizontalScroll(rememberScrollState())) {
+                FilterChip(selected = labels, onClick = { labels = !labels }, label = { Text("Aa") })
+                FilterChip(selected = devicesLayer, onClick = { devicesLayer = !devicesLayer }, label = { Text("Devices") }, modifier = Modifier.padding(start = 6.dp))
+                MapStyleChip(style, { placesVm.setStyle(it) }, Modifier.padding(start = 6.dp))
+                FilterChip(selected = anchorsLayer, onClick = { anchorsLayer = !anchorsLayer }, label = { Text("⌖") }, modifier = Modifier.padding(start = 6.dp))
+                FilterChip(selected = heatmapLayer, onClick = { heatmapLayer = !heatmapLayer }, label = { Text("Heatmap") }, modifier = Modifier.padding(start = 6.dp))
+                FilterChip(selected = camerasLayer, onClick = { camerasLayer = !camerasLayer }, label = { Text("Cameras") }, modifier = Modifier.padding(start = 6.dp))
+                FilterChip(selected = circlesLayer, onClick = { circlesLayer = !circlesLayer }, label = { Text("Circles") }, modifier = Modifier.padding(start = 6.dp))
+            }
             MapFilterRow(filter, { placesVm.setFilter(it) })
         }
         RefitOverlay(mapRef, live.refits.events, onTicker = { ticker = it })
@@ -270,6 +533,70 @@ private fun ProximityInset(rs: org.sworrl.beaconfix.ranging.RangeSession, b: org
     }
 }
 
+/** The map's overlays, one folder per layer in draw order (bottom first); each is refilled only when its own inputs change. */
+private class MapLayers {
+    val tracks = FolderOverlay(); val aps = FolderOverlay(); val places = FolderOverlay(); val cameras = FolderOverlay()
+    val devices = FolderOverlay(); val anchors = FolderOverlay(); val ranges = FolderOverlay(); val me = FolderOverlay()
+    val stack: List<Overlay> get() = listOf(tracks, aps, places, cameras, devices, anchors, ranges, me)
+    var attribution: MapAttribution? = null
+}
+
+/** Replaces [layer]'s contents with what [build] adds (straight into its item list: FolderOverlay.add re-scans the bounds each time), then redraws. */
+private inline fun MapView.refill(layer: FolderOverlay, build: (MutableList<Overlay>) -> Unit) {
+    val items = ArrayList<Overlay>()
+    build(items)
+    layer.items.clear(); layer.items.addAll(items)
+    invalidate()
+}
+
+/** The most cameras drawn at once, and how far the view moves before the cameras are asked for again. */
+private const val MAX_CAMERAS = 300
+private const val CAMERA_REFETCH_M = 20_000.0
+/** The most beacon names drawn at once; how long the view stands still before names and cameras follow it. */
+private const val MAX_AP_LABELS = 250
+private const val SETTLE_MS = 400L
+
+/** Which label thresholds [zoom] is past: beacon and place names show from 15, pediatric ERs' from 11. */
+private fun bandOf(zoom: Double): Int = when { zoom >= 15 -> 2; zoom >= 11 -> 1; else -> 0 }
+
+/** A beacon's uncertainty outline, in map coordinates. */
+private class ApShape(val kind: Int, val points: List<GeoPoint>, val dashed: Boolean) {
+    companion object { const val REGION = 0; const val ELLIPSE = 1; const val CIRCLE = 2 }
+}
+
+/** The beacon list and the outlines computed for it, published together so a layer never pairs one list with another's shapes. */
+/** The beacons named on the map: in the label area, at most MAX_AP_LABELS nearest its middle (a dense city is a pile of
+ *  text past that); below zoom 15 only the critical, non-mobile ones. */
+private fun apNamedIn(aps: List<ApEntity>, box: BoundingBox?, zoomed: Double): Set<String> {
+    if (box == null) return emptySet()
+    val c = box.centerWithDateLine
+    return aps.filter { a -> (zoomed >= 15 || (!(FixGrade.graded(a) && FixGrade.isMobile(a)) && SecurityText.grade(a.security) == "critical")) && box.contains(a.lat!!, a.lon!!) }
+        .sortedBy { org.sworrl.beaconfix.estimate.Geo.distanceM(c.latitude, c.longitude, it.lat!!, it.lon!!) }.take(MAX_AP_LABELS).mapTo(HashSet()) { it.bssid }
+}
+
+/** A beacon's marker icon: its dot (or M for a mobile one), with its name when [named]. */
+private fun apIcon(m: MapView, cache: HashMap<String, BitmapDrawable>, a: ApEntity, named: Boolean): BitmapDrawable {
+    val g = SecurityText.grade(a.security)
+    val col = when { a.home -> "#FF4FD8"; g == "critical" -> "#FF4D4D"; g == "weak" && a.posSource != "placed" -> "#FF9F43"; a.posSource == "observed" -> "#35D6FF"; a.posSource == "placed" -> "#FFD166"; else -> "#9FB0C8" }
+    val name = if (named) a.ssid.ifEmpty { "(hidden)" } else ""
+    return if (FixGrade.graded(a) && FixGrade.isMobile(a)) labelIcon(m, cache, "M", name, FixGrade.argb("M"), false)
+        else labelIcon(m, cache, if (g == "critical" || g == "weak") gradeGlyph(g) else "", name, AColor.parseColor(col), true)
+}
+
+private class ApShapes(val aps: List<ApEntity>, val shapes: Map<String, ApShape>)
+
+/** null for a beacon that travels with us (just its "M"); a region's R95 disc; a graded fix's 95 % ellipse; else the accuracy circle. */
+private fun apShape(a: ApEntity): ApShape? {
+    val p = GeoPoint(a.lat ?: return null, a.lon ?: return null)
+    val graded = FixGrade.graded(a)
+    return when {
+        graded && FixGrade.isMobile(a) -> null
+        graded && FixGrade.isRegion(a) && a.r95 != null -> ApShape(ApShape.REGION, Polygon.pointsAsCircle(p, a.r95.coerceIn(5.0, 3000.0)), false)
+        graded && a.semiMajor != null && a.semiMajor > 0 -> ApShape(ApShape.ELLIPSE, FixGrade.ellipse95(a).map { GeoPoint(it.first, it.second) }, FixGrade.dashed(a))
+        else -> ApShape(ApShape.CIRCLE, Polygon.pointsAsCircle(p, (a.acc ?: 50.0).coerceIn(5.0, 1500.0)), true)
+    }
+}
+
 /** A dot (or glyph) with an optional text label to its right, rendered once per (text, colour) and cached. */
 private fun labelIcon(map: MapView, cache: HashMap<String, BitmapDrawable>, glyph: String, label: String, color: Int, dot: Boolean, big: Boolean = false): BitmapDrawable {
     val key = "$glyph|$label|$color|$dot|$big"
@@ -294,3 +621,81 @@ private fun labelIcon(map: MapView, cache: HashMap<String, BitmapDrawable>, glyp
     return BitmapDrawable(map.resources, bmp).also { cache[key] = it }
 }
 @Suppress("unused") private fun unusedPoi(p: PoiDto, a: ApEntity) = Unit
+
+private fun parseDirectionToDegrees(dir: String, notes: String): Double? {
+    val combined = (dir + " " + notes).uppercase()
+    return when {
+        "NORTHBOUND" in combined || combined.trim() == "NB" || combined.trim() == "N" -> 0.0
+        "NORTHEAST" in combined || combined.trim() == "NE" -> 45.0
+        "EASTBOUND" in combined || combined.trim() == "EB" || combined.trim() == "E" -> 90.0
+        "SOUTHEAST" in combined || combined.trim() == "SE" -> 135.0
+        "SOUTHBOUND" in combined || combined.trim() == "SB" || combined.trim() == "S" -> 180.0
+        "SOUTHWEST" in combined || combined.trim() == "SW" -> 225.0
+        "WESTBOUND" in combined || combined.trim() == "WB" || combined.trim() == "W" -> 270.0
+        "NORTHWEST" in combined || combined.trim() == "NW" -> 315.0
+        else -> {
+            val num = Regex("""\b(\d{1,3})\s*(?:deg|°)?\b""").find(combined)?.groupValues?.get(1)?.toDoubleOrNull()
+            if (num != null && num in 0.0..360.0) num else null
+        }
+    }
+}
+
+private fun buildFovCone(center: GeoPoint, bearingDeg: Double, distanceM: Double, spanDeg: Double): List<GeoPoint> {
+    val pts = mutableListOf<GeoPoint>()
+    pts.add(center)
+    val startAngle = bearingDeg - spanDeg / 2.0
+    val endAngle = bearingDeg + spanDeg / 2.0
+    val steps = 8
+    for (i in 0..steps) {
+        val ang = startAngle + (endAngle - startAngle) * (i.toDouble() / steps)
+        val radAng = Math.toRadians(ang)
+        val dLat = (distanceM * kotlin.math.cos(radAng)) / 111319.5
+        val dLon = (distanceM * kotlin.math.sin(radAng)) / (111319.5 * kotlin.math.cos(Math.toRadians(center.latitude)))
+        pts.add(GeoPoint(center.latitude + dLat, center.longitude + dLon))
+    }
+    pts.add(center)
+    return pts
+}
+
+private fun splitIntoSegments(fixes: List<org.sworrl.beaconfix.data.db.FixEntity>): List<List<GeoPoint>> {
+    val valid = fixes.filter { it.lat != 0.0 && it.lon != 0.0 && it.acc <= 500 }.sortedBy { it.time }
+    if (valid.size < 2) return emptyList()
+
+    val segments = mutableListOf<List<GeoPoint>>()
+    var cur = mutableListOf<GeoPoint>()
+    var lastFix: org.sworrl.beaconfix.data.db.FixEntity? = null
+    var lastAdded: GeoPoint? = null
+
+    for (f in valid) {
+        val gp = GeoPoint(f.lat, f.lon)
+        if (lastFix != null) {
+            val dtSec = if (f.time > 0 && lastFix.time > 0) Math.abs(f.time - lastFix.time) / 1000.0 else 0.0
+            val dist = org.sworrl.beaconfix.estimate.Geo.distanceM(lastFix.lat, lastFix.lon, f.lat, f.lon)
+
+            // Speed spike check (>35 m/s or ~78 mph)
+            if (dtSec in 1.0..300.0 && (dist / dtSec) > 35.0 && dist > 200.0) {
+                continue
+            }
+
+            // Trip break check (>15 min or >4000m)
+            if (dtSec > 900.0 || dist > 4000.0) {
+                if (cur.size > 1) segments.add(cur)
+                cur = mutableListOf()
+                lastAdded = null
+            } else if (lastAdded != null) {
+                val dLast = org.sworrl.beaconfix.estimate.Geo.distanceM(lastAdded.latitude, lastAdded.longitude, f.lat, f.lon)
+                if (dLast < 15.0) {
+                    lastFix = f
+                    continue
+                }
+            }
+        }
+        cur.add(gp)
+        lastFix = f
+        lastAdded = gp
+    }
+
+    if (cur.size > 1) segments.add(cur)
+    return segments
+}
+

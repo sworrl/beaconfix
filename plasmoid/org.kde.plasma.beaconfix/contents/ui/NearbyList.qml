@@ -16,6 +16,16 @@ ColumnLayout {
     // Clipboard without a C++ helper: a hidden TextEdit does it
     TextEdit { id: clip; visible: false }
     function copyText(t) { clip.text = t; clip.selectAll(); clip.copy() }
+    // tel: wants the bare number: OSM phone tags carry spaces, dashes, dots, brackets and sometimes several
+    // numbers ("+1 555-0100;+1 555-0101"); dial the first
+    function telUrl(ph) { return "tel:" + String(ph || "").split(/[;,]/)[0].replace(/[^0-9+*#]/g, "") }
+    // openstreetmap.org directions, route=<lat>,<lon>;<lat>,<lon> encoded as the site does; toFixed() is never
+    // localised (no decimal comma). Without a fix the start stays empty instead of 0,0.
+    function directionsUrl(p) {
+        var from = nearby.src.valid ? Number(nearby.src.lat).toFixed(6) + "," + Number(nearby.src.lon).toFixed(6) : ""
+        return "https://www.openstreetmap.org/directions?engine=fossgis_osrm_car&route="
+               + encodeURIComponent(from + ";" + Number(p.lat).toFixed(6) + "," + Number(p.lon).toFixed(6))
+    }
     function distText(m) { return m < 950 ? Math.round(m / 10) * 10 + " m" : m < 9950 ? (m / 1000).toFixed(1) + " km" : Math.round(m / 1000) + " km" }
 
     // ── pediatric help (desktop 3.8+). Every field is optional: an older desktop just shows the rows it has. ──
@@ -102,7 +112,7 @@ ColumnLayout {
                     PC3.ToolButton {
                         visible: !!helpRow.q.phone; icon.name: "call-start"; text: helpRow.q.phone || ""; display: QQC2.AbstractButton.TextBesideIcon
                         font.pixelSize: Kirigami.Theme.smallFont.pixelSize
-                        onClicked: Qt.openUrlExternally("tel:" + (helpRow.q.phone || "").replace(/ /g, ""))
+                        onClicked: Qt.openUrlExternally(nearby.telUrl(helpRow.q.phone))
                         QQC2.ToolTip.text: "Call " + (helpRow.q.phone || ""); QQC2.ToolTip.visible: hovered
                     }
                 }
@@ -199,7 +209,7 @@ ColumnLayout {
                     visible: !!row.modelData.p.phone
                     icon.name: "call-start"; display: QQC2.AbstractButton.IconOnly; text: "Call"
                     QQC2.ToolTip.text: "Call " + (row.modelData.p.phone || "") + " (right-click: copy)"; QQC2.ToolTip.visible: hovered; QQC2.ToolTip.delay: 500
-                    onClicked: Qt.openUrlExternally("tel:" + (row.modelData.p.phone || "").replace(/ /g, ""))
+                    onClicked: Qt.openUrlExternally(nearby.telUrl(row.modelData.p.phone))
                     TapHandler { acceptedButtons: Qt.RightButton; onTapped: nearby.copyText(row.modelData.p.phone || "") }
                 }
                 PC3.ToolButton {
@@ -217,7 +227,7 @@ ColumnLayout {
                     display: QQC2.AbstractButton.IconOnly
                     text: "Directions"
                     QQC2.ToolTip.text: "Directions (OpenStreetMap)"; QQC2.ToolTip.visible: hovered; QQC2.ToolTip.delay: 500
-                    onClicked: Qt.openUrlExternally(`https://www.openstreetmap.org/directions?engine=fossgis_osrm_car&route=${nearby.src.lat},${nearby.src.lon};${row.modelData.p.lat},${row.modelData.p.lon}`)
+                    onClicked: Qt.openUrlExternally(nearby.directionsUrl(row.modelData.p))
                 }
             }
         }

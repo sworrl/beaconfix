@@ -43,6 +43,16 @@ data class CollectorState(
     val scan: List<ScanSample> = emptyList(),
     val history: Map<String, List<Int>> = emptyMap(),   // bssid → last RSSI values for sparklines
     val error: String = "",
+    val motionMode: MotionMode = MotionMode.STATIONARY,
+    val isCharging: Boolean = false,
+    val samplingIntervalMs: Long = 45_000L,
+    /** Wi-Fi RTT to ordinary APs (ranging.ApRttRanger): responders in the last scan (802.11mc, of them 802.11az), how many of them answered in the last 2 min, why not ("" / ok / cooldown / doze / …) */
+    val rttHeard: Int = 0,
+    val rttHeardAz: Int = 0,
+    val rttAnswered: Int = 0,
+    val rttState: String = "",
+    /** bssid → its newest range this session */
+    val rttRanges: Map<String, org.sworrl.beaconfix.ranging.ApRange> = emptyMap(),
 )
 
 /** Live status shared between the service and the UI. */
@@ -66,11 +76,17 @@ class CollectorService : LifecycleService() {
     @Inject lateinit var recorder: ObservationRecorder
     @Inject lateinit var status: CollectorStatus
     @Inject lateinit var scanner: WifiScanner
+    @Inject lateinit var location: LocationSource
+    @Inject lateinit var motion: MotionDetector
+    @Inject lateinit var livePasses: org.sworrl.beaconfix.sightings.LivePassTracker
     @Inject lateinit var prefs: Prefs
     @Inject lateinit var widgets: org.sworrl.beaconfix.widget.WidgetUpdater
     @Inject lateinit var notifier: org.sworrl.beaconfix.widget.StatusNotifier
     @Inject lateinit var ranging: org.sworrl.beaconfix.ranging.RangingRepository
+    @Inject lateinit var hubPresence: org.sworrl.beaconfix.net.HubPresence
     private var loop: Job? = null
+    private var locationJob: Job? = null
+    private var motionStatusJob: Job? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -107,17 +123,70 @@ class CollectorService : LifecycleService() {
         return false
     }
 
-    private fun startLoop() { if (loop == null) loop = lifecycleScope.launch { run() } }
-    private fun stopLoop() { loop?.cancel(); loop = null; status.update { it.copy(running = false, survey = false) }; refreshNotification() }
+    private fun startLoop() {
+        if (loop == null) loop = lifecycleScope.launch { run() }
+        if (locationJob == null) {
+            locationJob = lifecycleScope.launch {
+                runCatching {
+                    location.updates(intervalMs = 4000L, minDistanceM = 3f).collect { loc ->
+                        motion.onLocationUpdate(loc)
+                        hubPresence.offer(loc.latitude, loc.longitude, loc.accuracy.toDouble(), loc.time, "gps", if (loc.hasSpeed()) loc.speed else null)
+                        livePasses.onLocation(loc)      // docs/SIGHTINGS.md §2: phone-live camera passes
+                    }
+                }
+            }
+        }
+        if (motionStatusJob == null) {
+            motionStatusJob = lifecycleScope.launch {
+                motion.status.collect { ms ->
+                    status.update {
+                        it.copy(
+                            motionMode = ms.mode,
+                            isCharging = ms.isCharging,
+                            samplingIntervalMs = ms.suggestedIntervalMs
+                        )
+                    }
+                    refreshNotification()
+                }
+            }
+        }
+    }
+
+    private fun stopLoop() {
+        loop?.cancel(); loop = null
+        locationJob?.cancel(); locationJob = null
+        motionStatusJob?.cancel(); motionStatusJob = null
+        status.update { it.copy(running = false, survey = false) }
+        refreshNotification()
+    }
 
     private suspend fun run() {
         status.update { it.copy(running = true, throttled = scanner.throttlingOn()) }
         while (currentCoroutineContext().isActive) {
             val survey = status.state.value.survey
-            val interval = if (survey) (if (scanner.throttlingOn()) 30_000L else 4_000L) else prefs.collectIntervalSec.first() * 1000L
-            try { recorder.scanAndRecord(fresh = true) } catch (e: Exception) { status.update { it.copy(error = e.message ?: e.toString()) } }
-            delay(3000); refreshNotification()
-            delay((interval - 3000).coerceAtLeast(1000))
+            val motionStatus = motion.status.value
+            val interval = if (survey) {
+                if (scanner.throttlingOn()) 30_000L else 4_000L
+            } else {
+                motionStatus.suggestedIntervalMs
+            }
+            try {
+                recorder.scanAndRecord(fresh = true)
+            } catch (e: Exception) {
+                status.update { it.copy(error = e.message ?: e.toString()) }
+            }
+            delay(1000)
+            refreshNotification()
+
+            // Wait for interval, but awaken early if motion changes to a faster sampling rate
+            val remaining = (interval - 1000).coerceAtLeast(500)
+            kotlinx.coroutines.withTimeoutOrNull(remaining) {
+                motion.status.collect { s ->
+                    if (s.suggestedIntervalMs < interval) {
+                        return@collect
+                    }
+                }
+            }
         }
     }
 
@@ -127,6 +196,8 @@ class CollectorService : LifecycleService() {
 
     override fun onDestroy() {
         loop?.cancel(); loop = null
+        locationJob?.cancel(); locationJob = null
+        motionStatusJob?.cancel(); motionStatusJob = null
         status.update { it.copy(presence = false, running = false, survey = false) }
         runCatching { ranging.presence(false) }
         widgets.touch("collector")

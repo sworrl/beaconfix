@@ -1,0 +1,88 @@
+{
+  "spec": "docs/SECURE-API.md",
+  "server_sk": "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA",
+  "server_pk": "B6N8vBQgk8i3VdwbEOhstCY3StFqqFPtC9_AsrhtHHw",
+  "fingerprint": "aaa8fff703b50b2297f4f6e13508f724",
+  "device_sk": "ZWZnaGlqa2xtbm9wcXJzdHV2d3h5ent8fX5_gIGCg4Q",
+  "device_pk": "VxR2nRFr92Q2rnS8eT0sMK0ZA8WaxSc4BcfiaYtBDDY",
+  "device_id": "deed385a24ef7976adde5ba33",
+  "shared": "yepqP3mgALYLB21K_JkLJy8_C1qqPwuHE8IJJz42OGM",
+  "root_key": "WvaXY_lIJfNx8B36e9V0WlSy8XOWdibIeMlQ4_oV2eo",
+  "enroll": {
+    "invite": "bfs3:eyJ1IjoiaHR0cHM6Ly9odWIuZXhhbXBsZS5jb20iLCJzIjoiQjZOOHZCUWdrOGkzVmR3YkVPaHN0Q1kzU3RGcXFGUHRDOV9Bc3JodEhIdyIsImkiOiIwMTIzNDU2Nzg5YWJjZGVmIiwiayI6Inljckx6TTNPejlEUjB0UFUxZGJYMk5uYTI5emQzdF9nNGVMajVPWG01LWciLCJlIjoxNzkwOTAwOTAwfQ",
+    "invite_id": "0123456789abcdef",
+    "invite_secret": "ycrLzM3Oz9DR0tPU1dbX2Nna29zd3t_g4eLj5OXm5-g",
+    "name": "Pixel 10 Pro XL",
+    "kind": "android",
+    "ts": 1790900000,
+    "mac": "74d6a9c95d11ce9c96b7e7bda4ae9cb727f4ccd080dbad7cbeaba27732fb9894e0b579fcfaa954ec672058c01ae1d0bb884b085b3acc6fdf017cc3d016ed4a52",
+    "proof": "96b9fd87801d3fe0f50771fa8ef6e589787df6612b17d66ef81650410ad644566e8024e9ee55d4cafda31d3b487b083417aa04bd9c172653427dda74eae28112"
+  },
+  "requests": [
+    {
+      "counter": 1,
+      "method": "GET",
+      "target": "/api/v3/state",
+      "ts": 1790900000,
+      "nonce": "oPQ6v5Y5s6iIGA92",
+      "key": "A8Ir89xSX0yaUSg5n8QjprnLnej0MJtyUWvGxleD0HQ",
+      "aad": "bfs3\nGET\n/api/v3/state\ndeed385a24ef7976adde5ba33\n1\n1790900000",
+      "plaintext": "",
+      "sealed": "X7dTRozfS1X0eAOU7tRdnw"
+    },
+    {
+      "counter": 2,
+      "method": "POST",
+      "target": "/api/v3/db/sync",
+      "ts": 1790900000,
+      "nonce": "XZLFP_sp76rvgQb9",
+      "key": "rMESVd6mY3lWnXJMELWwJ2UTpDdihP927dvZDQO9dbc",
+      "aad": "bfs3\nPOST\n/api/v3/db/sync\ndeed385a24ef7976adde5ba33\n2\n1790900000",
+      "plaintext": "{\"device\":\"Pixel\",\"observations\":[{\"bssid\":\"AA:BB:CC:DD:EE:FF\",\"dbm\":-61,\"lat\":40.0031,\"lon\":-75.0686,\"acc\":4.0,\"time\":\"2026-10-01T19:40:00\",\"rangeM\":7.3,\"rangeSd\":0.9}]}",
+      "sealed": "73D-IjQ_WVGNM9UtVQYtJCgl7Llh5BW6cFpquvlCTe1UbsZWJdE0UbcA0AL1dkqbQjjmvU3qi-VXxE8z8tH0395hLI3I9SlYOtLGv3tuZEWuXIRDSpV9XO0sk8UqIG94mtEl4Ry2vX56WZeFi4fIvW7Qm0MC16XGZuIn5lbDhIEit_HFlRjeWfvRLy-OniwEgllWNQRkhR7sTMVsKNi3LsFhcImibJ_KNt7HiDldxG03k_A__0AKWN2R"
+    },
+    {
+      "counter": 1099511627783,
+      "method": "GET",
+      "target": "/api/v3/db/changes?since=12&limit=500",
+      "ts": 1790900000,
+      "nonce": "vjD2KQcUlo9RL3N1",
+      "key": "W1rPXPDPhIzL8YPYz8qmfhELBCaDcyffTdU4QvZKC08",
+      "aad": "bfs3\nGET\n/api/v3/db/changes?since=12&limit=500\ndeed385a24ef7976adde5ba33\n1099511627783\n1790900000",
+      "plaintext": "",
+      "sealed": "H1s1apUDmlMxqd6LSZpIsw"
+    }
+  ],
+  "responses": [
+    {
+      "counter": 1,
+      "status": 200,
+      "nonce": "jXuMl6Zgg1faONPG",
+      "plaintext": "{\"valid\":true,\"lat\":40.00313}",
+      "sealed": "kzEp2ngDxA47lwz4vWcCtw4a-dkFwCVY0GDiTUS8gWG7CvBZ0MTMZpiUqMlk"
+    },
+    {
+      "counter": 2,
+      "status": 401,
+      "nonce": "v96Lc0ugh0SAjTNQ",
+      "plaintext": "{\"error\":\"unauthorized\"}",
+      "sealed": "jHrHB1-4dx3kjRPZS8pxD0-GMvdwEyHDOpR5_eGGo8xVMEs9qwSViA"
+    }
+  ],
+  "events": [
+    {
+      "counter": 5,
+      "seq": 1,
+      "nonce": "UKUDv2kerF7AHwtS",
+      "plaintext": "{\"type\":\"fix\",\"seq\":1}",
+      "line": "UKUDv2kerF7AHwtSPosZOF_EArEgGnGi3Rx1bmFjDZRI0l3qRLfCpT2FCJ19E32bwTs"
+    },
+    {
+      "counter": 5,
+      "seq": 2,
+      "nonce": "G1sBaqJNjPmEICPa",
+      "plaintext": "{\"type\":\"fix\",\"seq\":2}",
+      "line": "G1sBaqJNjPmEICPay5YzVRFU2hbNZgTXDf5CJnsKd6nYZMz0j2NksS-EMRK68yjpr3k"
+    }
+  ]
+}

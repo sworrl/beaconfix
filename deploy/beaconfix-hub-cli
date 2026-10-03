@@ -1,0 +1,11 @@
+#!/bin/sh
+# Hub administration as the hub's user with the hub's environment (run as root):
+#   beaconfix-hub-cli --invite "Pixel 10 Pro XL" --kind android     single-use invite (15 min), text + QR
+#   beaconfix-hub-cli --devices | --status | --revoke <deviceId-or-name>
+set -eu
+ENV_FILE=${BEACONFIX_HUB_ENV:-/etc/beaconfix/beaconfix-hub.env}
+BIN=${BEACONFIX_BIN:-/usr/local/bin/beaconfix}
+[ -r "$ENV_FILE" ] || { echo "beaconfix-hub-cli: cannot read $ENV_FILE" >&2; exit 1; }
+# shellcheck disable=SC2046
+exec runuser -u beaconfix -- env -i PATH=/usr/local/bin:/usr/bin:/bin TERM="${TERM:-dumb}" \
+    $(grep -E '^[A-Za-z_][A-Za-z0-9_]*=[^ ]*$' "$ENV_FILE") "$BIN" --server "$@"

@@ -8,7 +8,7 @@
     android:targetCellHeight="2"
     android:resizeMode="horizontal|vertical"
     android:updatePeriodMillis="0"
-    android:widgetCategory="home_screen"
+    android:widgetCategory="home_screen|keyguard"
     android:description="@string/widget_sync_desc"
     android:previewLayout="@layout/widget_preview_sync"
     android:previewImage="@drawable/widget_preview_sync"

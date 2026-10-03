@@ -11,8 +11,12 @@ namespace {
 constexpr double LN10 = 2.302585092994046;
 constexpr double ACC68 = 1.515;              // 68 % radius → per-axis σ of a circular normal
 constexpr double CHI2_2_999 = 13.815510557964274;
+constexpr int MAXD = 4;                       // per-AP device deviations δ fitted (more devices: pinned at δ = 0)
+constexpr int MAXP = 4 + MAXD;                // parameters: x, y, P0, n, δ…
 
 struct Cl {                                   // one place (cluster of samples)
+    int    dk = 0;                            // device key (index into the sorted device names): places never mix devices
+    int    dev = -1;                          // index of its δ, −1 = the reference device (or pinned)
     double x = 0, y = 0;                      // local metres
     double level = 0;                         // median corrected level (dBm)
     double W = 1;                             // mean age/status weight
@@ -21,9 +25,10 @@ struct Cl {                                   // one place (cluster of samples)
     int    m = 0;
     double fading = 0;
     double sx = 0, sy = 0;                    // seed position (clustering)
+    double sa = 0;                            // seed fix accuracy (clustering)
 };
 struct Rg { double x = 0, y = 0, r = 0, sd2 = 1; };
-struct Theta { double x = 0, y = 0, p0 = -40, n = 2.4; };
+struct Theta { double x = 0, y = 0, p0 = -40, n = 2.4; double dv[MAXD] = {0, 0, 0, 0}; };
 
 double median(std::vector<double> v)
 {
@@ -34,6 +39,9 @@ double median(std::vector<double> v)
 }
 
 double clamp01(double v) { return v < 0 ? 0 : v > 1 ? 1 : v; }
+
+// The radius within which two samples are one place (docs/GRADING.md §1.1)
+double placeRadius(double accA, double accB, double minM, double accK) { return std::max(minM, accK * std::min(accA, accB)); }
 
 // 2×2 symmetric eigen-decomposition: λ1 ≥ λ2, e1 the unit eigenvector of λ1
 void eig2(double cxx, double cxy, double cyy, double *l1, double *l2, double *ex, double *ey)
@@ -62,19 +70,38 @@ void eigMax(double C[3], const double D[3])
     C[2] = l1 * ey * ey + l2 * fy * fy;
 }
 
-bool invert4(const double A[4][4], int k, double out[4][4])
+// Solve A·x = b (k ≤ MAXP) by Gaussian elimination with partial pivoting (the same steps as solve())
+bool solveN(const double A[MAXP][MAXP], const double b[MAXP], int k, double out[MAXP])
+{
+    double M[MAXP][MAXP + 1];
+    for (int i = 0; i < k; ++i) { for (int j = 0; j < k; ++j) M[i][j] = A[i][j]; M[i][k] = b[i]; }
+    for (int c = 0; c < k; ++c) {
+        int piv = c;
+        for (int r = c + 1; r < k; ++r) if (std::fabs(M[r][c]) > std::fabs(M[piv][c])) piv = r;
+        if (std::fabs(M[piv][c]) < 1e-12) return false;
+        if (piv != c) for (int j = 0; j <= k; ++j) std::swap(M[c][j], M[piv][j]);
+        for (int r = 0; r < k; ++r) {
+            if (r == c) continue;
+            const double f = M[r][c] / M[c][c];
+            for (int j = c; j <= k; ++j) M[r][j] -= f * M[c][j];
+        }
+    }
+    for (int i = 0; i < k; ++i) out[i] = M[i][k] / M[i][i];
+    return true;
+}
+
+bool invertN(const double A[MAXP][MAXP], int k, double out[MAXP][MAXP])
 {
     for (int col = 0; col < k; ++col) {
-        double Ac[4][4]; for (int i = 0; i < 4; ++i) for (int j = 0; j < 4; ++j) Ac[i][j] = A[i][j];
-        double e[4] = {0, 0, 0, 0}; e[col] = 1; double o[4];
-        if (!solve(Ac, e, k, o)) return false;
+        double e[MAXP] = {0, 0, 0, 0, 0, 0, 0, 0}; e[col] = 1; double o[MAXP];
+        if (!solveN(A, e, k, o)) return false;
         for (int i = 0; i < k; ++i) out[i][col] = o[i];
     }
     return true;
 }
 
 // ── the model at one cluster ──
-struct At { double d, rho, ell, s2, r, J[4]; };
+struct At { double d, rho, ell, s2, r, J[MAXP]; };
 At evalAt(const Cl &c, const Theta &t, double h)
 {
     At a;
@@ -85,8 +112,9 @@ At evalAt(const Cl &c, const Theta &t, double h)
     const double b = 10.0 * t.n / LN10;
     const double grad = b * a.rho / (a.d * a.d);             // |∂model/∂p|
     a.s2 = c.sh2 + grad * grad * c.a * c.a;
-    a.r = c.level - (t.p0 + t.n * a.ell);
+    a.r = c.level - (t.p0 + (c.dev >= 0 ? t.dv[c.dev] : 0.0) + t.n * a.ell);
     a.J[0] = b * dx / (a.d * a.d); a.J[1] = b * dy / (a.d * a.d); a.J[2] = -1.0; a.J[3] = -a.ell;
+    for (int i = 0; i < MAXD; ++i) a.J[4 + i] = c.dev == i ? -1.0 : 0.0;
     return a;
 }
 
@@ -97,7 +125,8 @@ struct Solver {
     std::vector<double> mult;                 // per-cluster multiplicity (jackknife/bootstrap)
     double tau = 1;
     bool robust = false;
-    Solver(const std::vector<Cl> &c, const std::vector<Rg> &r, const Options &op) : cl(c), rg(r), o(op), mult(c.size(), 1.0) {}
+    int np = 4;                               // parameters in use: 4 + the fitted device deviations
+    Solver(const std::vector<Cl> &c, const std::vector<Rg> &r, const Options &op, int nd = 0) : cl(c), rg(r), o(op), mult(c.size(), 1.0), np(4 + nd) {}
 
     // Robust: a Gaussian + uniform outlier mixture (the EM responsibilities are the IRLS weights), so a gross
     // outlier costs a constant instead of growing without bound; otherwise plain least squares.
@@ -128,19 +157,21 @@ struct Solver {
             c += rhoFn((g.r - d) / (std::sqrt(g.sd2) * tau));
         }
         const double zp = (t.p0 - o.p0Mean) / o.p0Sd, zn = (t.n - o.defaultN) / o.nSd;
-        return c + 0.5 * zp * zp + 0.5 * zn * zn;
+        c = c + 0.5 * zp * zp + 0.5 * zn * zn;
+        for (int i = 0; i < np - 4; ++i) { const double zd = t.dv[i] / o.devOffsetSd; c += 0.5 * zd * zd; }
+        return c;
     }
 
     // Normal equations at t: A = Σψ JᵀJ + prior, g = Σψ J r + prior gradient
-    void normal(const Theta &t, double tauUse, double A[4][4], double g[4]) const
+    void normal(const Theta &t, double tauUse, double A[MAXP][MAXP], double g[MAXP]) const
     {
-        for (int i = 0; i < 4; ++i) { g[i] = 0; for (int j = 0; j < 4; ++j) A[i][j] = 0; }
+        for (int i = 0; i < MAXP; ++i) { g[i] = 0; for (int j = 0; j < MAXP; ++j) A[i][j] = 0; }
         for (size_t k = 0; k < cl.size(); ++k) {
             if (mult[k] <= 0) continue;
             const At a = evalAt(cl[k], t, o.heightM);
             const double z = a.r / (std::sqrt(a.s2) * tauUse);
             const double psi = mult[k] * cl[k].W * uFn(z) / (a.s2 * tauUse * tauUse);
-            for (int i = 0; i < 4; ++i) { g[i] += psi * a.J[i] * a.r; for (int j = 0; j < 4; ++j) A[i][j] += psi * a.J[i] * a.J[j]; }
+            for (int i = 0; i < np; ++i) { g[i] += psi * a.J[i] * a.r; for (int j = 0; j < np; ++j) A[i][j] += psi * a.J[i] * a.J[j]; }
         }
         for (const Rg &gg : rg) {
             const double dx = t.x - gg.x, dy = t.y - gg.y, d = std::sqrt(dx * dx + dy * dy + o.heightM * o.heightM);
@@ -152,21 +183,24 @@ struct Solver {
         }
         A[2][2] += 1.0 / (o.p0Sd * o.p0Sd); g[2] += (t.p0 - o.p0Mean) / (o.p0Sd * o.p0Sd);
         A[3][3] += 1.0 / (o.nSd * o.nSd);   g[3] += (t.n - o.defaultN) / (o.nSd * o.nSd);
+        for (int i = 0; i < np - 4; ++i) { A[4 + i][4 + i] += 1.0 / (o.devOffsetSd * o.devOffsetSd); g[4 + i] += t.dv[i] / (o.devOffsetSd * o.devOffsetSd); }
     }
 
     Theta run(Theta t, int iters, double *costOut) const
     {
         double lambda = 1e-2;
         for (int it = 0; it < iters; ++it) {
-            double A[4][4], g[4];
+            double A[MAXP][MAXP], g[MAXP];
             normal(t, tau, A, g);
             const double c0 = cost(t);
-            for (int i = 0; i < 4; ++i) A[i][i] *= (1.0 + lambda);
-            double rhs[4] = {-g[0], -g[1], -g[2], -g[3]}, dx[4];
-            if (!solve(A, rhs, 4, dx)) break;
+            for (int i = 0; i < np; ++i) A[i][i] *= (1.0 + lambda);
+            double rhs[MAXP], dx[MAXP];
+            for (int i = 0; i < np; ++i) rhs[i] = -g[i];
+            if (!solveN(A, rhs, np, dx)) break;
             const double step = std::sqrt(dx[0] * dx[0] + dx[1] * dx[1]);
             if (step > 300.0) { dx[0] *= 300.0 / step; dx[1] *= 300.0 / step; }
             Theta nt{t.x + dx[0], t.y + dx[1], std::clamp(t.p0 + dx[2], -90.0, 10.0), std::clamp(t.n + dx[3], 1.5, 4.5)};
+            for (int i = 0; i < np - 4; ++i) nt.dv[i] = std::clamp(t.dv[i] + dx[4 + i], -30.0, 30.0);
             const double c1 = cost(nt);
             if (c1 <= c0) {
                 const bool small = std::sqrt(dx[0] * dx[0] + dx[1] * dx[1]) < 0.05 && c0 - c1 < 1e-7 * std::max(1.0, c0);
@@ -182,28 +216,68 @@ struct Solver {
     }
 };
 
-// Closed-form marginal log-likelihood of a position with (P0, n) integrated out (Gaussian prior), plus
-// ranges and misses. Returns the posterior mean of (P0, n) at that position too.
+// Closed-form marginal log-likelihood of a position with (P0, n) — and the nd device deviations δ — integrated out
+// (Gaussian priors), plus ranges and misses. Returns the posterior mean of (P0, n, δ…) at that position too.
 double gridLogL(const std::vector<Cl> &cl, const std::vector<Rg> &rg, const QList<Miss> &misses, const std::vector<double> &mxs,
-                const std::vector<double> &mys, double px, double py, const Options &o, double *b0, double *b1)
+                const std::vector<double> &mys, double px, double py, const Options &o, int nd, double *b0, double *b1, double *dvOut = nullptr)
 {
     const double bn = 10.0 * o.defaultN / LN10;
-    double S00 = 0, S01 = 0, S11 = 0, T0 = 0, T1 = 0, Syy = 0, logdet = 0;
-    for (const Cl &c : cl) {
-        const double dx = px - c.x, dy = py - c.y, rho = std::sqrt(dx * dx + dy * dy);
-        const double d = std::max(1.0, std::sqrt(rho * rho + o.heightM * o.heightM)), ell = -10.0 * std::log10(d);
-        const double grad = bn * rho / (d * d), s2 = c.sh2 + grad * grad * c.a * c.a;
-        const double w = c.W / s2;
-        S00 += w; S01 += w * ell; S11 += w * ell * ell; T0 += w * c.level; T1 += w * ell * c.level; Syy += w * c.level * c.level;
-        logdet += std::log(s2 / c.W);
+    double m0, m1, ll;
+    if (nd == 0) {
+        double S00 = 0, S01 = 0, S11 = 0, T0 = 0, T1 = 0, Syy = 0, logdet = 0;
+        for (const Cl &c : cl) {
+            const double dx = px - c.x, dy = py - c.y, rho = std::sqrt(dx * dx + dy * dy);
+            const double d = std::max(1.0, std::sqrt(rho * rho + o.heightM * o.heightM)), ell = -10.0 * std::log10(d);
+            const double grad = bn * rho / (d * d), s2 = c.sh2 + grad * grad * c.a * c.a;
+            const double w = c.W / s2;
+            S00 += w; S01 += w * ell; S11 += w * ell * ell; T0 += w * c.level; T1 += w * ell * c.level; Syy += w * c.level * c.level;
+            logdet += std::log(s2 / c.W);
+        }
+        const double iP = 1.0 / (o.p0Sd * o.p0Sd), iN = 1.0 / (o.nSd * o.nSd);
+        const double L00 = S00 + iP, L01 = S01, L11 = S11 + iN;
+        const double e0 = T0 + o.p0Mean * iP, e1 = T1 + o.defaultN * iN;
+        const double det = L00 * L11 - L01 * L01;
+        m0 = (L11 * e0 - L01 * e1) / det; m1 = (L00 * e1 - L01 * e0) / det;
+        const double quad = Syy + o.p0Mean * o.p0Mean * iP + o.defaultN * o.defaultN * iN - (e0 * m0 + e1 * m1);
+        ll = -0.5 * quad - 0.5 * std::log(det) - 0.5 * logdet;
+    } else {
+        // β = (P0, n, δ_0 … δ_nd−1), the design row of a place (1, ℓ, one-hot of its device): L = XᵀWX + Λ0, solved by Cholesky
+        const int q = 2 + nd;
+        double S[2 + MAXD][2 + MAXD] = {{0}}, T[2 + MAXD] = {0}, Syy = 0, logdet = 0;
+        for (const Cl &c : cl) {
+            const double dx = px - c.x, dy = py - c.y, rho = std::sqrt(dx * dx + dy * dy);
+            const double d = std::max(1.0, std::sqrt(rho * rho + o.heightM * o.heightM)), ell = -10.0 * std::log10(d);
+            const double grad = bn * rho / (d * d), s2 = c.sh2 + grad * grad * c.a * c.a;
+            const double w = c.W / s2;
+            double xr[2 + MAXD] = {1.0, ell, 0, 0, 0, 0};
+            if (c.dev >= 0) xr[2 + c.dev] = 1.0;
+            for (int i = 0; i < q; ++i) { T[i] += w * xr[i] * c.level; for (int j = 0; j < q; ++j) S[i][j] += w * xr[i] * xr[j]; }
+            Syy += w * c.level * c.level;
+            logdet += std::log(s2 / c.W);
+        }
+        double lam[2 + MAXD], mu[2 + MAXD], e[2 + MAXD];
+        lam[0] = 1.0 / (o.p0Sd * o.p0Sd); mu[0] = o.p0Mean;
+        lam[1] = 1.0 / (o.nSd * o.nSd);   mu[1] = o.defaultN;
+        for (int i = 2; i < q; ++i) { lam[i] = 1.0 / (o.devOffsetSd * o.devOffsetSd); mu[i] = 0.0; }
+        for (int i = 0; i < q; ++i) { S[i][i] += lam[i]; e[i] = T[i] + lam[i] * mu[i]; }
+        double C[2 + MAXD][2 + MAXD] = {{0}}, logdetL = 0;
+        for (int i = 0; i < q; ++i)
+            for (int j = 0; j <= i; ++j) {
+                double s = S[i][j];
+                for (int k = 0; k < j; ++k) s -= C[i][k] * C[j][k];
+                if (i == j) { if (s <= 0) return -1e300; C[i][i] = std::sqrt(s); logdetL += 2.0 * std::log(C[i][i]); }
+                else C[i][j] = s / C[j][j];
+            }
+        double y[2 + MAXD], m[2 + MAXD];
+        for (int i = 0; i < q; ++i) { double s = e[i]; for (int k = 0; k < i; ++k) s -= C[i][k] * y[k]; y[i] = s / C[i][i]; }
+        for (int i = q - 1; i >= 0; --i) { double s = y[i]; for (int k = i + 1; k < q; ++k) s -= C[k][i] * m[k]; m[i] = s / C[i][i]; }
+        double quad = Syy;
+        for (int i = 0; i < q; ++i) quad += lam[i] * mu[i] * mu[i];
+        for (int i = 0; i < q; ++i) quad -= e[i] * m[i];
+        m0 = m[0]; m1 = m[1];
+        if (dvOut) for (int i = 0; i < nd; ++i) dvOut[i] = m[2 + i];
+        ll = -0.5 * quad - 0.5 * logdetL - 0.5 * logdet;
     }
-    const double iP = 1.0 / (o.p0Sd * o.p0Sd), iN = 1.0 / (o.nSd * o.nSd);
-    const double L00 = S00 + iP, L01 = S01, L11 = S11 + iN;
-    const double e0 = T0 + o.p0Mean * iP, e1 = T1 + o.defaultN * iN;
-    const double det = L00 * L11 - L01 * L01;
-    const double m0 = (L11 * e0 - L01 * e1) / det, m1 = (L00 * e1 - L01 * e0) / det;
-    const double quad = Syy + o.p0Mean * o.p0Mean * iP + o.defaultN * o.defaultN * iN - (e0 * m0 + e1 * m1);
-    double ll = -0.5 * quad - 0.5 * std::log(det) - 0.5 * logdet;
     for (const Rg &g : rg) {
         const double dx = px - g.x, dy = py - g.y, d = std::sqrt(dx * dx + dy * dy + o.heightM * o.heightM);
         ll += -0.5 * (g.r - d) * (g.r - d) / g.sd2;
@@ -395,18 +469,17 @@ QString qualityFor(const QString &g)
     return QStringLiteral("none");
 }
 
-int vantageCount(const QList<Obs> &obs, double clusterMinM)
+int vantageCount(const QList<Obs> &obs, double clusterMinM, double clusterAccK)
 {
     if (obs.isEmpty()) return 0;
-    std::vector<double> accs; for (const Obs &o : obs) accs.push_back(o.acc);
-    const double R = std::max(clusterMinM, median(accs));
     const Frame fr(obs[0].lat, obs[0].lon);
-    std::vector<std::pair<double, double>> seeds;
+    struct S { double x, y, acc; };
+    std::vector<S> seeds;
     for (const Obs &o : obs) {
         const double x = fr.x(o.lon), y = fr.y(o.lat);
         bool found = false;
-        for (const auto &s : seeds) if (std::hypot(x - s.first, y - s.second) < R) { found = true; break; }
-        if (!found) seeds.push_back({x, y});
+        for (const S &s : seeds) if (std::hypot(x - s.x, y - s.y) < placeRadius(o.acc, s.acc, clusterMinM, clusterAccK)) { found = true; break; }
+        if (!found) seeds.push_back({x, y, o.acc});
     }
     return int(seeds.size());
 }
@@ -492,36 +565,57 @@ Fit fitAp(const QList<Obs> &samples, qint64 now, const Options &opt, const Conte
 
     // ── samples → places ──
     const Frame fr(use[0].lat, use[0].lon);
-    struct Sm { double x, y, level, w0, acc; int idx; };
+    struct Sm { double x, y, level, w0, acc; int idx, dk; };
     std::vector<Sm> sm;
     QSet<QString> sessions, devices;
+    QStringList devNames;                                   // sorted: device keys are deterministic (C++ and Kotlin agree)
+    for (const Obs &o : use) if (!devNames.contains(o.device)) devNames << o.device;
+    std::sort(devNames.begin(), devNames.end());
     for (int i = 0; i < use.size(); ++i) {
         const Obs &o = use[i];
         double w0 = 1.0;
         if (now > 0 && o.t > 0) w0 = std::max(0.15, std::exp(-std::max(0.0, double(now - o.t) / 86400.0) / opt.ageTauDays));
         w0 *= std::max(0.05, o.weight);
-        sm.push_back({fr.x(o.lon), fr.y(o.lat), double(o.dbm) - ctx.deviceOffset.value(o.device, 0.0), w0, o.acc, i});
+        sm.push_back({fr.x(o.lon), fr.y(o.lat), double(o.dbm) - ctx.deviceOffset.value(o.device, 0.0), w0, o.acc, i, int(devNames.indexOf(o.device))});
         sessions.insert(o.device + QLatin1Char('|') + QString::number(o.t > 0 ? o.t / 86400 : -1));
         devices.insert(o.device);
         f.newest = std::max(f.newest, o.t);
     }
     f.sessions = sessions.size(); f.devices = devices.size();
     std::vector<double> accs; for (const Sm &s : sm) accs.push_back(s.acc);
-    double Rc = std::max(opt.clusterMinM, median(accs));
+    // Places: a sample joins the first seed within max(clusterMinM, clusterAccK × the better of the two fixes) — two
+    // precise vantage points (a smoothed walk, 4–8 m) a few metres apart stay apart and keep the walk's geometry, while
+    // poor fixes (a phone indoors, 20–40 m) still merge, since their separation is noise. (Was one radius,
+    // max(15 m, median accuracy): a 60–120 m walk around a building collapsed to 6–8 places.)
+    // A place holds one device: devices hear the same AP differently (the δ below), so their levels are not pooled.
     std::vector<std::vector<int>> members;
     std::vector<Cl> cl;
+    double grow = 1;
     for (;;) {
         members.clear(); cl.clear();
         for (int i = 0; i < int(sm.size()); ++i) {
             int found = -1;
-            for (int k = 0; k < int(cl.size()); ++k) if (std::hypot(sm[i].x - cl[k].sx, sm[i].y - cl[k].sy) < Rc) { found = k; break; }
-            if (found < 0) { Cl c; c.sx = sm[i].x; c.sy = sm[i].y; cl.push_back(c); members.push_back({i}); }
+            for (int k = 0; k < int(cl.size()); ++k)
+                if (cl[k].dk == sm[i].dk && std::hypot(sm[i].x - cl[k].sx, sm[i].y - cl[k].sy) < grow * placeRadius(sm[i].acc, cl[k].sa, opt.clusterMinM, opt.clusterAccK)) { found = k; break; }
+            if (found < 0) { Cl c; c.dk = sm[i].dk; c.sx = sm[i].x; c.sy = sm[i].y; c.sa = sm[i].acc; cl.push_back(c); members.push_back({i}); }
             else members[found].push_back(i);
         }
         if (int(cl.size()) <= opt.maxClusters) break;
-        Rc *= 1.5;
+        grow *= 1.5;
     }
     const int K = int(cl.size());
+    // Per-AP device deviations: the device with the most places is the reference (δ = 0, carries P0); the next MAXD by
+    // places (ties: name order) each get a δ ~ N(0, devOffsetSd²); any further device stays pinned at its calibrated offset
+    int nd = 0;
+    if (devNames.size() >= 2) {
+        std::vector<int> cnt(devNames.size(), 0);
+        for (const Cl &c : cl) ++cnt[c.dk];
+        std::vector<int> byCnt(devNames.size()); for (int i = 0; i < int(byCnt.size()); ++i) byCnt[i] = i;
+        std::sort(byCnt.begin(), byCnt.end(), [&](int a, int b) { return cnt[a] > cnt[b] || (cnt[a] == cnt[b] && a < b); });
+        std::vector<int> devIdx(devNames.size(), -1);
+        for (int r = 1; r < int(byCnt.size()) && nd < MAXD; ++r) if (cnt[byCnt[r]] > 0) devIdx[byCnt[r]] = nd++;
+        for (Cl &c : cl) c.dev = devIdx[c.dk];
+    }
     for (int k = 0; k < K; ++k) {
         double sw = 0, sx = 0, sy = 0; std::vector<double> lv, ac;
         for (int i : members[k]) { sw += sm[i].w0; sx += sm[i].w0 * sm[i].x; sy += sm[i].w0 * sm[i].y; lv.push_back(sm[i].level); ac.push_back(sm[i].acc); }
@@ -572,7 +666,7 @@ Fit fitAp(const QList<Obs> &samples, qint64 now, const Options &opt, const Conte
                 const double px = cx - W + (i + 0.5) * cs, py = cy - W + (j + 0.5) * cs;
                 // range prior: an AP is rarely far beyond the nearest place it was heard from
                 double near = 1e300; for (const Cl &c : cls) near = std::min(near, std::hypot(px - c.x, py - c.y));
-                ll[j * G + i] = gridLogL(cls, rg, ctx.misses, mxs, mys, px, py, opt, nullptr, nullptr) - near / opt.rangePriorM;
+                ll[j * G + i] = gridLogL(cls, rg, ctx.misses, mxs, mys, px, py, opt, nd, nullptr, nullptr) - near / opt.rangePriorM;
             }
         llMax = -1e300; for (double v : ll) llMax = std::max(llMax, v);
         psum = 0; pmx = 0; pmy = 0;
@@ -633,7 +727,8 @@ Fit fitAp(const QList<Obs> &samples, qint64 now, const Options &opt, const Conte
     {   double s1 = 0, s2 = 0; for (const Cl &c : cl) { const double w = c.W / c.sh2; s1 += w; s2 += w * w; } f.ess = s2 > 0 ? s1 * s1 / s2 : 0; }
 
     Theta best; bool haveLm = false; double tauEff = 1;
-    Solver sv(cl, rg, opt);
+    double altGap = -1;                                       // cost (≈ nats) of the alternative solution above the best
+    Solver sv(cl, rg, opt, nd);
     if (K >= 3) {
         // Stage A (robust, nominal scale) from every seed and the mirror of the best; Stage B (robust at the
         // pooled scale τ) from each result
@@ -652,8 +747,9 @@ Fit fitAp(const QList<Obs> &samples, qint64 now, const Options &opt, const Conte
             bool dup = false; for (const Theta &t : starts) if (std::hypot(t.x - pt.first, t.y - pt.second) < 10) { dup = true; break; }
             if (dup) continue;
             Theta t; t.x = pt.first; t.y = pt.second;
-            double b0, b1; gridLogL(cl, rg, ctx.misses, mxs, mys, t.x, t.y, opt, &b0, &b1);
+            double b0, b1, dv0[MAXD] = {0, 0, 0, 0}; gridLogL(cl, rg, ctx.misses, mxs, mys, t.x, t.y, opt, nd, &b0, &b1, dv0);
             t.p0 = std::clamp(b0, -90.0, 10.0); t.n = std::clamp(b1, 1.5, 4.5);
+            for (int i = 0; i < nd; ++i) t.dv[i] = std::clamp(dv0[i], -30.0, 30.0);
             starts.push_back(t);
         }
         if (!starts.empty()) {
@@ -675,6 +771,16 @@ Fit fitAp(const QList<Obs> &samples, qint64 now, const Options &opt, const Conte
         std::vector<Theta> stB; std::vector<double> costB;
         for (const Theta &t0 : stA) { double c; stB.push_back(sv.run(t0, opt.maxIter, &c)); costB.push_back(c); }
         int ib = 0; for (int i = 1; i < int(stB.size()); ++i) if (costB[i] < costB[ib]) ib = i;
+        {   // the mirror of the SOLUTION across the places' principal axis: from places along a line the AP and its reflection
+            // explain the levels equally well, and no seed need have started on the other side (docs/GRADING.md §1.4)
+            const Theta &b = stB[ib];
+            const double vx = b.x - gmx, vy = b.y - gmy, along = vx * e1x + vy * e1y;
+            Theta m = b; m.x = gmx + 2 * along * e1x - vx; m.y = gmy + 2 * along * e1y - vy;
+            if (std::isfinite(m.x) && std::isfinite(m.y) && std::hypot(m.x - b.x, m.y - b.y) > 10) {
+                double c; stB.push_back(sv.run(m, opt.maxIter, &c)); costB.push_back(c);
+                if (costB.back() < costB[ib]) ib = int(stB.size()) - 1;
+            }
+        }
         best = stB[ib]; haveLm = std::isfinite(best.x) && std::isfinite(best.y) && std::isfinite(costB[ib]);
         int ialt = -1;
         for (int i = 0; i < int(stB.size()); ++i)
@@ -682,27 +788,23 @@ Fit fitAp(const QList<Obs> &samples, qint64 now, const Options &opt, const Conte
         f.sigmaDb = sv.tau * opt.sigmaDb;
         if (haveLm) {   // the posterior again with each place down-weighted as the robust fit did
             std::vector<Cl> rw = cl;
-            for (int k = 0; k < K; ++k) { const At a = evalAt(cl[k], best, opt.heightM); const double z = a.r / (std::sqrt(a.s2) * sv.tau); rw[k].W = cl[k].W * sv.uFn(z); }
+            for (int k = 0; k < K; ++k) { const At a = evalAt(cl[k], best, opt.heightM); const double z = a.r / (std::sqrt(a.s2) * sv.tau); rw[k].W = std::max(1e-9, cl[k].W * sv.uFn(z)); }
             runGrid(rw);
         }
-        tauEff = std::max(1.0, sv.tau);
-        if (haveLm && ialt >= 0) { f.altLat = fr.lat(stB[ialt].y); f.altLon = fr.lon(stB[ialt].x); f.ambiguous = costB[ialt] - costB[ib] < 2.0; }
+        if (haveLm && ialt >= 0) { f.altLat = fr.lat(stB[ialt].y); f.altLon = fr.lon(stB[ialt].x); altGap = costB[ialt] - costB[ib]; f.ambiguous = altGap < 2.0; }
     }
 
     // ── the answer: LM solution (≥ 3 places) or the grid posterior ──
     Theta sol;
     double C[3];
     double crlbC[3] = {0, 0, 0};
-    double Finv[4][4]; bool haveFinv = false;
+    double Finv[MAXP][MAXP]; bool haveFinv = false;
+    const int np = 4 + nd;
     if (haveLm) {
         sol = best;
-        double A[4][4], g[4];
-        sv.normal(sol, tauEff, A, g);
-        if (invert4(A, 4, Finv)) {
-            haveFinv = true;
-            C[0] = Finv[0][0]; C[1] = Finv[0][1]; C[2] = Finv[1][1];
-        } else { C[0] = gC[0]; C[1] = gC[1]; C[2] = gC[2]; }
-        // design effect of spatially correlated shadowing: K / N_eff, N_eff = 1ᵀR⁻¹1
+        // Gudmundson: the places' shared shadowing correlates as R_ij = exp(−|q_i − q_j|/d_c). N_eff = 1ᵀR⁻¹1 (Cholesky)
+        // is the number of effectively independent places: the degrees of freedom their residuals carry.
+        double neff = K;
         {
             std::vector<double> L(K * K, 0.0);
             bool ok = true;
@@ -716,19 +818,109 @@ Fit fitAp(const QList<Obs> &samples, qint64 now, const Options &opt, const Conte
             if (ok) {
                 std::vector<double> z(K);
                 for (int i = 0; i < K; ++i) { double s = 1.0; for (int q = 0; q < i; ++q) s -= L[i * K + q] * z[q]; z[i] = s / L[i * K + i]; }
-                double neff = 0; for (double v : z) neff += v * v;
-                const double deff = std::max(1.0, K / std::max(1e-9, neff));
-                C[0] *= deff; C[1] *= deff; C[2] *= deff;
+                neff = 0; for (double v : z) neff += v * v;
+                neff = std::clamp(neff, 1.0, double(K));
             }
         }
-        // correlated fix error: shared within a session
-        { const double am = median(accs) / ACC68; const double fl = am * am / std::max(1, f.sessions); C[0] += fl; C[2] += fl; }
-        // Cramér–Rao floor with the nominal σ0
+        // The noise scale τ² = σ²/σ0², replacing the old max(1, τ²) (which never let a good fit shrink): the posterior mean
+        // under a scaled-inverse-χ² prior of ν0 pseudo-dof centred so that E[σ²] = σ0² without data, updated by the
+        // robust-weighted residual SS of the places. Correlated places are not independent residuals: they carry
+        // ν_d = (K_in − p_eff)·N_eff/K dof (p_eff the trace of the hat matrix, so the P0 / n priors count fractionally) and
+        // SS·N_eff/K of the sum of squares — samples never count, places only as far as they decorrelate. Many well-fitting
+        // places shrink σ, a few (or one tight cluster) leave it near σ0, a poor fit widens it:
+        // E[σ²]/σ0² = (ν0 − 2 + SS·N_eff/K)/(ν0 − 2 + ν_d).
         {
-            Solver s0(cl, rg, opt);
-            double A0[4][4], g0[4], I0[4][4];
+            double H[MAXP][MAXP] = {{0}}, A1[MAXP][MAXP], I1[MAXP][MAXP], ss = 0, kin = 0;
+            for (int k = 0; k < K; ++k) {
+                const At a = evalAt(cl[k], sol, opt.heightM);
+                const double z = a.r / std::sqrt(a.s2), w = cl[k].W * sv.uFn(z / sv.tau);
+                ss += w * z * z; kin += w;
+                for (int i = 0; i < np; ++i) for (int j = 0; j < np; ++j) H[i][j] += w / a.s2 * a.J[i] * a.J[j];
+            }
+            for (int i = 0; i < np; ++i) for (int j = 0; j < np; ++j) A1[i][j] = H[i][j];
+            A1[2][2] += 1.0 / (opt.p0Sd * opt.p0Sd); A1[3][3] += 1.0 / (opt.nSd * opt.nSd);
+            for (int i = 4; i < np; ++i) A1[i][i] += 1.0 / (opt.devOffsetSd * opt.devOffsetSd);
+            double peff = np;
+            if (invertN(A1, np, I1)) { peff = 0; for (int i = 0; i < np; ++i) for (int j = 0; j < np; ++j) peff += I1[i][j] * H[j][i]; }
+            const double nud = std::max(0.0, kin - peff) * neff / K, v0 = std::max(0.0, opt.sigmaPriorDof - 2);
+            const double tau2 = (v0 + (nud > 0 ? ss * neff / K : 0.0)) / std::max(1e-9, v0 + nud);
+            tauEff = std::sqrt(std::max(0.01, tau2));
+        }
+        // Laplace at that scale as a sandwich A⁻¹·B·A⁻¹: the fit weighs the places as if independent, B adds the
+        // covariance of their shared shadowing τ²σ0²ρ_in·R_ij. This replaces the scalar design effect K/N_eff, which is the
+        // variance inflation of a mean: the common part of correlated shadowing falls into P0 and does not move the fit.
+        double A[MAXP][MAXP], g[MAXP];
+        sv.normal(sol, tauEff, A, g);
+        if (invertN(A, np, Finv)) {
+            haveFinv = true;
+            std::vector<double> Jw(MAXP * K);
+            for (int k = 0; k < K; ++k) {
+                const At a = evalAt(cl[k], sol, opt.heightM);
+                const double psi = cl[k].W * sv.uFn(a.r / (std::sqrt(a.s2) * tauEff)) / (a.s2 * tauEff * tauEff);
+                for (int i = 0; i < np; ++i) Jw[MAXP * k + i] = psi * a.J[i];
+            }
+            const double s2c = tauEff * tauEff * opt.sigmaDb * opt.sigmaDb * opt.rhoIn;
+            double B[MAXP][MAXP]; for (int i = 0; i < np; ++i) for (int j = 0; j < np; ++j) B[i][j] = A[i][j];
+            for (int k = 0; k < K; ++k)
+                for (int l = 0; l < K; ++l) {
+                    if (l == k) continue;
+                    const double c = s2c * std::exp(-std::hypot(cl[k].x - cl[l].x, cl[k].y - cl[l].y) / opt.shadowCorrM);
+                    for (int i = 0; i < np; ++i) for (int j = 0; j < np; ++j) B[i][j] += c * Jw[MAXP * k + i] * Jw[MAXP * l + j];
+                }
+            double FB[MAXP][MAXP];
+            for (int i = 0; i < np; ++i) for (int j = 0; j < np; ++j) { double s = 0; for (int q = 0; q < np; ++q) s += Finv[i][q] * B[q][j]; FB[i][j] = s; }
+            double S[2][2];
+            for (int i = 0; i < 2; ++i) for (int j = 0; j < 2; ++j) { double s = 0; for (int q = 0; q < np; ++q) s += FB[i][q] * Finv[q][j]; S[i][j] = s; }
+            C[0] = S[0][0]; C[1] = 0.5 * (S[0][1] + S[1][0]); C[2] = S[1][1];
+            // RSS ranging is log-normal: near the places the likelihood is a banana (closer is steep, farther is flat) and the
+            // curvature at the optimum understates the far side. So the R95 is also read off the posterior itself: the
+            // marginal likelihood (P0, n integrated, as on the coarse grid) at the fitted scale, tempered by the sandwich /
+            // Laplace ratio for the correlation, on a 41 × 41 grid over ±postWindow σ of the major axis; the radius about the
+            // estimate that holds 95 % of it widens C (shape kept) when larger. Beyond the window lies the far-field
+            // degeneracy (P0 and n trade against distance), which the coarse grid, the region test and `ambiguous` handle.
+            if (opt.postWindow > 0) {
+                std::vector<Cl> sc = cl;
+                for (int k = 0; k < K; ++k) {
+                    const At a = evalAt(cl[k], sol, opt.heightM);
+                    sc[k].W = std::max(1e-9, cl[k].W * sv.uFn(a.r / (std::sqrt(a.s2) * sv.tau)));
+                    sc[k].sh2 *= tauEff * tauEff; sc[k].a *= tauEff;
+                }
+                double l1, l2, ex, ey; eig2(C[0], C[1], C[2], &l1, &l2, &ex, &ey);
+                const double temper = std::max(1.0, (C[0] + C[2]) / (Finv[0][0] + Finv[1][1]));
+                const double ext = std::max(10.0, opt.postWindow * std::sqrt(std::max(0.0, l1)));
+                const int N = 41;
+                const double h = 2 * ext / (N - 1);
+                std::vector<double> lv(N * N), rr(N * N);
+                double lmax = -1e300;
+                for (int j = 0; j < N; ++j)
+                    for (int i = 0; i < N; ++i) {
+                        const double px = sol.x - ext + i * h, py = sol.y - ext + j * h;
+                        lv[j * N + i] = gridLogL(sc, rg, ctx.misses, mxs, mys, px, py, opt, nd, nullptr, nullptr) / temper;
+                        lmax = std::max(lmax, lv[j * N + i]);
+                        rr[j * N + i] = std::hypot(px - sol.x, py - sol.y);
+                    }
+                std::vector<int> idx(N * N); for (int i = 0; i < N * N; ++i) idx[i] = i;
+                std::sort(idx.begin(), idx.end(), [&](int p, int q) { return rr[p] < rr[q] || (rr[p] == rr[q] && p < q); });
+                double ps = 0; for (double v : lv) ps += std::exp(v - lmax);
+                double acc = 0, r95p = 0;
+                for (int i : idx) { acc += std::exp(lv[i] - lmax); if (acc >= 0.95 * ps) { r95p = rr[i]; break; } }
+                double a0, b0, o0; ellipse(C[0], C[1], C[2], &a0, &b0, &o0);
+                const double r95c = radiusFor(a0, b0, 0.95);
+                if (r95c > 0 && r95p > r95c) { const double q = (r95p / r95c) * (r95p / r95c); C[0] *= q; C[1] *= q; C[2] *= q; }
+            }
+        } else { C[0] = gC[0]; C[1] = gC[1]; C[2] = gC[2]; }
+        // Correlated fix error: a session's GNSS error moves every place together, so the fit by the same amount. The
+        // per-place errors-in-variables term (§1.2) counts the same variance as independent; both are kept on purpose:
+        // the split between common (smoothed tracks: mostly the bias) and independent (raw fixes) is not known per
+        // sample, and either alone under-covers the other kind of track.
+        { const double am = median(accs) / ACC68; const double fl = am * am / std::max(1, f.sessions); C[0] += fl; C[2] += fl; }
+        // The Cramér–Rao bound with the nominal σ0 is a geometry figure for the fix test (crlbR95), no longer a floor: at
+        // the fitted scale it is the Laplace above without the robust down-weights, never wider than the sandwich.
+        {
+            Solver s0(cl, rg, opt, nd);
+            double A0[MAXP][MAXP], g0[MAXP], I0[MAXP][MAXP];
             s0.normal(sol, 1.0, A0, g0);
-            if (invert4(A0, 4, I0)) { crlbC[0] = I0[0][0]; crlbC[1] = I0[0][1]; crlbC[2] = I0[1][1]; eigMax(C, crlbC); }
+            if (invertN(A0, np, I0)) { crlbC[0] = I0[0][0]; crlbC[1] = I0[0][1]; crlbC[2] = I0[1][1]; }
         }
         // leave-one-place-out jackknife
         if (K >= 4 && K <= opt.jackMaxK) {
@@ -768,7 +960,7 @@ Fit fitAp(const QList<Obs> &samples, qint64 now, const Options &opt, const Conte
         }
     } else {
         sol.x = pmx; sol.y = pmy;
-        double b0, b1; gridLogL(cl, rg, ctx.misses, mxs, mys, pmx, pmy, opt, &b0, &b1);
+        double b0, b1; gridLogL(cl, rg, ctx.misses, mxs, mys, pmx, pmy, opt, nd, &b0, &b1);
         sol.p0 = std::clamp(b0, -90.0, 10.0); sol.n = std::clamp(b1, 1.5, 4.5);
         C[0] = gC[0]; C[1] = gC[1]; C[2] = gC[2];
     }
@@ -829,11 +1021,20 @@ Fit fitAp(const QList<Obs> &samples, qint64 now, const Options &opt, const Conte
             f.p0RangeCorr = vr > 0 && Finv[2][2] > 0 ? std::fabs(cpr) / std::sqrt(vr * Finv[2][2]) : 0;
         }
     }
-    if (f.ambiguous) {   // the alternative must be separated by more than 2σ along the line joining them
+    if (f.ambiguous) {
         const double dx = fr.x(f.altLon) - sol.x, dy = fr.y(f.altLat) - sol.y, dd = std::hypot(dx, dy);
         const double s2 = dd > 0 ? (dx * dx * f.cxx + 2 * dx * dy * f.cxy + dy * dy * f.cyy) / (dd * dd) : 0;
         // inside the places' hull a far alternative is a second mode (counted by the grid), not a mirror
-        if (dd <= 2 * std::sqrt(std::max(0.0, s2)) || f.inHull) f.ambiguous = false;
+        if (f.inHull) f.ambiguous = false;
+        else {
+            // Either solution may be the AP: the error about the reported one is the mixture's second moment,
+            // C + p·d·dᵀ with p = P(alternative) ≈ 1/(1 + e^gap), so R95 reaches the ghost as often as it is the AP.
+            // Widened even when the ghost lies within 2σ (within 2σ is not within R95); only the ghost marker needs more.
+            const double p = 1.0 / (1.0 + std::exp(altGap));
+            C[0] += p * dx * dx; C[1] += p * dx * dy; C[2] += p * dy * dy;
+            setEllipse(f, C);
+            if (dd <= 2 * std::sqrt(std::max(0.0, s2))) f.ambiguous = false;   // too close to show apart
+        }
     }
 
     // ── kind ──
@@ -844,7 +1045,7 @@ Fit fitAp(const QList<Obs> &samples, qint64 now, const Options &opt, const Conte
         f.kind = QStringLiteral("region");
         if (haveLm) {
             sol.x = pmx; sol.y = pmy;
-            double b0, b1; gridLogL(cl, rg, ctx.misses, mxs, mys, pmx, pmy, opt, &b0, &b1);
+            double b0, b1; gridLogL(cl, rg, ctx.misses, mxs, mys, pmx, pmy, opt, nd, &b0, &b1);
             sol.p0 = std::clamp(b0, -90.0, 10.0); sol.n = std::clamp(b1, 1.5, 4.5);
             eigMax(C, gC);
             setEllipse(f, C);
@@ -883,10 +1084,10 @@ Fit fitAp(const QList<Obs> &samples, qint64 now, const Options &opt, const Conte
 
     // ── "sample here next": the spot whose sample adds the most information ──
     {
-        Solver s0(cl, rg, opt);
-        double A0[4][4], g0[4], I0[4][4];
+        Solver s0(cl, rg, opt, nd);
+        double A0[MAXP][MAXP], g0[MAXP], I0[MAXP][MAXP];
         s0.normal(sol, 1.0, A0, g0);
-        if (invert4(A0, 4, I0) && (f.kind == QLatin1String("region") || f.r95 > 25)) {
+        if (invertN(A0, 4 + nd, I0) && (f.kind == QLatin1String("region") || f.r95 > 25)) {
             const double b = 10.0 * sol.n / LN10, aFix = 10.0 / ACC68;
             double bestGain = 0, bx = 0, by = 0;
             for (int ri = 0; ri < 3; ++ri) for (int bi = 0; bi < 16; ++bi) {
@@ -920,14 +1121,14 @@ Fit fitAp(const QList<Obs> &samples, qint64 now, const Options &opt, const Conte
 // ── incremental update (between batched refits) ──────────────────────────────
 // One new sample says "the AP is d metres from here" (d from the AP's own P0/n): a 2-D Kalman
 // step with H = the unit vector observer → fit, and the full covariance kept.
-Fit update(const Fit &prev, const Obs &o, const Options &opt)
+Fit update(const Fit &prev, const Obs &o, const Options &opt, double deviceOffsetDb)
 {
     if (!prev.valid || (prev.kind != QLatin1String("fix") && prev.kind != QLatin1String("region"))) return prev;
     Fit f = prev;
     const Frame fr(prev.lat, prev.lon);
     const double ox = fr.x(o.lon), oy = fr.y(o.lat);
     const double r = std::max(1.0, std::hypot(ox, oy));
-    const double d3 = modelDistance(prev.p0, prev.pathloss, o.dbm);
+    const double d3 = std::pow(10.0, (prev.p0 - (double(o.dbm) - deviceOffsetDb)) / (10.0 * prev.pathloss));   // modelDistance of the level as this host would hear it
     const double dm = std::sqrt(std::max(1.0, d3 * d3 - opt.heightM * opt.heightM));
     const double ux = -ox / r, uy = -oy / r;
     const double sigD = d3 * LN10 * opt.sigmaDb / (10.0 * prev.pathloss);

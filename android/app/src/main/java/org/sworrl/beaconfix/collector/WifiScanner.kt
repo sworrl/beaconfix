@@ -51,6 +51,9 @@ class WifiScanner @Inject constructor(@ApplicationContext private val ctx: Conte
     } catch (e: SecurityException) { emptyList() }
     var lastFresh = false; private set
 
+    /** The scan cache as ScanResults (Wi-Fi RTT needs them: RangingRequest.Builder.addAccessPoint); empty without permission. */
+    fun rawLatest(): List<android.net.wifi.ScanResult> = try { @Suppress("MissingPermission") wifi.scanResults } catch (e: SecurityException) { emptyList() }
+
     /** How long ago any scan on this phone (ours or another app's) last saw [bssid], in ms; null when the scan cache does not hold it. */
     fun seenAgoMs(bssid: String): Long? = try {
         @Suppress("MissingPermission")

@@ -1,0 +1,22 @@
+BeaconFix
+Copyright 2026 sworrl
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+It includes third-party software, models and data under their own licenses:
+
+* QR Code generator library (src/third_party/qrcodegen.{hpp,cpp})
+  Copyright (c) Project Nayuki — MIT License (header retained in the files).
+* Map and position data: BeaconDB, OpenStreetMap contributors (ODbL 1.0), Esri World Imagery,
+  OpenTopoMap (CC-BY-SA), Open Topo Data (SRTM), WiGLE; the EFF short wordlist (CC BY 3.0 US).
+* Surveillance-camera data: the DeFlock ALPR dataset (OpenStreetMap contributors, ODbL 1.0) and
+  flocklocations.com community reports (CC BY 4.0).
+* Agency transparency-portal facts: Eyes on Flock (eyesonflock.com), CC BY-SA 4.0 — kept in their own
+  table and shown with this attribution.
+* Road geometry for road snapping: OpenStreetMap contributors via Overpass (ODbL 1.0).
+* Camera-avoidance routes (only with the user's own API key): openrouteservice.org by HeiGIT and
+  GraphHopper, under their terms; route data © OpenStreetMap contributors (ODbL 1.0).
+* Android ALPR models, downloaded at first use (not bundled):
+  open-image-models plate detector and fast-plate-ocr recognizer — see docs/LICENSING.md.
+
+The full list, with each component's license and where it is used, is docs/LICENSING.md.

@@ -1,0 +1,63 @@
+# BeaconFix hub: the master map database for every node, BFS3 on tcp/443 (docs/SECURE-API.md, deploy/README.md).
+# Certificate renewals: the host drops new files into /etc/beaconfix/tls/ and runs `systemctl try-restart beaconfix-hub`
+# (the hub also re-reads a changed certificate on its own within an hour).
+[Unit]
+Description=BeaconFix hub (master map database, BFS3 API)
+Documentation=https://github.com/sworrl/beaconfix/blob/master/docs/SECURE-API.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=beaconfix
+Group=beaconfix
+EnvironmentFile=/etc/beaconfix/beaconfix-hub.env
+ExecStart=/usr/local/bin/beaconfix --server
+Restart=always
+RestartSec=5
+# SIGTERM → the hub leaves its event loop and writes the encrypted database (can take a few seconds for a big one)
+TimeoutStopSec=90
+KillSignal=SIGTERM
+
+StateDirectory=beaconfix
+StateDirectoryMode=0700
+UMask=0077
+ReadWritePaths=/var/lib/beaconfix
+
+# Port 443 without root
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+# Hardening. In an unprivileged LXC (nesting=1) these work with current systemd; if the unit fails with
+# status=226/NAMESPACE, comment out PrivateDevices= and the Protect{Kernel*,Clock,Hostname}= lines first.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# Resources: the live (decrypted) database sits on disk under the state dir, not in RAM; a re-encryption of the
+# whole database briefly needs ~2× its size in memory.
+MemoryHigh=480M
+MemoryMax=640M
+TasksMax=64
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target

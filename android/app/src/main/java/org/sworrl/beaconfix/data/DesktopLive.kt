@@ -38,12 +38,15 @@ import javax.inject.Singleton
  */
 data class DesktopView(val desktop: DesktopEntity, val location: LocationDto? = null, val trip: Trip? = null, val pois: List<PoiDto> = emptyList(),
                        val events: List<EventDto> = emptyList(), val error: String = "", val fetched: Long = 0, val streaming: Boolean = false, val devices: List<LinkedDevice> = emptyList(),
-                       val emergency: EmergencyDto? = null, val cachedAt: Long = 0, val stale: Boolean = false, val cached: Set<String> = emptySet())
+                       val emergency: EmergencyDto? = null, val cachedAt: Long = 0, val stale: Boolean = false, val cached: Set<String> = emptySet(),
+                       val flockCameras: List<org.sworrl.beaconfix.data.api.FlockCameraDto> = emptyList(),
+                       val alprSummary: org.sworrl.beaconfix.data.api.AlprSummaryDto? = null)
 
 @Singleton
 class DesktopLive @Inject constructor(
     private val store: DesktopStore, private val refits: org.sworrl.beaconfix.estimate.RefitBus,
     private val cache: DesktopCache, private val db: AppDatabase,
+    private val plateEvents: dagger.Lazy<org.sworrl.beaconfix.sightings.PlateEventRepository>,
 ) {
     private val seenRefits = HashSet<Long>()
     private fun noteRefit(e: EventDto) { if (e.type == "ap_refit" && e.lat != null && e.lon != null && seenRefits.add(e.id)) refits.emit(org.sworrl.beaconfix.estimate.RefitEvent(e.bssid, e.ssid, e.lat, e.lon, e.fromLat, e.fromLon, e.acc ?: 50.0, e.prevAcc, e.n, e.vantage, e.rms, e.vantagePoints.map { org.sworrl.beaconfix.estimate.RefitEvent.Vantage(it.lat, it.lon, it.dbm, it.device) }, origin = "desktop")) }
@@ -63,14 +66,24 @@ class DesktopLive @Inject constructor(
      * (`DesktopCache`: snapshots per kind, places per desktop), and a desktop's view starts from that cache the first
      * time it is built, so screens show the last known picture while the desktop is out of reach. A 404 (an older
      * desktop without that endpoint) or an unreadable answer skips that part only; `DevFlags` blocks the network.
+     * Cameras: only the newest "flock" request's answer is applied (an older one finishing later is dropped), and a
+     * cameras-only refresh leaves the view's error / fetched / stale alone (they describe the location and the rest).
+     * Returns whether some desktop answered with cameras (false when "flock" is not asked for).
      */
-    suspend fun refreshAll(what: Set<String> = DEFAULT) {
+    suspend fun refreshAll(what: Set<String> = DEFAULT, flockNear: Pair<Double, Double>? = null, flockKey: String = "map"): Boolean {
         val paired = store.paired()
         val fresh = HashMap<String, DesktopView>()
         for (d in paired) if (_views.value[d.id] == null) fresh[d.id] = prefill(d)
         _views.update { cur -> paired.associate { d -> d.id to ((cur[d.id] ?: fresh[d.id] ?: DesktopView(d)).copy(desktop = d)) } }
-        for (d in paired) refreshOne(d, what)
+        val counter = flockGens.getOrPut(flockKey) { java.util.concurrent.atomic.AtomicLong() }
+        val gen = if ("flock" in what) counter.incrementAndGet() else 0L
+        var cams = false
+        for (d in paired) if (refreshOne(d, what, flockNear, gen, counter)) cams = true
+        return cams
     }
+    /** per caller (the map, the car screen): bumped by each refresh that asks for cameras, and an answer is applied
+     *  only while its number is still that caller's newest — one caller's requests never cancel another's */
+    private val flockGens = java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.atomic.AtomicLong>()
 
     private suspend fun prefill(d: DesktopEntity): DesktopView = runCatching {
         val src = DesktopCache.desktopSource(d.id)
@@ -78,10 +91,15 @@ class DesktopLive @Inject constructor(
         Mirror.prefill(d, snaps, db.pois().allNow())
     }.getOrElse { DesktopView(d) }
 
-    private suspend fun refreshOne(d: DesktopEntity, what: Set<String>) {
-        if (DevFlags.desktopBlocked()) { put(d.id) { Mirror.settle(it, false, BLOCKED, System.currentTimeMillis()) }; return }
-        val api = store.api(d); val auth = store.auth(d) ?: return
+    /** true when "flock" was asked for and [d]'s camera answer was applied. */
+    private suspend fun refreshOne(d: DesktopEntity, what: Set<String>, flockNear: Pair<Double, Double>? = null, gen: Long = 0L,
+                                   counter: java.util.concurrent.atomic.AtomicLong? = null): Boolean {
+        // the view's freshness describes the location, trip and the rest: a cameras-only refresh never settles it
+        val settles = what.any { it != "flock" }
+        if (DevFlags.desktopBlocked()) { if (settles) put(d.id) { Mirror.settle(it, false, BLOCKED, System.currentTimeMillis()) }; return false }
+        val api = store.api(d); val auth = store.auth(d) ?: return false
         val src = DesktopCache.desktopSource(d.id)
+        var cams = false
         try {
             val done = withTimeoutOrNull(timeoutFor(what)) {
                 // where the desktop is: positions its snapshots and its places' origin
@@ -115,16 +133,36 @@ class DesktopLive @Inject constructor(
                     live(d.id, Mirror.DEVICES) { it.copy(devices = dv.devices) }
                     snap(Mirror.DEVICES, dv, DevicesPositions.serializer())
                 }
+                if ("flock" in what) {
+                    // an area, never the whole nationwide set (~137k cameras, ~30 MB): around [flockNear], else the desktop's own fix
+                    Mirror.bodyOf { api.flockCameras(auth, flockNear?.first, flockNear?.second, flockNear?.let { FLOCK_KM }, FLOCK_LIMIT) }?.let { fc ->
+                        if (gen == (counter?.get() ?: gen)) { live(d.id, "flock") { it.copy(flockCameras = fc.cameras) }; cams = true }
+                    }
+                    if (gen == (counter?.get() ?: gen)) Mirror.bodyOf { api.flockSummary(auth) }?.let { sum ->
+                        live(d.id, "alprSummary") { it.copy(alprSummary = sum) }
+                    }
+                    // plate events (docs/SIGHTINGS.md §5): the desktop's feed into Room, alerted per §6 (at most once a minute)
+                    plateEvents.get().quickSync(d)
+                }
                 true
             }
-            put(d.id) { Mirror.settle(it, done == true, if (done == true) "" else "timed out", System.currentTimeMillis()) }
+            if (settles) put(d.id) { Mirror.settle(it, done == true, if (done == true) "" else "timed out", System.currentTimeMillis()) }
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
             val code = (e as? retrofit2.HttpException)?.code()
             if (code == 401) store.forgetToken(d.id)
-            put(d.id) { Mirror.settle(it, false, e.message ?: "unreachable", System.currentTimeMillis()) }
+            if (settles) put(d.id) { Mirror.settle(it, false, e.message ?: "unreachable", System.currentTimeMillis()) }
         }
+        return cams
+    }
+
+    suspend fun syncNationwideUs(): Boolean {
+        val d = store.paired().firstOrNull() ?: return false
+        val auth = store.auth(d) ?: return false
+        val api = ApiFactory.create(d.host, d.port, d.tls)
+        val res = runCatching { api.syncNationwideUs(auth) }.getOrNull()
+        return res?.isSuccessful == true
     }
 
     /** Server-sent events from the first paired desktop while a screen is visible: `fix` and `beacon` events. */
@@ -152,7 +190,10 @@ class DesktopLive @Inject constructor(
 
     companion object {
         /** What a screen refreshes by default. */
-        val DEFAULT = setOf("location", "trip", "pois", "events", "emergency")
+        val DEFAULT = setOf("location", "trip", "pois", "events", "emergency", "flock")
+        /** The camera area asked for around a position (km), and the most cameras one answer may carry. */
+        const val FLOCK_KM = 50.0
+        const val FLOCK_LIMIT = 2000
         const val BLOCKED = "offline (simulated)"
         /** 12 s for the usual handful of small GETs, a little more when more is asked for (Starlink can be slow). */
         fun timeoutFor(what: Set<String>): Long = (12_000L + 2_000L * (what.size - 5).coerceAtLeast(0)).coerceAtMost(20_000L)

@@ -7,6 +7,7 @@ plugins {
     alias(libs.plugins.kotlin.serialization)
     alias(libs.plugins.kotlin.ksp)
     alias(libs.plugins.hilt)
+    alias(libs.plugins.aboutlibraries)
 }
 
 // Release signing: secrets never live in the repo. Either export
@@ -37,10 +38,13 @@ android {
         applicationId = "org.sworrl.beaconfix"
         minSdk = 26
         targetSdk = 35
-        versionCode = 8
-        versionName = "1.5.0"
+        versionCode = 9
+        versionName = "1.6.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables { useSupportLibrary = true }
+        // The hub a fresh install assumes before enrolment (an invite carries the real one). Set yours outside the repo:
+        // `beaconfixHubUrl=https://hub.your.domain/` in ~/.gradle/gradle.properties.
+        buildConfigField("String", "HUB_URL", "\"" + ((project.findProperty("beaconfixHubUrl") as String?) ?: "https://hub.example.com/") + "\"")
     }
 
     signingConfigs {
@@ -79,7 +83,10 @@ android {
     buildFeatures { compose = true; buildConfig = true }
     packaging {
         resources {
-            excludes += listOf("/META-INF/{AL2.0,LGPL2.1}", "META-INF/versions/9/OSGI-INF/MANIFEST.MF", "META-INF/versions/**", "META-INF/DEPENDENCIES", "META-INF/LICENSE*", "META-INF/NOTICE*", "META-INF/*.kotlin_module", "META-INF/BC*.SF", "META-INF/BC*.RSA")
+            excludes += listOf("/META-INF/{AL2.0,LGPL2.1}", "META-INF/versions/9/OSGI-INF/MANIFEST.MF", "META-INF/versions/**", "META-INF/DEPENDENCIES", "META-INF/*.kotlin_module", "META-INF/BC*.SF", "META-INF/BC*.RSA")
+            // third-party notices are kept, not dropped: several jars ship a META-INF/LICENSE or NOTICE, so the copies
+            // are concatenated instead of colliding; the app shows them all under Settings → Open-source licenses
+            merges += listOf("META-INF/LICENSE", "META-INF/LICENSE.txt", "META-INF/LICENSE.md", "META-INF/NOTICE", "META-INF/NOTICE.txt", "META-INF/NOTICE.md")
             pickFirsts += listOf("META-INF/INDEX.LIST")
         }
         jniLibs { useLegacyPackaging = false }
@@ -95,6 +102,38 @@ android {
 }
 
 ksp { arg("room.schemaLocation", "$projectDir/schemas") }
+
+// Settings → Open-source licenses (docs/LICENSING.md): every dependency's license from its POM, collected at build time,
+// plus the components that are not Maven dependencies (the ALPR models) from app/config/libraries.
+aboutLibraries {
+    configPath = "app/config"      // relative to the root project (android/)
+    excludeFields = arrayOf("generated")
+}
+// the plugin does not declare the config directory as an input: an edit there must regenerate the list
+tasks.matching { it.name.startsWith("prepareLibraryDefinitions") }.configureEach { inputs.dir("config").withPathSensitivity(PathSensitivity.RELATIVE) }
+
+// ALPR dash cam: the plate detector / reader models, fetched at build time (see alpr_models.gradle.kts)
+android.sourceSets["main"].assets.srcDir(layout.buildDirectory.dir("generated/alpr_assets"))
+android.buildTypes["release"].proguardFile("alpr-proguard-rules.pro")
+// ONNX Runtime ships ~43 MB of x86 / x86_64 libraries for emulators; the dash cam is for ARM phones
+android.packaging.jniLibs.excludes += listOf("lib/x86/libonnxruntime*.so", "lib/x86_64/libonnxruntime*.so")
+apply(from = "alpr_models.gradle.kts")
+
+// Surveillance signatures (docs/DETECTION.md): ONE file shared with the desktop, data/signatures/surveillance.json,
+// copied into the assets at build time (never duplicated by hand). The unit tests read it and the shared cases directly.
+val surveillanceSignatures = rootProject.file("../data/signatures/surveillance.json")
+val copySurveillanceSignatures = tasks.register<Copy>("copySurveillanceSignatures") {
+    from(surveillanceSignatures)
+    into(layout.buildDirectory.dir("generated/signature_assets/signatures"))
+}
+android.sourceSets["main"].assets.srcDir(layout.buildDirectory.dir("generated/signature_assets"))
+tasks.named("preBuild") { dependsOn(copySurveillanceSignatures) }
+tasks.withType<Test>().configureEach {
+    systemProperty("beaconfix.signatures", surveillanceSignatures.absolutePath)
+    systemProperty("beaconfix.signatureCases", rootProject.file("../tests/fixtures/surveillance_cases.json").absolutePath)
+    inputs.file(surveillanceSignatures).withPathSensitivity(PathSensitivity.RELATIVE)
+    inputs.file(rootProject.file("../tests/fixtures/surveillance_cases.json")).withPathSensitivity(PathSensitivity.RELATIVE)
+}
 
 dependencies {
     implementation(libs.androidx.core.ktx)
@@ -148,6 +187,13 @@ dependencies {
     implementation(libs.androidx.camera.camera2)
     implementation(libs.androidx.camera.lifecycle)
     implementation(libs.androidx.camera.view)
+    implementation(libs.androidx.car.app)
+    implementation(libs.androidx.car.app.projected)
+    implementation("com.google.guava:guava:33.3.1-android")
+    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.30.0")   // ALPR dash cam (MIT)
+    // Settings → Open-source licenses: the dependency licenses are collected at build time (AboutLibraries, Apache-2.0)
+    implementation(libs.aboutlibraries.core)
+    implementation(libs.aboutlibraries.compose.m3)
 
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)

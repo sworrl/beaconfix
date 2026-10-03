@@ -1,0 +1,5 @@
+// /etc/polkit-1/rules.d/50-beaconfix-node.rules — the headless node (user beaconfix) may ask NetworkManager for
+// Wi-Fi scans (reading the access-point list needs no permission; triggering a fresh scan does)
+polkit.addRule(function(action, subject) {
+    if (action.id == "org.freedesktop.NetworkManager.wifi.scan" && subject.user == "beaconfix") return polkit.Result.YES;
+});

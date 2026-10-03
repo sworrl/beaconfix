@@ -1,0 +1,13 @@
+# Optional pretraining set (README, "stage 1"): Open Images V7 street classes, same licenses as oi_plates.
+# Written by:
+#   python fetch_data.py --out data/oi-vehicles --limit 120000 --negatives 0 \
+#     --classes "Vehicle registration plate;Car;Truck;Bus;Van;Taxi;Ambulance;Motorcycle;Bicycle;Wheel;Traffic sign;Person"
+# class_list must keep that order (fetch_data.py numbers the categories 1..N in --classes order).
+path: data/oi-vehicles
+train: train
+validation: val
+
+class_num: 12
+class_list: ['License_plate', 'Car', 'Truck', 'Bus', 'Van', 'Taxi', 'Ambulance', 'Motorcycle', 'Bicycle', 'Wheel', 'Traffic_sign', 'Person']
+
+auto_download: null

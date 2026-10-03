@@ -57,8 +57,13 @@ PlasmoidItem {
     property bool   pedsSupported: false        // the desktop finds pediatric ERs (3.8+: "pediatric" in features)
     property string poiNote:  ""
     property string tileBase: ""
+    property string heatGen: ""            // route generation: the tray draws the heat map as tiles (tileBase/h/<gen>/…)
     property string _poisJson: ""
     property string _trackJson: ""
+    property var    flockCameras: []
+    property string _flockPrint: ""
+    property var    routeFixes: []
+    property string _routePrint: ""
     property var    elevation: null
     property string elevationNote: ""
     property var    sun: null
@@ -88,11 +93,14 @@ PlasmoidItem {
 
     readonly property string sourceName:
         source === "starlink" ? "Starlink dish GPS" :
-        source === "wifi" ? (provider === "apple" ? "Apple Wi-Fi" : "BeaconDB Wi-Fi") :
+        source === "gnss"     ? "RV GNSS receiver" :
+        source === "anchor"   ? "surveyed position (this computer's anchor)" :
+        source === "wifi" ? (provider === "apple" ? "Apple Wi-Fi" : provider === "fingerprint" ? "Wi-Fi fingerprint (past GPS scans)"
+                             : provider === "internal" ? "internal beacon map" : "BeaconDB Wi-Fi") :
         source === "ip"       ? "IP geolocation (approximate)" : "no fix"
     readonly property string sourceIcon: "beaconfix"
     readonly property color  sourceColor:
-        source === "starlink" ? "#6cff8a" : source === "wifi" ? "#35d6ff" : source === "ip" ? "#ffd166" : "#ff4f4f"
+        source === "starlink" || source === "gnss" ? "#6cff8a" : source === "anchor" ? "#c9a0ff" : source === "wifi" ? "#35d6ff" : source === "ip" ? "#ffd166" : "#ff4f4f"
 
     Plasmoid.icon: sourceIcon
     toolTipMainText: valid ? place : "BeaconFix"
@@ -161,6 +169,14 @@ PlasmoidItem {
                 if (pj !== root._poisJson) { root._poisJson = pj; root.pois = d.pois || [] }
                 var tj = JSON.stringify(d.track || [])
                 if (tj !== root._trackJson) { root._trackJson = tj; root.track = d.track || [] }
+                // The camera list can be 100k+ entries (tens of MB): JSON.stringify of it alone held the shell's
+                // GUI thread for ~1.7 s every poll. A fingerprint of what the map draws costs ~50 ms.
+                var fcp = root.camPrint(d.flockCameras || [])
+                if (fcp !== root._flockPrint) { root._flockPrint = fcp; root.flockCameras = d.flockCameras || [] }
+                // The whole fix history (only grows): its JSON.stringify was ~25 ms per poll. Hashed whole, not just
+                // the tail: a phone sync inserts older fixes mid-list, and a prune can keep the count unchanged.
+                var rfp = root.routePrint(d.routeFixes || [])
+                if (rfp !== root._routePrint) { root._routePrint = rfp; root.routeFixes = d.routeFixes || [] }
                 // The category list follows the desktop (a newer one adds categories, e.g. pediatric ER), but is
                 // only reassigned when it changed: the map's Places menu rebuilds its items on every assignment
                 var cj = JSON.stringify(d.poiCategories || [])
@@ -168,6 +184,7 @@ PlasmoidItem {
                 root.pedsSupported = (d.features || []).indexOf("pediatric") >= 0
                 root.poiNote = d.poiNote || ""
                 root.tileBase = d.tileBase || ""
+                root.heatGen = d.heatGen || ""
                 root.knownDevices = d.knownDevices || []
                 var ldj = JSON.stringify(d.linkedDevices || [])
                 if (ldj !== root._linkedJson) { root._linkedJson = ldj; root.linkedDevices = d.linkedDevices || [] }
@@ -287,6 +304,36 @@ PlasmoidItem {
         var newSeen = Math.max(base, maxId)
         return {out: first ? ev.slice(-5) : fresh, first: first, reset: reset, maxId: maxId, seenId: newSeen, seenTime: newSeen === maxId ? topTime : seenTime}
     }
+    // Fingerprint of the camera fields the map draws (position, heading, vetted, passes, model): two
+    // independent 32-bit hashes plus the count. Fields the map ignores (lastSeen, seq, ...) do not count.
+    function camPrint(list) {
+        var h1 = 0x811c9dc5 | 0, h2 = 5381
+        for (var i = 0; i < list.length; i++) {
+            var c = list[i]
+            if (!c) { h1 = Math.imul(h1 ^ 1, 16777619); continue }
+            var v = (Math.round((c.lat || 0) * 1e7) ^ Math.imul(Math.round((c.lon || 0) * 1e7), 31)) + (c.passCount | 0) * 977 + (c.vetted ? 0x5bd1e995 : 0)
+            var dir = String(c.direction || ""), mdl = String(c.model || "")
+            for (var j = 0; j < dir.length; j++) v = Math.imul(v, 31) + dir.charCodeAt(j)
+            v = Math.imul(v, 31) + mdl.length + (mdl.length ? mdl.charCodeAt(0) * 131 + mdl.charCodeAt(mdl.length - 1) : 0)
+            h1 = Math.imul(h1 ^ v, 16777619)
+            h2 = (Math.imul(h2, 33) + v) | 0
+        }
+        return list.length + ":" + (h1 >>> 0).toString(16) + ":" + (h2 >>> 0).toString(16)
+    }
+    // Fingerprint of routeFixes (lat, lon, acc, time: all the heatmap reads), as camPrint does for cameras
+    function routePrint(list) {
+        var h1 = 0x811c9dc5 | 0, h2 = 5381
+        for (var i = 0; i < list.length; i++) {
+            var f = list[i]
+            if (!f) { h1 = Math.imul(h1 ^ 1, 16777619); continue }
+            var v = (Math.round((f.lat || 0) * 1e7) ^ Math.imul(Math.round((f.lon || 0) * 1e7), 31)) + Math.imul(Math.round((f.acc || 0) * 10), 977)
+            var tm = String(f.time || "")
+            for (var j = 0; j < tm.length; j++) v = Math.imul(v, 31) + tm.charCodeAt(j)
+            h1 = Math.imul(h1 ^ v, 16777619)
+            h2 = (Math.imul(h2, 33) + v) | 0
+        }
+        return list.length + ":" + (h1 >>> 0).toString(16) + ":" + (h2 >>> 0).toString(16)
+    }
     function distM(la1, lo1, la2, lo2) {
         var R = 6371000, d2r = Math.PI / 180
         var dLa = (la2 - la1) * d2r, dLo = (lo2 - lo1) * d2r
@@ -315,10 +362,20 @@ PlasmoidItem {
             anchors.centerIn: parent
             spacing: Kirigami.Units.smallSpacing
             Kirigami.Icon {
+                id: panelIcon
                 source: root.sourceIcon
+                fallback: ""
                 implicitWidth:  Kirigami.Units.iconSizes.smallMedium
                 implicitHeight: Kirigami.Units.iconSizes.smallMedium
                 opacity: root.busy ? 0.5 : 1
+                // The widget installed without the app (no "beaconfix" in the icon theme): the bundled copy
+                Image {
+                    anchors.fill: parent
+                    visible: !panelIcon.valid
+                    source: visible ? "../icons/beaconfix.png" : ""
+                    sourceSize: Qt.size(width * Screen.devicePixelRatio, height * Screen.devicePixelRatio)
+                    smooth: true; mipmap: true
+                }
             }
             PC3.Label {
                 visible: root.showPlace && !compact.vertical && root.valid
@@ -330,7 +387,7 @@ PlasmoidItem {
                 visible: root.showAccuracy && !compact.vertical && root.valid
                 radius: 7; height: 14; width: accChip.implicitWidth + 10; color: root.sourceColor
                 PC3.Label { id: accChip; anchors.centerIn: parent; color: "#0b101a"; font.bold: true; font.pixelSize: Kirigami.Theme.smallFont.pixelSize - 1
-                            text: (root.source === "starlink" ? "GPS " : root.source === "wifi" ? "WI-FI " : root.source === "ip" ? "IP " : "")
+                            text: (root.source === "starlink" || root.source === "gnss" ? "GPS " : root.source === "anchor" ? "SURVEYED " : root.source === "wifi" ? "WI-FI " : root.source === "ip" ? "IP " : "")
                                   + (root.accuracy >= 1000 ? Math.round(root.accuracy / 1000) + " km" : Math.round(root.accuracy) + " m") }
             }
             PC3.Label {
@@ -353,15 +410,15 @@ PlasmoidItem {
         // Pulse + sweep: a 2.4 s cycle stepped at 12 fps by a timer, not a NumberAnimation.
         // An infinite NumberAnimation makes Qt Quick re-render the whole desktop at 60 fps for
         // as long as the widget is on it, which on this VM's GL path costs most of a core.
-        // …and on the desktop it only runs while the pointer is over the widget or for two
-        // minutes after the last interaction or event, so an idle desktop stays idle.
+        // …and on the desktop it only runs while the pointer is over the widget (and 10 s after it
+        // leaves). Events no longer wake it: they arrive every live scan, which kept a desktop widget
+        // re-rendering the whole desktop at 12 fps around the clock. Their own animations still play.
         property real phase: 0
         property bool  awake: true
         readonly property bool onDesktop: Plasmoid.location === PlasmaCore.Types.Floating || Plasmoid.formFactor === PlasmaCore.Types.Planar
-        HoverHandler { id: repHover; onHoveredChanged: if (hovered) fullRep.wake() }
+        HoverHandler { id: repHover; onHoveredChanged: if (hovered) fullRep.wake(); else idleTimer.restart() }
         function wake() { awake = true; idleTimer.restart() }
-        Timer { id: idleTimer; interval: 120000; onTriggered: if (!repHover.hovered) { fullRep.awake = false; fullRep.phase = 0 } }
-        Connections { target: root; function onNewEvents(list, animate) { if (animate && list.length) fullRep.wake() } }
+        Timer { id: idleTimer; interval: 10000; onTriggered: if (!repHover.hovered) { fullRep.awake = false; fullRep.phase = 0 } }
         Component.onCompleted: wake()
         Timer {
             interval: 83; repeat: true
@@ -448,6 +505,8 @@ PlasmoidItem {
                         src: root
                         phase: fullRep.phase
                         layerIndex: Plasmoid.configuration.mapLayer
+                        satSource: Plasmoid.configuration.satSource
+                        showContours: Plasmoid.configuration.showContours
                         hiddenCats: root.hiddenCats
                         showSsids: root.showSsids
                         showEvents: root.showEvents
@@ -459,6 +518,8 @@ PlasmoidItem {
                         onSsidsToggled: on => Plasmoid.configuration.showSsids = on
                         onEventsToggled: on => Plasmoid.configuration.showEvents = on
                         onLayerPicked: index => Plasmoid.configuration.mapLayer = index
+                        onContoursToggled: on => Plasmoid.configuration.showContours = on
+                        onSatSourcePicked: index => { Plasmoid.configuration.satSource = index; Plasmoid.configuration.mapLayer = 2 }
                         onCategoryToggled: (key, visible) => root.setCategory(key, visible)
                         onAllCategories: visible => root.setAllCategories(visible)
                     }
@@ -501,7 +562,7 @@ PlasmoidItem {
                 Layout.fillWidth: true
                 PC3.Button { icon.name: "view-refresh"; text: "Re-check"; enabled: !root.busy; onClicked: root.refresh() }
                 PC3.Button { icon.name: "internet-web-browser"; text: "OSM"; enabled: root.valid
-                    onClicked: Qt.openUrlExternally(`https://www.openstreetmap.org/?mlat=${root.lat}&mlon=${root.lon}#map=15/${root.lat}/${root.lon}`) }
+                    onClicked: Qt.openUrlExternally(`https://www.openstreetmap.org/?mlat=${root.lat.toFixed(6)}&mlon=${root.lon.toFixed(6)}#map=15/${root.lat.toFixed(5)}/${root.lon.toFixed(5)}`) }
                 PC3.Button {
                     id: shareBtn
                     icon.name: "document-share"; text: "Share"; enabled: root.valid

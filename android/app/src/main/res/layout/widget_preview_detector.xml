@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:padding="12dp"
+    android:background="@drawable/widget_preview_bg">
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="🛡️ ALPR Radar: Armed"
+        android:textColor="#00E5FF"
+        android:textStyle="bold"
+        android:textSize="14sp"
+        android:maxLines="1" />
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Closest: Flock Falcon · 450 ft Ahead (NB)"
+        android:textColor="#E6EDF7"
+        android:textSize="12sp"
+        android:maxLines="1" />
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Sound &amp; Haptics: Active · 56 Beacons"
+        android:textColor="#9FB0C8"
+        android:textSize="11sp" />
+</LinearLayout>

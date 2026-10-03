@@ -59,6 +59,7 @@ signals:
     // An advert with the BeaconFix UUID: its tag (8 bytes), RSSI (dBm), TX power (dBm or 127), kind, flags byte.
     // held: not a report from BlueZ but holdTick's repeat of the last RSSI (no new measurement; see holdTick).
     void sample(const QByteArray &tag, int rssi, int txPower, int kind, int flags, qint64 timeMs, const QString &address, bool held = false);
+    void advertHeard(const QString &address, const QString &name, const QStringList &uuids, int mfrId, const QByteArray &mfrData, int rssi);
     void advertisingChanged(bool on);
     void scanStalledChanged(bool stalled);
     void txPowerChanged(int dbm);

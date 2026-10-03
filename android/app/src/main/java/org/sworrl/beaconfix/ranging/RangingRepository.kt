@@ -15,6 +15,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
@@ -85,6 +86,7 @@ class RangingRepository @Inject constructor(
     @ApplicationContext private val ctx: Context, private val desktops: DesktopStore, private val identity: IdentityStore, private val scanner: WifiScanner,
     private val status: CollectorStatus, private val db: AppDatabase, private val anchors: AnchorRepository, private val live: DesktopLive,
     private val rtt: RttRanging, private val ble: BleRanging, private val motion: MotionSensors, private val widgets: dagger.Lazy<org.sworrl.beaconfix.widget.WidgetUpdater>,
+    private val prefs: org.sworrl.beaconfix.data.Prefs,
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val _sessions = MutableStateFlow<Map<String, RangeSession>>(emptyMap())
@@ -264,12 +266,23 @@ class RangingRepository @Inject constructor(
                 r.isSuccessful -> s.copy(remote = r.body(), remoteAt = now, posts = s.posts + 1, lastPost = now, reachableAt = now)
                 else -> s.copy(error = "ranging post HTTP ${r.code()}", lastPost = now, reachableAt = now)
             }
+            if (r?.isSuccessful == true) runCatching { rememberOffset(r.body()?.calib) }
         }
         // ── absolute: a ring (or point) around the desktop's anchor ──
         s = s.copy(rangedFix = rangedFix(s, pf))
         // ── pacing: is anything changing? (either side moving, the distance, the desktop's BLE level) ──
         pacer.observe(now, s.best?.distanceM, moving, live.views.value[d.id]?.trip?.moving == true, bleNew.map { it.rssi })
         return s
+    }
+    private var savedOffset: Pair<Double, Double>? = null; private var offsetLoaded = false
+    /** Keep the calibrated RTT offset for ranging ordinary APs (collector.ObservationRecorder → ApRttRanger); dropped when stale. */
+    private suspend fun rememberOffset(c: org.sworrl.beaconfix.data.api.RangeCalib?) {
+        if (c == null || (c.rttOffsetM == null && !c.rttStale)) return       // nothing said about RTT
+        val v = if (c.rttStale || c.rttCalibrated == false) null else c.rttOffsetM?.let { it to (c.rttOffsetSigmaM ?: 0.5) }
+        if (!offsetLoaded) { savedOffset = prefs.rttOffset.first(); offsetLoaded = true }
+        val old = savedOffset
+        if (v == old || (v != null && old != null && kotlin.math.abs(v.first - old.first) < 0.01 && kotlin.math.abs(v.second - old.second) < 0.01)) return
+        savedOffset = v; prefs.setRttOffset(v)
     }
     private val bleBatch = HashMap<String, ArrayList<BleSample>>()
     private val unsentBle = HashMap<String, ArrayList<BleSample>>()

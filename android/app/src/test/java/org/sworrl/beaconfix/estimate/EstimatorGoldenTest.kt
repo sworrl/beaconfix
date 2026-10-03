@@ -21,7 +21,8 @@ import kotlin.math.max
 
 /**
  * The Kotlin estimator against the desktop's golden vectors (tests/fixtures/estimator_golden.json, written by
- * tests/estimator_golden.cpp --write): the same checks as `estimator_golden --check` — every case, the update stream,
+ * tests/estimator_golden.cpp --write): the same checks as `estimator_golden --check` — every case, the update streams
+ * (the second with a device offset, "offsetDb"),
  * the self-location cases and the helpers. lat/lon/suggestLat/suggestLon within 1e-9°, other numbers within
  * 1e-6·max(1, |want|), strings (grades!) and booleans exactly.
  */
@@ -46,6 +47,7 @@ class EstimatorGoldenTest {
         val o = Options()
         o.defaultN = j.d("defaultN", o.defaultN); o.nSd = j.d("nSd", o.nSd); o.p0Mean = j.d("p0Mean", o.p0Mean)
         o.p0Sd = j.d("p0Sd", o.p0Sd); o.kappa = j.d("kappa", o.kappa); o.bootstrap = j.i("bootstrap", o.bootstrap)
+        o.devOffsetSd = j.d("devOffsetSd", o.devOffsetSd)
         return o
     }
 
@@ -113,8 +115,12 @@ class EstimatorGoldenTest {
         }
     }
 
-    @Test fun matchesTheDesktopEngine() {
+    /** The fixture was written by the same estimator generation (on its own, so a stale stamp does not hide the numbers). */
+    @Test fun fixtureIsThisGeneration() {
         assertEquals("fixture and engine generation", Estimator.VERSION, root["estimatorVersion"]!!.jsonPrimitive.int)
+    }
+
+    @Test fun matchesTheDesktopEngine() {
         val cases = root["cases"]!!.jsonArray
         assertTrue("fixture has cases", cases.isNotEmpty())
         val fits = ArrayList<Fit>()
@@ -129,7 +135,11 @@ class EstimatorGoldenTest {
             val u = v.jsonObject
             var f = fits[u.i("fromCase")]
             val stream = u["stream"]!!.jsonArray; val steps = u["expect"]!!.jsonArray
-            for (i in 0 until stream.size) { f = Estimator.update(f, obsFrom(stream[i].jsonObject)); cmp("update[$i]", steps[i].jsonObject, fitJson(f)) }
+            for (i in 0 until stream.size) {
+                // the second stream is heard by a device louder than this one: its calibrated offset goes to update()
+                f = Estimator.update(f, obsFrom(stream[i].jsonObject), Options(), stream[i].jsonObject.d("offsetDb", 0.0))
+                cmp("update[$i]", steps[i].jsonObject, fitJson(f))
+            }
         }
         root["self"]!!.jsonArray.forEachIndexed { si, v ->
             val known = v.jsonObject["known"]!!.jsonArray.map { knownFrom(it.jsonObject) }

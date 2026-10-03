@@ -1,0 +1,15 @@
+{
+  "uniqueId": "com.microsoft.onnxruntime:onnxruntime-android",
+  "name": "ONNX Runtime",
+  "artifactVersion": "1.22.0",
+  "description": "Runs the ALPR models on the phone.",
+  "website": "https://onnxruntime.ai",
+  "developers": [
+    {
+      "name": "Microsoft Corporation"
+    }
+  ],
+  "licenses": [
+    "mit_microsoft"
+  ]
+}

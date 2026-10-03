@@ -145,7 +145,8 @@ class BackupViewModel @Inject constructor(
         firstSeen = c.l("firstSeen"), lastSeen = c.l("lastSeen"), timesSeen = c.l("timesSeen").toInt(), lat = c.d("lat"), lon = c.d("lon"), acc = c.d("acc"),
         posSource = c.s("posSource"), security = c.s("security"))
     private fun observation(c: Cursor) = ObservationEntity(id = c.l("id"), bssid = c.s("bssid"), time = c.l("time"), lat = c.d("lat") ?: 0.0, lon = c.d("lon") ?: 0.0,
-        acc = c.d("acc") ?: 0.0, dbm = c.l("dbm").toInt(), freq = c.l("freq").toInt(), source = c.s("source"), synced = c.b("synced"), remote = c.b("remote"))
+        acc = c.d("acc") ?: 0.0, dbm = c.l("dbm").toInt(), freq = c.l("freq").toInt(), source = c.s("source"), synced = c.b("synced"), remote = c.b("remote"),
+        rangeM = c.d("rangeM"), rangeSd = c.d("rangeSd"))
     private fun fix(c: Cursor) = FixEntity(id = c.l("id"), time = c.l("time"), lat = c.d("lat") ?: 0.0, lon = c.d("lon") ?: 0.0, acc = c.d("acc") ?: 0.0,
         source = c.s("source"), provider = c.s("provider"), place = c.s("place"))
     private fun anchor(c: Cursor) = AnchorEntity(id = c.s("id"), json = c.s("json"), name = c.s("name"), kind = c.s("kind"), lat = c.d("lat") ?: 0.0, lon = c.d("lon") ?: 0.0,
@@ -154,7 +155,7 @@ class BackupViewModel @Inject constructor(
     private companion object {
         const val TAG = "BfBackup"
         const val SQL_APS = "SELECT bssid, ssid, freq, band, ch, firstSeen, lastSeen, timesSeen, lat, lon, acc, posSource, security FROM aps ORDER BY bssid"
-        const val SQL_OBS = "SELECT id, bssid, time, lat, lon, acc, dbm, freq, source, synced, remote FROM observations WHERE remote = 0 ORDER BY id"
+        const val SQL_OBS = "SELECT id, bssid, time, lat, lon, acc, dbm, freq, source, synced, remote, rangeM, rangeSd FROM observations WHERE remote = 0 ORDER BY id"
         const val SQL_FIXES = "SELECT id, time, lat, lon, acc, source, provider, place FROM fixes WHERE source <> 'desktop' ORDER BY id"
         const val SQL_ANCHORS = "SELECT * FROM anchors ORDER BY id"
     }

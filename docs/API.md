@@ -1,9 +1,9 @@
 # LAN API
 
 The tray serves `http://<beaconfix-host>:47822/api/v1/` (settings `apiEnabled`, default on;
-`apiPort`, default 47822; if the port is busy the next nine are tried). When
-`avahi-publish-service` is installed the service is advertised as `_beaconfix._tcp` with TXT
-`v=1 pair=0|1`. If `~/.config/sworrl/beaconfix.crt` and `beaconfix.key` exist the server speaks
+`apiPort`, default 47822; if the port is busy the next nine are tried). The
+service is advertised over Avahi as `_beaconfix._tcp` with TXT `name=<PC name> id=<identity id> link=1 api=3
+port=<port>` (+ `iname host addr kind v features tls pair`, src/mdns.h). If `~/.config/sworrl/beaconfix.crt` and `beaconfix.key` exist the server speaks
 TLS instead of plain HTTP.
 
 ## Access control
@@ -13,9 +13,9 @@ TLS instead of plain HTTP.
 2. **Known devices** (`apiKnownOnly`, default on): tokens only work from a peer that is in the
    known-device list (matched by `fixed_ip` / `ip`, then by MAC through the neighbour table for
    peers on this host's own subnets, then by MAC glob). Unknown peers get
-   `403 {"error":"unknown device"}`. Pairing requests from unknown peers are still accepted while
-   pairing is open, flagged for manual approval.
-3. **Bearer tokens.** Every endpoint except `hello` and the pairing endpoints needs
+   `403 {"error":"unknown device"}`. Link requests from unknown peers are accepted (the PC user
+   compares the code and taps Link); a linked device is added to the list.
+3. **Bearer tokens.** Every endpoint except `hello` and the link / pairing endpoints needs
    `Authorization: Bearer <token>`. Tokens are 32 random bytes, base64url, shown exactly once.
    Only their SHA-256 is stored (`~/.config/sworrl/beaconfix-devices.json`, mode 0600); comparison
    is constant-time. Scopes: `read`, `control`.
@@ -27,7 +27,47 @@ TLS instead of plain HTTP.
 All responses are JSON with `Cache-Control: no-store`. Errors: `401` (`WWW-Authenticate: Bearer`),
 `403`, `404`, `405` (`Allow:`), `413`, `429`, `503`.
 
-## Pairing (v2: pictures + proximity)
+## The hub (`/api/v3`, BFS3)
+
+The same routes are served by the hub (`beaconfix --server`, docs/SECURE-API.md, docs/HUB.md) as
+`https://<hub>/api/v3/<route>` — every request and response sealed per device (X25519 enrolment, per-message
+ChaCha20-Poly1305 keys, counter + replay window, ±300 s). On the hub, `/api/v1` exists only on its loopback
+admin listener with the admin token; the network address answers only `/api/v3/*` and `GET /healthz`. Hub-only
+routes: `POST /api/v3/enroll` (plain JSON), `POST nodes/heartbeat`, `POST jobs/lease`, `POST jobs/<id>/result`,
+`POST jobs/results`, `GET jobs`, `POST hub/invites` (a PC linking a phone: [LINKING.md](LINKING.md)); admin (loopback, `X-BF-Admin`): `GET hub/status`, `GET hub/devices`,
+`POST hub/invite`, `POST hub/revoke`. `/api/v1/db/changes` rows keep their own `device` for fixes too (a hub's feed
+carries every node's), so a node stores the phone's stops under the phone's name.
+Plate events (3.10, [SIGHTINGS.md](SIGHTINGS.md) §5): `db/changes` carries `plateEvents` (records only) and `db/sync`
+accepts them; `GET plate-events…` work over v3 too and `POST plate-events` needs the `sync` scope. The hub stores no
+images: `POST plate-events/<uid>/media` answers `404` there and the media routes are served by the node (the desktop).
+
+On a node, `GET /api/v1/state` carries `"hub": {enrolled, url, fingerprint, deviceId, lastSync, lastOk, lastError,
+nextSync, failures, jobsDone …}` and `linkedDevices` includes every node the hub knows (positions pulled every 30 s).
+
+## Linking (v3: QR or mDNS, a six-digit code on both screens, nothing typed)
+
+Normative: [LINKING.md](LINKING.md). The PC's **Link a device…** (tray menu, Devices tab) shows a QR; a phone that
+scans it is linked at once, a phone that picks the PC from its mDNS list asks and the PC user taps **Link** after
+comparing the code. Either way the phone receives, sealed to the session key, a read + control token for this API
+and (when the PC is enrolled with a hub) a hub invite. D-Bus for scripts / a PC without a screen: `LinkOffer()` →
+`{sid, qr, expires}`, `LinkQr(sid)`, `LinkSessions()`, `LinkApprove(sid)`, `LinkReject(sid)`, `LinkCancel(sid)`.
+
+```
+phone                                             PC
+  QR path
+  |  POST /api/v1/link {sid,name,kind,pub,mac}       |   202 {"sid","pub","status":"approved","expires"}
+  mDNS path
+  |  POST /api/v1/link {name,kind,commit,proximity?} |   202 {"sid","pub","status":"commit","expires"}
+  |  POST /api/v1/link/<sid> {pub}                   |   202 {"status":"pending"} — the PC shows "<name> wants to link — 123 456 [Link] [Reject]"
+  both
+  |  GET /api/v1/link/<sid>   (every 2 s)            |   {"status":"pending"} | {"status":"denied","reason"} | {"status":"approved","sealed"} (once)
+  |  POST /api/v1/link/hub-invite  (token, control)  |   {"hub":"bfs3:…"}  (409 no hub, 503 hub unreachable)
+```
+
+## Pairing (v2: pictures + proximity — old apps only)
+
+The server still answers this for app versions that predate linking, but no PC UI opens pairing any more
+(only `beaconfix --pairing <minutes>`), and a pending v2 request can only be denied from the Devices tab.
 
 ```
 device                                            BeaconFix (desktop)
@@ -82,8 +122,7 @@ when the verdict is allowed; the response then has `"autoApproved":true` and the
 token that request produced (`grantControl`). A device whose identity is linked to yours does not
 need that: identity sign-in (`/identity/auth`) already yields a read + control token.
 
-Open pairing from the Devices tab, the tray menu ("Allow a device to pair"), or
-`beaconfix --pairing 10` (minutes; `0` closes). Manual tokens: *Create token…* in the Devices
+Open pairing (old apps) with `beaconfix --pairing 10` (minutes; `0` closes). Manual tokens: *Create token…* in the Devices
 tab, or `beaconfix --token "Photo frame"` (add `--control` for the control scope). Revoke with
 `beaconfix --revoke <name-or-id>`; list with `--devices`; status with `--api-status`.
 **Upgrade an existing device to control** without a new token: `beaconfix --grant-control
@@ -101,7 +140,11 @@ Identity endpoints (challenge sign-in, linking, bundle hand-off) are specified i
 
 | method | path | scope | response |
 |---|---|---|---|
-| GET | `/api/v1/hello` | none | `{"name","version","hostname","pairing","tls","ts","api":2,"kind":"desktop","mdns":<bool>,"identity":{"id","name"}|null,"features":["sync","locate","home","events","stream","estimates","identity","peers","anchors","ranging","aps-paging","grant-control","pediatric","whoami","grades"]}` (`pediatric`: 3.8, the pediatric ER fields below; `whoami`: 3.8, `GET /devices/me`; `grades`: 3.9, graded estimates below) |
+| GET | `/api/v1/hello` | none | `{"name","version","hostname","pairing","tls","ts","api":3,"link":true,"pcName","kind":"desktop","mdns":<bool>,"identity":{"id","name"}|null,"features":["sync","locate","home","events","stream","estimates","identity","peers","anchors","ranging","aps-paging","grant-control","pediatric","whoami","grades","flock","heatmap","plate-events","camera-trust","route-avoid"]}` (`camera-trust`, `route-avoid`: the camera routes and routing below; `plate-events`: 3.10, the plate-event routes below; `pediatric`: 3.8, the pediatric ER fields below; `whoami`: 3.8, `GET /devices/me`; `grades`: 3.9, graded estimates below) |
+| POST | `/api/v1/link` body `{"sid","name","kind","pub","mac"}` (QR) or `{"name","kind","commit","proximity"?}` (mDNS) | none | QR: `202 {"sid","pub","status":"approved","expires"}`, `403` bad MAC, `404` unknown / expired, `409` used; mDNS: `202 {"sid","pub","status":"commit","expires"}`, `400` without `commit`, `429` when three wait or the source spent 12 a minute ([LINKING.md](LINKING.md)) |
+| POST | `/api/v1/link/<sid>` body `{"pub"}` | none | mDNS: the key behind the commitment → `202 {"sid","status":"pending","expires"}`; `403` mismatch (the request is denied) or another address; `409` sent twice |
+| GET | `/api/v1/link/<sid>` | none | `{"status":"pending"}` · `{"status":"denied","reason"}` · `{"status":"approved","sealed"}` (once, then `404`) |
+| POST | `/api/v1/link/hub-invite` | control | a fresh hub invite for the calling device `{"hub":"bfs3:…"}`; `409` this PC is not enrolled, `503` the hub is unreachable |
 | POST | `/api/v1/pair` body `{"name","kind","scopes":["read"],"identity":{id,pub,name}?,"sas":{"pub"},"proximity":{beacons[],lat,lon,acc,source,ts}}` | none | `202 {"id","code","expires","poll","proximity":{…},"sas":{"pub"},"autoApproved"?}`; `403` when pairing is closed; `429` when five are pending |
 | GET | `/api/v1/pair/<id>` | none | `{"status":"pending","proximity":{…},"sas":{"picked":<bool>}}` · `{"status":"denied","reason":"wrong pictures"?}` · `{"status":"cancelled"}` · `{"status":"approved","scopes":[…],"token":"…"}` (token once); `404` unknown/expired |
 | POST | `/api/v1/pair/<id>/cancel` | none | the device withdraws its request → `{"status":"cancelled"}` |
@@ -128,14 +171,28 @@ Identity endpoints (challenge sign-in, linking, bundle hand-off) are specified i
 | GET | `/api/v1/emergency` | read | nearest `police`, `fire`, `hospital` (the nearest **general** ER, else the nearest hospital), `urgent`, `pharmacy`, `vet` with `d` / `brg` / `phone` / `address` / `hours` / `website` / `osm` / `driveS` / `driveM` / `driveEst`, and `number` — the local emergency number; 3.8 adds `pediatric`, `pediatricCloser`, `pediatricUrgent`, `pediatricNote`, `pediatricSearchKm`, `pediatricTime`, `origin` (below) |
 | GET | `/api/v1/track` | read | `{"track":[…]}` the trip log |
 | GET | `/api/v1/trip` | read | `{"stats":{…}}` |
+| GET | `/api/v1/flock?bbox=s,w,n,e` / `?lat=&lon=&km=` / `&limit=` / `?all=1` | read | `{"cameras":[…],"area","limit","truncated","stats","loading"}` surveillance (ALPR) cameras in an area, nearest first: the box, or `km` (default 50, ≤ 2000) around `lat`/`lon` (default: the fix); `limit` default 5000, ≤ 20000. A nationwide sync stores ~140k, so the whole table only comes with `all=1` (or `?geojson=1`, the export) |
+| GET | `/api/v1/plate-events?since=<seq>&limit=<n>&kind=camera_pass\|plate_search` | read | plate events ([SIGHTINGS.md](SIGHTINGS.md)), the feed: `{"events":[…],"cursor","more"}` oldest first after `since` (`limit` 1–1000, default 200). Each event = every `plate_events` column **under its column name** (`uid`, `kind`, `plate`, `time`, `lat`, `lon`, `acc`, `camera_id`, `camera_lat`, `camera_lon`, `distance_m`, `speed_kmh`, `heading_deg`, `approach_bearing_deg`, `camera_dir_deg`, `facing`, `operator`, `agency`, `model`, `camera_type`, `source`, `source_url`, `source_name`, `confidence`, `leaky`, `details`, `metrics` (an object), `device`, `created_at`, `updated_at`, `seq`) but `raw`, plus `media:[{uid, kind, mime, width, height, bytes, attribution, license, originalUrl?, capturedAt?, jpegReconstructible, originalMime?, originalBytes?}]`. `?latest=1&limit=` (an extension): newest first by `time`, for lists. Feature `plate-events` in `hello` |
+| GET | `/api/v1/plate-events/<uid>` | read | one event, `raw` included (an object); `<uid>` may be percent-encoded (`pass:osm:node/123:29843267` holds `/` and `:`), a uid merged into another pass resolves to the survivor; `404` |
+| GET | `/api/v1/plate-events/media/<mediaUid>?as=display\|stored` | read | the image: `display` (default) = the original JPEG rebuilt bit for bit (`image/jpeg`) for a JPEG-recompressed JXL, a PNG for any other JXL, WebP as stored; `stored` = the stored bytes (`image/jxl` / `image/webp`). Webcam stills are never served (`404`, SIGHTINGS.md §2.0) |
+| POST | `/api/v1/plate-events` body `{"events":[…],"device"?}` | control | a phone's passes / searches (column names; camelCase aliases such as `cameraId`, `distanceM` accepted; `metrics`/`raw` objects or JSON text; `uid` optional — derived per §1.1) merged per §1.1 → `{"accepted","uids":[surviving uid \| null],"errors"?}`. A new `phone_live` / `dashcam` ALPR pass or a new plate search notifies on the desktop |
+| POST | `/api/v1/plate-events/<uid>/media` body `{"kind":"dashcam"\|"camera_photo","mime","data":<base64>,"width","height","capturedAt","attribution"?,"license"?,"originalUrl"?}` (≤ 40 MB request) | control | re-encoded losslessly (§3.1) and attached to the surviving event (`camera_photo`: to its camera) → `{"uid":<media uid>,"event"}`; `404` unknown event, `422` not a readable image. The hub refuses it (`404`): media stay on the nodes |
+| GET | `/api/v1/plate-events/status` | read | `{"backfill":{kv plate_events_backfill + "running","chunksLeft"?},"hibf":{kv hibf_watch + "enabled","plates","sources":{fetched,updatedAt,files,agencies}},"hibfSources":[{tokens,state,files,records,latest,file,url}],"counts":{total,cameraPass,alprPass,cameraOnlyPass,plateSearch,leaky,latest,passesByType,media,mediaBytes,mediaOriginalBytes},"eyesOnFlock":{kv eyesonflock: status (ok \| error \| blocked), error, fetched, lastAttempt, portals, bytes, camerasMatched, license, attribution},"routing":{ready, default, providers},"roads":{queued, fresh, busy},"active","tools":{cjxl,djxl,ffmpeg}}` |
+| POST | `/api/v1/plate-events/backfill` body `{"restart":true}`? | control | start / resume the backfill (`restart` reruns it from the first fix) → `202 {"ok","restart","backfill"}`; `409` on the hub (it does not detect) |
+| | *(plate events, continued)* | | `GET /plate-events/<uid>` and `?latest=1` also carry `agencyFacts` when the camera's operator / the searching agency matches an Eyes on Flock transparency portal (SIGHTINGS.md §4.6; CC BY-SA 4.0, `attribution` and `license` inside). Camera passes' `metrics` carry `pReadBase`, `snapFactor`, `snap` (road snapping, §2.6), `trustFactor`, `trust` (the camera's trust terms, §2.7) |
+| GET | `/api/v1/cameras/<id>` | read | one camera ([SIGHTINGS.md](SIGHTINGS.md) §2.6, §2.7, §4.6): the `flock_cameras` row (camelCase, as `/flock`) + `cameraType`, `trust` (0–1), `trustDetail` (`{logit, trust, sourceClass, terms:[{term, value, note}], computed, weights}`), `verdict`, `verdictAt`, `roads` (`{fetched, watchedWay, watched:{wayId, distanceM, bearingDeg, layer, oneway, basis}}`), `agencyFacts`?; `<id>` may be percent-encoded (`osm:node/123`); `404` |
+| POST | `/api/v1/cameras/<id>/verdict` body `{"verdict":"present"\|"absent"\|"clear"}` | control | the user saw the camera (log-odds +1) / it is not there (−1.5) / forget it; the trust is recomputed and every pass of the camera rescored → `{"camera","verdict","verdictAt","trust","trustDetail","passesRescored"}`; `400` bad verdict, `404` unknown camera |
+| POST | `/api/v1/route/avoid` body `{"to":{"lat","lon"},"from":{"lat","lon"}?,"provider":"ors"\|"graphhopper"?}` | read | a route around the ALPR cameras' cones ([SIGHTINGS.md](SIGHTINGS.md) §8) with the user's own OpenRouteService / GraphHopper key (desktop Settings); `from` defaults to the current fix, `[lat, lon]` arrays accepted → `200 {"provider","providerName","route":{"type":"LineString","coordinates":[[lon,lat]…]},"distanceM","durationS","avoided":{"areas","cameras","corridorCameras","capped","corridorM"},"passes":[{"id","lat","lon","operator","model","distanceM","alongM","inCone","trust"}],"passesInCone","attribution"}`; `400` bad input, `412 {"error","needsKey":true}` no key (or the provider refused it), `502` the provider failed. Over the hub: read scope |
+| GET | `/api/v1/route/status` | read | `{"ready","default","providers":[{"id","name","hasKey","signup","terms"}]}` — never the keys |
+| GET | `/api/v1/flock/audits?plate=&limit=` | read | (older apps) `{"audits":[{id, plate, cameraId, lat, lon, operator, timestamp, source, confidence, details}],"count"}` — now plate events in the old shape: a pass gives its camera and operator, a search its agency. `/flock/encounters` likewise lists camera passes (`encounterNum` = the pass's number at that camera). `POST /flock/crossref` starts a HaveIBeenFlocked check (within its floors) and returns the plate searches stored; `POST /flock/recalculate` restarts the backfill |
 | GET | `/api/v1/home` | read | `{"patterns":[…],"atHome","awayKm","awayText","homeLat","homeLon","homeTime"}` |
 | PUT | `/api/v1/home` body `{"patterns":[…]}` | control | replaces the home networks |
 | POST | `/api/v1/locate` body `{"wifiAccessPoints":[{"macAddress","signalStrength"}]}` | read | `{"location":{"lat","lng"},"accuracy","used"}` from the internal map, or `404` |
 | GET | `/api/v1/db/stats` | read | database statistics (3.9 adds `grades` {letter: count} and `scanCells`) |
 | GET | `/api/v1/estimator` | read | the estimator's state (3.9, [GRADING.md](GRADING.md)): `{"version","kappa","calibration":{"anchors","withSamples","fixes","regions","meanNees","kappa","coverage95","regionCoverage95","byGrade":{"A":{"n","medianErrorM"},…},"updated"},"deviceOffsets":{device: dB},"groups":[{"ref","members":[{"bssid","offsetDb"}]}],"grades":{letter: count},"kinds":{"fix","region","mobile","none"},"upgradePending","scanCells","suggestions":[{"bssid","ssid","grade","lat","lon","gain","distanceM"}],"environment"}` — also D-Bus `EstimatorJson()` and `beaconfix --estimator` |
-| POST | `/api/v1/db/observations` body `{"observations":[{"bssid","ssid","dbm","lat","lon","acc","time"}]}` | control | merges another device's observations into the map |
-| GET | `/api/v1/db/changes?since=<seq>&limit=<n>` | read | sync feed: `{since,cursor,more,count,device,identity,aps[],observations[],fixes[],anchors[]}` after a cursor, oldest first (every row carries `identity`; `anchors` holds anchors and tombstones, 3.7) |
-| POST | `/api/v1/db/sync` body `{"device","identity"?,"observations":[…],"aps":[…],"fixes":[…],"anchors"?:[…],"sinceCursor"?}` | control | merges a peer's data (1 MB bodies), queues refits, returns `{accepted:{observations,aps,fixes,anchors},cursor,refitQueued,identity,changes?}`; anchors merge by newest `placedAt` / `deletedAt`; `403 identity not linked` when the peer names an identity that is not yours or linked |
+| POST | `/api/v1/db/observations` body `{"observations":[{"bssid","ssid","dbm","lat","lon","acc","time","rangeM"?,"rangeSd"?}]}` | control | merges another device's observations into the map; `rangeM`/`rangeSd` (m, 1-σ) when the AP answered Wi-Fi RTT (also in `/db/sync` and `/db/changes`); times with an offset or `Z` are stored as local time |
+| GET | `/api/v1/db/changes?since=<seq>&limit=<n>` | read | sync feed: `{since,cursor,more,count,device,identity,aps[],observations[],fixes[],anchors[],plateEvents[]}` after a cursor, oldest first (every row of aps / observations / fixes carries `identity`; `anchors` holds anchors and tombstones, 3.7; `plateEvents` (3.10) = plate-event records with `raw`, no media — [SIGHTINGS.md](SIGHTINGS.md) §5) |
+| POST | `/api/v1/db/sync` body `{"device","identity"?,"observations":[…],"aps":[…],"fixes":[…],"anchors"?:[…],"plateEvents"?:[…],"sinceCursor"?}` | control | merges a peer's data (1 MB bodies), queues refits, returns `{accepted:{observations,aps,fixes,anchors,plateEvents},cursor,refitQueued,identity,changes?}`; anchors merge by newest `placedAt` / `deletedAt`, plate events per [SIGHTINGS.md](SIGHTINGS.md) §1.1 (a row without `device` gets the sender's name); `403 identity not linked` when the peer names an identity that is not yours or linked |
 | GET | `/api/v1/db/export` | control | JSON dump of the database |
 | POST | `/api/v1/db/import?name=<file>&from=<ISO>&to=<ISO>&what=positions,wifi,places` body: the raw file (≤ 200 MB, streamed to a temporary file) | control | imports your history — Google `Timeline.json` / `Records.json` / Semantic Location History, WiGLE CSV, GPX, KML or a BeaconFix export ([DATABASE.md](DATABASE.md)) → the summary object with `"ok"`; `400 {"ok":false,"error"}` when unreadable; `409` while another import runs; `413` above the limit |
 | GET | `/api/v1/identity` | none | the public identity record + `linkedIds`, `grouped`, `unlocked`; `404` until one exists |

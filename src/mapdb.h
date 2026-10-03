@@ -1,6 +1,12 @@
 #pragma once
 #include "locator.h"
+#include "flockdetector.h"
 #include "ranging/anchors.h"
+#include "tracksmoother.h"
+#include "plateevents.h"
+#include "roadsnap.h"
+#include "eyesonflock.h"
+#include <QElapsedTimer>
 #include <QHash>
 #include <QJsonObject>
 #include <QList>
@@ -10,6 +16,7 @@
 #include <QSqlDatabase>
 #include <QString>
 #include <QStringList>
+#include <QThreadPool>
 #include <QTimer>
 
 // The internal mapping database: everything BeaconFix has learned, in one SQLite
@@ -95,10 +102,116 @@ public:
     // Store one anchor (or tombstone). force = a local edit (always wins, new seq); otherwise a synced row that
     // only replaces what we have when it is newer (placedAt / deletedAt). Returns true when the table changed.
     bool putAnchor(Anchors::Anchor a, bool force, Anchors::Anchor *stored = nullptr);
+    // Flock / ALPR Cameras and sighting vetting
+    QList<QPair<QString, double>> providerErrorSamples() const;
+    // Every device's own fixes (device "" = this host), time-ordered, for the track smoother
+    QHash<QString, QList<TrackSmoother::Fix>> deviceFixes() const;   // (provider, |error| / claimed acc): this host's Wi-Fi fixes vs the phone's GPS within 2 min
+    QList<FlockCamera> loadFlockCameras() const;
+    QList<FlockCamera> loadFlockCamerasIn(double latMin, double latMax, double lonMin, double lonMax, int limit = 0) const;   // nearest-first when limit > 0
+    bool saveFlockCamera(const FlockCamera &cam);
+    int  saveFlockCameras(const QList<FlockCamera> &cams);
+    bool recordFlockSighting(const QString &bssidOrMac, double lat, double lon, const FlockDetector::Detection &det, const QDateTime &time = QDateTime::currentDateTime());
+    QJsonObject flockStats() const;
+    QJsonObject cameraCounts() const;                                                // per source / type / stale (docs/DATABASE.md)
+    QByteArray exportFlockGeoJson() const;
+    int  insertNewFlockCameras(const QList<FlockCamera> &cams);                      // INSERT OR IGNORE, one transaction
+    // The DeFlock bulk source (src/cameraimport.h): rows added / updated / unchanged. A row with OSM tags (Overpass) keeps
+    // them and only gains the OSM version / timestamp / manufacturer; a tagless row takes DeFlock's values.
+    QJsonObject upsertDeflockCameras(const QList<FlockCamera> &cams);
+    // After a complete DeFlock import: bulk-imported OSM rows DeFlock no longer lists (deleted nodes, gunshot detectors,
+    // anything not an ALPR) are deleted — or only marked stale when they have camera passes. {"checked","deleted","stale"}
+    QJsonObject reconcileBulkCameras(const QSet<QString> &deflockIds);
+    bool hasLegacyBulkCameras() const;                                               // rows of the old flocklocations bulk import
+
+    // License Plates management
+    QList<LicensePlate> loadLicensePlates() const;
+    bool saveLicensePlate(const LicensePlate &p);
+    bool deleteLicensePlate(const QString &plate);
+    LicensePlate activeLicensePlate() const;
+
+    // Camera Encounters / Passes
+    QList<CameraEncounter> loadCameraEncounters(const QString &cameraId = QString(), int limit = 200) const;
+    bool logCameraEncounter(CameraEncounter &enc);
+    int  cameraPassCount(const QString &cameraId) const;
+
+    // Plate Audits / Public database sightings
+    QList<PlateAudit> loadPlateAudits(const QString &plate = QString(), int limit = 200) const;
+    bool logPlateAudit(const PlateAudit &audit);
+
+    QJsonObject alprSummary() const;
+
+    // ── Plate events (docs/SIGHTINGS.md): camera passes and plate searches, their media ──
+    // Merge one event per §1.1 (column names as keys; camelCase aliases accepted; metrics / raw as objects or JSON text).
+    // local = computed on this host (a local re-run replaces its own earlier result). Returns the surviving uid ("" = refused).
+    QString mergePlateEvent(const QJsonObject &ev, bool local, bool *created = nullptr, bool *changed = nullptr, QString *error = nullptr);
+    QString resolvePlateUid(const QString &uid) const;                    // an alias (merged away) → the surviving uid
+    QJsonObject plateEvent(const QString &uid, bool withRaw = true, bool withMedia = true) const;
+    // The feed: seq > since, oldest first; kind "" = both
+    QJsonArray plateEventsSince(qint64 since, int limit, const QString &kind, bool *more, qint64 *cursor) const;
+    QJsonArray plateEventsLatest(int limit, const QString &kind = QString(), bool withMedia = false) const;   // newest first (time)
+    QJsonObject plateEventCounts() const;
+    QJsonArray plateEventMedia(const QString &eventUid, const QString &cameraId, bool includeLocal = true) const;   // metadata; includeLocal = webcam stills too (never served onward)
+    struct MediaRow {
+        QString uid, eventUid, cameraId, kind, mime, originalUrl, originalMime, originalSha256, attribution, license, capturedAt, createdAt;
+        int width = 0, height = 0; qint64 bytes = 0, originalBytes = 0; bool jpegReconstructible = false;
+    };
+    bool storeMedia(MediaRow m, const QByteArray &data);                  // uid = first 32 hex of SHA-256(data); idempotent
+    QByteArray mediaData(const QString &uid, MediaRow *meta = nullptr) const;
+    int  cameraMediaCount(const QString &cameraId, const QString &kind = QString()) const;
+    // A camera's type / OSM tags learned later (the photo lookup): the camera row and every pass of it follow
+    void setCameraClassification(const QString &cameraId, const QString &type, const QString &tagsJson);
+    // The leaky flag of every pass, from kv hibf_sources (§4.4); returns how many changed
+    int  updateLeakyPasses(const QJsonArray &agencies);
+    void recountPasses(const QStringList &cameraIds = QStringList());     // flock_cameras.pass_count from the passes
+    // Route fixes for the pass detector: one device ("" = this host) or all (device = "*"), time range [from, to] (local ISO, "" open)
+    QList<PlateEvents::TrackFix> trackFixes(const QString &fromIso, const QString &toIso, const QString &device = QStringLiteral("*")) const;
+    // Fixes stored after `sinceSeq`: per device the time range they cover (the incremental backfill), *maxSeq the newest
+    QHash<QString, QPair<QString, QString>> newFixRanges(qint64 sinceSeq, qint64 *maxSeq) const;
+    QString firstFixTime() const;
+    // Every camera within padM of a track (small boxes along it, through flock_pos)
+    QList<FlockCamera> camerasNearTrack(const QList<PlateEvents::TrackFix> &track, double padM = 150.0) const;
+    FlockCamera flockCamera(const QString &id, bool *found = nullptr) const;
+
+    // ── Camera trust, road snapping, agency portals (docs/SIGHTINGS.md §2.6, §2.7, §4.6) ──
+    struct CameraExtra {
+        bool hasTrust = false; double trust = 0.5; QJsonObject trustDetail;   // hasTrust false: not computed yet (NULL)
+        QString verdict, verdictAt;                                            // present | absent | ""
+        qint64 watchedWay = 0; QJsonObject watchedDetail; QString waysFetched; // the road it watches; when its roads were fetched
+        QString agencyPortal;                                                  // the Eyes on Flock portal slug, "" none
+    };
+    CameraExtra cameraExtra(const QString &id) const;
+    void setCameraTrust(const QString &id, double trust, const QJsonObject &detail);
+    void setCameraVerdict(const QString &id, const QString &verdict);         // present | absent | "" (cleared); the trust is recomputed
+    void setCameraRoads(const QString &id, const QString &fetchedIso, qint64 watchedWay, const QJsonObject &watchedDetail);
+    void setCameraAgency(const QString &id, const QString &slug);
+    // RF evidence near a point: our det: ALPR rows (not stale) and cameras field-confirmed by an RF detection
+    QList<FlockCamera> rfDetectionsNear(double lat, double lon, double radiusM) const;
+    void storeWays(const QList<RoadSnap::Way> &ways, const QString &fetchedIso);
+    QList<RoadSnap::Way> waysNear(double lat, double lon, double radiusM) const;   // every cached way whose box comes within radiusM
+    QJsonArray passesOfCamera(const QString &cameraId) const;                      // its camera_pass rows (metrics as objects, no raw)
+    QStringList camerasWithPasses() const;
+    QString latestRegion() const;                                                  // the region (state) of the newest fix that has one
+    bool updatePassScore(const QString &uid, int confidence, const QJsonObject &metrics);   // a rescore: confidence + metrics, seq when changed
+    int  storePortals(const QList<EyesOnFlock::Portal> &portals, const QString &fetchedIso);   // replaces the table
+    QList<EyesOnFlock::Portal> loadPortals() const;
+
+    // Route history for Heatmap (all devices and visits): every fix in time order, accuracy ≤ 500 m, teleport spikes dropped.
+    // loadAllRouteFixes scans the table; routeFixes is the same list from memory, scanned once and then kept current by
+    // every fixes writer (appends extend it, out-of-order rows are merged on the next read; implicitly shared, copies O(1)).
+    QList<Fix> loadAllRouteFixes() const;
+    QList<Fix> routeFixes() const;
+    quint64    routeGeneration() const { return m_routeGen; }        // bumps whenever routeFixes() may have changed
+    quint64    routeResetGeneration() const { return m_routeReset; } // bumps when it changed other than by appending
+    // Cameras within maxM of the route (one pass over the camera positions against a ~100 m grid of the fixes:
+    // O(fixes + cameras), never fixes × cameras); fixes: (index into the list, metres), ascending index
+    struct RouteCamHit { FlockCamera cam; QList<QPair<int, double>> fixes; };
+    QList<RouteCamHit> camerasAlongRoute(const QList<Fix> &fixes, double maxM = 65.0) const;
+
     QJsonObject exportJson() const;
     int  importJson(const QJsonObject &dump, QString *error = nullptr);
 
-    void flush();                                              // encrypt + write now (if dirty)
+    void flush();                                              // encrypt + write now (if dirty); waits for a background one
+    void scheduleFlush();                                      // the debounced background write, soon (if dirty): never blocks
     static QString runtimeDir();
 
 signals:
@@ -108,7 +221,10 @@ private:
     bool ensureKey(bool create);
     bool decryptToLive(bool readOnly);
     bool schema();
+    void migrateCameras();                 // once: the 2026-10 camera cleanup (kv camera_clean_v1, docs/DATABASE.md)
     void markDirty();
+    void flushAsync();                    // the debounced flush: encrypt + write on a worker
+    static bool writeBlob(const QByteArray &key, const QByteArray &plain, const QString &path, QString *error);
     void updatePosition(const QString &bssid, const ApRecord &r, int flags);
     qint64 nextSeq();
     void   loadSeq();
@@ -124,6 +240,21 @@ private:
     bool m_batch = false;                 // inside saveApRecords: markDirty() only sets the flag
     qint64 m_seq = 0;
     QTimer m_flushTimer;
+    QThreadPool m_flushPool;              // one worker: the blob writes, in order
+    bool m_flushing = false;
+    QElapsedTimer m_dirtyAge;             // since the first unwritten change: the debounce can't put a write off forever
+    // routeFixes(): rows (acc ≤ 500) in time order with their stored time text (the SQL sorts on it), and the filtered list
+    struct RouteRow { QString t; Fix f; bool own = false; int out = -1; qint64 ms = 0; };   // out: index in m_route, -1 = teleport spike; ms: f.time (no time-zone work in the filter)
+    void routeAdd(const QString &t, const Fix &f, bool own);
+    void routeInvalidate();
+    void routeOwnReplaced(const QList<Fix> &fixes);
+    static Fix routeFixRow(const Fix &f, const QString &t);    // f as it reads back from the fixes table (t: its stored time)
+    mutable QList<RouteRow> m_routeRaw;
+    mutable QList<Fix> m_route;
+    mutable bool m_routeLoaded = false, m_routeRefilter = false;
+    mutable qsizetype m_routeSorted = 0, m_routeOutAt = 0;     // raw[0, sorted) is in order; raw[0, outAt) is in m_route
+    mutable QList<qsizetype> m_routePatch;                     // raw rows whose content changed in place (saveFixes)
+    quint64 m_routeGen = 1, m_routeReset = 1;
     mutable QHash<QString, quint64> m_recSig;
     quint64 m_flagsSig = 0;
     QHash<QString, ApPos> m_pins;   // per-record signature of what is stored: saveApRecords skips unchanged records

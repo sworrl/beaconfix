@@ -81,6 +81,7 @@ object BackupWriter {
             w.name("time").value(iso(o.time, zone))
             w.name("lat").value(o.lat); w.name("lon").value(o.lon); w.name("acc").value(o.acc)
             w.name("dbm").value(o.dbm.toLong())
+            o.rangeM?.takeIf { it > 0 && it.isFinite() }?.let { r -> w.name("rangeM").value(r); o.rangeSd?.takeIf { it >= 0 && it.isFinite() }?.let { w.name("rangeSd").value(it) } }
             w.name("fix_source").value("android")
             str(w, "device", device)
             w.endObject(); nObs++

@@ -90,7 +90,7 @@ fun HomeScreen(onPair: () -> Unit, onIdentity: () -> Unit = {}, onHelp: () -> Un
         }
 
         // ── each connected desktop ──────────────────────────────────────
-        if (views.isEmpty()) InfoCard("Desktops") { EmptyState("🖥", "No desktop connected", "Pair with the BeaconFix on your desktop or laptop (same identity = no code needed).", "Find desktops") { onPair() } }
+        if (views.isEmpty()) InfoCard("Desktops") { EmptyState("🖥", "No PC linked", "Link this phone to BeaconFix on your PC: scan the QR it shows, or pick it on this network. Nothing to type.", "Link a PC") { onPair() } }
         for (v in views) InfoCard(v.desktop.name.ifEmpty { v.desktop.hostname }) {
             val l = v.location
             if (l == null) Text(v.error.ifEmpty { "Fetching…" }, color = if (v.error.isEmpty()) Slate else MaterialTheme.colorScheme.error)
@@ -138,7 +138,7 @@ fun HomeScreen(onPair: () -> Unit, onIdentity: () -> Unit = {}, onHelp: () -> Un
 
         InfoCard("On this phone") {
             KeyValue("Beacons known", "${ui.aps}"); KeyValue("With a position", "${ui.positioned}"); KeyValue("Observations", "${ui.obs}"); KeyValue("Waiting to sync", "${ui.unsynced}")
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) { OutlinedButton(onClick = onPair) { Text("Desktops") }; OutlinedButton(onClick = onIdentity) { Text("Identity") } }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) { OutlinedButton(onClick = onPair) { Text("Link a PC") }; OutlinedButton(onClick = onIdentity) { Text("Identity") } }
         }
         CurrentWifiCard()
     }

@@ -78,12 +78,16 @@ class MainActivity : ComponentActivity() {
     }
     /**
      * Positions other apps hand us: Share → BeaconFix with plain text (a maps link, geo: URI or "lat, lon") and
-     * `beaconfix://map?lat=&lon=&label=` open the map on that spot; `beaconfix://help` opens Help. Files still go to Import.
+     * `beaconfix://map?lat=&lon=&label=` open the map on that spot; `beaconfix://help` opens Help; `beaconfix://sighting/<uid>`
+     * opens a plate event. Files still go to Import.
      */
     private fun incoming(i: Intent, args: LaunchArgs): LaunchArgs {
         val data = i.data
         if (i.action == Intent.ACTION_VIEW && data?.scheme.equals("beaconfix", ignoreCase = true)) when (data?.host?.lowercase()) {
             "help" -> return args.copy(action = "help")
+            // a sighting notification (docs/SIGHTINGS.md §6): beaconfix://sighting/<uid> · the list: beaconfix://sightings
+            "sighting" -> return args.copy(action = "sighting", sightingUid = data.path.orEmpty().trimStart('/').ifEmpty { null })
+            "sightings" -> return args.copy(action = "sightings")
             "map" -> return focusOn(IncomingLink.parse(data.toString()), args)
         }
         if (i.action == Intent.ACTION_SEND && args.file == null && (i.type ?: "text/plain").startsWith("text/")) {
@@ -107,7 +111,7 @@ class MainActivity : ComponentActivity() {
 
 data class LaunchArgs(val pairHost: String? = null, val pairPort: Int = 47822, val action: String? = null, val identityName: String? = null,
                       val importHost: String? = null, val importCode: String? = null, val importPass: String? = null, val linkPayload: String? = null, val seq: Long = 0,
-                      val file: android.net.Uri? = null, val importDryRun: Boolean = false) {
+                      val file: android.net.Uri? = null, val importDryRun: Boolean = false, val sightingUid: String? = null) {
     companion object {
         fun from(i: Intent): LaunchArgs {
             // a file shared or opened with BeaconFix (Share → BeaconFix, or "Open with")
@@ -132,7 +136,8 @@ data class LaunchArgs(val pairHost: String? = null, val pairPort: Int = 47822, v
                 i.action == Intent.ACTION_VIEW && (scheme == "content" || scheme == "file") -> data
                 else -> null
             }
-            return LaunchArgs(pairHost, pairPort, i.getStringExtra("action"), i.getStringExtra("identity_name"),
+            val action = i.getStringExtra("action") ?: i.getStringExtra("open_tab")
+            return LaunchArgs(pairHost, pairPort, action, i.getStringExtra("identity_name"),
                 i.getStringExtra("import_host"), i.getStringExtra("import_code"), i.getStringExtra("import_pass"), payload, System.nanoTime(), file, i.getBooleanExtra("import_dry_run", false))
         }
     }

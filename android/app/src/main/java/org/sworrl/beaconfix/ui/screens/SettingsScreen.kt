@@ -31,7 +31,7 @@ import org.sworrl.beaconfix.ui.theme.Slate
 import org.sworrl.beaconfix.ui.vm.SettingsViewModel
 
 @Composable
-fun SettingsScreen(onPair: () -> Unit, onIdentity: () -> Unit = {}, onWidgets: () -> Unit = {}, onImport: () -> Unit = {}, vm: SettingsViewModel = hiltViewModel()) {
+fun SettingsScreen(onPair: () -> Unit, onIdentity: () -> Unit = {}, onWidgets: () -> Unit = {}, onImport: () -> Unit = {}, onLicenses: () -> Unit = {}, vm: SettingsViewModel = hiltViewModel()) {
     val ctx = androidx.compose.ui.platform.LocalContext.current
     val ui by vm.ui.collectAsState()
     val placesVm: SettingsPlacesViewModel = hiltViewModel()
@@ -67,7 +67,7 @@ fun SettingsScreen(onPair: () -> Unit, onIdentity: () -> Unit = {}, onWidgets: (
             Text("Your key pair and name — the same identity across the desktop, laptop and phone. Export it, link it, or move it here.", color = Slate, style = MaterialTheme.typography.bodySmall)
             OutlinedButton(onClick = onIdentity) { Text("Manage identity") }
         }
-        InfoCard("Desktops") { OutlinedButton(onClick = onPair) { Text("Pair / manage desktops") } }
+        InfoCard("PCs") { OutlinedButton(onClick = onPair) { Text("Link a PC / linked PCs") } }
         InfoCard("Home-screen widgets") {
             Text("Help · Location · Beacons · Sync · Map. They refresh every 15 minutes and after each scan or sync.", color = Slate, style = MaterialTheme.typography.bodySmall)
             OutlinedButton(onClick = onWidgets) { Text("Preview the widgets") }
@@ -86,7 +86,11 @@ fun SettingsScreen(onPair: () -> Unit, onIdentity: () -> Unit = {}, onWidgets: (
         DeveloperAutomationCard(placesVm)
         InfoCard("Privacy") {
             Text("Everything stays on this phone and on the desktops you pair with. No analytics, no crash reporting, no third-party servers. The only other network traffic is map tiles (OpenStreetMap) and, for Help and Places when no desktop answers, OpenStreetMap place and address lookups around you (“Find places from this phone” above turns the place search off). Tokens are stored in Android's Keystore-backed encrypted preferences; the database is in app-private storage and excluded from backups.", color = Slate, style = MaterialTheme.typography.bodySmall)
-            Text("BeaconFix Android ${BuildConfig.VERSION_NAME} · GPL-2.0-or-later", color = Slate, style = MaterialTheme.typography.bodySmall)
+            Text("BeaconFix Android ${BuildConfig.VERSION_NAME} · Apache-2.0", color = Slate, style = MaterialTheme.typography.bodySmall)
+        }
+        InfoCard("Open-source licenses") {
+            Text("BeaconFix is Apache-2.0. The libraries it is built with, the ALPR models (MIT) and ONNX Runtime (MIT) keep their own licenses.", color = Slate, style = MaterialTheme.typography.bodySmall)
+            OutlinedButton(onClick = onLicenses) { Text("Open-source licenses") }
         }
     }
 }

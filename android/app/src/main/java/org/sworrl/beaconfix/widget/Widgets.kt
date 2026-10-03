@@ -171,7 +171,7 @@ class MapWidget : GlanceAppWidget() {
         provideContent { GlanceTheme {
             Box(GlanceModifier.fillMaxSize().background(GlanceTheme.colors.widgetBackground).cornerRadius(16.dp).clickable(actionStartActivity<MainActivity>())) {
                 if (bmp != null) Image(ImageProvider(bmp), contentDescription = "Map around the current position", modifier = GlanceModifier.fillMaxSize(), contentScale = ContentScale.Crop)
-                else Box(GlanceModifier.fillMaxSize(), contentAlignment = Alignment.Center) { Column(horizontalAlignment = Alignment.CenterHorizontally) { Image(ImageProvider(R.drawable.ic_notification), contentDescription = null, modifier = GlanceModifier.size(28.dp)); body(if (st.lat == 0.0 && st.lon == 0.0) "No fix yet" else "Rendering the map…") } }
+                else Box(GlanceModifier.fillMaxSize(), contentAlignment = Alignment.Center) { Column(horizontalAlignment = Alignment.CenterHorizontally) { Image(ImageProvider(R.drawable.ic_beaconfix), contentDescription = null, modifier = GlanceModifier.size(28.dp)); body(if (st.lat == 0.0 && st.lon == 0.0) "No fix yet" else "Rendering the map…") } }
                 Box(GlanceModifier.fillMaxWidth().padding(8.dp), contentAlignment = Alignment.TopStart) {
                     Row(GlanceModifier.background(ColorProvider(Color(0xCC0B101A))).cornerRadius(8.dp).padding(horizontal = 8.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
                         Text(st.place.ifEmpty { "BeaconFix" }, style = TextStyle(color = ColorProvider(Color.White), fontSize = 12.sp, fontWeight = FontWeight.Bold), maxLines = 1)

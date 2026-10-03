@@ -17,6 +17,12 @@ import kotlin.math.sqrt
 
 // Position estimation from signal-strength samples, with a graded confidence (docs/GRADING.md).
 //
+// Model (per place k): y_k = P0 + g_dev + δ_dev − 10·n·log10(d_k) + ε_k, d_k = √(|p − q_k|² + h²). g_dev is the hearing
+// device's calibrated offset (Context.deviceOffset, this device = 0); δ_dev its deviation for THIS AP (prior
+// N(0, devOffsetSd²)): the device with the most places is the reference (δ = 0), the next MAXD get a fitted δ, any further
+// one stays pinned. Places never mix devices. After the robust LM, the solution's mirror across the places' principal
+// axis is refitted too; outside the hull an unresolved mirror widens the covariance as a two-point mixture.
+//
 // This file is a line-by-line port of the desktop engine (src/estimator.h + src/estimator.cpp): same model, same
 // order of operations, same constants, iteration counts, tie-breaking and bootstrap RNG. Both are checked against
 // tests/fixtures/estimator_golden.json (EstimatorGoldenTest here, estimator_golden --check on the desktop).
@@ -100,13 +106,17 @@ data class Options(
     var outlierPrior: Double = 0.1,
     var outlierSpanDb: Double = 80.0,
     var heightM: Double = 3.0,
-    var clusterMinM: Double = 15.0,
+    var clusterMinM: Double = 5.0,       // place radius: max(clusterMinM, clusterAccK × the better fix accuracy of the pair)
+    var clusterAccK: Double = 1.5,
     var maxClusters: Int = 120,
     var ageTauDays: Double = 180.0,
     var maxAcc: Double = 300.0,
     var geomAcc: Double = 100.0,
     var rhoIn: Double = 0.6,
-    var shadowCorrM: Double = 30.0,
+    var shadowCorrM: Double = 8.0,       // Gudmundson decorrelation distance (measured: docs/GRADING.md §1.5)
+    var sigmaPriorDof: Double = 6.0,     // ν0 of the scaled-inverse-χ² prior on σ² (centred: E[σ²] = σ0² without data)
+    var postWindow: Double = 4.0,        // R95 from the posterior over ±this many σ of the major axis (0 = Laplace only)
+    var devOffsetSd: Double = 10.0,      // σ (dB) of a device's per-AP deviation from its calibrated offset
     var rangePriorM: Double = 150.0,
     var missFloor: Double = 0.2,
     var sensitivity: Double = -92.0,
@@ -160,11 +170,13 @@ class Frame(val lat0: Double = 0.0, val lon0: Double = 0.0) {
 
 object Estimator {
     /** Stored as the "estimatorVersion" preference: estimates older than this are recomputed. */
-    const val VERSION = 2
+    const val VERSION = 4
 
     private const val LN10 = 2.302585092994046
     private const val ACC68 = 1.515
     private const val CHI2_2_999 = 13.815510557964274
+    private const val MAXD = 4                 // per-AP device deviations δ fitted (more devices: pinned at δ = 0)
+    private const val MAXP = 4 + MAXD          // parameters: x, y, P0, n, δ…
 
     // std::max / std::min / std::clamp semantics (not Math.max: those differ on NaN and signed zero)
     private fun cmax(a: Double, b: Double): Double = if (a < b) b else a
@@ -187,6 +199,8 @@ object Estimator {
     // ── internals ────────────────────────────────────────────────────────────
     /** One place (cluster of samples). */
     private data class Cl(
+        var dk: Int = 0,                  // device key (index into the sorted device names): places never mix devices
+        var dev: Int = -1,                // index of its δ, −1 = the reference device (or pinned)
         var x: Double = 0.0, var y: Double = 0.0,
         var level: Double = 0.0,
         var W: Double = 1.0,
@@ -195,10 +209,13 @@ object Estimator {
         var m: Int = 0,
         var fading: Double = 0.0,
         var sx: Double = 0.0, var sy: Double = 0.0,
+        var sa: Double = 0.0,             // seed fix accuracy (clustering)
     )
     private class Rg(val x: Double, val y: Double, val r: Double, val sd2: Double)
-    private data class Theta(val x: Double = 0.0, val y: Double = 0.0, val p0: Double = -40.0, val n: Double = 2.4)
-    private class Sm(val x: Double, val y: Double, val level: Double, val w0: Double, val acc: Double, @Suppress("unused") val idx: Int)
+    private class Theta(val x: Double = 0.0, val y: Double = 0.0, val p0: Double = -40.0, val n: Double = 2.4, val dv: DoubleArray = DoubleArray(MAXD)) {
+        fun copy(x: Double = this.x, y: Double = this.y): Theta = Theta(x, y, p0, n, dv.copyOf())
+    }
+    private class Sm(val x: Double, val y: Double, val level: Double, val w0: Double, val acc: Double, @Suppress("unused") val idx: Int, val dk: Int)
 
     private fun median(v: DoubleArray): Double {
         if (v.isEmpty()) return 0.0
@@ -209,6 +226,9 @@ object Estimator {
     private fun median(v: List<Double>): Double = median(v.toDoubleArray())
 
     private fun clamp01(v: Double): Double = if (v < 0) 0.0 else if (v > 1) 1.0 else v
+
+    /** The radius within which two samples are one place (docs/GRADING.md §1.1). */
+    private fun placeRadius(accA: Double, accB: Double, minM: Double, accK: Double): Double = cmax(minM, accK * cmin(accA, accB))
 
     /** 2×2 symmetric eigen-decomposition → [λ1, λ2, e1x, e1y] with λ1 ≥ λ2. */
     private fun eig2(cxx: Double, cxy: Double, cyy: Double): DoubleArray {
@@ -238,12 +258,31 @@ object Estimator {
     }
 
     private fun mat4() = Array(4) { DoubleArray(4) }
+    private fun matP() = Array(MAXP) { DoubleArray(MAXP) }
 
-    private fun invert4(A: Array<DoubleArray>, k: Int, out: Array<DoubleArray>): Boolean {
+    /** Solve A·x = b (k ≤ MAXP) by Gaussian elimination with partial pivoting (the same steps as [solve]). */
+    private fun solveN(A: Array<DoubleArray>, b: DoubleArray, k: Int, out: DoubleArray): Boolean {
+        val M = Array(MAXP) { DoubleArray(MAXP + 1) }
+        for (i in 0 until k) { for (j in 0 until k) M[i][j] = A[i][j]; M[i][k] = b[i] }
+        for (c in 0 until k) {
+            var piv = c
+            for (r in c + 1 until k) if (abs(M[r][c]) > abs(M[piv][c])) piv = r
+            if (abs(M[piv][c]) < 1e-12) return false
+            if (piv != c) for (j in 0..k) { val tmp = M[c][j]; M[c][j] = M[piv][j]; M[piv][j] = tmp }
+            for (r in 0 until k) {
+                if (r == c) continue
+                val f = M[r][c] / M[c][c]
+                for (j in c..k) M[r][j] -= f * M[c][j]
+            }
+        }
+        for (i in 0 until k) out[i] = M[i][k] / M[i][i]
+        return true
+    }
+
+    private fun invertN(A: Array<DoubleArray>, k: Int, out: Array<DoubleArray>): Boolean {
         for (col in 0 until k) {
-            val Ac = mat4(); for (i in 0 until 4) for (j in 0 until 4) Ac[i][j] = A[i][j]
-            val e = DoubleArray(4); e[col] = 1.0; val o = DoubleArray(4)
-            if (!solve(Ac, e, k, o)) return false
+            val e = DoubleArray(MAXP); e[col] = 1.0; val o = DoubleArray(MAXP)
+            if (!solveN(A, e, k, o)) return false
             for (i in 0 until k) out[i][col] = o[i]
         }
         return true
@@ -259,17 +298,20 @@ object Estimator {
         val b = 10.0 * t.n / LN10
         val grad = b * rho / (d * d)
         val s2 = c.sh2 + grad * grad * c.a * c.a
-        val r = c.level - (t.p0 + t.n * ell)
-        val J = doubleArrayOf(b * dx / (d * d), b * dy / (d * d), -1.0, -ell)
+        val r = c.level - (t.p0 + (if (c.dev >= 0) t.dv[c.dev] else 0.0) + t.n * ell)
+        val J = DoubleArray(MAXP)
+        J[0] = b * dx / (d * d); J[1] = b * dy / (d * d); J[2] = -1.0; J[3] = -ell
+        for (i in 0 until MAXD) J[4 + i] = if (c.dev == i) -1.0 else 0.0
         return At(d, rho, ell, s2, r, J)
     }
 
-    private class Solver(val cl: List<Cl>, val rg: List<Rg>, val o: Options) {
+    private class Solver(val cl: List<Cl>, val rg: List<Rg>, val o: Options, val nd: Int = 0) {
         var mult: DoubleArray = DoubleArray(cl.size) { 1.0 }
         var tau = 1.0
         var robust = false
+        val np = 4 + nd                        // parameters in use: 4 + the fitted device deviations
 
-        fun copy(): Solver = Solver(cl, rg, o).also { it.mult = mult.copyOf(); it.tau = tau; it.robust = robust }
+        fun copy(): Solver = Solver(cl, rg, o, nd).also { it.mult = mult.copyOf(); it.tau = tau; it.robust = robust }
 
         fun outlierDensity(): Double = o.outlierPrior * cmin(1.0, o.sigmaDb * tau / o.outlierSpanDb)
         fun rhoFn(z: Double): Double {
@@ -295,18 +337,20 @@ object Estimator {
                 c += rhoFn((g.r - d) / (sqrt(g.sd2) * tau))
             }
             val zp = (t.p0 - o.p0Mean) / o.p0Sd; val zn = (t.n - o.defaultN) / o.nSd
-            return c + 0.5 * zp * zp + 0.5 * zn * zn
+            c = c + 0.5 * zp * zp + 0.5 * zn * zn
+            for (i in 0 until np - 4) { val zd = t.dv[i] / o.devOffsetSd; c += 0.5 * zd * zd }
+            return c
         }
 
         /** Normal equations at t: A = Σψ JᵀJ + prior, g = Σψ J r + prior gradient. */
         fun normal(t: Theta, tauUse: Double, A: Array<DoubleArray>, g: DoubleArray) {
-            for (i in 0 until 4) { g[i] = 0.0; for (j in 0 until 4) A[i][j] = 0.0 }
+            for (i in 0 until MAXP) { g[i] = 0.0; for (j in 0 until MAXP) A[i][j] = 0.0 }
             for (k in cl.indices) {
                 if (mult[k] <= 0.0) continue
                 val a = evalAt(cl[k], t, o.heightM)
                 val z = a.r / (sqrt(a.s2) * tauUse)
                 val psi = mult[k] * cl[k].W * uFn(z) / (a.s2 * tauUse * tauUse)
-                for (i in 0 until 4) { g[i] += psi * a.J[i] * a.r; for (j in 0 until 4) A[i][j] += psi * a.J[i] * a.J[j] }
+                for (i in 0 until np) { g[i] += psi * a.J[i] * a.r; for (j in 0 until np) A[i][j] += psi * a.J[i] * a.J[j] }
             }
             for (gg in rg) {
                 val dx = t.x - gg.x; val dy = t.y - gg.y; val d = sqrt(dx * dx + dy * dy + o.heightM * o.heightM)
@@ -318,21 +362,24 @@ object Estimator {
             }
             A[2][2] += 1.0 / (o.p0Sd * o.p0Sd); g[2] += (t.p0 - o.p0Mean) / (o.p0Sd * o.p0Sd)
             A[3][3] += 1.0 / (o.nSd * o.nSd); g[3] += (t.n - o.defaultN) / (o.nSd * o.nSd)
+            for (i in 0 until np - 4) { A[4 + i][4 + i] += 1.0 / (o.devOffsetSd * o.devOffsetSd); g[4 + i] += t.dv[i] / (o.devOffsetSd * o.devOffsetSd) }
         }
 
         fun run(t0: Theta, iters: Int, costOut: DoubleArray?): Theta {
             var t = t0
             var lambda = 1e-2
             for (it in 0 until iters) {
-                val A = mat4(); val g = DoubleArray(4)
+                val A = matP(); val g = DoubleArray(MAXP)
                 normal(t, tau, A, g)
                 val c0 = cost(t)
-                for (i in 0 until 4) A[i][i] *= (1.0 + lambda)
-                val rhs = doubleArrayOf(-g[0], -g[1], -g[2], -g[3]); val dx = DoubleArray(4)
-                if (!solve(A, rhs, 4, dx)) break
+                for (i in 0 until np) A[i][i] *= (1.0 + lambda)
+                val rhs = DoubleArray(MAXP); val dx = DoubleArray(MAXP)
+                for (i in 0 until np) rhs[i] = -g[i]
+                if (!solveN(A, rhs, np, dx)) break
                 val step = sqrt(dx[0] * dx[0] + dx[1] * dx[1])
                 if (step > 300.0) { dx[0] *= 300.0 / step; dx[1] *= 300.0 / step }
                 val nt = Theta(t.x + dx[0], t.y + dx[1], cclamp(t.p0 + dx[2], -90.0, 10.0), cclamp(t.n + dx[3], 1.5, 4.5))
+                for (i in 0 until np - 4) nt.dv[i] = cclamp(t.dv[i] + dx[4 + i], -30.0, 30.0)
                 val c1 = cost(nt)
                 if (c1 <= c0) {
                     val small = sqrt(dx[0] * dx[0] + dx[1] * dx[1]) < 0.05 && c0 - c1 < 1e-7 * cmax(1.0, c0)
@@ -349,28 +396,69 @@ object Estimator {
     }
 
     /**
-     * Closed-form marginal log-likelihood of a position with (P0, n) integrated out (Gaussian prior), plus ranges and
-     * misses. [b] (if given) receives the posterior mean of (P0, n) at that position.
+     * Closed-form marginal log-likelihood of a position with (P0, n) — and the [nd] device deviations δ — integrated out
+     * (Gaussian priors), plus ranges and misses. [b] (if given) receives the posterior mean of (P0, n) at that position,
+     * [dvOut] (if given) that of the δs.
      */
     private fun gridLogL(cl: List<Cl>, rg: List<Rg>, misses: List<Miss>, mxs: DoubleArray, mys: DoubleArray,
-                         px: Double, py: Double, o: Options, b: DoubleArray?): Double {
+                         px: Double, py: Double, o: Options, nd: Int, b: DoubleArray?, dvOut: DoubleArray? = null): Double {
         val bn = 10.0 * o.defaultN / LN10
-        var S00 = 0.0; var S01 = 0.0; var S11 = 0.0; var T0 = 0.0; var T1 = 0.0; var Syy = 0.0; var logdet = 0.0
-        for (c in cl) {
-            val dx = px - c.x; val dy = py - c.y; val rho = sqrt(dx * dx + dy * dy)
-            val d = cmax(1.0, sqrt(rho * rho + o.heightM * o.heightM)); val ell = -10.0 * log10(d)
-            val grad = bn * rho / (d * d); val s2 = c.sh2 + grad * grad * c.a * c.a
-            val w = c.W / s2
-            S00 += w; S01 += w * ell; S11 += w * ell * ell; T0 += w * c.level; T1 += w * ell * c.level; Syy += w * c.level * c.level
-            logdet += ln(s2 / c.W)
+        val m0: Double; val m1: Double; var ll: Double
+        if (nd == 0) {
+            var S00 = 0.0; var S01 = 0.0; var S11 = 0.0; var T0 = 0.0; var T1 = 0.0; var Syy = 0.0; var logdet = 0.0
+            for (c in cl) {
+                val dx = px - c.x; val dy = py - c.y; val rho = sqrt(dx * dx + dy * dy)
+                val d = cmax(1.0, sqrt(rho * rho + o.heightM * o.heightM)); val ell = -10.0 * log10(d)
+                val grad = bn * rho / (d * d); val s2 = c.sh2 + grad * grad * c.a * c.a
+                val w = c.W / s2
+                S00 += w; S01 += w * ell; S11 += w * ell * ell; T0 += w * c.level; T1 += w * ell * c.level; Syy += w * c.level * c.level
+                logdet += ln(s2 / c.W)
+            }
+            val iP = 1.0 / (o.p0Sd * o.p0Sd); val iN = 1.0 / (o.nSd * o.nSd)
+            val L00 = S00 + iP; val L01 = S01; val L11 = S11 + iN
+            val e0 = T0 + o.p0Mean * iP; val e1 = T1 + o.defaultN * iN
+            val det = L00 * L11 - L01 * L01
+            m0 = (L11 * e0 - L01 * e1) / det; m1 = (L00 * e1 - L01 * e0) / det
+            val quad = Syy + o.p0Mean * o.p0Mean * iP + o.defaultN * o.defaultN * iN - (e0 * m0 + e1 * m1)
+            ll = -0.5 * quad - 0.5 * ln(det) - 0.5 * logdet
+        } else {
+            // β = (P0, n, δ_0 … δ_nd−1), the design row of a place (1, ℓ, one-hot of its device): L = XᵀWX + Λ0, by Cholesky
+            val q = 2 + nd
+            val S = Array(2 + MAXD) { DoubleArray(2 + MAXD) }; val T = DoubleArray(2 + MAXD); var Syy = 0.0; var logdet = 0.0
+            for (c in cl) {
+                val dx = px - c.x; val dy = py - c.y; val rho = sqrt(dx * dx + dy * dy)
+                val d = cmax(1.0, sqrt(rho * rho + o.heightM * o.heightM)); val ell = -10.0 * log10(d)
+                val grad = bn * rho / (d * d); val s2 = c.sh2 + grad * grad * c.a * c.a
+                val w = c.W / s2
+                val xr = DoubleArray(2 + MAXD); xr[0] = 1.0; xr[1] = ell
+                if (c.dev >= 0) xr[2 + c.dev] = 1.0
+                for (i in 0 until q) { T[i] += w * xr[i] * c.level; for (j in 0 until q) S[i][j] += w * xr[i] * xr[j] }
+                Syy += w * c.level * c.level
+                logdet += ln(s2 / c.W)
+            }
+            val lam = DoubleArray(2 + MAXD); val mu = DoubleArray(2 + MAXD); val e = DoubleArray(2 + MAXD)
+            lam[0] = 1.0 / (o.p0Sd * o.p0Sd); mu[0] = o.p0Mean
+            lam[1] = 1.0 / (o.nSd * o.nSd); mu[1] = o.defaultN
+            for (i in 2 until q) { lam[i] = 1.0 / (o.devOffsetSd * o.devOffsetSd); mu[i] = 0.0 }
+            for (i in 0 until q) { S[i][i] += lam[i]; e[i] = T[i] + lam[i] * mu[i] }
+            val C = Array(2 + MAXD) { DoubleArray(2 + MAXD) }; var logdetL = 0.0
+            for (i in 0 until q)
+                for (j in 0..i) {
+                    var s = S[i][j]
+                    for (k in 0 until j) s -= C[i][k] * C[j][k]
+                    if (i == j) { if (s <= 0) return -1e300; C[i][i] = sqrt(s); logdetL += 2.0 * ln(C[i][i]) }
+                    else C[i][j] = s / C[j][j]
+                }
+            val y = DoubleArray(2 + MAXD); val m = DoubleArray(2 + MAXD)
+            for (i in 0 until q) { var s = e[i]; for (k in 0 until i) s -= C[i][k] * y[k]; y[i] = s / C[i][i] }
+            for (i in q - 1 downTo 0) { var s = y[i]; for (k in i + 1 until q) s -= C[k][i] * m[k]; m[i] = s / C[i][i] }
+            var quad = Syy
+            for (i in 0 until q) quad += lam[i] * mu[i] * mu[i]
+            for (i in 0 until q) quad -= e[i] * m[i]
+            m0 = m[0]; m1 = m[1]
+            if (dvOut != null) for (i in 0 until nd) dvOut[i] = m[2 + i]
+            ll = -0.5 * quad - 0.5 * logdetL - 0.5 * logdet
         }
-        val iP = 1.0 / (o.p0Sd * o.p0Sd); val iN = 1.0 / (o.nSd * o.nSd)
-        val L00 = S00 + iP; val L01 = S01; val L11 = S11 + iN
-        val e0 = T0 + o.p0Mean * iP; val e1 = T1 + o.defaultN * iN
-        val det = L00 * L11 - L01 * L01
-        val m0 = (L11 * e0 - L01 * e1) / det; val m1 = (L00 * e1 - L01 * e0) / det
-        val quad = Syy + o.p0Mean * o.p0Mean * iP + o.defaultN * o.defaultN * iN - (e0 * m0 + e1 * m1)
-        var ll = -0.5 * quad - 0.5 * ln(det) - 0.5 * logdet
         for (g in rg) {
             val dx = px - g.x; val dy = py - g.y; val d = sqrt(dx * dx + dy * dy + o.heightM * o.heightM)
             ll += -0.5 * (g.r - d) * (g.r - d) / g.sd2
@@ -554,17 +642,15 @@ object Estimator {
     }
 
     /** Distinct places, as the fitter clusters them. */
-    fun vantageCount(obs: List<Obs>, clusterMinM: Double = 15.0): Int {
+    fun vantageCount(obs: List<Obs>, clusterMinM: Double = 5.0, clusterAccK: Double = 1.5): Int {
         if (obs.isEmpty()) return 0
-        val accs = DoubleArray(obs.size) { obs[it].acc }
-        val R = cmax(clusterMinM, median(accs))
         val fr = Frame(obs[0].lat, obs[0].lon)
         val seeds = ArrayList<DoubleArray>()
         for (o in obs) {
             val x = fr.x(o.lon); val y = fr.y(o.lat)
             var found = false
-            for (s in seeds) if (hypot(x - s[0], y - s[1]) < R) { found = true; break }
-            if (!found) seeds.add(doubleArrayOf(x, y))
+            for (s in seeds) if (hypot(x - s[0], y - s[1]) < placeRadius(o.acc, s[2], clusterMinM, clusterAccK)) { found = true; break }
+            if (!found) seeds.add(doubleArrayOf(x, y, o.acc))
         }
         return seeds.size
     }
@@ -650,33 +736,52 @@ object Estimator {
         val fr = Frame(use[0].lat, use[0].lon)
         val sm = ArrayList<Sm>()
         val sessions = HashSet<String>(); val devices = HashSet<String>()
+        val devNames = ArrayList<String>()                     // sorted: device keys are deterministic (C++ and Kotlin agree)
+        for (o in use) if (!devNames.contains(o.device)) devNames.add(o.device)
+        devNames.sort()
         for (i in use.indices) {
             val o = use[i]
             var w0 = 1.0
             if (now > 0 && o.t > 0) w0 = cmax(0.15, exp(-cmax(0.0, (now - o.t).toDouble() / 86400.0) / opt.ageTauDays))
             w0 *= cmax(0.05, o.weight)
-            sm.add(Sm(fr.x(o.lon), fr.y(o.lat), o.dbm.toDouble() - (ctx.deviceOffset[o.device] ?: 0.0), w0, o.acc, i))
+            sm.add(Sm(fr.x(o.lon), fr.y(o.lat), o.dbm.toDouble() - (ctx.deviceOffset[o.device] ?: 0.0), w0, o.acc, i, devNames.indexOf(o.device)))
             sessions.add(o.device + "|" + (if (o.t > 0) o.t / 86400L else -1L).toString())
             devices.add(o.device)
             f.newest = maxOf(f.newest, o.t)
         }
         f.sessions = sessions.size; f.devices = devices.size
         val accs = DoubleArray(sm.size) { sm[it].acc }
-        var Rc = cmax(opt.clusterMinM, median(accs))
+        // Places: a sample joins the first seed within max(clusterMinM, clusterAccK × the better of the two fixes): a
+        // smoothed walk keeps its geometry, poor indoor fixes still merge (was one radius, max(15 m, median accuracy)).
+        // A place holds one device: devices hear the same AP differently (the δ below), so their levels are not pooled.
         var members = ArrayList<ArrayList<Int>>()
         var cl = ArrayList<Cl>()
+        var grow = 1.0
         while (true) {
             members = ArrayList(); cl = ArrayList()
             for (i in sm.indices) {
                 var found = -1
-                for (k in cl.indices) if (hypot(sm[i].x - cl[k].sx, sm[i].y - cl[k].sy) < Rc) { found = k; break }
-                if (found < 0) { val c = Cl(); c.sx = sm[i].x; c.sy = sm[i].y; cl.add(c); members.add(arrayListOf(i)) }
+                for (k in cl.indices)
+                    if (cl[k].dk == sm[i].dk && hypot(sm[i].x - cl[k].sx, sm[i].y - cl[k].sy) < grow * placeRadius(sm[i].acc, cl[k].sa, opt.clusterMinM, opt.clusterAccK)) { found = k; break }
+                if (found < 0) { val c = Cl(); c.dk = sm[i].dk; c.sx = sm[i].x; c.sy = sm[i].y; c.sa = sm[i].acc; cl.add(c); members.add(arrayListOf(i)) }
                 else members[found].add(i)
             }
             if (cl.size <= opt.maxClusters) break
-            Rc *= 1.5
+            grow *= 1.5
         }
         val K = cl.size
+        // Per-AP device deviations: the device with the most places is the reference (δ = 0, carries P0); the next MAXD by
+        // places (ties: name order) each get a δ ~ N(0, devOffsetSd²); any further device stays pinned at its calibrated offset
+        var nd = 0
+        if (devNames.size >= 2) {
+            val cnt = IntArray(devNames.size)
+            for (c in cl) ++cnt[c.dk]
+            val byCnt = (0 until devNames.size).sortedWith(Comparator { a, b -> if (cnt[a] > cnt[b] || (cnt[a] == cnt[b] && a < b)) -1 else if (cnt[b] > cnt[a] || (cnt[b] == cnt[a] && b < a)) 1 else 0 })
+            val devIdx = IntArray(devNames.size) { -1 }
+            var r = 1
+            while (r < byCnt.size && nd < MAXD) { if (cnt[byCnt[r]] > 0) devIdx[byCnt[r]] = nd++; ++r }
+            for (c in cl) c.dev = devIdx[c.dk]
+        }
         for (k in 0 until K) {
             var sw = 0.0; var sx = 0.0; var sy = 0.0; val lv = ArrayList<Double>(); val ac = ArrayList<Double>()
             for (i in members[k]) { sw += sm[i].w0; sx += sm[i].w0 * sm[i].x; sy += sm[i].w0 * sm[i].y; lv.add(sm[i].level); ac.add(sm[i].acc) }
@@ -731,7 +836,7 @@ object Estimator {
                     val px = cx - W + (i + 0.5) * cs; val py = cy - W + (j + 0.5) * cs
                     // range prior: an AP is rarely far beyond the nearest place it was heard from
                     var near = 1e300; for (c in cls) near = cmin(near, hypot(px - c.x, py - c.y))
-                    ll[j * G + i] = gridLogL(cls, rg, ctx.misses, mxs, mys, px, py, opt, null) - near / opt.rangePriorM
+                    ll[j * G + i] = gridLogL(cls, rg, ctx.misses, mxs, mys, px, py, opt, nd, null) - near / opt.rangePriorM
                 }
             llMax = -1e300; for (v in ll) llMax = cmax(llMax, v)
             psum = 0.0; pmx = 0.0; pmy = 0.0
@@ -792,7 +897,8 @@ object Estimator {
         run { var s1 = 0.0; var s2 = 0.0; for (c in cl) { val w = c.W / c.sh2; s1 += w; s2 += w * w }; f.ess = if (s2 > 0) s1 * s1 / s2 else 0.0 }
 
         var best = Theta(); var haveLm = false; var tauEff = 1.0
-        val sv = Solver(cl, rg, opt)
+        var altGap = -1.0                                      // cost (≈ nats) of the alternative solution above the best
+        val sv = Solver(cl, rg, opt, nd)
         val bb = DoubleArray(2)
         if (K >= 3) {
             // Stage A (robust, nominal scale) from every seed and the mirror of the best; Stage B (robust at the
@@ -810,8 +916,11 @@ object Estimator {
             for (pt in pts) {
                 var dup = false; for (t in starts) if (hypot(t.x - pt[0], t.y - pt[1]) < 10) { dup = true; break }
                 if (dup) continue
-                gridLogL(cl, rg, ctx.misses, mxs, mys, pt[0], pt[1], opt, bb)
-                starts.add(Theta(pt[0], pt[1], cclamp(bb[0], -90.0, 10.0), cclamp(bb[1], 1.5, 4.5)))
+                val dv0 = DoubleArray(MAXD)
+                gridLogL(cl, rg, ctx.misses, mxs, mys, pt[0], pt[1], opt, nd, bb, dv0)
+                val t = Theta(pt[0], pt[1], cclamp(bb[0], -90.0, 10.0), cclamp(bb[1], 1.5, 4.5))
+                for (i in 0 until nd) t.dv[i] = cclamp(dv0[i], -30.0, 30.0)
+                starts.add(t)
             }
             if (starts.isNotEmpty()) {
                 val b = starts[0]
@@ -833,6 +942,16 @@ object Estimator {
             val stB = ArrayList<Theta>(); val costB = ArrayList<Double>()
             for (t0 in stA) { stB.add(sv.run(t0, opt.maxIter, co)); costB.add(co[0]) }
             var ib = 0; for (i in 1 until stB.size) if (costB[i] < costB[ib]) ib = i
+            run {   // the mirror of the SOLUTION across the places' principal axis: from places along a line the AP and its reflection
+                // explain the levels equally well, and no seed need have started on the other side (docs/GRADING.md §1.4)
+                val b = stB[ib]
+                val vx = b.x - gmx; val vy = b.y - gmy; val along = vx * e1x + vy * e1y
+                val m = b.copy(x = gmx + 2 * along * e1x - vx, y = gmy + 2 * along * e1y - vy)
+                if (m.x.isFinite() && m.y.isFinite() && hypot(m.x - b.x, m.y - b.y) > 10) {
+                    stB.add(sv.run(m, opt.maxIter, co)); costB.add(co[0])
+                    if (costB[costB.size - 1] < costB[ib]) ib = stB.size - 1
+                }
+            }
             best = stB[ib]; haveLm = best.x.isFinite() && best.y.isFinite() && costB[ib].isFinite()
             var ialt = -1
             for (i in stB.indices)
@@ -840,27 +959,22 @@ object Estimator {
             f.sigmaDb = sv.tau * opt.sigmaDb
             if (haveLm) {   // the posterior again with each place down-weighted as the robust fit did
                 val rw = cl.map { it.copy() }
-                for (k in 0 until K) { val a = evalAt(cl[k], best, opt.heightM); val z = a.r / (sqrt(a.s2) * sv.tau); rw[k].W = cl[k].W * sv.uFn(z) }
+                for (k in 0 until K) { val a = evalAt(cl[k], best, opt.heightM); val z = a.r / (sqrt(a.s2) * sv.tau); rw[k].W = cmax(1e-9, cl[k].W * sv.uFn(z)) }
                 runGrid(rw)
             }
-            tauEff = cmax(1.0, sv.tau)
-            if (haveLm && ialt >= 0) { f.altLat = fr.lat(stB[ialt].y); f.altLon = fr.lon(stB[ialt].x); f.ambiguous = costB[ialt] - costB[ib] < 2.0 }
+            if (haveLm && ialt >= 0) { f.altLat = fr.lat(stB[ialt].y); f.altLon = fr.lon(stB[ialt].x); altGap = costB[ialt] - costB[ib]; f.ambiguous = altGap < 2.0 }
         }
 
         // ── the answer: LM solution (≥ 3 places) or the grid posterior ──
         var sol: Theta
         val C = DoubleArray(3)
         val crlbC = DoubleArray(3)
-        val Finv = mat4(); var haveFinv = false
+        val Finv = matP(); var haveFinv = false
+        val np = 4 + nd
         if (haveLm) {
             sol = best
-            val A = mat4(); val g = DoubleArray(4)
-            sv.normal(sol, tauEff, A, g)
-            if (invert4(A, 4, Finv)) {
-                haveFinv = true
-                C[0] = Finv[0][0]; C[1] = Finv[0][1]; C[2] = Finv[1][1]
-            } else { C[0] = gC[0]; C[1] = gC[1]; C[2] = gC[2] }
-            // design effect of spatially correlated shadowing: K / N_eff, N_eff = 1ᵀR⁻¹1
+            // Gudmundson: N_eff = 1ᵀR⁻¹1, R_ij = exp(−|q_i − q_j|/d_c): the effectively independent places
+            var neff = K.toDouble()
             run {
                 val L = DoubleArray(K * K)
                 var ok = true
@@ -877,19 +991,93 @@ object Estimator {
                 if (ok) {
                     val z = DoubleArray(K)
                     for (ii in 0 until K) { var s = 1.0; for (q in 0 until ii) s -= L[ii * K + q] * z[q]; z[ii] = s / L[ii * K + ii] }
-                    var neff = 0.0; for (v in z) neff += v * v
-                    val deff = cmax(1.0, K / cmax(1e-9, neff))
-                    C[0] *= deff; C[1] *= deff; C[2] *= deff
+                    neff = 0.0; for (v in z) neff += v * v
+                    neff = cclamp(neff, 1.0, K.toDouble())
                 }
             }
-            // correlated fix error: shared within a session
-            run { val am = median(accs) / ACC68; val fl = am * am / max(1, f.sessions); C[0] += fl; C[2] += fl }
-            // Cramér–Rao floor with the nominal σ0
+            // The noise scale τ² = σ²/σ0²: scaled-inverse-χ² posterior mean, prior ν0 centred on σ0, data = the robust-weighted
+            // residual SS over the effectively independent places: E[σ²]/σ0² = (ν0 − 2 + SS·N_eff/K)/(ν0 − 2 + ν_d)
             run {
-                val s0 = Solver(cl, rg, opt)
-                val A0 = mat4(); val g0 = DoubleArray(4); val I0 = mat4()
+                val H = matP(); val A1 = matP(); val I1 = matP(); var ss = 0.0; var kin = 0.0
+                for (k in 0 until K) {
+                    val a = evalAt(cl[k], sol, opt.heightM)
+                    val z = a.r / sqrt(a.s2); val w = cl[k].W * sv.uFn(z / sv.tau)
+                    ss += w * z * z; kin += w
+                    for (i in 0 until np) for (j in 0 until np) H[i][j] += w / a.s2 * a.J[i] * a.J[j]
+                }
+                for (i in 0 until np) for (j in 0 until np) A1[i][j] = H[i][j]
+                A1[2][2] += 1.0 / (opt.p0Sd * opt.p0Sd); A1[3][3] += 1.0 / (opt.nSd * opt.nSd)
+                for (i in 4 until np) A1[i][i] += 1.0 / (opt.devOffsetSd * opt.devOffsetSd)
+                var peff = np.toDouble()
+                if (invertN(A1, np, I1)) { peff = 0.0; for (i in 0 until np) for (j in 0 until np) peff += I1[i][j] * H[j][i] }
+                val nud = cmax(0.0, kin - peff) * neff / K; val v0 = cmax(0.0, opt.sigmaPriorDof - 2)
+                val tau2 = (v0 + (if (nud > 0) ss * neff / K else 0.0)) / cmax(1e-9, v0 + nud)
+                tauEff = sqrt(cmax(0.01, tau2))
+            }
+            // Laplace at that scale as a sandwich A⁻¹·B·A⁻¹, B adding the places' shared shadowing τ²σ0²ρ_in·R_ij (was × K/N_eff)
+            val A = matP(); val g = DoubleArray(MAXP)
+            sv.normal(sol, tauEff, A, g)
+            if (invertN(A, np, Finv)) {
+                haveFinv = true
+                val Jw = DoubleArray(MAXP * K)
+                for (k in 0 until K) {
+                    val a = evalAt(cl[k], sol, opt.heightM)
+                    val psi = cl[k].W * sv.uFn(a.r / (sqrt(a.s2) * tauEff)) / (a.s2 * tauEff * tauEff)
+                    for (i in 0 until np) Jw[MAXP * k + i] = psi * a.J[i]
+                }
+                val s2c = tauEff * tauEff * opt.sigmaDb * opt.sigmaDb * opt.rhoIn
+                val B = matP(); for (i in 0 until np) for (j in 0 until np) B[i][j] = A[i][j]
+                for (k in 0 until K)
+                    for (l in 0 until K) {
+                        if (l == k) continue
+                        val c = s2c * exp(-hypot(cl[k].x - cl[l].x, cl[k].y - cl[l].y) / opt.shadowCorrM)
+                        for (i in 0 until np) for (j in 0 until np) B[i][j] += c * Jw[MAXP * k + i] * Jw[MAXP * l + j]
+                    }
+                val FB = matP()
+                for (i in 0 until np) for (j in 0 until np) { var s = 0.0; for (q in 0 until np) s += Finv[i][q] * B[q][j]; FB[i][j] = s }
+                val S = Array(2) { DoubleArray(2) }
+                for (i in 0 until 2) for (j in 0 until 2) { var s = 0.0; for (q in 0 until np) s += FB[i][q] * Finv[q][j]; S[i][j] = s }
+                C[0] = S[0][0]; C[1] = 0.5 * (S[0][1] + S[1][0]); C[2] = S[1][1]
+                // R95 from the local posterior: the marginal likelihood at the fitted scale, tempered by sandwich / Laplace,
+                // on a 41 × 41 grid over ±postWindow σ of the major axis; widens C (shape kept) when larger
+                if (opt.postWindow > 0) {
+                    val sc = cl.map { it.copy() }
+                    for (k in 0 until K) {
+                        val a = evalAt(cl[k], sol, opt.heightM)
+                        sc[k].W = cmax(1e-9, cl[k].W * sv.uFn(a.r / (sqrt(a.s2) * sv.tau)))
+                        sc[k].sh2 *= tauEff * tauEff; sc[k].a *= tauEff
+                    }
+                    val e = eig2(C[0], C[1], C[2])
+                    val temper = cmax(1.0, (C[0] + C[2]) / (Finv[0][0] + Finv[1][1]))
+                    val ext = cmax(10.0, opt.postWindow * sqrt(cmax(0.0, e[0])))
+                    val N = 41
+                    val h = 2 * ext / (N - 1)
+                    val lv = DoubleArray(N * N); val rr = DoubleArray(N * N)
+                    var lmax = -1e300
+                    for (j in 0 until N)
+                        for (i in 0 until N) {
+                            val px = sol.x - ext + i * h; val py = sol.y - ext + j * h
+                            lv[j * N + i] = gridLogL(sc, rg, ctx.misses, mxs, mys, px, py, opt, nd, null) / temper
+                            lmax = cmax(lmax, lv[j * N + i])
+                            rr[j * N + i] = hypot(px - sol.x, py - sol.y)
+                        }
+                    val idx = (0 until N * N).sortedWith(Comparator { p, q -> if (rr[p] < rr[q]) -1 else if (rr[q] < rr[p]) 1 else p.compareTo(q) })
+                    var ps = 0.0; for (v in lv) ps += exp(v - lmax)
+                    var acc = 0.0; var r95p = 0.0
+                    for (i in idx) { acc += exp(lv[i] - lmax); if (acc >= 0.95 * ps) { r95p = rr[i]; break } }
+                    val e0 = ellipse(C[0], C[1], C[2])
+                    val r95c = radiusFor(e0[0], e0[1], 0.95)
+                    if (r95c > 0 && r95p > r95c) { val q = (r95p / r95c) * (r95p / r95c); C[0] *= q; C[1] *= q; C[2] *= q }
+                }
+            } else { C[0] = gC[0]; C[1] = gC[1]; C[2] = gC[2] }
+            // correlated fix error: shared within a session (the per-place errors-in-variables term counts it too, on purpose)
+            run { val am = median(accs) / ACC68; val fl = am * am / max(1, f.sessions); C[0] += fl; C[2] += fl }
+            // the Cramér–Rao bound with the nominal σ0: the geometry figure crlbR95, no longer a floor
+            run {
+                val s0 = Solver(cl, rg, opt, nd)
+                val A0 = matP(); val g0 = DoubleArray(MAXP); val I0 = matP()
                 s0.normal(sol, 1.0, A0, g0)
-                if (invert4(A0, 4, I0)) { crlbC[0] = I0[0][0]; crlbC[1] = I0[0][1]; crlbC[2] = I0[1][1]; eigMax(C, crlbC) }
+                if (invertN(A0, np, I0)) { crlbC[0] = I0[0][0]; crlbC[1] = I0[0][1]; crlbC[2] = I0[1][1] }
             }
             // leave-one-place-out jackknife
             if (K >= 4 && K <= opt.jackMaxK) {
@@ -928,7 +1116,7 @@ object Estimator {
                 eigMax(C, Bc)
             }
         } else {
-            gridLogL(cl, rg, ctx.misses, mxs, mys, pmx, pmy, opt, bb)
+            gridLogL(cl, rg, ctx.misses, mxs, mys, pmx, pmy, opt, nd, bb)
             sol = Theta(pmx, pmy, cclamp(bb[0], -90.0, 10.0), cclamp(bb[1], 1.5, 4.5))
             C[0] = gC[0]; C[1] = gC[1]; C[2] = gC[2]
         }
@@ -989,11 +1177,20 @@ object Estimator {
                 f.p0RangeCorr = if (vr > 0 && Finv[2][2] > 0) abs(cpr) / sqrt(vr * Finv[2][2]) else 0.0
             }
         }
-        if (f.ambiguous) {   // the alternative must be separated by more than 2σ along the line joining them
+        if (f.ambiguous) {
             val dx = fr.x(f.altLon) - sol.x; val dy = fr.y(f.altLat) - sol.y; val dd = hypot(dx, dy)
             val s2 = if (dd > 0) (dx * dx * f.cxx + 2 * dx * dy * f.cxy + dy * dy * f.cyy) / (dd * dd) else 0.0
             // inside the places' hull a far alternative is a second mode (counted by the grid), not a mirror
-            if (dd <= 2 * sqrt(cmax(0.0, s2)) || f.inHull) f.ambiguous = false
+            if (f.inHull) f.ambiguous = false
+            else {
+                // Either solution may be the AP: the error about the reported one is the mixture's second moment,
+                // C + p·d·dᵀ with p = P(alternative) ≈ 1/(1 + e^gap), so R95 reaches the ghost as often as it is the AP.
+                // Widened even when the ghost lies within 2σ (within 2σ is not within R95); only the ghost marker needs more.
+                val p = 1.0 / (1.0 + exp(altGap))
+                C[0] += p * dx * dx; C[1] += p * dx * dy; C[2] += p * dy * dy
+                setEllipse(f, C)
+                if (dd <= 2 * sqrt(cmax(0.0, s2))) f.ambiguous = false   // too close to show apart
+            }
         }
 
         // ── kind ──
@@ -1003,7 +1200,7 @@ object Estimator {
             // a region: centred on the posterior mean (the best guess under this much uncertainty)
             f.kind = "region"
             if (haveLm) {
-                gridLogL(cl, rg, ctx.misses, mxs, mys, pmx, pmy, opt, bb)
+                gridLogL(cl, rg, ctx.misses, mxs, mys, pmx, pmy, opt, nd, bb)
                 sol = Theta(pmx, pmy, cclamp(bb[0], -90.0, 10.0), cclamp(bb[1], 1.5, 4.5))
                 eigMax(C, gC)
                 setEllipse(f, C)
@@ -1042,10 +1239,10 @@ object Estimator {
 
         // ── "sample here next": the spot whose sample adds the most information ──
         run {
-            val s0 = Solver(cl, rg, opt)
-            val A0 = mat4(); val g0 = DoubleArray(4); val I0 = mat4()
+            val s0 = Solver(cl, rg, opt, nd)
+            val A0 = matP(); val g0 = DoubleArray(MAXP); val I0 = matP()
             s0.normal(sol, 1.0, A0, g0)
-            if (invert4(A0, 4, I0) && (f.kind == "region" || f.r95 > 25)) {
+            if (invertN(A0, 4 + nd, I0) && (f.kind == "region" || f.r95 > 25)) {
                 val b = 10.0 * sol.n / LN10; val aFix = 10.0 / ACC68
                 var bestGain = 0.0; var bx = 0.0; var by = 0.0
                 for (ri in 0 until 3) for (bi in 0 until 16) {
@@ -1079,15 +1276,16 @@ object Estimator {
     // ── incremental update (between batched refits) ──────────────────────────
     /**
      * One new sample says "the AP is d metres from here" (d from the AP's own P0/n): a 2-D Kalman step with H = the unit
-     * vector observer → fit, and the full covariance kept.
+     * vector observer → fit, and the full covariance kept. [deviceOffsetDb]: how much louder o.device hears than this
+     * device (Context.deviceOffset), removed from o.dbm as [fitAp] does.
      */
-    fun update(prev: Fit, o: Obs, opt: Options = Options()): Fit {
+    fun update(prev: Fit, o: Obs, opt: Options = Options(), deviceOffsetDb: Double = 0.0): Fit {
         if (!prev.valid || (prev.kind != "fix" && prev.kind != "region")) return prev
         val f = prev.copy()
         val fr = Frame(prev.lat, prev.lon)
         val ox = fr.x(o.lon); val oy = fr.y(o.lat)
         val r = cmax(1.0, hypot(ox, oy))
-        val d3 = modelDistance(prev.p0, prev.pathloss, o.dbm)
+        val d3 = 10.0.pow((prev.p0 - (o.dbm.toDouble() - deviceOffsetDb)) / (10.0 * prev.pathloss))   // modelDistance of the level as this device would hear it
         val dm = sqrt(cmax(1.0, d3 * d3 - opt.heightM * opt.heightM))
         val ux = -ox / r; val uy = -oy / r
         val sigD = d3 * LN10 * opt.sigmaDb / (10.0 * prev.pathloss)

@@ -1,17 +1,22 @@
 #pragma once
 #include <QCache>
 #include <QDateTime>
+#include <QElapsedTimer>
 #include <QHash>
 #include <QJsonObject>
 #include <QImage>
 #include <QPixmap>
 #include <QPointF>
+#include <QPointer>
+#include <QDialog>
 #include <QSet>
+#include <QThreadPool>
 #include <QTimer>
 #include <QWidget>
 
-class Locator;
-class TileSource;
+#include "locator.h"
+#include "flockdetector.h"
+#include "tilesource.h"
 struct AccessPoint;
 
 // The map: slippy basemap (dark / streets / satellite / topo), our position with
@@ -21,6 +26,9 @@ struct AccessPoint;
 class BeaconView : public QWidget {
     Q_OBJECT
 public:
+    // Pinpointing an AP to under a foot: zoom 23 is ~1.8 cm a pixel here; imagery stops at its source's own depth
+    // (19 for Esri) and is scaled past it, while markers, ellipses, contours and the scale bar stay sharp
+    static constexpr int MAX_VIEW_ZOOM = 23;
     enum Layer { Dark, Streets, Satellite, Topo };
 
     explicit BeaconView(Locator *loc, TileSource *tiles, QWidget *parent = nullptr);
@@ -32,15 +40,28 @@ public:
     void selectPoi(int index);
     void setLayer(Layer l);
     Layer layer() const { return m_layer; }
+    void setSatSource(int s);                // TileSource::SatSource; also switches to the Satellite layer
+    bool showContours() const { return m_showContours; }
+    void setShowContours(bool on);           // satellite hybrid: contour lines (drawn by TileSource from terrain tiles)
     QSet<QString> hiddenCategories() const { return m_hiddenCats; }
     void setCategoryVisible(const QString &key, bool visible);
     bool showNames() const { return m_showNames; }
     void setShowNames(bool on);
     void setShowDevices(bool on);
     void setShowImported(bool on);           // the imported history track (Timeline / WiGLE / GPX / KML)
+    bool showHeatmap() const { return m_showHeatmap; }
+    void setShowHeatmap(bool on);
+    bool showFlockCameras() const { return m_showFlockCameras; }
+    void setShowFlockCameras(bool on);
+    bool showApCircles() const { return m_showApCircles; }
+    void setShowApCircles(bool on);
     void replayLastRefit();
     bool showLegend() const { return m_showLegend; }
     void setShowLegend(bool on);             // the grade legend (bottom right)
+    // docs/SIGHTINGS.md §8: a route to (lat, lon) around the ALPR cameras, from the chosen start or our fix; drawn until cleared
+    void routeAvoidingAlprs(double toLat, double toLon);
+    void setRouteStart(double lat, double lon);
+    void clearAvoidRoute();
     // Grade colours (Okabe–Ito, colour-blind safe): A–F, R (region only), M (mobile); grey otherwise
     static QColor gradeColor(const QString &grade);
     static QColor gradeTextColor(const QString &grade);   // black or white, whichever reads on gradeColor()
@@ -60,7 +81,7 @@ protected:
     void resizeEvent(QResizeEvent *) override;
 
 private:
-    enum HitKind { HitNone, HitBeacon, HitPoi, HitCluster, HitButton, HitAnchor };
+    enum HitKind { HitNone, HitBeacon, HitPoi, HitCluster, HitButton, HitAnchor, HitCamera };
     struct Hit { HitKind kind; QPointF pos; double radius; QList<int> items; int button = -1; };
 
     // Web-Mercator, normalised to [0,1]²
@@ -74,12 +95,23 @@ private:
     static double metersPerPixelAt(double lat, double zoom);
 
     int     maxZoom() const;
-    QString tileKey(Layer l, int z, int x, int y, bool labels) const;
-    void    ensureTile(Layer l, int z, int x, int y, bool labels);
-    void    drawTiles(QPainter &p, bool labels);
+    TileSource::Layer srcLayer(Layer l) const;                 // Satellite → the chosen imagery source
+    // ov: 0 = the base layer, else the TileSource::Layer of a satellite-hybrid overlay (Labels, Roads, Contours)
+    QString tileKey(Layer l, int z, int x, int y, int ov) const;
+    void    ensureTile(Layer l, int z, int x, int y, int ov);
+    void    drawTiles(QPainter &p, int ov);
+    void    drawBase(QPainter &p);                              // the static layers, from m_base when the view hasn't changed
+    void    drawHeatmap(QPainter &p);
+    void    loadRouteFixes();
+    void    startHeat();
+    static QImage renderHeat(const QList<Fix> &fixes, const QPointF &tl, double zoom, const QSize &size);
+    void    setFlockCameras(const QList<FlockCamera> &cams);
+    void    loadFlockCameras();                                 // those around the view, from the database
+    const Stats &stats();
     void    drawTrack(QPainter &p);
     void    drawImportedTrack(QPainter &p);
     void    drawPois(QPainter &p);
+    void    drawFlockCameras(QPainter &p);
     void    drawBeacons(QPainter &p);
     void    drawMe(QPainter &p);
     void    drawLabels(QPainter &p);
@@ -103,16 +135,21 @@ private:
     int     hitAt(const QPointF &pos) const;
     QString beaconCard(int apIndex) const;
     QString poiCard(int poiIndex) const;
+    QString cameraCard(int camIndex) const;
     static QString compass(double deg);
     static QString distText(double m);
 
     Locator *m_loc;
     TileSource *m_src;
     QCache<QString, QPixmap> m_tiles;
-    QSet<QString> m_pending;
+    struct TileReq { Layer l; int z, x, y; int ov; };
+    QHash<QString, TileReq> m_pending;                          // asked of TileSource, not back yet
+    QSet<QString> m_wanted;                                     // what the last base render looked for
     QHash<QString, QDateTime> m_failed;
     QTimer  m_anim;
     Layer   m_layer = Dark;
+    int     m_satSource = 0;                                    // TileSource::SatSource
+    bool    m_showContours = true;
     QSet<QString> m_hiddenCats;
 
     double  m_zoom = 15, m_zoomTarget = 15;
@@ -160,4 +197,50 @@ private:
     double  m_hudBottom = 0;
     QList<QPointF> m_poiPos;                                    // per POI index, this frame (null = hidden)
     double  m_phase = 0, m_sweep = 0;
+    bool    m_showHeatmap = true;
+    bool    m_showFlockCameras = true;
+    bool    m_showApCircles = true;
+    QList<Fix> m_routeFixes;
+    bool    m_routeFixesDirty = true;
+    QList<FlockCamera> m_flockCameras;
+    QList<QPointF> m_cameraMerc;                                // per camera, mercator (no trig per frame)
+    QHash<int, QPointF> m_cameraPos;                            // per drawn camera, this frame
+    QRectF  m_camBox; double m_camZoom = 0;                     // what m_flockCameras covers (x = lon, y = lat)
+    bool    m_camCapped = false, m_camStale = true;
+    QPointF m_camCentre; double m_camK = 1, m_camR2 = 0;        // capped: only the disc (lat², (lon·k)²) ≤ r² about the centre
+    QTimer  m_camKick;
+
+    // Paint caches. Tiles, vignette, heat map and tracks change only with the view or the data, so
+    // they're rendered into m_base and blitted under the live overlay; the animation tick repaints
+    // just the pulse around us unless something else moves.
+    struct BaseKey {
+        QSize size; qreal dpr = 0; QPointF center; double zoom = 0; int layer = 0, tiles = 0, heat = 0, heatData = 0, track = 0;
+        bool heatOn = false, imported = false, fixValid = false; qsizetype hist = 0, imp = 0;
+        bool operator==(const BaseKey &o) const {
+            return size == o.size && dpr == o.dpr && center == o.center && zoom == o.zoom && layer == o.layer && tiles == o.tiles
+                && heat == o.heat && heatData == o.heatData && track == o.track && heatOn == o.heatOn && imported == o.imported && fixValid == o.fixValid
+                && hist == o.hist && imp == o.imp;
+        }
+    };
+    QPixmap m_base; BaseKey m_baseKey; QElapsedTimer m_baseAt; bool m_baseMissing = false, m_baseTopo = false;   // topo: offline stand-ins drawn
+    int     m_tileVersion = 0, m_trackVersion = 0;
+    qint64  m_fullAt = 0;                                       // last full-widget repaint from the tick
+    QRectF  m_paintClip;                                        // this paint's area: markers outside it only record their hits
+    Stats   m_stats; QElapsedTimer m_statsAt;
+    QList<ApEstimate> m_apEst; QStringList m_apStatus; QElapsedTimer m_apEstAt;   // per AP index, drawBeacons()
+    // The heat map is rasterised on m_pool for an area a bit larger than the view, then panned and
+    // scaled with the view until a fresh one arrives
+    struct Heat { QImage img; QPointF tl; double zoom = 0; int version = -1; };
+    Heat    m_heat; int m_heatVersion = 0, m_heatSerial = 0; bool m_heatBusy = false;
+    QTimer  m_heatKick;
+    QElapsedTimer m_routeLoadedAt;
+    // the ALPR-avoiding route (docs/SIGHTINGS.md §8)
+    void    drawAvoidRoute(QPainter &p);
+    void    showRouteResult(const QJsonObject &o);
+    bool    m_haveRouteStart = false, m_routing = false;
+    double  m_routeStartLat = 0, m_routeStartLon = 0;
+    QList<QPointF> m_avoidRoute;                                // mercator
+    QList<QPointF> m_avoidPassed;                               // the cameras it still passes (in a cone), mercator
+    QPointer<QDialog> m_routeDialog;
+    QThreadPool m_pool;                                         // last: waits for the heat worker before the rest goes
 };

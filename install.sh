@@ -87,6 +87,8 @@ cmake -S "$HERE" -B "$HERE/build" -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PRE
       -DBEACONFIX_INSTALL_WIDGET=OFF -DBEACONFIX_INSTALL_POLKIT=OFF >/dev/null
 cmake --build "$HERE/build" -j"$(nproc)"
 cmake --install "$HERE/build" >/dev/null
+# Up to 3.9 the icon was a scalable SVG; a stale one would win over the new PNG sizes in the hicolor theme
+rm -f "$PREFIX/share/icons/hicolor/scalable/apps/beaconfix.svg"
 note "installed $PREFIX/bin/beaconfix"
 
 # ── 3. Desktop integration for a user prefix ─────────────────────────────────

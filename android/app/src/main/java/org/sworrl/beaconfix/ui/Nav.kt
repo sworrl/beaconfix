@@ -27,6 +27,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -52,7 +53,7 @@ import org.sworrl.beaconfix.ui.screens.MapScreen
 import org.sworrl.beaconfix.ui.screens.MoreScreen
 import org.sworrl.beaconfix.ui.screens.NearbyScreen
 import org.sworrl.beaconfix.ui.screens.OnboardingScreen
-import org.sworrl.beaconfix.ui.screens.PairScreen
+import org.sworrl.beaconfix.ui.screens.LinkScreen
 import org.sworrl.beaconfix.ui.screens.SettingsScreen
 import org.sworrl.beaconfix.ui.screens.SurveyScreen
 import org.sworrl.beaconfix.ui.screens.SyncScreen
@@ -67,6 +68,7 @@ data class Dest(val route: String, val label: String, val icon: ImageVector, val
 val DESTS = listOf(
     Dest("home", "Home", Icons.Default.Home, true), Dest("map", "Map", Icons.Default.Map, true), Dest("beacons", "Beacons", Icons.Default.Wifi, true),
     Dest("nearby", "Places", Icons.Default.Place, true), Dest("more", "More", Icons.Default.MoreHoriz, true),
+    Dest("detector", "Detector", Icons.Default.Radar, false),
     Dest("trip", "Trip", Icons.Default.Explore, false), Dest("events", "Events", Icons.Default.RssFeed, false), Dest("survey", "Survey", Icons.Default.Radar, false),
     Dest("sync", "Sync", Icons.Default.Sync, false), Dest("settings", "Settings", Icons.Default.Settings, false),
 )
@@ -87,10 +89,13 @@ fun BeaconFixRoot(launch: LaunchArgs = LaunchArgs()) {
         if (!launch.linkPayload.isNullOrBlank() && launch.linkPayload.startsWith(org.sworrl.beaconfix.identity.IdentityOps.PREFIX)) idVm.handleScanned(launch.linkPayload)
     }
     // No identity yet → onboarding takes over the whole screen (any app: create or import)
-    if (hasIdentity == false) { OnboardingScreen(initialName = launch.identityName, onImportHistory = {}, vm = idVm); return }
+    // "Link a PC" on the first screen: the identity is made, then the Link screen opens
+    var linkAfterOnboarding by androidx.compose.runtime.saveable.rememberSaveable { androidx.compose.runtime.mutableStateOf(false) }
+    if (hasIdentity == false) { OnboardingScreen(initialName = launch.identityName, onImportHistory = {}, onLinkPc = { linkAfterOnboarding = true }, vm = idVm); return }
     if (hasIdentity == null) return
     val nav = rememberNavController()
     val shareVm: ShareViewModel = hiltViewModel()
+    LaunchedEffect(linkAfterOnboarding) { if (linkAfterOnboarding) { linkAfterOnboarding = false; nav.navigate("link") } }
     LaunchedEffect(launch.seq) {
         // A pairing request from outside (a tapped beaconfix://pair link, any app's pair_host extra) only fills in the
         // address and asks: a paired desktop receives this phone's location history and feeds the Help screen, widget,
@@ -108,7 +113,8 @@ fun BeaconFixRoot(launch: LaunchArgs = LaunchArgs()) {
             "sync" -> rootVm.syncNow(); "scan" -> rootVm.scanOnce(); "collector_on" -> rootVm.collector(true); "collector_off" -> rootVm.collector(false)
             "help" -> nav.navigate("help?focus="); "help_peds" -> nav.navigate("help?focus=peds"); "find_rv" -> nav.navigate("home") { popUpTo("home"); launchSingleTop = true }
             "share_location" -> shareVm.shareLocation(ctx)
-            "identity", "widgets", "import", "map", "beacons", "survey", "settings", "trip", "events", "nearby", "more", "sync_tab", "anchors" -> nav.navigate(if (launch.action == "sync_tab") "sync" else launch.action)
+            "sighting" -> launch.sightingUid?.let { nav.navigate("sighting/" + android.net.Uri.encode(it)) } ?: nav.navigate("sightings")
+            "identity", "widgets", "import", "map", "beacons", "survey", "settings", "trip", "events", "nearby", "more", "sync_tab", "anchors", "detector", "hub", "alpr", "link", "sightings", "licenses" -> nav.navigate(if (launch.action == "sync_tab") "sync" else launch.action)
         }
     }
     val wide = currentWindowAdaptiveInfo().windowSizeClass.windowWidthSizeClass != WindowWidthSizeClass.COMPACT
@@ -127,7 +133,7 @@ fun BeaconFixRoot(launch: LaunchArgs = LaunchArgs()) {
 @Composable
 private fun Graph(nav: NavHostController, idVm: IdentityViewModel, modifier: Modifier, incomingFile: android.net.Uri? = null) {
     NavHost(nav, startDestination = "home", modifier = modifier) {
-        composable("home") { HomeScreen(onPair = { nav.navigate("pair") }, onIdentity = { nav.navigate("identity") }, onHelp = { nav.navigate("help?focus=") }, onMap = { nav.navigate("map") }) }
+        composable("home") { HomeScreen(onPair = { nav.navigate("link") }, onIdentity = { nav.navigate("identity") }, onHelp = { nav.navigate("help?focus=") }, onMap = { nav.navigate("map") }) }
         composable("map") { MapScreen() }
         composable("beacons") { BeaconsScreen() }
         composable("nearby") { NearbyScreen(onHelp = { nav.navigate("help?focus=") }, onMap = { nav.navigate("map") }) }
@@ -136,13 +142,23 @@ private fun Graph(nav: NavHostController, idVm: IdentityViewModel, modifier: Mod
         composable("help?focus={focus}") { e -> HelpScreen(focus = e.arguments?.getString("focus"), onBack = { nav.popBackStack() }, onMap = { nav.navigate("map") }) }
         composable("events") { EventsScreen() }
         composable("survey") { SurveyScreen() }
-        composable("sync") { SyncScreen(onPair = { nav.navigate("pair") }) }
-        composable("settings") { SettingsScreen(onPair = { nav.navigate("pair") }, onIdentity = { nav.navigate("identity") }, onWidgets = { nav.navigate("widgets") }, onImport = { nav.navigate("import") }) }
-        composable("pair?host={host}&port={port}&auto={auto}") { entry ->
-            PairScreen(onDone = { nav.popBackStack() }, autoHost = entry.arguments?.getString("host"),
-                autoPort = entry.arguments?.getString("port")?.toIntOrNull() ?: 47822, autoPair = entry.arguments?.getString("auto") == "true")
+        composable("sync") { SyncScreen(onPair = { nav.navigate("link") }, onHub = { nav.navigate("hub") }) }
+        composable("hub") { org.sworrl.beaconfix.ui.screens.HubScreen(onBack = { nav.popBackStack() }, onLink = { nav.navigate("link") }) }
+        composable("link") { LinkScreen(onBack = { nav.popBackStack() }) }
+        composable("alpr") { org.sworrl.beaconfix.alpr.ui.AlprScreen(onBack = { nav.popBackStack() }) }
+        composable("detector") { org.sworrl.beaconfix.ui.screens.DetectorScreen(onAlpr = { nav.navigate("alpr") }) }
+        composable("settings") { SettingsScreen(onPair = { nav.navigate("link") }, onIdentity = { nav.navigate("identity") }, onWidgets = { nav.navigate("widgets") }, onImport = { nav.navigate("import") }, onLicenses = { nav.navigate("licenses") }) }
+        composable("licenses") { org.sworrl.beaconfix.ui.screens.LicensesScreen(onBack = { nav.popBackStack() }) }
+        composable("sightings") { org.sworrl.beaconfix.sightings.ui.SightingsScreen(onOpen = { nav.navigate("sighting/" + android.net.Uri.encode(it)) }, onBack = { nav.popBackStack() }) }
+        composable("sighting/{uid}") { e ->
+            org.sworrl.beaconfix.sightings.ui.SightingDetailScreen(uid = e.arguments?.getString("uid").orEmpty(), onBack = { nav.popBackStack() }, onMap = { nav.navigate("map") })
         }
-        composable("identity") { IdentityScreen(onBack = { nav.popBackStack() }, vm = idVm) }
+        composable("pair?host={host}&port={port}&auto={auto}") { entry ->
+            // a beaconfix://pair link (or adb automation): the address becomes a row on the Link screen
+            LinkScreen(onBack = { nav.popBackStack() }, hintHost = entry.arguments?.getString("host"),
+                hintPort = entry.arguments?.getString("port")?.toIntOrNull() ?: 47822, autoLink = entry.arguments?.getString("auto") == "true")
+        }
+        composable("identity") { IdentityScreen(onBack = { nav.popBackStack() }, onLink = { nav.navigate("link") }, vm = idVm) }
         composable("anchors") { org.sworrl.beaconfix.ui.screens.AnchorsScreen(onBack = { nav.popBackStack() }, onMap = { nav.navigate("map") }) }
         composable("widgets") { WidgetGalleryScreen(onBack = { nav.popBackStack() }) }
         composable("import") { ImportScreen(onBack = { nav.popBackStack() }, incoming = incomingFile) }

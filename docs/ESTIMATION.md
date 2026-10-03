@@ -32,7 +32,8 @@ the formulas and the letters. This page is the overview.
 
 For one beacon with samples `{lat, lon, acc, dBm, time, device}`:
 
-1. **Places.** Samples within `max(15 m, median fix accuracy)` of each other are one place;
+1. **Places.** A sample joins a place whose seed is within `max(5 m, 1.5 × the better fix
+   accuracy of the two)`, so a smoothed walk keeps its shape and poor indoor fixes still merge;
    its level is their median, its variance the shadowing (shared within the place) plus the
    observer's own fix error mapped through the model's slope (errors-in-variables).
    Fixes worse than 100 m are used only when nothing better exists.
@@ -43,9 +44,13 @@ For one beacon with samples `{lat, lon, acc, dBm, time, device}`:
 3. **Robust polish.** Levenberg–Marquardt from the grid maxima, the classic centroids and
    the mirror across the places' principal axis, with a Gaussian + uniform outlier mixture
    (EM weights) at a pooled robust scale.
-4. **Uncertainty.** Laplace covariance, widened by the design effect of correlated
-   shadowing and the correlated fix error, floored by the Cramér–Rao bound, the
-   leave-one-place-out jackknife and a cluster bootstrap, scaled by the anchor calibration.
+4. **Uncertainty.** The noise scale is estimated, not assumed: a scaled-inverse-χ² posterior
+   (prior σ0 = 6 dB) updated by the residuals of the *effectively independent places*, so many
+   well-fitting places shrink the error bars and a handful do not. Then a sandwich Laplace
+   covariance with the places' correlated shadowing (8 m), widened to the R95 the local
+   posterior shows (ranging is log-normal: the far side is flat), plus the correlated fix error,
+   floored by the leave-one-place-out jackknife and a cluster bootstrap, scaled by the anchor
+   calibration. Estimator 3; docs/GRADING.md §1.5 has the numbers behind each constant.
 5. **Kind.** A **fix** (grades A–F) needs ≥ 3 places and R95 ≤ 150 m (and a geometry that
    allows it); otherwise a **region** (R): a disc of radius R95 around the posterior mean;
    an AP that travels is **mobile** (M). A moved AP keeps only its recent epoch.
@@ -94,6 +99,48 @@ weights, then an integrity check: a χ² test on the normalised range residuals 
 worst beacon and solves again (up to twice); the result says `ok`, `repaired`, `failed` or
 `unverified` (fewer than four beacons). Regions and mobile APs are never used.
 
+### The order a scan is resolved in (4.0)
+
+Measured against a surveyed point in rural West Virginia (2026-10-01): the phone's fused GPS
+5-15 m, the internal beacon map 85 m median, Apple and BeaconDB 160-525 m while claiming
+±50-100 m. So the chain is, first answer wins:
+
+1. **Site lock** — the newest `this-computer` anchor *is* the fix while this host's scan matches
+   the neighbourhood learnt there: other people's APs (ours travel with the RV) heard in at least
+   half the on-site scans, ≥ 3 of them heard now, ≥ half of them, level RMS ≤ 12 dB; hysteresis
+   (two scans under 30 % to leave). A young fingerprint (< 5 scans) trusts the anchor if it was
+   placed in the last 2 h or a fresh precise fix of a linked device is within 30 m. On site no
+   geolocation service is asked, and RV anchors are never re-projected from a Wi-Fi fix.
+2. RV GNSS (the Pi agent).
+3. **Fingerprint** (`src/fingerprint.h`) — nearest past scans in signal space: every
+   (device, time) scan with a fix ≤ 25 m is an epoch; a scan is scored against epochs sharing
+   ≥ 3 APs by the offset-free level mismatch (σ 8 dB), strong one-sided APs and the number shared,
+   and the 7 best are softmax-averaged. It needs no AP positions, so it is as good as the GPS the
+   epochs were tagged with: 11.8 m median, 16.5 m p90 on the test data.
+4. Internal beacon map, 5. BeaconDB, 6. Apple, 7. IP.
+
+**Provider calibration.** Each Wi-Fi provider's claimed accuracy is multiplied by the 68th
+percentile of |error| / claimed, measured against the site anchor or a linked device's GPS fix
+≤ 15 m and ≤ 2 min old (kv `provider_cal`, last 60 per provider, seeded from history on first run).
+
+### Vantage points: the track smoother (4.0)
+
+Why not FFTs, measured: a parked Pixel's Allan deviation is ~3.5 m at 1 min and flat at ~2 m
+from 2 min to an hour — the error wanders slowly, so no filter (frequency or otherwise) averages
+it away. Each device's fixes go through `src/tracksmoother.h` (position, velocity and a
+Gauss–Markov bias per axis; mode-dependent motion; χ² gating; Rauch–Tung–Striebel smoothing; see
+its header) and every observation uses the smoothed position and its honest 68 % radius at its
+instant. The site anchor is the phone's base station: while the phone hears our own AP at
+≥ −45 dBm (inside the RV) after the anchor was placed, it was at the anchor (±4 m), which makes
+the bias observable and carries it into the walk that follows. On site, a mobile AP this host
+hears at ≥ −60 dBm is placed on the anchor, the radius its level implies.
+
+### Ranges (4.0)
+
+Phones range any AP answering Wi-Fi RTT (802.11mc; 802.11az from Android 15) during collection;
+an observation may carry `rangeM` / `rangeSd` (metres, 1-σ), stored in `observations.range_m /
+range_sd` and fitted as a range term beside the level. Few consumer APs answer.
+
 ## Sync
 
 Every stored AP position, observation and fix carries a change sequence number
@@ -114,5 +161,7 @@ cmake -S . -B build -DBEACONFIX_TESTS=ON && cmake --build build -j3 && (cd build
 spot or one sample gives a region that covers the truth; loud outliers are rejected; a
 straight road is capped for extrapolation/ambiguity; misses shrink a region; a moved AP
 keeps its recent epoch; a device offset, RTT ranges, hysteresis, external agreement; R95
-covers the truth ≥ 85 % of the time on random geometry). `tests/estimator_golden.cpp`
+covers the truth ≥ 85 % of the time on random geometry; many well-fitting places shrink the
+R95, four do not; a walk around a building with correlated shadowing, a lossy wall and a GPS
+bias keeps its places, finds the AP within 12 m (median) and R95 covers ≥ 85 %). `tests/estimator_golden.cpp`
 checks the golden vectors shared with the Android twin (docs/GRADING.md §7).

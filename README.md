@@ -1,39 +1,52 @@
 # BeaconFix
 
-**Where am I?** A KDE Plasma 6 / Qt 6 desktop locator for computers without GPS: a
-workstation in a motorhome, a laptop on a satellite link, a desktop that moves.
-BeaconFix works out where the machine is, shows the Wi-Fi beacons around it on a live map,
-keeps a trip log, and shares the position with the other devices on your local network
-through a secured API. Everything it learns goes into an encrypted personal map database,
-so places you have been before resolve again with no network at all.
+**Where am I, what is around me, and who is watching the road?** BeaconFix is a KDE Plasma 6 / Qt 6
+locator for computers without GPS — a workstation in a motorhome, a laptop on a satellite link, a
+desktop that moves — with an Android companion app and an optional self-hosted hub. It works out where
+the machine is, maps the Wi-Fi beacons around it to within a few metres, keeps a trip log, warns about
+automatic licence-plate-reader (ALPR) cameras on your route, and keeps an honest record of every
+camera you drove past. Everything it learns goes into an encrypted personal database that never leaves
+your devices unless you point it at your own hub.
 
-- **Position** from the Starlink dish's GPS, your own map database, [BeaconDB](https://beacondb.net),
-  Apple's Wi-Fi positioning service, or the IP address as a last resort, in that order.
-- **Live beacon map** with Wi-Fi names, signal rings, multilaterated and mapped positions,
-  events as motion (new, lost, louder, placed), a cinematic tour mode, and a security grade
-  for every access point with the reasoning spelled out.
-- **Trip log**: stops, dwell times, distance, speed and heading, elevation, sun times,
-  places visited, milestones, GPX export.
-- **LAN API** with pairing codes and bearer tokens so a photo frame, a phone or a second
-  computer can ask "where are we?".
-- **Home networks**: mark the networks that travel with you; they are never used for
-  positioning and give an "at home / 12 km from home" state.
-- **Nearest help**: police, fire, the nearest ER and the nearest pediatric ER with phone numbers,
-  addresses and drive times, plus the local emergency number.
-- **Android app** that records beacons with the phone's GPS, mirrors the desktop offline, ranges
-  to it in metres and adds a Help screen, widgets and Quick Settings tiles.
-- A **tray icon**, a **Qt window**, a **Plasma widget**, a **D-Bus** interface, a **CLI** and an
-  optional **Raspberry Pi agent**.
+<p align="center">
+  <img src="docs/screenshots/map-downtown.png" width="32%" alt="Satellite hybrid map with contours, a route heat layer and ALPR cameras">
+  <img src="docs/screenshots/map-z18.png" width="32%" alt="Street-scale view: route heat, ALPR cameras, contour lines in feet">
+  <img src="docs/screenshots/sightings.png" width="32%" alt="Sightings: camera passes with distance, P(read) confidence and camera facing">
+</p>
+
+## Highlights
+
+- **Position without GPS** — Starlink dish GPS, your own beacon map, BeaconDB, Apple's Wi-Fi
+  positioning or IP, in that order; a site lock and Wi-Fi fingerprinting when you are parked.
+- **A beacon map that tells you how sure it is** — every access point is positioned by a Bayesian
+  estimator (grid posterior, robust least squares, correlated-shadowing covariance, per-device
+  calibration) and graded A–F with an honest 95 % region. Measured against surveyed ground truth.
+- **Satellite-hybrid map to street-furniture scale** — newest free imagery (Esri Clarity, USGS, NASA),
+  roads, contours in feet, zoom to z23, area grouping, decluttered labels; 60 fps in the Plasma widget.
+- **ALPR awareness** — the DeFlock camera map (ALPR-only, with real camera directions), a narrow
+  field-of-view model per vendor, road snapping, and a plate-read probability for every pass. Alerts say
+  what is true: *"you passed an ALPR camera — your plate was likely read"*.
+- **Sightings log** — every camera pass and every public record of your plate being *searched*
+  (released Flock audit logs via HaveIBeenFlocked, checked with a privacy-preserving hashed prefix) is
+  stored with its metrics, images and a link to its source. Backfilled over your whole route history.
+- **On-phone ALPR dash cam** — plate detection and OCR on the phone, per-vehicle tracking, multi-frame
+  fusion, hotlist matching for AMBER / Silver / Blue alerts that works offline.
+- **Camera-avoidance routing** — routes that steer around ALPR camera cones (OpenRouteService or
+  GraphHopper, with your own free API key).
+- **Your devices, linked in seconds** — QR or LAN discovery with Bluetooth-style numeric comparison;
+  nothing to type. Optional hub over WireGuard with an end-to-end encrypted API (X25519 +
+  ChaCha20-Poly1305).
+- **Nearest help** — police, fire, the nearest ER and pediatric ER with phone numbers and drive times.
 
 ## Install
 
-Requirements: KDE Plasma 6 (for the widget; the app and tray work on any Qt 6 desktop),
-Qt 6.4+ (Core, Gui, Widgets, Network, DBus, Sql with the SQLite driver), OpenSSL, CMake 3.16+,
-a C++17 compiler, a Wi-Fi interface managed by NetworkManager. Optional: `grpcurl` for the
-Starlink dish GPS tier, `avahi-utils` to advertise the API on the LAN.
+Requirements: KDE Plasma 6 for the widget (the app and tray run on any Qt 6 desktop), Qt 6.5+ (Core,
+Gui, Widgets, Network, DBus, Sql with SQLite), OpenSSL, CMake 3.16+, a C++17 compiler, a Wi-Fi interface
+managed by NetworkManager. Optional: `grpcurl` (Starlink tier), `avahi-utils` (LAN discovery), `cjxl` /
+`djxl` from libjxl (lossless image storage), `ffmpeg` (opt-in traffic-webcam stills).
 
-**One line** (clones into `~/.local/src/beaconfix`, offers to install the build packages,
-builds, installs to `~/.local`, starts the tray, installs the widget):
+**One line** (clones into `~/.local/src/beaconfix`, offers to install the build packages, builds,
+installs to `~/.local`, starts the tray, installs the widget):
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/sworrl/beaconfix/master/get.sh | bash
@@ -47,7 +60,7 @@ git clone https://github.com/sworrl/beaconfix.git && cd beaconfix
 ./uninstall.sh          # --purge also deletes the database, key, settings and tokens
 ```
 
-**Debian package** (system-wide, includes the widget under `/usr/share/plasma/plasmoids`):
+**Debian package** (system-wide, includes the widget):
 
 ```sh
 cmake -S . -B build-pkg -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_BUILD_TYPE=Release
@@ -55,164 +68,160 @@ cmake --build build-pkg -j"$(nproc)" && (cd build-pkg && cpack -G DEB)
 sudo apt install ./build-pkg/beaconfix_*.deb
 ```
 
-Then add **BeaconFix** through *Add Widgets* on the desktop or a panel. The tray starts at
-login; the first start migrates any older JSON state into the database.
+Then add **BeaconFix** through *Add Widgets*. The tray starts at login.
 
-**Android app**: install `beaconfix-<version>.apk` from the
-[releases](https://github.com/sworrl/beaconfix/releases) page (Android 8+), open it and pair it
-with the desktop from *Link*. Building it yourself: [android/README.md](android/README.md).
+**Android app** (Android 8+): install the APK from the [releases](https://github.com/sworrl/beaconfix/releases)
+page, open *Link a PC* and scan the QR the desktop shows (*Link a device…* in the tray menu). Building
+it yourself: [android/README.md](android/README.md).
 
-### Optional: device ranging and the Pi agent
+**Hub** (optional, self-hosted): a headless BeaconFix (`beaconfix --server`) in a container reachable
+over your VPN only. See [deploy/README.md](deploy/README.md) and [docs/HUB.md](docs/HUB.md).
 
-- **Wi-Fi RTT responder** (the phone measures its distance to this computer to about a metre):
-  needs a Wi-Fi card whose driver supports `ENABLE_FTM_RESPONDER` (e.g. Intel AX210) and
-  `hostapd` (the script installs it). Run once as root:
-  `sudo ~/.local/share/beaconfix/setup-rtt-responder.sh` (`/usr/share/beaconfix/…` with the
-  package); add `--country CC` if BeaconFix has no fix yet. `--status` shows its state,
-  `--remove` takes out everything it installed (hostapd stays). See
+### Optional hardware
+- **Wi-Fi RTT responder** — the phone measures its distance to the PC to about a metre (Intel AX210 or
+  another card whose driver supports `ENABLE_FTM_RESPONDER`): `sudo ~/.local/share/beaconfix/setup-rtt-responder.sh`.
   [docs/RANGING.md](docs/RANGING.md) §6.
-- **BLE ranging** needs BlueZ with LE advertising; some kernel + BlueZ 5.7x combinations reject
-  every advertisement, BlueZ ≥ 5.8x works ([docs/RANGING.md](docs/RANGING.md) §9.1).
-- **Raspberry Pi agent** (a Pi with a GPS HAT as a precise position witness, BLE radio and NTP
-  server): `agent/install-on-pi.sh <user>@<pi>` from the desktop. See [docs/AGENT.md](docs/AGENT.md).
+- **Raspberry Pi agent** — a GPS HAT as a precise position witness, BLE radio and NTP server:
+  `agent/install-on-pi.sh <user>@<pi>`. [docs/AGENT.md](docs/AGENT.md).
 
 ## How it gets a fix
 
-| tier | source | accuracy | needs |
+| tier | source | typical accuracy | needs |
 |---|---|---|---|
-| 1 | **Starlink dish GPS** (`get_location` over gRPC on the dish) | ~10 m | `grpcurl`; *Allow access on local network* enabled in the Starlink app |
-| 2 | **Internal map database** (beacons you have positioned before) | 40–150 m | two or more known beacons in range |
-| 3 | **BeaconDB** (open Wi-Fi geolocation, the successor to Mozilla Location Service) | 30–100 m | coverage |
-| 4 | **Apple Wi-Fi positioning** (`gs-loc.apple.com`, keyless) | 30–150 m | coverage; can be switched off |
+| 0 | **Site lock** — parked where you surveyed an anchor, recognised by the Wi-Fi around it | the anchor | an anchor |
+| 1 | **Starlink dish GPS** (`get_location` over gRPC on the dish) | ~10 m | `grpcurl`; local-network access enabled in the Starlink app |
+| 2 | **Fingerprinting and the internal map** (beacons you have positioned) | 5–50 m | places you have been |
+| 3 | **BeaconDB** (open Wi-Fi geolocation) | 30–150 m | coverage |
+| 4 | **Apple Wi-Fi positioning** (keyless; can be switched off) | 30–500 m | coverage |
 | 5 | **IP geolocation** | city | nothing |
 
-Every fix records its `source` (`starlink`, `wifi`, `ip`) and `provider` (`internal`,
-`beacondb`, `apple`). Access points that travel with you are excluded: the connected network,
-anything heard at two places further apart than the fixes' own error, hotspot-like names, your
-**home networks**, and a glob ignore list. `_nomap` SSIDs are honoured.
+Provider accuracies are calibrated against your own better fixes, so a claimed "±50 m" that is really
+±400 m is treated as such. Access points that travel with you (hotspots, your home network, anything
+heard far apart) never position anything. [docs/ESTIMATION.md](docs/ESTIMATION.md).
 
 ## Features
 
-**Map** (app and widget): four keyless styles (dark, streets, satellite, topographic) through
-one 500 MB tile cache; the trip track; beacons drawn at their mapped position (gold diamond),
-multilaterated position (gold dot with a dashed ring), observed position (hollow diamond) or as
-a signal-distance orbit (cyan); Wi-Fi names beside the beacons with collision avoidance and band
-badges. Events animate: ripples for new beacons, fade-outs for lost ones, chevrons for level
-changes, a glide when a beacon gets placed, an arrow for a new fix, a pin for a new stop; a
-ticker keeps the last five. **Cinematic mode** glides to significant events and zooms out to
-city and state scale every 20 minutes by default, never while you are using the map.
+**Map** (app, widget, phone): satellite hybrid by default (Esri World Imagery and Clarity, USGS
+imagery, NASA VIIRS), streets, dark and topographic styles, road and label overlays, contour lines in
+feet drawn from elevation tiles, zoom to street-furniture scale (z23) with a metric/imperial scale bar,
+grouping of nearby beacons into areas, a heat layer of everywhere you have been, and ALPR cameras with
+their field of view. The Plasma widget renders at 60 fps. [docs/WIDGET.md](docs/WIDGET.md).
 
-**Places** from OpenStreetMap, each with its address, phone number (tap to call), hours and
-wheelchair access where OpenStreetMap has them, grouped and filterable in a **Nearby** list:
+**Beacon positions you can trust**: samples become places (per device), a grid posterior integrates out
+the unknown transmit power and path-loss exponent, a robust Levenberg–Marquardt fit refines it, and the
+covariance accounts for correlated shadowing, GPS error, per-device antenna differences, and mirror
+ambiguity on one-sided data. Each estimate gets a 95 % region, a score and a letter A–F (R for a region
+only, M for something that moves). Monte Carlo and surveyed ground truth are in
+[docs/GRADING.md](docs/GRADING.md); the desktop and the phone run line-for-line identical engines,
+checked against shared golden vectors.
 
-- **On the road**: fuel, propane, camping, water, dump stations, laundry, groceries, Wi-Fi,
-  rest areas.
-- **Emergency and civic**: police, fire stations, hospitals with an ER, **pediatric ERs**
-  (searched out to 150 km, each with its confidence: dedicated pediatric ER; children's hospital
-  with an ER on campus, or not confirmed, "call ahead"; general ER with a pediatrics
-  department), **pediatric urgent care** (marked "not an ER"), urgent care, pharmacies,
-  dentists, vets, libraries, town halls, courthouses, DMV, schools, community centres.
-- **Kids and fun**: playgrounds, parks, dog parks, pools, splash pads, zoos, museums, theme
-  parks, ice cream, cinemas, bowling, arcades, trampoline and skate parks, beaches, picnic
-  sites, trailheads.
+**ALPR cameras and plate events** ([docs/SIGHTINGS.md](docs/SIGHTINGS.md), [docs/DETECTION.md](docs/DETECTION.md)):
+- The camera map is DeFlock's daily ALPR-only dataset (OpenStreetMap, ODbL) plus community reports;
+  each camera is classified (ALPR, traffic webcam, PTZ, CCTV, enforcement) — only an ALPR reads plates.
+- A **pass** is found on the polyline of your track (desktop, phone, synced trips), snapped to the road
+  the camera watches (parallel roads, overpasses and the opposite carriageway are recognised), and
+  scored as P(read) from the vendor's field of view, the fix error and the camera's trust.
+- **Plate searches**: released Flock audit logs (via HaveIBeenFlocked) are checked for your registered
+  plates on an adaptive schedule — slow when idle, faster while driving and after passing a camera
+  whose agency publishes its logs. Only an 8-character hash prefix leaves your device.
+- Agency context from Eyes on Flock transparency data (retention, search counts, data sharing).
+- Every event keeps its metrics, the raw source record, a **View source** link, and images stored in
+  the smallest lossless format (JPEG XL recompression, or lossless JPEG XL / WebP): public photos of the
+  camera, your own dash-cam frame from the moment you passed, and (opt-in) a traffic-webcam still.
+- Wi-Fi/BLE signatures of Flock hardware and other police equipment, one shared, tiered signature file
+  for desktop and phone, tuned against public false-positive reports.
 
-The **nearest help** card lists police, fire, the nearest ER, the nearest pediatric ER (and a
-closer one when that one is less certain), urgent care, estimated drive times and the local
-emergency number. The general ER is never hidden behind a pediatric one.
+**Android app** ([android/README.md](android/README.md)): records beacons with the phone's GPS and
+smoothed track, mirrors the desktop offline, detects camera passes live, runs the ALPR dash cam
+(on-device detection and OCR, short-shutter capture, per-vehicle tracking and fusion, US plate-format
+rules), shows Sightings with their images, measures Wi-Fi RTT ranges, and has a Help screen, widgets,
+Quick Settings tiles and Android Auto support.
 
-**Security**: every beacon carries NetworkManager's RSN/WPA flags and is graded (open, WEP,
-WPA1, WPA2 with TKIP, WPA2-PSK, WPA2-Enterprise, WPA2/3 transition, WPA3-SAE, WPA3-192, OWE).
-Insecure ones get an event, a red column in the app and a warning ring on the widget map, and
-the widget's audit panel explains each weakness. See [docs/SECURITY.md](docs/SECURITY.md).
+**Hub** ([docs/HUB.md](docs/HUB.md), [docs/SECURE-API.md](docs/SECURE-API.md), [docs/LINKING.md](docs/LINKING.md)):
+the master database and a job queue on a small server; the desktop, a headless node and the phone do
+the processing and sync through it. Every request is sealed with BFS3 (X25519, HKDF-SHA512 ratchet,
+ChaCha20-Poly1305, replay window). Devices join by scanning a QR — no codes to type.
 
-**Trip**: distance today / this trip / all time, moving vs stopped, speed and heading, dwell,
-longest leg and stay, cities / regions / countries visited, elevation (SRTM) and sun times per
-stop, a ten-tier rank ladder with milestones, notifications, sharing (coordinates, `geo:` URI,
-map links, GPX), offline tile prefetch around each stop.
+**Places and nearest help**: fuel, propane, camping, water, dump stations, laundry, groceries; police,
+fire, hospitals with an ER, **pediatric ERs** with their confidence, urgent care, pharmacies; parks,
+playgrounds and more — with addresses, phone numbers, hours and drive times.
 
-**Home networks and known devices**: patterns (SSID or BSSID globs) for the networks that move
-with you, and a list of your own client devices for the API allowlist. Both can be seeded from
-JSON exports; see [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
+**Wi-Fi security**: every beacon is graded (open, WEP, WPA1 … WPA3-SAE, OWE) with the reasoning spelled
+out. [docs/SECURITY.md](docs/SECURITY.md).
 
-**LAN API**: `http://<beaconfix-host>:47822/api/v1/` for the fix, state, events, beacons,
-places, trip, home state, a `locate` service for other devices, an SSE stream and database
-export. LAN-only, token-only, rate limited, optional TLS. [docs/API.md](docs/API.md).
+**Trip**: distance, speed, heading, stops and dwell times, elevation and sun times per stop, places
+visited, milestones, GPX export.
 
-**Internal map database**: SQLite, encrypted at rest with AES-256-GCM, key in KWallet or a key
-file. [docs/DATABASE.md](docs/DATABASE.md). Every beacon's position is refined as samples
-accumulate (a grid posterior and robust least squares on a path-loss model — [docs/ESTIMATION.md](docs/ESTIMATION.md)),
-and graded: a 95 % region, the chance of being within 25 m, a 0–100 score and a letter A–F (R for
-an area only, M for one that travels), drawn as grade-coloured ellipses on every map
-([docs/GRADING.md](docs/GRADING.md)). Two BeaconFix installs, or the Android app, keep each other in step through the sync API.
+**Identity**: one Ed25519 identity across your devices, moved as an encrypted bundle or linked.
+[docs/IDENTITY.md](docs/IDENTITY.md).
 
-**Identity**: one Ed25519 identity across the desktop, the laptop and the phone; moved between
-devices as an encrypted bundle (QR, text, file, or a 6-digit code on the LAN); independently
-created identities can be linked; devices sign in to the API with a challenge signature instead
-of pairing codes. [docs/IDENTITY.md](docs/IDENTITY.md).
-
-**Device ranging**: the phone and the Pi agent measure their distance to the desktop with Wi-Fi
-RTT (802.11mc, about a metre) and BLE, fused with the maths in [docs/RANGING.md](docs/RANGING.md);
-antenna positions can be placed on the map as anchors.
-
-**OS integration** (each part opt-in): the system **time zone follows the fix** (timedated over
-D-Bus; a shipped polkit rule makes it prompt-free for admins), the fix is **published to GeoClue**
-through a small root helper so location-aware apps, browsers and Night Light see it, **KWin Night
-Light** points at where you are, and **locale hints** (country, units, emergency number, dialling
-code) are exposed for other widgets.
+**OS integration** (opt-in): the system time zone follows the fix, the fix is published to GeoClue,
+KWin Night Light follows your position, and locale hints are exposed to other widgets.
 
 ## Pieces
 
 | piece | what |
 |---|---|
-| `beaconfix` | the Qt window: fix card, map, Nearby, access-point table, trip log, Devices, Settings |
-| `beaconfix --tray` | the background locator and tray icon; owns the state, the database, the API and the tile server; D-Bus activated |
-| Plasma widget `org.kde.plasma.beaconfix` | panel or desktop applet with Map, Nearby, Radar and Trip tabs — [docs/WIDGET.md](docs/WIDGET.md) |
-| D-Bus `org.sworrl.BeaconFix` | properties, methods and signals for scripts and other apps — [docs/DBUS.md](docs/DBUS.md) |
-| CLI | `--once`, `--json`, `--refresh`, `--gpx`, `--copy`, `--nearby <what>`, `--tz`, `--apply-os`, `--identity…`, `--refit`, `--sync <peer>`, `--peers`, `--import <file>`, API / home / known-device / database management — `beaconfix --help` |
-| Android app `org.sworrl.beaconfix` | beacon recording, offline mirror, Help, ranging, widgets, tiles — [android/README.md](android/README.md) |
-| Pi agent `agent/beaconfix-agent` | a Raspberry Pi with a GPS HAT as position witness, BLE radio and NTP server — [docs/AGENT.md](docs/AGENT.md) |
-| `beaconfix-osd` | tiny root helper (pkexec) that writes `/etc/geolocation` for GeoClue; installed with its polkit action and rules by `install.sh` / the package |
+| `beaconfix` | the Qt window: fix, map, Nearby, beacons, Sightings, trip, devices, settings |
+| `beaconfix --tray` | the background locator: state, database, LAN API, tile server, plate events; D-Bus activated |
+| `beaconfix --server` / `--node` | the hub, and a headless processing node |
+| Plasma widget `org.kde.plasma.beaconfix` | Map, Nearby, Radar and Trip tabs — [docs/WIDGET.md](docs/WIDGET.md) |
+| D-Bus `org.sworrl.BeaconFix` | properties, methods and signals — [docs/DBUS.md](docs/DBUS.md) |
+| CLI | `beaconfix --help` |
+| Android app `org.sworrl.beaconfix` | [android/README.md](android/README.md) |
+| Pi agent | [docs/AGENT.md](docs/AGENT.md) |
+| `tools/train-plate-detector/` | a clean (MIT code + CC BY data) retraining pipeline for the plate detector |
 
 ## Privacy
 
-What leaves the machine, and to whom:
+Nothing is sent to the author or to any BeaconFix service — there is none. What can leave your devices,
+and to whom:
 
 | when | to | what |
 |---|---|---|
-| a Wi-Fi fix is needed and the internal database cannot answer | BeaconDB (`api.beacondb.net`) | BSSIDs, signal levels and channels of the access points heard (your home networks and the connected network excluded) |
-| BeaconDB has no match (tier 4, can be disabled in Settings) | Apple (`gs-loc.apple.com`) | the same BSSIDs, up to 30 |
-| everything else failed (can be disabled) | ip-api.com | your public IP address, implicitly |
-| a fix is accepted | Nominatim (OpenStreetMap) | the coordinates, for a place name |
-| places are refreshed | Overpass (OpenStreetMap) | the coordinates and a radius |
-| a precise stop is logged (can be disabled) | Open Topo Data | the coordinates, for elevation |
-| the map is shown | the tile servers of the selected style (OpenStreetMap, Esri, OpenTopoMap) | tile coordinates |
-| you open Help on the phone with no desktop in reach | Overpass (OpenStreetMap) | the phone's coordinates and a radius |
-| optional, only with a token | WiGLE | BSSIDs, one at a time |
-| Starlink tier | the dish on your own LAN | nothing leaves the LAN |
+| a Wi-Fi fix is needed and your own map cannot answer | BeaconDB | BSSIDs and signal levels heard (home networks and the connected network excluded) |
+| BeaconDB has no match (can be disabled) | Apple (`gs-loc.apple.com`) | the same BSSIDs, up to 30 |
+| everything else failed (can be disabled) | ip-api.com | your public IP, implicitly |
+| a fix is accepted | Nominatim (OpenStreetMap); timeapi.io if time-zone sync is on | the coordinates |
+| places / roads near cameras are refreshed | Overpass (OpenStreetMap) | coordinates and a radius |
+| a stop is logged (can be disabled) | Open Topo Data | the coordinates |
+| the map is shown | the selected tile servers (OpenStreetMap, Esri, USGS, NASA GIBS, OpenTopoMap, CARTO, AWS terrain tiles) | tile coordinates |
+| the camera map is refreshed | DeFlock (`data.dontgetflocked.com`), flocklocations.com | nothing (bulk downloads) |
+| a camera you passed is looked up | OpenStreetMap API, Wikimedia Commons, Panoramax | the camera's OSM id / position |
+| your plates are checked (adaptive schedule) | HaveIBeenFlocked | 8-hex-character SHA-256 prefixes of your plate variants — never the plate |
+| agency context, weekly | Eyes on Flock | nothing (a bulk download) |
+| the phone snaps a track to roads | OSRM demo server | the track's coordinates |
+| opt-in: camera-avoiding route | OpenRouteService or GraphHopper (your key) | start, destination and the avoided areas |
+| opt-in: traffic-webcam still | the state 511 operator | the camera id |
+| opt-in, with a token | WiGLE; Telegram (your own bot) | BSSIDs one at a time; the alerts you chose |
 
-Nothing is uploaded to the author or to any BeaconFix service; there is none. The LAN API is
-on by default but answers only private addresses, only with a token, and only from devices you
-have paired. Turn it off with `apiEnabled=false`.
+The LAN API answers only private addresses, only with a token, only from linked devices. The hub, if you
+run one, is yours, behind your VPN, with an end-to-end encrypted API.
 
 ## Documentation
 
-- [docs/API.md](docs/API.md) — the LAN API, pairing, tokens, examples
-- [docs/WIDGET.md](docs/WIDGET.md) — the Plasma widget
-- [docs/CONFIGURATION.md](docs/CONFIGURATION.md) — every setting and file
-- [docs/SECURITY.md](docs/SECURITY.md) — threat model, encryption, Wi-Fi grading
-- [docs/DATABASE.md](docs/DATABASE.md) — the internal map database
-- [docs/DBUS.md](docs/DBUS.md) — the D-Bus interface
-- [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) — building, layout, adding a tier, testing
-- [docs/RANGING.md](docs/RANGING.md) — device ranging: Wi-Fi RTT, BLE, anchors, the maths
-- [docs/AGENT.md](docs/AGENT.md) — the Raspberry Pi agent (GNSS witness, BLE, NTP)
-- [CHANGELOG.md](CHANGELOG.md)
+| | |
+|---|---|
+| [docs/ESTIMATION.md](docs/ESTIMATION.md), [docs/GRADING.md](docs/GRADING.md) | positioning and beacon estimation, grades, measured accuracy |
+| [docs/SIGHTINGS.md](docs/SIGHTINGS.md), [docs/DETECTION.md](docs/DETECTION.md) | camera passes, plate searches, images, signatures |
+| [docs/API.md](docs/API.md), [docs/DBUS.md](docs/DBUS.md) | the LAN API and the D-Bus interface |
+| [docs/HUB.md](docs/HUB.md), [docs/SECURE-API.md](docs/SECURE-API.md), [docs/LINKING.md](docs/LINKING.md) | the hub, BFS3, linking devices |
+| [docs/DATABASE.md](docs/DATABASE.md), [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | the database, every setting and file |
+| [docs/RANGING.md](docs/RANGING.md), [docs/AGENT.md](docs/AGENT.md) | Wi-Fi RTT / BLE ranging, the Pi agent |
+| [docs/SECURITY.md](docs/SECURITY.md), [docs/IDENTITY.md](docs/IDENTITY.md) | threat model, Wi-Fi grading, identity |
+| [docs/WIDGET.md](docs/WIDGET.md), [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) | the Plasma widget, building and testing |
+| [docs/LICENSING.md](docs/LICENSING.md) | the license policy and every third-party component |
+| [CHANGELOG.md](CHANGELOG.md) | release notes |
 
 ## License
 
-GPL-2.0-or-later. See [LICENSE](LICENSE). Data credits: BeaconDB, OpenStreetMap contributors
-(Nominatim, Overpass, tiles), Esri World Imagery, OpenTopoMap, Open Topo Data (SRTM), WiGLE,
-and the EFF short wordlist (CC BY 3.0 US, https://www.eff.org/dice) for the identity codes.
+Apache-2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE). Third-party code, models and data keep their
+own licenses ([docs/LICENSING.md](docs/LICENSING.md)); copyleft components live in separate modules or
+optional downloads. Map and camera data © OpenStreetMap contributors (ODbL) via DeFlock; imagery and
+data from Esri, USGS, NASA, OpenTopoMap, BeaconDB, Open Topo Data, Wikimedia Commons and Panoramax
+contributors, Eyes on Flock (CC BY-SA 4.0), and the EFF short wordlist (CC BY 3.0 US).
 
 ## Contributing
 
-Issues and pull requests are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md).
+Issues and pull requests are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md). Contact:
+github@falcontechnix.com.

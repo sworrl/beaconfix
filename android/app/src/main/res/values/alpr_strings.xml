@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="alpr_tile_label">ALPR dash cam</string>
+    <string name="alpr_channel_dashcam">ALPR dash cam</string>
+    <string name="alpr_channel_hotlist">Hotlist matches</string>
+    <string name="alpr_channel_hotlist_desc">A plate read by the dash cam is on a public AMBER / Silver / Blue alert list</string>
+    <string name="alpr_channel_possible">ALPR possible matches and notices</string>
+</resources>

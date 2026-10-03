@@ -15,6 +15,9 @@ import org.sworrl.beaconfix.data.db.MIGRATION_1_2
 import org.sworrl.beaconfix.data.db.MIGRATION_2_3
 import org.sworrl.beaconfix.data.db.MIGRATION_3_4
 import org.sworrl.beaconfix.data.db.MIGRATION_4_5
+import org.sworrl.beaconfix.data.db.MIGRATION_5_6
+import org.sworrl.beaconfix.data.db.MIGRATION_6_7
+import org.sworrl.beaconfix.data.db.MIGRATION_7_8
 import org.sworrl.beaconfix.data.db.MigrationSql
 import java.io.File
 import java.lang.reflect.Proxy
@@ -90,9 +93,63 @@ class MigrationSqlTest {
         assertEquals(a.keys + "estimate_history", b.keys)
     }
 
+    @Test fun fiveToSixOnlyAddsNullableObservationColumns() {
+        val sql = sqlOf(MIGRATION_5_6)
+        assertEquals(MigrationSql.ALTER_OBSERVATIONS_V6, sql)
+        assertTrue(sql.none { it.contains("DROP", ignoreCase = true) || it.contains("DELETE", ignoreCase = true) || it.contains("RENAME", ignoreCase = true) })
+        // v5's `observations` is v6's minus exactly those columns (appended last, nullable), indices unchanged
+        val v6 = schema(6)["observations"]!!; val v5 = schema(5)["observations"]!!
+        var fromV6 = v6.first()
+        for ((name, type) in MigrationSql.OBSERVATIONS_V6_COLUMNS) {
+            val col = ", `$name` $type"
+            assertTrue("$name in the v6 observations table", fromV6.contains(col))
+            fromV6 = fromV6.replace(col, "")
+        }
+        assertEquals(v5.first(), fromV6)
+        assertEquals(v5.drop(1), v6.drop(1))
+    }
+
+    @Test fun protectedTablesAreUnchangedFromFiveToSix() {
+        val a = schema(5); val b = schema(6)
+        for (t in a.keys - "observations") assertEquals(t, a[t], b[t])
+        assertEquals(a.keys, b.keys)
+    }
+
+    @Test fun sixToSevenCreatesThePlateEventTablesAsExported() {
+        val s = schema(7)
+        val sql = sqlOf(MIGRATION_6_7)
+        assertEquals(s["plate_events"]!! + s["plate_event_media"]!!, sql)
+        assertTrue(sql.none { it.contains("DROP", ignoreCase = true) || it.contains("DELETE", ignoreCase = true) || it.contains("ALTER", ignoreCase = true) })
+    }
+
+    @Test fun protectedTablesAreUnchangedFromSixToSeven() {
+        val a = schema(6); val b = schema(7)
+        for (t in a.keys) assertEquals(t, a[t], b[t])
+        assertEquals(a.keys + "plate_events" + "plate_event_media", b.keys)
+    }
+
+    @Test fun sevenToEightOnlyAddsTheHubFlagAndFillsItFromDirty() {
+        val sql = sqlOf(MIGRATION_7_8)
+        assertEquals(listOf(MigrationSql.ALTER_PLATE_EVENTS_V8, MigrationSql.FILL_PLATE_EVENTS_V8), sql)
+        assertTrue(sql.none { it.contains("DROP", ignoreCase = true) || it.contains("DELETE", ignoreCase = true) || it.contains("RENAME", ignoreCase = true) })
+        // v7's `plate_events` is v8's minus exactly that column (appended last, NOT NULL DEFAULT 0), indices unchanged
+        val v8 = schema(8)["plate_events"]!!; val v7 = schema(7)["plate_events"]!!
+        val col = ", `hub_dirty` INTEGER NOT NULL DEFAULT 0"
+        assertTrue(v8.first(), v8.first().endsWith("$col)"))
+        assertTrue(MigrationSql.ALTER_PLATE_EVENTS_V8.endsWith(col.removePrefix(", ")))
+        assertEquals(v7.first(), v8.first().replace(col, ""))
+        assertEquals(v7.drop(1), v8.drop(1))
+    }
+
+    @Test fun protectedTablesAreUnchangedFromSevenToEight() {
+        val a = schema(7); val b = schema(8)
+        for (t in a.keys - "plate_events") assertEquals(t, a[t], b[t])
+        assertEquals(a.keys, b.keys)
+    }
+
     @Test fun migrationsChainToTheNewestSchema() {
         val versions = dir.listFiles()!!.mapNotNull { it.name.removeSuffix(".json").toIntOrNull() }.sorted()
-        assertTrue(versions.toString(), versions.containsAll(listOf(3, 4, 5)))
+        assertTrue(versions.toString(), versions.containsAll(listOf(3, 4, 5, 6, 7, 8)))
         assertEquals((1 until versions.last()).toList(), ALL_MIGRATIONS.map { it.startVersion })
         ALL_MIGRATIONS.forEach { assertEquals(it.startVersion + 1, it.endVersion) }
     }

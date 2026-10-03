@@ -8,13 +8,15 @@ import android.graphics.drawable.BitmapDrawable
 import org.osmdroid.util.GeoPoint
 import org.osmdroid.views.MapView
 import org.osmdroid.views.overlay.Marker
+import org.osmdroid.views.overlay.Overlay
 import org.osmdroid.views.overlay.Polygon
 import org.sworrl.beaconfix.data.db.PoiEntity
 import android.graphics.Color as AColor
 
 /**
  * Cached places (every desktop and this phone, from `DesktopCache.pois()`, so they draw offline too), the RV's last
- * known position, and a pin for a shared place, drawn onto MapScreen's osmdroid map on each redraw.
+ * known position, and a pin for a shared place, drawn into MapScreen's places layer whenever the places, the labels
+ * setting or the zoom band change.
  *
  * Draw order: everything else first, then police and fire, then ERs, then pediatric ERs last (on top), 1.3× larger
  * with a pink ring. Tapping a place calls `onTap` (MapScreen opens the place sheet).
@@ -33,13 +35,14 @@ class PlacesOverlay {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Icon>?) = size > 240
     }
 
-    fun draw(map: MapView, rows: List<PoiEntity>, labels: Boolean, rv: RvPin?, pin: Pin?, onTap: (PoiEntity) -> Unit, onPin: (Pin) -> Unit) {
+    /** Adds the places, the RV and the shared pin to [into] (MapScreen passes its places layer; the map's own list by default). */
+    fun draw(map: MapView, rows: List<PoiEntity>, labels: Boolean, rv: RvPin?, pin: Pin?, onTap: (PoiEntity) -> Unit, onPin: (Pin) -> Unit, into: MutableList<Overlay> = map.overlays) {
         val zoom = map.zoomLevelDouble
         for (p in drawOrder(rows)) {
             val peds = p.cat == PEDS_ER
             val name = p.name.ifEmpty { p.label }
             val showLabel = labels && (zoom >= 15 || (peds && zoom >= 11))
-            map.overlays.add(Marker(map).apply {
+            into.add(Marker(map).apply {
                 position = GeoPoint(p.lat, p.lon)
                 val ic = icon(map, p.icon.ifEmpty { "📍" }, if (showLabel) name else "", colorOf(p), ring = peds)
                 icon = ic.drawable; setAnchor(ic.anchorU, 0.5f)
@@ -49,11 +52,11 @@ class PlacesOverlay {
         }
         rv?.let { r ->
             val gp = GeoPoint(r.lat, r.lon)
-            if (r.acc > 0) map.overlays.add(Polygon(map).apply {
+            if (r.acc > 0) into.add(Polygon(map).apply {
                 points = Polygon.pointsAsCircle(gp, r.acc.coerceIn(5.0, 2000.0))
                 fillPaint.color = AColor.parseColor("#1AFFD166"); outlinePaint.color = AColor.parseColor("#FFD166"); outlinePaint.strokeWidth = 1.2f
             })
-            map.overlays.add(Marker(map).apply {
+            into.add(Marker(map).apply {
                 position = gp
                 val ic = icon(map, "🚐", r.label, AColor.parseColor("#FFD166"), ring = false, big = true)
                 icon = ic.drawable; setAnchor(ic.anchorU, 0.5f)
@@ -62,7 +65,7 @@ class PlacesOverlay {
             })
         }
         pin?.let { s ->
-            map.overlays.add(Marker(map).apply {
+            into.add(Marker(map).apply {
                 position = GeoPoint(s.lat, s.lon)
                 val ic = icon(map, "📍", s.label, AColor.parseColor("#35D6FF"), ring = false, big = true)
                 icon = ic.drawable; setAnchor(ic.anchorU, 0.5f)

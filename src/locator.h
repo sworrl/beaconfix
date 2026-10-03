@@ -1,12 +1,17 @@
 #pragma once
 #include "wifiscanner.h"
 #include "estimator.h"
+#include "flockdetector.h"
+#include "fingerprint.h"
 #include "ranging/anchors.h"
 #include "ranging/rangemath.h"
 #include <QColor>
+#include <functional>
 #include <algorithm>
 #include <QDateTime>
+#include <QElapsedTimer>
 #include <QHash>
+#include <QJsonArray>
 #include <QJsonObject>
 #include <QNetworkAccessManager>
 #include <QObject>
@@ -36,6 +41,7 @@ struct Fix {
 
 struct ApObservation {
     double lat = 0, lon = 0; double acc = 0; int dbm = -100; QDateTime time;
+    double rangeM = -1, rangeSd = 0;  // Wi-Fi RTT (FTM, 802.11mc/az) distance to the AP when it answered (-1 none), 1-σ (m)
     QString device;                   // who heard it: "" = this host, else the LAN-API device id / peer name
     qint64  id = 0;                   // database row (0 = not stored yet)
     bool    dirty = false;            // changed in memory since it was stored
@@ -197,9 +203,11 @@ struct Stats {
 // keeps state + history on disk, and is exported on the session bus as
 // org.sworrl.BeaconFix so the tray, the plasmoid and other apps share one fix.
 class ApiServer;
+class HubClient;
 class MapDb;
 class Identity;
 class Notifier;
+class PlateWatch;
 class OsIntegration;
 
 class Locator : public QObject {
@@ -225,6 +233,15 @@ class Locator : public QObject {
     Q_PROPERTY(double  awayKm    READ awayKm)
 public:
     explicit Locator(bool standalone, QObject *parent = nullptr);
+    // The hub (beaconfix --server): set before construction. No positioning of its own (no scans, no probes, no
+    // geolocation / Overpass lookups, no notifications or OS integration); merges, refits, positions, anchors as usual.
+    static void setHubRole(bool on);
+    static bool hubRole();
+    // A headless node (beaconfix --node, e.g. the RV VM): positions itself as usual but has no session bus — no
+    // notifications, no OS integration. Set before construction.
+    static void setHeadless(bool on);
+    static bool headless();
+    static QString deviceName();                         // what this host calls itself in synced rows (the hostname)
 
     bool    valid()     const { return m_fix.valid; }
     double  latitude()  const { return m_fix.lat; }
@@ -309,6 +326,47 @@ public:
     QJsonValue  pedsOriginJson() const;                           // the same for the pediatric search, or null
     static double distanceM(double lat1, double lon1, double lat2, double lon2);
 
+    // Flock / ALPR surveillance cameras
+    QList<FlockCamera> flockCameras() const;              // every one (~140k after a sync): not for hot paths
+    QList<FlockCamera> flockCamerasIn(double latMin, double latMax, double lonMin, double lonMax, int limit = 0) const;
+    QList<FlockCamera> flockCamerasNear(double lat, double lon, double radiusKm, int limit) const;   // nearest first
+    void    refreshFlockCameras(bool force = false);
+    bool    flockLoading() const { return m_flockBusy; }
+    QJsonObject flockStats() const;
+    QByteArray exportFlockGeoJson() const;
+
+    // Nationwide US Camera Sync
+    void    syncNationwideUsCameras(bool force = false);
+    bool    usSyncActive() const { return m_usSyncActive; }
+    int     usSyncSector() const { return m_usSyncSector; }
+    int     usSyncSteps() const { return m_usSyncSteps; }       // 3 (DeFlock, reconcile, community) or the Overpass sectors
+    int     usSyncTotalAdded() const { return m_usSyncTotalAdded; }
+    QString usSyncStatus() const { return m_usSyncStatus; }
+
+    // License Plates & ALPR Encounters
+    QList<LicensePlate> licensePlates() const;
+    bool saveLicensePlate(const LicensePlate &p);
+    bool deleteLicensePlate(const QString &plate);
+    QList<CameraEncounter> cameraEncounters(const QString &cameraId = QString(), int limit = 200) const;
+    bool logCameraEncounter(CameraEncounter &enc);
+    QList<PlateAudit> plateAudits(const QString &plate = QString(), int limit = 200) const;
+    QJsonObject alprSummary() const;
+    int  recalculatePasses();
+    int  crossReferenceOpenDatabases(const QString &plateFilter = QString());
+    void checkCameraProximity(const Fix &f);
+    // Plate events (docs/SIGHTINGS.md): passes, plate searches, their images
+    PlateWatch *plateWatch() const { return m_plates; }
+    void openPlateEvent(const QString &uid);            // "" = the Sightings list
+
+    // Full route history for heatmap (local fixes + peer fixes + imports)
+    QList<Fix> allRouteFixes() const;
+    QJsonObject siteJson() const;                       // the site lock: on, anchor, how well the neighbourhood matches
+    quint64    routeGeneration() const;                 // bumps whenever allRouteFixes() may have changed
+    // The route as the widget's heat map draws it: polylines in Web-Mercator [0,1]² (accuracy > 500 m, single-fix
+    // spikes and teleports dropped, broken at gaps > 15 min / 4 km, stationary clusters within 20 m collapsed)
+    QList<QList<QPointF>> routeLinesMerc() const;
+    QList<QPointF> routePointsMerc(double maxAccM = 100) const;   // every route fix as a point (Web-Mercator), accuracy ≤ maxAccM
+
     // Settings
     int         moveThresholdM() const { return m_moveThresholdM; }
     bool        useStarlink()    const { return m_useStarlink; }
@@ -390,7 +448,7 @@ public:
     static QJsonObject fitJson(const Estimator::Fit &f);  // the "fit" object of the AP JSON (API / D-Bus / sync)
     void    calibrateEstimator();                        // anchor leave-one-out κ + per-device offsets + BSSID groups
     // Device ranging (docs/RANGING.md §5–§8); set by the tray
-    void    setRanging(RangingService *r) { m_ranging = r; }
+    void    setRanging(RangingService *r);
     RangingService *ranging() const { return m_ranging; }
     QString kindForDevice(const QString &device, const QString &hint = QString()) const;   // android | laptop | desktop | pi | gnss | device
     static QStringList features();                       // what this build can do (hello / StateJson)
@@ -414,6 +472,24 @@ public:
     QList<SyncPeer> syncPeers() const { return m_syncPeers; }
     void    setSyncPeers(const QList<SyncPeer> &peers);
     bool    syncBusy() const { return m_syncBusy; }
+    // One push/pull round over any transport — the LAN API with a token (syncStep) or the hub over BFS3 (hubclient.h):
+    // POST db/sync with our own rows after the "pushed" cursor, then GET db/changes after "pulled" (kv sync:<key>:…),
+    // merged here. done(ok, message, http status of the failing step or 0).
+    using SyncReply = std::function<void(int status, const QJsonObject &body, const QString &error)>;
+    using SyncSend  = std::function<void(const QByteArray &method, const QString &endpoint, const QByteArray &body, SyncReply reply)>;
+    void    syncRound(const QString &key, const QString &peerLabel, SyncSend send, std::function<void(bool ok, const QString &message, int status)> done,
+                      const QString &selfName = QString());   // selfName: what our rows are called there (default the hostname)
+    // Every node's newest position as another hub / BeaconFix reports it (GET devices/positions): into our linked devices
+    int     mergeRemoteDevices(const QJsonArray &devices, const QString &via, const QStringList &skip = {});
+    // Jobs (docs/HUB.md). The hub: refits become jobs (the sink) instead of local work; a node's result is validated
+    // and stored as if computed here; refitNow is the hub's fallback. A node: computeRefit runs (or reuses) its own fit.
+    void    setRefitSink(std::function<void(const QString &bssid)> sink) { m_refitSink = std::move(sink); }
+    void    queueStaleRefits() { queueUpgradeRefits(); }   // with a sink: every fit older than the estimator becomes a job
+    bool    applyRefitResult(const QString &bssid, const QJsonObject &result);
+    QJsonObject computeRefit(const QString &bssid);       // {"fits":[{"bssid","fit":<storage>}…]} or {} when we have no samples of it
+    bool    refitNow(const QString &bssid);
+    void    setHubClient(HubClient *h) { m_hubClient = h; }
+    HubClient *hubClient() const { return m_hubClient; }
 
 public slots:
     void    Refresh();
@@ -431,6 +507,13 @@ public slots:
     bool    RevokeDevice(const QString &nameOrId);
     QString CreateToken(const QString &name, const QString &scopes);   // scopes: "read" or "read,control"; returns the token once
     bool    OpenPairing(int minutes);
+    // Linking v3 (docs/LINKING.md): what the Link dialog does, for scripts and a PC without a screen
+    QString LinkOffer();                                 // JSON {sid, qr, expires}: a fresh QR session (its hub invite joins within seconds — LinkQr)
+    QString LinkQr(const QString &sid) const;            // the session's "bflink:" text now ("" once used / gone)
+    QString LinkSessions() const;                        // JSON array: sid, origin, state, name, kind, ip, code, proximity, expires
+    bool    LinkApprove(const QString &sid);             // an mDNS request: Link (after comparing the code)
+    bool    LinkReject(const QString &sid);
+    void    LinkCancel(const QString &sid);              // that QR no longer links
     QStringList HomeNetworks() const { return m_home; }
     int     ImportHomeNetworks(const QString &path) { return importHomeNetworks(path); }
     QString KnownDevices() const;
@@ -440,6 +523,21 @@ public slots:
     bool    KnownAdd(const QString &mac, const QString &name);
     bool    KnownRemove(const QString &mac);
     int     KnownImport(const QString &path);
+    QString FlockCamerasJson() const;
+    QString FlockStatsJson() const;
+    void    RefreshFlockCameras() { refreshFlockCameras(true); }
+    QString LicensePlatesJson() const;
+    bool    SaveLicensePlate(const QString &json);
+    bool    DeleteLicensePlate(const QString &plate);
+    QString CameraEncountersJson(const QString &cameraId = QString(), int limit = 200) const;
+    QString PlateAuditsJson(const QString &plate = QString(), int limit = 200) const;
+    QString AlprSummaryJson() const;
+    QString PlateEventsJson(int limit = 100) const;      // newest first (docs/SIGHTINGS.md)
+    void    OpenPlateEvent(const QString &uid) { openPlateEvent(uid); }   // the event dialog ("" = the Sightings tab)
+    QString PlateEventsStatusJson() const;
+    int     RecalculatePasses() { return recalculatePasses(); }
+    int     CrossReferenceOpenDatabases(const QString &plateFilter = QString()) { return crossReferenceOpenDatabases(plateFilter); }
+    void    SyncNationwideUsCameras() { syncNationwideUsCameras(true); }
     void    SetHomeNetworks(const QStringList &patterns) { setHomeNetworks(patterns); }
     int     Refit();                                     // full refit of every beacon with samples; returns valid fits
     QString EstimatorJson() const;                       // JSON: GET /api/v1/estimator (calibration, device offsets, groups, grades)
@@ -466,6 +564,11 @@ public slots:
     QString RangingInfo() const;                         // JSON: GET /api/v1/ranging/info
     QString RangingCalibrate(const QString &device, double distanceM, int durationS);
     bool    GrantControl(const QString &nameOrId);       // add the control scope to a paired device's existing token
+    // The hub (docs/SECURE-API.md): this node's enrolment and sync
+    QString HubStatus() const;                           // JSON: enrolled, url, fingerprint, deviceId, last sync / error
+    QString HubEnroll(const QString &invite, const QString &name);   // "bfs3:…" → JSON {ok, deviceId, fingerprint | error}
+    bool    HubForget();                                 // drop the enrolment (keys, cursors stay out of use)
+    QString HubSync();                                   // one round now; JSON {ok, message}
     // OS integration
     QString ApplyOs(bool dryRun);                        // JSON: what was (or would be) applied
     QString TimeZoneForFix() const;
@@ -482,6 +585,11 @@ signals:
     void probeFinished(bool ok, const QString &message);
     void scanUpdated();
     void poisUpdated();
+    void flockCamerasUpdated();
+    void cameraPassed(const QString &encounterJson);      // a new plate event worth an alert (JSON: the plate_events row)
+    void plateEventOpenRequested(const QString &uid);     // a notification's Details: the event dialog ("" = the Sightings tab)
+    void plateEventsChanged();
+    void usSyncProgress(int sector, int totalSectors, int camerasAdded, const QString &status);
     void statusMessage(const QString &message);
     void eventLogged(const QString &json);          // one BeaconEvent, as JSON
     void syncFinished(const QString &url, bool ok, const QString &message);
@@ -500,6 +608,7 @@ private:
     void liveScan();
     void startProbeScan();
     void diffScan(const QList<AccessPoint> &aps);
+    void onBleAdvertHeard(const QString &mac, const QString &name, const QStringList &uuids, int mfrId, const QByteArray &mfrData, int rssi);
     BeaconEvent apEvent(const QString &type, const AccessPoint &ap) const;
     void queryBeaconDb(const QList<AccessPoint> &usable);
     void tryApple(const QList<AccessPoint> &usable, const QString &why);
@@ -516,6 +625,13 @@ private:
     void refitQueued();
     bool refitOne(const QString &bssid, qint64 now);
     QList<Estimator::Obs> obsFor(const ApRecord &r, const QString &bssid) const;
+    // Smoothed vantage points (src/tracksmoother.h): per device, fix time (ms) → smoothed position + honest σ,
+    // rebuilt when the route generation changes. The site anchor is the phone's base station: while the phone
+    // hears our own AP very loudly (in the RV) after the anchor was placed, it was at the anchor (±4 m).
+    struct Vantage { double lat = 0, lon = 0, acc = 0; bool outlier = false; };
+    mutable QHash<QString, QHash<qint64, Vantage>> m_vantage;
+    mutable quint64 m_vantageGen = ~0ULL;
+    void ensureVantage() const;
     Estimator::Context contextFor(const ApRecord &r, const QString &bssid, const QList<Estimator::Obs> &obs) const;
     QList<Estimator::Miss> missesFor(const QList<Estimator::Obs> &obs) const;
     void noteScanCell(const Fix &at);
@@ -525,6 +641,8 @@ private:
     void calibrateAnchors();
     void finishUpgradeRefit();
     void queueUpgradeRefits();
+    HubClient *m_hubClient = nullptr;
+    std::function<void(const QString &)> m_refitSink;
     void loadSyncPeers();
     void saveSyncPeers() const;
     void syncStep(int peerIndex);
@@ -534,7 +652,7 @@ private:
     void noteSightings(const QList<AccessPoint> &aps, const Fix &at);
     void queryOverpass(double lat, double lon, int radiusM, int mirror);
     void queryPediatric(double lat, double lon, int radiusM, int mirror);
-    bool overpassSlot(bool peds, bool force);     // one Overpass query at a time, 5 s apart: false = queued
+    bool overpassSlot(int kind, bool force);      // one Overpass query at a time, 5 s apart: false = queued. kind 0 places · 1 peds · 2 cameras · 3 US sector
     void overpassDone();
     void pumpOverpass();
     void rebuildMergedPois();
@@ -560,6 +678,8 @@ private:
     bool m_standalone;
     ApiServer *m_api = nullptr;
     MapDb *m_db = nullptr;
+    PlateWatch *m_plates = nullptr;
+    void onPlateAlert(const QJsonObject &ev);
     bool m_dbUsable = false;              // open and writable: persistence goes through it
     Identity *m_identity = nullptr;
     Notifier *m_notifier = nullptr;
@@ -581,6 +701,31 @@ private:
     void maybeReproject(const Fix &cand);    // the RV moved: re-project the RV anchors (§4.3.5)
     void noteAnchorCalibration(const QList<AccessPoint> &aps);   // RSSI at known distance → environment P0 / n
     bool tryRvGnss();                        // §4.3.7
+    // ── Site lock (docs/ESTIMATION.md "Locating ourselves"): the this-computer anchor IS our position while this
+    // host's scans match the neighbourhood learnt there (other people's APs — ours travel with the RV). A Wi-Fi
+    // geolocation service 160-500 m off can then neither move us nor drag the RV's anchors along.
+    struct SiteAp { double mean = 0; int hits = 0; };
+    QHash<QString, SiteAp> m_siteAps;        // BSSID → mean level and how many on-site scans heard it
+    int  m_siteScans = 0, m_siteMiss = 0;
+    QString m_siteKey;                       // anchor id @ position @ placedAt the fingerprint belongs to
+    bool m_onSite = false;
+    QJsonObject m_siteMatch;                 // the last match, for StateJson
+    const BfAnchor *siteAnchor() const;
+    bool updateSite(const QList<AccessPoint> &aps);
+    Fix  siteFix() const;
+    bool trySite();
+    void loadSite(); void saveSite();
+    // ── Fingerprint positioning: past GPS-tagged scans, nearest in signal space (src/fingerprint.h)
+    ScanMatch::Index m_fpIndex; bool m_fpBuilding = false; QDateTime m_fpBuilt; int m_fpObsCount = 0;
+    void ensureFingerprintIndex();
+    bool tryFingerprint(const QList<AccessPoint> &usable);
+    // ── Provider calibration: |error| / claimed accuracy of each Wi-Fi provider, measured against the site anchor
+    // or a fresh phone GPS fix; its 68th percentile scales the accuracy they claim (Apple / BeaconDB were 2-5×
+    // over-confident out here)
+    QHash<QString, QList<double>> m_provRatios;
+    double providerScale(const QString &provider) const;
+    void noteProviderError(const QString &provider, double lat, double lon, double claimedAcc);
+    void loadProviderCal(); void saveProviderCal();
     QHash<QString, RangeMath::Rls2> m_envRls;   // band ("2.4" | "5" | "6") → path-loss fit
     QHash<QString, int> m_envSamples;
     RangingService *m_ranging = nullptr;
@@ -600,7 +745,9 @@ private:
     QList<BeaconEvent> m_events;
     int    m_eventId = 0;
     bool   m_busy = false;
-    bool   m_geocodePending = false;
+    bool   m_geocodePending = false, m_geocodeDeferred = false;
+    QElapsedTimer m_geocodeLast;      // Nominatim: at most one request a second
+    double m_geocodeLat = 0, m_geocodeLon = 0;
     Fix    m_fix, m_last;
     QString m_lastError, m_starlinkError, m_coarseNote;
     QList<AccessPoint> m_aps;
@@ -611,6 +758,7 @@ private:
     QSet<QString> m_travelling, m_notTravelling;
     QStringList m_wigleQueue;
     bool m_wigleBusy = false;
+    QDateTime m_wigleCoolUntil;       // after a 429 (daily quota) / 401: no lookups until then
     QList<Poi> m_pois;                              // near: the main places query
     QList<Poi> m_allPois;                           // near + far, what pois() returns
     double m_poiLat = 0, m_poiLon = 0; int m_poiRadiusM = 0;
@@ -633,7 +781,25 @@ private:
     // Overpass etiquette: one query in flight, 5 s between queries, a minute's pause after 429 / 504
     QTimer m_overpassTimer;
     QDateTime m_overpassIdle, m_overpassCoolUntil;
-    bool m_poiPending = false, m_poiPendingForce = false, m_pedsPending = false, m_pedsPendingForce = false;
+    bool m_poiPending = false, m_poiPendingForce = false, m_pedsPending = false, m_pedsPendingForce = false, m_flockPending = false, m_flockPendingForce = false;
+    bool m_flockBusy = false;                      // also held across the 3 s before a mirror retry: the slot stays taken
+    bool m_usSectorBusy = false, m_usSectorPending = false;   // the nationwide sector chain takes the same slot (kind 3)
+    double m_flockLat = 0, m_flockLon = 0;
+    QDateTime m_flockTime, m_flockTried;
+    QHash<QString, QDateTime> m_flockNoted;
+    QHash<QString, QDateTime> m_lastCameraPass;
+    bool m_usSyncActive = false;
+    int  m_usSyncSector = 0;
+    int  m_usSyncSteps = 3;
+    int  m_usSyncTotalAdded = 0;
+    QString m_usSyncStatus;
+    void queryNextUsSector(int sectorIdx, int mirror = 0);
+    // The camera sync (docs/DATABASE.md): DeFlock (ALPRs, ODbL) → reconcile the old bulk rows → flocklocations community
+    // rows (CC BY 4.0); Overpass sectors only when DeFlock fails
+    void cameraSyncCommunity();
+    void cameraSyncDone();
+    QJsonObject m_camSync;
+    void queryFlock(double lat, double lon, int radiusM, int mirror);
     QString m_tileBase;
     QHash<QString, double> m_elevCache;   // "lat,lon" rounded to ~100 m
     QString m_elevNote; bool m_elevBusy = false; QDateTime m_elevTried;
@@ -641,6 +807,9 @@ private:
     QDateTime m_tripStart;
     QSet<QString> m_seenRegions, m_seenCountries;
     int m_prefetchedTiles = 0;
+    mutable QJsonArray m_cachedRouteFixes;           // StateJson's routeFixes, rebuilt only when the database's route list changes
+    mutable quint64 m_cachedRouteGen = 0, m_cachedRouteReset = 0;   // MapDb::routeGeneration / routeResetGeneration it was built at
+    mutable qsizetype m_cachedRouteCount = 0;        // fixes it covers (appends extend it)
 
     int m_intervalMin = 15;
     int m_moveThresholdM = 250;

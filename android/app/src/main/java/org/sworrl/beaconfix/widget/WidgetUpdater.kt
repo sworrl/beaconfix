@@ -68,7 +68,7 @@ private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
 
 /** Hilt entry point for code that Hilt does not inject (Glance widgets and their action callbacks). */
 @EntryPoint @InstallIn(SingletonComponent::class)
-interface WidgetEntryPoint { fun updater(): WidgetUpdater; fun syncScheduler(): SyncScheduler; fun prefs(): Prefs; fun help(): org.sworrl.beaconfix.help.HelpRepository }
+interface WidgetEntryPoint { fun updater(): WidgetUpdater; fun syncScheduler(): SyncScheduler; fun prefs(): Prefs; fun help(): org.sworrl.beaconfix.help.HelpRepository; fun alertManager(): org.sworrl.beaconfix.detector.DetectorAlertManager }
 
 /**
  * Builds the [WidgetState] from the database, prefs, the collector's last scan and the paired desktop, renders the map
@@ -87,7 +87,22 @@ class WidgetUpdater @Inject constructor(
     /** last few human lines for the notification ("recent") */
     @Volatile var recent: List<String> = emptyList()
     fun note(line: String) { recent = (listOf(line) + recent).take(6) }
-    fun collectorText(): String { val s = status.state.value; return when { !s.running -> "collector paused"; s.throttled -> "scanning (throttled by Android: 4 scans / 2 min)"; s.survey -> "surveying continuously"; else -> "scanning" } }
+    fun collectorText(): String {
+        val s = status.state.value
+        val motion = when (s.motionMode) {
+            org.sworrl.beaconfix.collector.MotionMode.IN_VEHICLE -> "driving"
+            org.sworrl.beaconfix.collector.MotionMode.ON_FOOT -> "walking"
+            org.sworrl.beaconfix.collector.MotionMode.STATIONARY -> "stationary"
+        }
+        val pwr = if (s.isCharging) " · charging" else ""
+        val sec = s.samplingIntervalMs / 1000
+        return when {
+            !s.running -> "collector paused"
+            s.throttled -> "scanning (throttled by Android: 4 scans / 2 min)"
+            s.survey -> "surveying continuously"
+            else -> "scanning (${motion}${pwr} · ${sec}s)"
+        }
+    }
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private var pending: Job? = null
     private var pendingHelp: Job? = null
@@ -209,7 +224,7 @@ class WidgetUpdater @Inject constructor(
     }
 
     // ── static map snapshot: OSM tiles through osmdroid's cache, beacons and the fix drawn on top ──
-    private suspend fun renderMap(lat: Double, lon: Double, acc: Double, w: Int = 640, h: Int = 480, z: Int = 15): String? = withContext(Dispatchers.Main) {
+    private suspend fun renderMap(lat: Double, lon: Double, acc: Double, w: Int = 640, h: Int = 480, z: Int = 15): String? = withContext(Dispatchers.IO) {
         val provider = MapTileProviderBasic(ctx, TileSourceFactory.MAPNIK)
         try {
             val n = 2.0.pow(z)

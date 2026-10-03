@@ -1,0 +1,49 @@
+{
+ "results": [
+  {
+   "org_id": "4411",
+   "org_name": "Example County SO",
+   "org_state": "WV",
+   "org_locality": "Example",
+   "search_time_utc": "2025-01-01T06:10:30.000Z",
+   "license_plate_hash": "9f89b1d8ade18387e252af469ed38aa4532ba9d19727a575b5fc51f6d5ea8223",
+   "case_number": "25-0001",
+   "reason": "investigation",
+   "search_type": "lookup",
+   "total_devices_searched": 1200,
+   "total_networks_searched": 41,
+   "upload_id": 2,
+   "source_url": "https://www.muckrock.com/foi/example-1/flock-audit-1/",
+   "source_org_name": "Example County SO",
+   "text_prompt": null
+  },
+  {
+   "org_id": "77",
+   "org_name": "Other Town PD",
+   "org_state": "TX",
+   "search_time_utc": "2025-02-03T10:00:00.000Z",
+   "license_plate_hash": "a31e0ab70c7011de9cdfcf86299ac7d49e10e47067c207721ff30d1394a7b49e",
+   "case_number": "",
+   "reason": "stolen vehicle",
+   "upload_id": 5,
+   "source_url": "",
+   "source_org_name": "Other Town PD"
+  },
+  {
+   "org_id": "78",
+   "org_name": "Hashless PD",
+   "org_state": "GA",
+   "search_time_utc": "2025-03-04T11:12:13.000Z",
+   "case_number": null,
+   "reason": "suspicious",
+   "upload_id": 7,
+   "source_url": "ftp://nope",
+   "source_org_name": ""
+  }
+ ],
+ "nextCursor": null,
+ "hasMore": false,
+ "count": 3,
+ "total": 3,
+ "limit": 10000
+}

@@ -1,0 +1,8 @@
+{"type":"FeatureCollection","name":"synthetic sample in the DeFlock cameras.geojson shape","note":"a string with \"features\": [ and { braces } that is not the array","meta":{"features":"not this one either"},"features":[
+{"type":"Feature","geometry":{"type":"Point","coordinates":[-75.0,40.0]},"properties":{"osmId":1001,"osmType":"node","operator":"Example Police Department","brand":"Flock Safety","direction":270,"surveillanceZone":"traffic","mountType":"pole","osmTimestamp":"2026-05-26T03:54:51Z","osmVersion":6}},
+{"type":"Feature","geometry":{"type":"Point","coordinates":[-75.001,40.001]},"properties":{"osmId":1002,"osmType":"way","brand":"Motorola Solutions","direction":90,"directions":[90,270],"osmTimestamp":"2025-10-05T22:31:51Z","osmVersion":20}},
+{"type":"Feature","geometry":{"type":"Point","coordinates":[-75.002,40.002]},"properties":{"osmId":1003,"osmType":"node","operator":"Town of \"Example\" {braces} [brackets] \\ backslash","direction":0,"osmTimestamp":"2024-12-27T22:33:51Z","osmVersion":1}},
+{"type":"Feature","geometry":{"type":"Point","coordinates":[-75.003,40.003]},"properties":{"osmType":"node"}},
+{"type":"Feature","geometry":{"type":"Point","coordinates":[0,0]},"properties":{"osmId":1005,"osmType":"node"}},
+{"type":"Feature","geometry":{"type":"Point","coordinates":[-75.004,40.004]},"properties":{"osmId":1006,"osmType":"node","brand":"Flock Safety","osmTimestamp":"2026-01-08T00:54:03Z","osmVersion":7}}
+]}

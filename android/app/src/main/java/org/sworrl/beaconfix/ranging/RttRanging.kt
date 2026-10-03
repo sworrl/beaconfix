@@ -15,6 +15,7 @@ import android.net.wifi.rtt.WifiRttManager
 import android.location.LocationManager
 import android.os.Build
 import android.os.PowerManager
+import androidx.annotation.RequiresApi
 import androidx.core.content.ContextCompat
 import androidx.core.location.LocationManagerCompat
 import dagger.hilt.android.qualifiers.ApplicationContext
@@ -39,10 +40,13 @@ import kotlin.coroutines.resume
  */
 @Singleton
 class RttRanging @Inject constructor(@ApplicationContext private val ctx: Context) {
-    private val mgr: WifiRttManager? by lazy { if (ctx.packageManager.hasSystemFeature(PackageManager.FEATURE_WIFI_RTT)) ctx.getSystemService(WifiRttManager::class.java) else null }
+    // Wi-Fi RTT is API 28 (Android 9): older phones have neither the feature nor the classes
+    private val mgr: WifiRttManager? by lazy {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && ctx.packageManager.hasSystemFeature(PackageManager.FEATURE_WIFI_RTT)) ctx.getSystemService(WifiRttManager::class.java) else null
+    }
     private val wifi by lazy { ctx.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager }
     val supported: Boolean get() = mgr != null
-    val available: Boolean get() = mgr?.isAvailable == true
+    val available: Boolean get() = Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && mgr?.isAvailable == true
     fun permitted(): Boolean = ContextCompat.checkSelfPermission(ctx, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED &&
         (Build.VERSION.SDK_INT < 33 || ContextCompat.checkSelfPermission(ctx, Manifest.permission.NEARBY_WIFI_DEVICES) == PackageManager.PERMISSION_GRANTED)
     @Volatile var lastError: String = ""; private set
@@ -70,6 +74,7 @@ class RttRanging @Inject constructor(@ApplicationContext private val ctx: Contex
     @SuppressLint("MissingPermission")
     suspend fun range(info: RttInfo, burst: Int = 8): List<RttSample> {
         sent = false
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) { setState(RttState.UNSUPPORTED, "Wi-Fi RTT needs Android 9"); return emptyList() }
         val m = mgr ?: run { setState(RttState.UNSUPPORTED, "no Wi-Fi RTT on this phone"); return emptyList() }
         if (!permitted()) { setState(RttState.NO_PERMISSION, "needs the location / nearby-devices permission"); return emptyList() }
         if (!m.isAvailable) {
@@ -117,12 +122,15 @@ class RttRanging @Inject constructor(@ApplicationContext private val ctx: Contex
         return out
     }
 
+    @RequiresApi(Build.VERSION_CODES.P)
     private fun request(info: RttInfo, burst: Int): RangingRequest? {
         val b = RangingRequest.Builder()
         if (Build.VERSION.SDK_INT >= 33) {
             val cw = when (info.bandwidthMHz) { 40 -> ScanResult.CHANNEL_WIDTH_40MHZ; 80 -> ScanResult.CHANNEL_WIDTH_80MHZ; 160 -> ScanResult.CHANNEL_WIDTH_160MHZ; else -> ScanResult.CHANNEL_WIDTH_20MHZ }
             val pre = when (info.preamble.lowercase()) { "legacy" -> ScanResult.PREAMBLE_LEGACY; "vht" -> ScanResult.PREAMBLE_VHT; "he" -> ScanResult.PREAMBLE_HE; else -> ScanResult.PREAMBLE_HT }
-            val cfg = ResponderConfig.Builder().setMacAddress(MacAddress.fromString(info.bssid)).setResponderType(ResponderConfig.RESPONDER_AP).set80211mcSupported(true)
+            // RESPONDER_AP is the builder's default; setResponderType itself only exists from API 34
+            val cfg = ResponderConfig.Builder().setMacAddress(MacAddress.fromString(info.bssid))
+                .also { if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) it.setResponderType(ResponderConfig.RESPONDER_AP) }.set80211mcSupported(true)
                 .setChannelWidth(cw).setFrequencyMhz(info.freqMHz).setCenterFreq0Mhz(if (info.centerFreq0MHz > 0) info.centerFreq0MHz else info.freqMHz).setCenterFreq1Mhz(info.centerFreq1MHz).setPreamble(pre).build()
             b.addResponder(cfg)
             b.setRttBurstSize(burst.coerceIn(RangingRequest.getMinRttBurstSize(), RangingRequest.getMaxRttBurstSize()))
