@@ -156,9 +156,13 @@ class DashCamService : LifecycleService() {
         }.also { if (it.canDetectOrientation()) it.enable() }
         uplink.onRevoked = { main.post { settings.update { it.copy(enabled = false) }; stopSelf() } }
         uplink.start()
+        activeInstance = this
         // location: speed / heading for every event, and the legal geofence
         lifecycleScope.launch {
-            if (hasLocation()) runCatching { locations.current(10_000) }.getOrNull()?.let { onLocation(it) }
+            if (hasLocation()) {
+                val l = runCatching { locations.current(5_000) }.getOrNull()
+                if (l != null) onLocation(l)
+            }
             if (lastLoc == null) reconcile()
             if (hasLocation()) locations.updates(1_000, 0f).catch { Log.w(TAG, "location", it) }.collect { onLocation(it) }
         }
@@ -178,6 +182,7 @@ class DashCamService : LifecycleService() {
     }
 
     override fun onDestroy() {
+        activeInstance = null
         capturing = false
         unbind()
         runCatching { unregisterReceiver(battery) }
@@ -266,12 +271,12 @@ class DashCamService : LifecycleService() {
         val geo = loc?.let { Geofence.check(blocked, it.latitude, it.longitude, freshState()) }
         val reason = when {
             privateInspection -> "Paused: Private camera inspection active"
+            uiActive -> "Paused: Live viewfinder active on screen"
             !hasPerm(Manifest.permission.CAMERA) -> "No camera permission"
             status.state.value.modelError.isNotEmpty() -> "Models unavailable: ${status.state.value.modelError}"
             Build.VERSION.SDK_INT >= 29 && thermal >= PowerManager.THERMAL_STATUS_SEVERE -> "Paused: phone too hot (${thermalName(thermal)})"
             cfg.chargingOnly && !charging -> "Paused: waiting for the charger (Charging only is on)"
             !hasLocation() -> "Paused: location permission needed (legal geofence)"
-            loc == null -> "Paused: waiting for a location fix"
             geo != null && geo.blocked -> "Paused: private ALPR is not allowed in ${stateName(geo.region)} (${geo.region})"
             else -> null
         }
@@ -426,6 +431,19 @@ class DashCamService : LifecycleService() {
                 if (paired) uplink.submitHit(HitBody(m.entry.id, m.read, a.conf.toDouble(), AlprJson.rfc3339(a.atMs), loc?.latitude, loc?.longitude))
             } else if (settings.value.notifyPossible) alerts.possibleMatch(m, a.thumb)
         }
+        val nowWall = System.currentTimeMillis()
+        for (p in out.plates) {
+            val r = p.read
+            if (r != null && r.text.length >= 4 && r.conf >= 0.60f) {
+                val kind = when {
+                    p.matches.any { it.kind == MatchKind.EXACT } -> "hotlist"
+                    p.matches.isNotEmpty() -> "possible"
+                    else -> ""
+                }
+                val readText = p.fused.ifEmpty { r.text }
+                status.addRead(RecentRead(readText, r.conf, nowWall, loc?.latitude, loc?.longitude, kind, null))
+            }
+        }
         for (ve in out.events) {
             val kind = when {
                 ve.matches.any { it.kind == MatchKind.EXACT } -> "hotlist"
@@ -443,6 +461,13 @@ class DashCamService : LifecycleService() {
         const val ACTION_STOP = "org.sworrl.beaconfix.alpr.STOP"
         /** At most one burst pass this often (the analysis thread stays partly idle). */
         private const val BURST_GAP_MS = 120L
+
+        @Volatile var uiActive: Boolean = false
+            set(value) {
+                field = value
+                activeInstance?.reconcile()
+            }
+        @Volatile private var activeInstance: DashCamService? = null
 
         /** Start from a foreground context (an activity): Android 14+ refuses a camera service started from the background. */
         fun start(ctx: Context) = ContextCompat.startForegroundService(ctx, Intent(ctx, DashCamService::class.java))

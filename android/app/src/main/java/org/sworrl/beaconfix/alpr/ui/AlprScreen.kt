@@ -22,6 +22,17 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.layout.Box
+import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.camera.core.CameraSelector
+import androidx.camera.core.ImageAnalysis
+import androidx.camera.core.Preview
+import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.core.resolutionselector.ResolutionSelector
+import androidx.camera.core.resolutionselector.ResolutionStrategy
+import androidx.camera.view.PreviewView
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.background
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -33,26 +44,40 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Slider
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.drawText
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.hilt.navigation.compose.hiltViewModel
+import java.util.concurrent.Executors
 import org.sworrl.beaconfix.alpr.AlprConfig
 import org.sworrl.beaconfix.alpr.AlprState
 import org.sworrl.beaconfix.alpr.FalconPairing
@@ -125,13 +150,14 @@ fun AlprScreen(onBack: () -> Unit, vm: AlprViewModel = hiltViewModel()) {
         if (msg.isNotEmpty()) Text(msg, Modifier.padding(horizontal = 20.dp, vertical = 4.dp), style = MaterialTheme.typography.bodyMedium)
         if (permNote.isNotEmpty()) Text(permNote, Modifier.padding(horizontal = 20.dp, vertical = 4.dp), color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
 
-        InfoCard("Use camera as ALPR") {
+        LivePlateScanner(vm, cfg)
+
+        InfoCard("Background Dash Cam (Screen Off)") {
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f)) {
-                    Text(if (st.running) (st.paused ?: "Reading plates") else "Off", fontWeight = FontWeight.SemiBold,
+                    Text(if (st.running) (st.paused ?: "Reading plates in background") else "Background mode: Off", fontWeight = FontWeight.SemiBold,
                         color = when { !st.running -> Slate; st.paused != null -> Orange; else -> Green })
-                    Text("The back camera reads plates on this phone; matches against public AMBER / Silver / Blue alerts alert here even with no connection. " +
-                        "Plate crops go to FalconEyez on the RV.", color = Slate, style = MaterialTheme.typography.bodySmall)
+                    Text("Keeps the camera reading plates continuously in the background with the screen off or while using other apps. Plate crops feed FalconEyez.", color = Slate, style = MaterialTheme.typography.bodySmall)
                 }
                 Switch(checked = st.running, onCheckedChange = { toggle(it) })
             }
@@ -316,6 +342,352 @@ fun AlprDetectorCard(onOpen: () -> Unit, modifier: Modifier = Modifier) {
                 else if (alprMissingPermissions(ctx).isNotEmpty()) onOpen()
                 else { e.alprSettings().update { it.copy(enabled = true) }; org.sworrl.beaconfix.alpr.DashCamService.start(ctx) }
             })
+        }
+    }
+}
+
+data class LiveDetection(
+    val box: org.sworrl.beaconfix.alpr.core.BoxF,
+    val text: String,
+    val conf: Float,
+    val hotlist: Boolean
+)
+
+private fun performHapticClick(ctx: Context) {
+    runCatching {
+        if (Build.VERSION.SDK_INT >= 31) {
+            val vm = ctx.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as? android.os.VibratorManager
+            vm?.defaultVibrator?.vibrate(android.os.VibrationEffect.createPredefined(android.os.VibrationEffect.EFFECT_CLICK))
+        } else {
+            @Suppress("DEPRECATION")
+            val v = ctx.getSystemService(Context.VIBRATOR_SERVICE) as? android.os.Vibrator
+            v?.vibrate(android.os.VibrationEffect.createOneShot(40, android.os.VibrationEffect.DEFAULT_AMPLITUDE))
+        }
+    }
+}
+
+@Composable
+fun LivePlateScanner(vm: AlprViewModel, cfg: AlprConfig, modifier: Modifier = Modifier) {
+    val ctx = LocalContext.current
+    val owner = LocalLifecycleOwner.current
+    var hasCameraPerm by remember { mutableStateOf(ContextCompat.checkSelfPermission(ctx, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) }
+    val askCamera = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        hasCameraPerm = granted
+    }
+
+    val pipelineRef = remember { java.util.concurrent.atomic.AtomicReference<org.sworrl.beaconfix.alpr.vision.AlprPipeline?>(null) }
+    val executor = remember { Executors.newSingleThreadExecutor() }
+
+    DisposableEffect(Unit) {
+        org.sworrl.beaconfix.alpr.DashCamService.uiActive = true
+        onDispose {
+            org.sworrl.beaconfix.alpr.DashCamService.uiActive = false
+            executor.execute {
+                pipelineRef.getAndSet(null)?.close()
+            }
+            executor.shutdown()
+        }
+    }
+
+    if (!hasCameraPerm) {
+        InfoCard("Live Plate Scanner") {
+            Text("Point your camera at a license plate to read it in real time.", color = Slate, style = MaterialTheme.typography.bodySmall)
+            Button(onClick = { askCamera.launch(Manifest.permission.CAMERA) }, modifier = Modifier.padding(top = 8.dp)) {
+                Text("Enable camera scanner")
+            }
+        }
+        return
+    }
+
+    var detections by remember { mutableStateOf<List<LiveDetection>>(emptyList()) }
+    var frameSize by remember { mutableStateOf<android.util.Size?>(null) }
+    var lastScannedText by remember { mutableStateOf("") }
+    var lastScannedConf by remember { mutableFloatStateOf(0f) }
+    var lastScannedAt by remember { mutableLongStateOf(0L) }
+    var isScannedHotlist by remember { mutableStateOf(false) }
+
+    val textMeasurer = rememberTextMeasurer()
+
+    Card(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 6.dp),
+        shape = RoundedCornerShape(12.dp)
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(300.dp)
+                .clip(RoundedCornerShape(12.dp))
+        ) {
+            AndroidView(
+                modifier = Modifier.fillMaxSize(),
+                factory = { c ->
+                    val previewView = PreviewView(c).apply {
+                        scaleType = PreviewView.ScaleType.FILL_CENTER
+                    }
+                    val future = ProcessCameraProvider.getInstance(c)
+                    future.addListener({
+                        val provider = runCatching { future.get() }.getOrNull() ?: return@addListener
+                        val preview = Preview.Builder().build().also {
+                            it.surfaceProvider = previewView.surfaceProvider
+                        }
+
+                        val sel = ResolutionSelector.Builder()
+                            .setResolutionStrategy(
+                                ResolutionStrategy(
+                                    android.util.Size(1280, 960),
+                                    ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER
+                                )
+                            ).build()
+
+                        val ab = ImageAnalysis.Builder()
+                            .setResolutionSelector(sel)
+                            .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                            .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
+
+                        val analysis = ab.build()
+                        val planes = org.sworrl.beaconfix.alpr.vision.PlaneBuffers()
+
+                        analysis.setAnalyzer(executor) { img ->
+                            try {
+                                if (pipelineRef.get() == null) {
+                                    runCatching {
+                                        pipelineRef.set(org.sworrl.beaconfix.alpr.vision.AlprPipeline(c, 4, cfg.xnnpack, cfg.accurateOcr))
+                                    }.onFailure { android.util.Log.e("LivePlateScanner", "Failed to init pipeline", it) }
+                                }
+                                val p = pipelineRef.get() ?: return@setAnalyzer
+                                val rot = img.imageInfo.rotationDegrees
+                                val frame = org.sworrl.beaconfix.alpr.vision.YuvFrame(img, rot, planes)
+                                val fw = frame.width
+                                val fh = frame.height
+                                frameSize = android.util.Size(fw, fh)
+
+                                val fc = org.sworrl.beaconfix.alpr.vision.FrameContext(System.currentTimeMillis(), null, null)
+                                val opt = org.sworrl.beaconfix.alpr.vision.PassOptions(tileCols = cfg.tileCols, accurateOcr = cfg.accurateOcr, makeEvents = false)
+                                val outcome = p.process(frame, fc, vm.hotlist.matcher, opt)
+
+                                val list = ArrayList<LiveDetection>()
+                                val now = System.currentTimeMillis()
+                                var bestPlateText = ""
+                                var bestPlateConf = 0f
+                                var bestHot = false
+
+                                for (plate in outcome.plates) {
+                                    val r = plate.read
+                                    val readText = plate.fused.ifEmpty { r?.text.orEmpty() }
+                                    val conf = r?.conf ?: 0f
+                                    val isHot = plate.matches.isNotEmpty()
+                                    list.add(LiveDetection(plate.det.box, readText, conf, isHot))
+
+                                    if (readText.length >= 4 && conf >= 0.60f) {
+                                        if (conf > bestPlateConf) {
+                                            bestPlateText = readText
+                                            bestPlateConf = conf
+                                            bestHot = isHot
+                                        }
+                                        val kind = when {
+                                            plate.matches.any { it.kind == org.sworrl.beaconfix.alpr.core.MatchKind.EXACT } -> "hotlist"
+                                            plate.matches.isNotEmpty() -> "possible"
+                                            else -> ""
+                                        }
+                                        val clBox = plate.det.box.clamp(frame.width, frame.height)
+                                        val thumb = if (clBox.w > 4f && clBox.h > 4f) {
+                                            runCatching {
+                                                val tw = 120
+                                                val th = maxOf(24, (tw * clBox.h / maxOf(1f, clBox.w)).toInt())
+                                                frame.bitmap(clBox, tw, th)
+                                            }.getOrNull()
+                                        } else null
+                                        vm.status.addRead(RecentRead(readText, conf, now, null, null, kind, thumb))
+                                    }
+                                }
+
+                                detections = list
+                                if (bestPlateText.isNotEmpty() && (now - lastScannedAt > 1500L || bestPlateText != lastScannedText)) {
+                                    lastScannedText = bestPlateText
+                                    lastScannedConf = bestPlateConf
+                                    lastScannedAt = now
+                                    isScannedHotlist = bestHot
+                                    performHapticClick(c)
+                                }
+                            } catch (t: Throwable) {
+                                android.util.Log.w("LivePlateScanner", "frame analysis", t)
+                            } finally {
+                                img.close()
+                            }
+                        }
+
+                        runCatching {
+                            provider.unbindAll()
+                            provider.bindToLifecycle(owner, CameraSelector.DEFAULT_BACK_CAMERA, preview, analysis)
+                        }.onFailure { android.util.Log.w("LivePlateScanner", "bind", it) }
+                    }, ContextCompat.getMainExecutor(c))
+                    previewView
+                }
+            )
+
+            val activeDets = detections
+            val currentFrame = frameSize
+            Canvas(Modifier.fillMaxSize()) {
+                val viewW = size.width
+                val viewH = size.height
+
+                if (currentFrame != null && activeDets.isNotEmpty()) {
+                    val imgW = currentFrame.width.toFloat()
+                    val imgH = currentFrame.height.toFloat()
+                    val scale = maxOf(viewW / imgW, viewH / imgH)
+                    val dx = (viewW - imgW * scale) / 2f
+                    val dy = (viewH - imgH * scale) / 2f
+
+                    for (det in activeDets) {
+                        val sx = det.box.x1 * scale + dx
+                        val sy = det.box.y1 * scale + dy
+                        val sw = det.box.w * scale
+                        val sh = det.box.h * scale
+
+                        val boxColor = if (det.hotlist) Red else Green
+                        drawRoundRect(
+                            color = boxColor,
+                            topLeft = Offset(sx, sy),
+                            size = Size(sw, sh),
+                            cornerRadius = CornerRadius(8f, 8f),
+                            style = Stroke(width = 3.dp.toPx())
+                        )
+
+                        if (det.text.isNotEmpty()) {
+                            val label = "${det.text} ${(det.conf * 100).toInt()}%"
+                            val measured = textMeasurer.measure(
+                                label,
+                                style = TextStyle(
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    fontFamily = FontFamily.Monospace,
+                                    color = Color.White
+                                )
+                            )
+                            val padH = 6.dp.toPx()
+                            val padV = 2.dp.toPx()
+                            val pillW = measured.size.width + padH * 2
+                            val pillH = measured.size.height + padV * 2
+                            val pillX = sx.coerceIn(0f, (viewW - pillW).coerceAtLeast(0f))
+                            val pillY = (sy - pillH - 4.dp.toPx()).coerceAtLeast(0f)
+
+                            drawRoundRect(
+                                color = if (det.hotlist) Red else Color(0xCC000000),
+                                topLeft = Offset(pillX, pillY),
+                                size = Size(pillW, pillH),
+                                cornerRadius = CornerRadius(6f, 6f)
+                            )
+                            drawText(
+                                measured,
+                                topLeft = Offset(pillX + padH, pillY + padV)
+                            )
+                        }
+                    }
+                } else {
+                    val reticleW = 200.dp.toPx()
+                    val reticleH = 100.dp.toPx()
+                    val rx = (viewW - reticleW) / 2f
+                    val ry = (viewH - reticleH) / 2f
+                    val arm = 20.dp.toPx()
+                    val stroke = Stroke(width = 2.dp.toPx())
+                    val reticleColor = Color(0x88FFFFFF)
+
+                    drawLine(reticleColor, Offset(rx, ry), Offset(rx + arm, ry), stroke.width)
+                    drawLine(reticleColor, Offset(rx, ry), Offset(rx, ry + arm), stroke.width)
+                    drawLine(reticleColor, Offset(rx + reticleW, ry), Offset(rx + reticleW - arm, ry), stroke.width)
+                    drawLine(reticleColor, Offset(rx + reticleW, ry), Offset(rx + reticleW, ry + arm), stroke.width)
+                    drawLine(reticleColor, Offset(rx, ry + reticleH), Offset(rx + arm, ry + reticleH), stroke.width)
+                    drawLine(reticleColor, Offset(rx, ry + reticleH), Offset(rx, ry + reticleH - arm), stroke.width)
+                    drawLine(reticleColor, Offset(rx + reticleW, ry + reticleH), Offset(rx + reticleW - arm, ry + reticleH), stroke.width)
+                    drawLine(reticleColor, Offset(rx + reticleW, ry + reticleH), Offset(rx + reticleW, ry + reticleH - arm), stroke.width)
+
+                    val hintText = "Point camera at license plate"
+                    val measured = textMeasurer.measure(
+                        hintText,
+                        style = TextStyle(fontSize = 11.sp, color = Color(0xAAFFFFFF))
+                    )
+                    drawText(
+                        measured,
+                        topLeft = Offset((viewW - measured.size.width) / 2f, ry + reticleH + 8.dp.toPx())
+                    )
+                }
+            }
+
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(8.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Surface(
+                    color = Color(0xCC000000),
+                    shape = RoundedCornerShape(6.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Box(
+                            Modifier
+                                .size(8.dp)
+                                .clip(RoundedCornerShape(4.dp))
+                                .background(Green)
+                        )
+                        Spacer(Modifier.width(6.dp))
+                        Text(
+                            "LIVE SCANNER",
+                            color = Color.White,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
+
+                Surface(
+                    color = Color(0x99000000),
+                    shape = RoundedCornerShape(6.dp)
+                ) {
+                    Text(
+                        if (cfg.tileCols > 0) "${cfg.tileCols}x tiles" else "Wide",
+                        color = Color.White,
+                        fontSize = 11.sp,
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                    )
+                }
+            }
+
+            val nowTime = System.currentTimeMillis()
+            if (lastScannedText.isNotEmpty() && (nowTime - lastScannedAt < 4000L)) {
+                Surface(
+                    color = if (isScannedHotlist) Red else Green,
+                    shape = RoundedCornerShape(8.dp),
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .padding(12.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            if (isScannedHotlist) "HOTLIST MATCH: " else "Scanned: ",
+                            color = Color.White,
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 13.sp
+                        )
+                        Text(
+                            "$lastScannedText (${(lastScannedConf * 100).toInt()}%)",
+                            color = Color.White,
+                            fontFamily = FontFamily.Monospace,
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 14.sp
+                        )
+                    }
+                }
+            }
         }
     }
 }
