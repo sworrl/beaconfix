@@ -2,6 +2,7 @@
 package org.sworrl.beaconfix.sightings.ui
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -223,14 +224,71 @@ fun InspectionSheet(
                 }
             }
 
-            // 6. Navigation Legs Summary
-            if (plan.toVantageLeg.ok) {
+            // 6. Navigation Legs Summary & Turn-by-Turn Directions
+            if (plan.toVantageLeg.ok || plan.toVantageLeg.steps.isNotEmpty()) {
                 Spacer(Modifier.height(8.dp))
                 Text(
                     "Approach: ${plan.toVantageLeg.distanceM.toInt()} m (~${(plan.toVantageLeg.durationS / 60).toInt()} min) · Departure: ${plan.awayLeg.distanceM.toInt()} m · Provider: ${plan.providerName}",
                     color = Slate,
                     style = MaterialTheme.typography.bodySmall
                 )
+
+                if (plan.toVantageLeg.steps.isNotEmpty()) {
+                    var showSteps by remember { mutableStateOf(true) }
+                    Row(
+                        Modifier.fillMaxWidth().clickable { showSteps = !showSteps }.padding(vertical = 4.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            "Turn-by-turn directions (${plan.toVantageLeg.steps.size} steps)",
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.primary,
+                            style = MaterialTheme.typography.bodyMedium
+                        )
+                        Text(if (showSteps) "▲ Hide" else "▼ Show", color = Slate, style = MaterialTheme.typography.bodySmall)
+                    }
+
+                    if (showSteps) {
+                        Card(
+                            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)),
+                            modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)
+                        ) {
+                            Column(Modifier.padding(8.dp)) {
+                                for ((stepIdx, s) in plan.toVantageLeg.steps.withIndex()) {
+                                    val icon = when {
+                                        s.type == 10 -> "↑"
+                                        s.type == 4 -> "◎"
+                                        s.type == 1 || s.type == 2 || s.type == 3 -> "→"
+                                        s.type == -1 || s.type == -2 || s.type == -3 -> "←"
+                                        else -> "•"
+                                    }
+                                    Row(Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                                        Surface(
+                                            color = MaterialTheme.colorScheme.primary.copy(alpha = 0.15f),
+                                            shape = RoundedCornerShape(6.dp),
+                                            modifier = Modifier.size(24.dp)
+                                        ) {
+                                            Box(contentAlignment = Alignment.Center) {
+                                                Text(icon, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary, fontSize = 12.sp)
+                                            }
+                                        }
+                                        Spacer(Modifier.width(8.dp))
+                                        Column(Modifier.weight(1f)) {
+                                            Text(s.instruction, fontWeight = FontWeight.Medium, style = MaterialTheme.typography.bodySmall)
+                                            if (s.streetName.isNotBlank() && !s.instruction.contains(s.streetName)) {
+                                                Text(s.streetName, color = Slate, fontSize = 11.sp)
+                                            }
+                                        }
+                                        if (s.distanceM > 0) {
+                                            Text("${s.distanceM.toInt()} m", color = Slate, style = MaterialTheme.typography.bodySmall)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
             Spacer(Modifier.height(16.dp))
@@ -265,40 +323,98 @@ fun InspectionSheet(
 fun InspectionActiveHud(
     plan: InspectionPlan,
     guardAlert: String?,
+    currentLocation: Pair<Double, Double>? = null,
     onDone: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    Surface(
-        color = if (guardAlert != null) Color(0xEE8B0000) else Color(0xEE144620),
-        shape = RoundedCornerShape(12.dp),
-        shadowElevation = 6.dp,
-        modifier = modifier.fillMaxWidth().padding(horizontal = 12.dp)
-    ) {
-        Row(
-            Modifier.padding(10.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween
+    var expanded by remember { mutableStateOf(false) }
+    val v0 = plan.vantages.firstOrNull()
+    val distToVantage = if (currentLocation != null && v0 != null) {
+        org.sworrl.beaconfix.estimate.Geo.distanceM(currentLocation.first, currentLocation.second, v0.lat, v0.lon)
+    } else null
+    val arrived = distToVantage != null && distToVantage <= 45.0
+
+    // Next step navigation
+    val nextStep = if (!arrived && plan.toVantageLeg.steps.isNotEmpty()) {
+        if (currentLocation != null) {
+            plan.toVantageLeg.steps.minByOrNull { s ->
+                org.sworrl.beaconfix.estimate.Geo.distanceM(currentLocation.first, currentLocation.second, s.lat, s.lon)
+            } ?: plan.toVantageLeg.steps.first()
+        } else {
+            plan.toVantageLeg.steps.first()
+        }
+    } else null
+
+    Column(modifier = modifier.fillMaxWidth().padding(horizontal = 12.dp)) {
+        Surface(
+            color = if (guardAlert != null) Color(0xEE8B0000) else Color(0xEE144620),
+            shape = RoundedCornerShape(12.dp),
+            shadowElevation = 6.dp,
+            modifier = Modifier.fillMaxWidth().clickable { if (plan.toVantageLeg.steps.isNotEmpty()) expanded = !expanded }
         ) {
-            Column(Modifier.weight(1f)) {
-                Text(
-                    if (guardAlert != null) "⚠️ $guardAlert" else "INSPECT UNSEEN · PRIVATE MODE ACTIVE",
-                    color = if (guardAlert != null) Color.Yellow else Color(0xFFB3FFCC),
-                    fontWeight = FontWeight.Bold,
-                    fontSize = 12.sp
-                )
-                Text(
-                    "Target: ${plan.model.ifEmpty { plan.cameraId }} · Fixes/Passes Suppressed · Guard: ON",
-                    color = Color.White.copy(alpha = 0.9f),
-                    fontSize = 11.sp
-                )
-            }
-            Spacer(Modifier.width(8.dp))
-            Button(
-                onClick = onDone,
-                colors = ButtonDefaults.buttonColors(containerColor = Color.White),
-                contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 12.dp, vertical = 4.dp)
+            Row(
+                Modifier.padding(10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
             ) {
-                Text("Done", color = Color.Black, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        if (guardAlert != null) "⚠️ $guardAlert"
+                        else if (arrived && v0 != null) "SAFE VANTAGE REACHED · Look ${v0.bearingToCamera.toInt()}° (${compass(v0.bearingToCamera)})"
+                        else if (nextStep != null) "TURN: ${nextStep.instruction}"
+                        else "INSPECT UNSEEN · PRIVATE MODE ACTIVE",
+                        color = if (guardAlert != null) Color.Yellow else Color(0xFFB3FFCC),
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 12.sp
+                    )
+                    Text(
+                        if (arrived && v0 != null) "Vantage station: ${v0.distanceM.toInt()} m from camera lens (blind spot)"
+                        else if (nextStep != null && distToVantage != null) "${distToVantage.toInt()} m to vantage · Avoiding ${plan.model.ifEmpty { "ALPR" }} cone (tap for turns)"
+                        else "Target: ${plan.model.ifEmpty { plan.cameraId }} · Fixes/Passes Suppressed · Guard: ON",
+                        color = Color.White.copy(alpha = 0.9f),
+                        fontSize = 11.sp
+                    )
+                }
+                Spacer(Modifier.width(8.dp))
+                Button(
+                    onClick = onDone,
+                    colors = ButtonDefaults.buttonColors(containerColor = Color.White),
+                    contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 12.dp, vertical = 4.dp)
+                ) {
+                    Text("Done", color = Color.Black, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                }
+            }
+        }
+
+        // Expanded turn steps list on map
+        if (expanded && plan.toVantageLeg.steps.isNotEmpty()) {
+            Spacer(Modifier.height(4.dp))
+            Surface(
+                color = Color(0xF018241D),
+                shape = RoundedCornerShape(10.dp),
+                shadowElevation = 8.dp,
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp)
+            ) {
+                Column(Modifier.padding(10.dp)) {
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text("Turn-by-turn route to vantage point", fontWeight = FontWeight.Bold, color = Color(0xFFB3FFCC), fontSize = 12.sp)
+                        Text("▲ Collapse", color = Color.LightGray, fontSize = 11.sp, modifier = Modifier.clickable { expanded = false })
+                    }
+                    Spacer(Modifier.height(4.dp))
+                    for ((idx, s) in plan.toVantageLeg.steps.withIndex()) {
+                        Row(Modifier.fillMaxWidth().padding(vertical = 2.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Text("${idx + 1}.", color = Gold, fontWeight = FontWeight.Bold, fontSize = 11.sp, modifier = Modifier.width(20.dp))
+                            Text(s.instruction, color = Color.White, fontSize = 11.sp, modifier = Modifier.weight(1f))
+                            if (s.distanceM > 0) {
+                                Text("${s.distanceM.toInt()} m", color = Color.LightGray, fontSize = 11.sp)
+                            }
+                        }
+                    }
+                }
             }
         }
     }

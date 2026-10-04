@@ -198,7 +198,7 @@ QByteArray requestBody(Provider p, LatLon a, LatLon b, const QList<Area> &areas,
     const QJsonArray pts{QJsonArray{a.lon, a.lat}, QJsonArray{b.lon, b.lat}};
     QJsonObject body;
     if (p == Provider::Ors) {
-        body = QJsonObject{{"coordinates", pts}, {"instructions", false}, {"units", "m"}};
+        body = QJsonObject{{"coordinates", pts}, {"instructions", true}, {"units", "m"}};
         if (!areas.isEmpty()) {
             QJsonArray polys;
             for (const Area &x : areas) polys.append(QJsonArray{ringJson(x.ring)});
@@ -206,7 +206,7 @@ QByteArray requestBody(Provider p, LatLon a, LatLon b, const QList<Area> &areas,
         }
     } else {
         const QString ghProfile = profile.toLower() == QLatin1String("foot") ? QStringLiteral("foot") : QStringLiteral("car");
-        body = QJsonObject{{"points", pts}, {"profile", ghProfile}, {"points_encoded", false}, {"instructions", false}, {"calc_points", true}, {"ch.disable", true}};
+        body = QJsonObject{{"points", pts}, {"profile", ghProfile}, {"points_encoded", false}, {"instructions", true}, {"calc_points", true}, {"ch.disable", true}};
         if (!areas.isEmpty()) {
             QJsonArray feats;
             QStringList cond;
@@ -238,9 +238,29 @@ Route parseResponse(Provider p, int http, const QByteArray &bytes)
         if (http == 200 && !f.isEmpty()) {
             const QJsonObject ft = f.first().toObject();
             coords(ft.value(QLatin1String("geometry")).toObject().value(QLatin1String("coordinates")).toArray());
-            const QJsonObject s = ft.value(QLatin1String("properties")).toObject().value(QLatin1String("summary")).toObject();
+            const QJsonObject props = ft.value(QLatin1String("properties")).toObject();
+            const QJsonObject s = props.value(QLatin1String("summary")).toObject();
             r.distanceM = s.value(QLatin1String("distance")).toDouble();
             r.durationS = s.value(QLatin1String("duration")).toDouble();
+            const QJsonArray segments = props.value(QLatin1String("segments")).toArray();
+            if (!segments.isEmpty()) {
+                const QJsonArray stepsArr = segments.first().toObject().value(QLatin1String("steps")).toArray();
+                for (const QJsonValue &sv : stepsArr) {
+                    const QJsonObject so = sv.toObject();
+                    Step step;
+                    step.distanceM = so.value(QLatin1String("distance")).toDouble();
+                    step.durationS = so.value(QLatin1String("duration")).toDouble();
+                    step.type = so.value(QLatin1String("type")).toInt();
+                    step.instruction = so.value(QLatin1String("instruction")).toString();
+                    step.streetName = so.value(QLatin1String("name")).toString();
+                    const QJsonArray wp = so.value(QLatin1String("way_points")).toArray();
+                    if (!wp.isEmpty()) {
+                        const int idx = wp.first().toInt();
+                        if (idx >= 0 && idx < r.points.size()) step.start = r.points[idx];
+                    }
+                    r.steps.append(step);
+                }
+            }
         }
     } else {
         msg = o.value(QLatin1String("message")).toString();
@@ -250,6 +270,22 @@ Route parseResponse(Provider p, int http, const QByteArray &bytes)
             coords(pa.value(QLatin1String("points")).toObject().value(QLatin1String("coordinates")).toArray());
             r.distanceM = pa.value(QLatin1String("distance")).toDouble();
             r.durationS = pa.value(QLatin1String("time")).toDouble() / 1000.0;
+            const QJsonArray instrs = pa.value(QLatin1String("instructions")).toArray();
+            for (const QJsonValue &iv : instrs) {
+                const QJsonObject io = iv.toObject();
+                Step step;
+                step.distanceM = io.value(QLatin1String("distance")).toDouble();
+                step.durationS = io.value(QLatin1String("time")).toDouble() / 1000.0;
+                step.type = io.value(QLatin1String("sign")).toInt();
+                step.instruction = io.value(QLatin1String("text")).toString();
+                step.streetName = io.value(QLatin1String("street_name")).toString();
+                const QJsonArray interval = io.value(QLatin1String("interval")).toArray();
+                if (!interval.isEmpty()) {
+                    const int idx = interval.first().toInt();
+                    if (idx >= 0 && idx < r.points.size()) step.start = r.points[idx];
+                }
+                r.steps.append(step);
+            }
         }
     }
     if (r.points.size() >= 2) { r.ok = true; return r; }
@@ -305,12 +341,23 @@ QJsonObject toJson(const Route &r, const Plan &plan, const QList<Passed> &passed
                               {"distanceM", std::round(x.distanceM * 10) / 10}, {"alongM", std::round(x.alongM)}, {"inCone", x.inCone},
                               {"trust", std::round(x.cam.trust * 1000) / 1000}});
     }
+    QJsonArray stepsArr;
+    for (const Step &s : r.steps) {
+        stepsArr.append(QJsonObject{{"distanceM", std::round(s.distanceM)},
+                                    {"durationS", std::round(s.durationS)},
+                                    {"instruction", s.instruction},
+                                    {"streetName", s.streetName},
+                                    {"type", s.type},
+                                    {"lat", s.start.lat},
+                                    {"lon", s.start.lon}});
+    }
     QSet<QString> avoided;
     for (const Area &a : plan.areas) avoided.insert(a.cameraId);
     const QString attribution = p == Provider::Ors ? QStringLiteral("© openrouteservice.org by HeiGIT · map data © OpenStreetMap contributors (ODbL)")
                                                    : QStringLiteral("Powered by GraphHopper · map data © OpenStreetMap contributors (ODbL)");
     return QJsonObject{{"provider", providerId(p)}, {"providerName", providerName(p)}, {"route", QJsonObject{{"type", "LineString"}, {"coordinates", coords}}},
                        {"distanceM", std::round(r.distanceM)}, {"durationS", std::round(r.durationS)},
+                       {"steps", stepsArr},
                        {"avoided", QJsonObject{{"areas", int(plan.areas.size())}, {"cameras", int(avoided.size())}, {"corridorCameras", int(plan.corridor.size())},
                                                {"capped", plan.capped}, {"corridorM", std::round(plan.corridorM)}}},
                        {"passes", ps}, {"passesInCone", inCone}, {"attribution", attribution}};
@@ -537,7 +584,8 @@ QList<Exposure> checkExposures(const QList<LatLon> &route, const QList<Cam> &all
     return out;
 }
 
-QString toGpx(const QList<LatLon> &toVantage, const QList<LatLon> &away, const Vantage &vantage, const Cam &cam)
+QString toGpx(const QList<LatLon> &toVantage, const QList<LatLon> &away, const Vantage &vantage, const Cam &cam,
+              const QList<Step> &approachSteps)
 {
     QString xml;
     xml += QStringLiteral("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
@@ -549,6 +597,20 @@ QString toGpx(const QList<LatLon> &toVantage, const QList<LatLon> &away, const V
         .arg(vantage.pt.lat, 0, 'f', 6).arg(vantage.pt.lon, 0, 'f', 6)
         .arg(vantage.side.toHtmlEscaped(), vantage.reason.toHtmlEscaped())
         .arg(qRound(vantage.bearingToCamera));
+    if (!approachSteps.isEmpty()) {
+        xml += QStringLiteral("  <rte>\n    <name>Turn-by-turn to Vantage</name>\n");
+        for (const Step &s : approachSteps) {
+            xml += QStringLiteral("    <rtept lat=\"%1\" lon=\"%2\">\n"
+                                  "      <name>%3</name>\n"
+                                  "      <desc>%4 (%5 m)</desc>\n"
+                                  "      <sym>navigation</sym>\n"
+                                  "    </rtept>\n")
+                .arg(s.start.lat, 0, 'f', 6).arg(s.start.lon, 0, 'f', 6)
+                .arg(s.instruction.toHtmlEscaped(), s.streetName.toHtmlEscaped())
+                .arg(qRound(s.distanceM));
+        }
+        xml += QStringLiteral("  </rte>\n");
+    }
     if (!toVantage.isEmpty()) {
         xml += QStringLiteral("  <trk>\n    <name>Approach to Vantage</name>\n    <trkseg>\n");
         for (const LatLon &p : toVantage) {
@@ -587,8 +649,19 @@ QJsonObject inspectToJson(const InspectPlan &ip, const QString &limitsText, cons
     auto routeJson = [](const Route &r) {
         QJsonArray coords;
         for (const LatLon &x : r.points) coords.append(QJsonArray{std::round(x.lon * 1e6) / 1e6, std::round(x.lat * 1e6) / 1e6});
+        QJsonArray stepsArr;
+        for (const Step &s : r.steps) {
+            stepsArr.append(QJsonObject{{"distanceM", std::round(s.distanceM)},
+                                        {"durationS", std::round(s.durationS)},
+                                        {"instruction", s.instruction},
+                                        {"streetName", s.streetName},
+                                        {"type", s.type},
+                                        {"lat", s.start.lat},
+                                        {"lon", s.start.lon}});
+        }
         return QJsonObject{{"route", QJsonObject{{"type", "LineString"}, {"coordinates", coords}}},
                            {"distanceM", std::round(r.distanceM)}, {"durationS", std::round(r.durationS)},
+                           {"steps", stepsArr},
                            {"ok", r.ok}, {"error", r.error}};
     };
 

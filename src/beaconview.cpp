@@ -13,6 +13,7 @@
 #include <QHeaderView>
 #include <QLabel>
 #include <QTableWidget>
+#include <QTabWidget>
 #include <QVBoxLayout>
 #include <QMessageBox>
 #include <QFontMetrics>
@@ -2749,7 +2750,29 @@ void BeaconView::showRouteResult(const QJsonObject &o)
         const QPointF ll = t->item(row, 0)->data(Qt::UserRole).toPointF();
         focusOn(ll.x(), ll.y(), 18);
     });
-    v->addWidget(t, 1);
+
+    auto *tabs = new QTabWidget(d);
+    tabs->addTab(t, QStringLiteral("Passed Cameras (%1)").arg(passes.size()));
+
+    const QJsonArray steps = o.value(QLatin1String("steps")).toArray();
+    if (!steps.isEmpty()) {
+        auto *st = new QTableWidget(int(steps.size()), 4, d);
+        st->setHorizontalHeaderLabels({QStringLiteral("#"), QStringLiteral("Road / Street"), QStringLiteral("Distance"), QStringLiteral("Instruction")});
+        st->setEditTriggers(QAbstractItemView::NoEditTriggers);
+        st->setSelectionBehavior(QAbstractItemView::SelectRows);
+        st->verticalHeader()->setVisible(false);
+        st->horizontalHeader()->setSectionResizeMode(3, QHeaderView::Stretch);
+        for (int i = 0; i < int(steps.size()); ++i) {
+            const QJsonObject s = steps[i].toObject();
+            st->setItem(i, 0, new QTableWidgetItem(QString::number(i + 1)));
+            st->setItem(i, 1, new QTableWidgetItem(s.value(QLatin1String("streetName")).toString()));
+            st->setItem(i, 2, new QTableWidgetItem(QStringLiteral("%1 m").arg(qRound(s.value(QLatin1String("distanceM")).toDouble()))));
+            st->setItem(i, 3, new QTableWidgetItem(s.value(QLatin1String("instruction")).toString()));
+        }
+        st->resizeColumnsToContents();
+        tabs->addTab(st, QStringLiteral("Turn-by-Turn Directions (%1)").arg(steps.size()));
+    }
+    v->addWidget(tabs, 1);
     auto *bb = new QDialogButtonBox(QDialogButtonBox::Close);
     QPushButton *clr = bb->addButton(QStringLiteral("Clear the route"), QDialogButtonBox::ResetRole);
     connect(clr, &QPushButton::clicked, this, &BeaconView::clearAvoidRoute);

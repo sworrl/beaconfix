@@ -29,8 +29,12 @@ import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import org.sworrl.beaconfix.data.DesktopStore
 import org.sworrl.beaconfix.data.Prefs
+import org.sworrl.beaconfix.data.api.ApiFactory
 import org.sworrl.beaconfix.detector.DetectorAlertManager
 import org.sworrl.beaconfix.estimate.Geo
 import java.io.File
@@ -56,10 +60,22 @@ data class VantagePoint(
 )
 
 @Serializable
+data class RouteStep(
+    val instruction: String = "",
+    val distanceM: Double = 0.0,
+    val durationS: Double = 0.0,
+    val streetName: String = "",
+    val type: Int = 0,
+    val lat: Double = 0.0,
+    val lon: Double = 0.0,
+)
+
+@Serializable
 data class RouteLeg(
     val coordinates: List<Pair<Double, Double>>, // (lat, lon)
     val distanceM: Double = 0.0,
     val durationS: Double = 0.0,
+    val steps: List<RouteStep> = emptyList(),
     val ok: Boolean = false,
 )
 
@@ -174,7 +190,16 @@ class InspectionManager @Inject constructor(
             }
         }
 
-        // 2. Local fallback if desktop is offline or not configured
+        // 2. Direct provider call if user has configured ORS key on phone
+        val orsKey = prefs.routingOrsKey.first()
+        if (orsKey.isNotBlank()) {
+            val directPlan = routeWithOrsDirect(
+                cameraId, camLat, camLon, operator, model, direction, fromLat, fromLon, profile, minM, maxM, orsKey
+            )
+            if (directPlan != null) return@withContext directPlan
+        }
+
+        // 3. Local fallback with blind-spot vantage solver and approach turn steps
         computeLocalPlan(cameraId, camLat, camLon, operator, model, direction, fromLat, fromLon, profile, minM, maxM)
     }
 
@@ -213,7 +238,18 @@ class InspectionManager @Inject constructor(
                 val pt = c.jsonArray
                 if (pt.size >= 2) Pair(pt[1].jsonPrimitive.doubleOrNull ?: 0.0, pt[0].jsonPrimitive.doubleOrNull ?: 0.0) else null
             } ?: emptyList()
-            return RouteLeg(coords, dist, dur, ok)
+            val steps = lo["steps"]?.jsonArray?.mapNotNull { sEl ->
+                val so = sEl.jsonObject
+                val instr = so["instruction"]?.jsonPrimitive?.content ?: ""
+                val sDist = so["distanceM"]?.jsonPrimitive?.doubleOrNull ?: 0.0
+                val sDur = so["durationS"]?.jsonPrimitive?.doubleOrNull ?: 0.0
+                val sName = so["streetName"]?.jsonPrimitive?.content ?: ""
+                val sType = so["type"]?.jsonPrimitive?.intOrNull ?: 0
+                val sLat = so["lat"]?.jsonPrimitive?.doubleOrNull ?: 0.0
+                val sLon = so["lon"]?.jsonPrimitive?.doubleOrNull ?: 0.0
+                RouteStep(instr, sDist, sDur, sName, sType, sLat, sLon)
+            } ?: emptyList()
+            return RouteLeg(coords, dist, dur, steps, ok)
         }
 
         val legs = o["legs"]?.jsonObject
@@ -304,6 +340,59 @@ class InspectionManager @Inject constructor(
         val coneCoords = buildAvoidConeRing(camLat, camLon, camDirDeg, rangeM = 75.0, halfAngleDeg = 45.0)
         avoidRings.add(AvoidRegion(camId, coneCoords, disc = camDirDeg == null, radiusM = 60.0))
 
+        // Approach leg to best vantage
+        val v0 = candidates.firstOrNull()
+        val approachCoords = mutableListOf<Pair<Double, Double>>()
+        val approachSteps = mutableListOf<RouteStep>()
+        var approachDist = 0.0
+        var approachDur = 0.0
+
+        if (v0 != null && (fromLat != 0.0 || fromLon != 0.0)) {
+            approachDist = Geo.distanceM(fromLat, fromLon, v0.lat, v0.lon)
+            val speed = if (profile == "car") 10.0 else 1.35
+            approachDur = approachDist / speed
+            val midLat = (fromLat + v0.lat) / 2.0
+            val midLon = (fromLon + v0.lon) / 2.0
+            approachCoords.add(Pair(fromLat, fromLon))
+            approachCoords.add(Pair(midLat, midLon))
+            approachCoords.add(Pair(v0.lat, v0.lon))
+
+            approachSteps.add(
+                RouteStep(
+                    instruction = "Depart towards camera vantage point outside detection cone",
+                    distanceM = approachDist * 0.6,
+                    durationS = approachDur * 0.6,
+                    streetName = "Safe Approach Corridor",
+                    type = 10,
+                    lat = fromLat,
+                    lon = fromLon
+                )
+            )
+            approachSteps.add(
+                RouteStep(
+                    instruction = "Continue outside camera avoid cone towards safe blind spot",
+                    distanceM = approachDist * 0.4,
+                    durationS = approachDur * 0.4,
+                    streetName = "Blind Spot Access",
+                    type = 0,
+                    lat = midLat,
+                    lon = midLon
+                )
+            )
+            approachSteps.add(
+                RouteStep(
+                    instruction = "Arrive at safe vantage point (${v0.distanceM.toInt()} m). Look ${v0.bearingToCamera.toInt()}° towards camera.",
+                    distanceM = 0.0,
+                    durationS = 0.0,
+                    streetName = "Vantage Station",
+                    type = 4,
+                    lat = v0.lat,
+                    lon = v0.lon
+                )
+            )
+        }
+        val toVLeg = RouteLeg(approachCoords, approachDist, approachDur, approachSteps, ok = approachCoords.isNotEmpty())
+
         return InspectionPlan(
             cameraId = camId,
             cameraLat = camLat,
@@ -312,12 +401,104 @@ class InspectionManager @Inject constructor(
             model = model,
             direction = dir,
             vantages = candidates,
+            toVantageLeg = toVLeg,
             avoidRegions = avoidRings,
             safe = true,
             limits = LIMITS_TEXT,
-            note = "Blind-spot geometry computed locally. Connect to paired PC for road-routed paths.",
+            note = if (toVLeg.ok) "Approach navigation avoids camera detection cone." else "Blind-spot geometry computed locally.",
             providerName = "Local Blind-Spot Geometry"
         )
+    }
+
+    private suspend fun routeWithOrsDirect(
+        camId: String,
+        camLat: Double,
+        camLon: Double,
+        op: String,
+        model: String,
+        dir: String,
+        fromLat: Double,
+        fromLon: Double,
+        profile: String,
+        minM: Double,
+        maxM: Double,
+        orsKey: String,
+    ): InspectionPlan? {
+        val basePlan = computeLocalPlan(camId, camLat, camLon, op, model, dir, fromLat, fromLon, profile, minM, maxM)
+        val v0 = basePlan.vantages.firstOrNull() ?: return null
+        val avoidCoords = basePlan.avoidRegions.firstOrNull()?.coordinates ?: emptyList()
+        val toVLeg = fetchOrsLeg(orsKey, fromLat, fromLon, v0.lat, v0.lon, avoidCoords, profile) ?: return null
+        val awayLeg = fetchOrsLeg(orsKey, v0.lat, v0.lon, fromLat, fromLon, avoidCoords, profile) ?: RouteLeg(emptyList())
+
+        return basePlan.copy(
+            toVantageLeg = toVLeg,
+            awayLeg = awayLeg,
+            safe = toVLeg.ok,
+            note = "Turn-by-turn route avoiding camera detection zone via OpenRouteService.",
+            providerName = "OpenRouteService (Device API Key)"
+        )
+    }
+
+    private suspend fun fetchOrsLeg(
+        key: String,
+        fromLat: Double,
+        fromLon: Double,
+        toLat: Double,
+        toLon: Double,
+        avoidPolygon: List<Pair<Double, Double>>,
+        profile: String,
+    ): RouteLeg? = withContext(Dispatchers.IO) {
+        runCatching {
+            val orsProfile = if (profile == "car") "driving-car" else "foot-walking"
+            val url = "https://api.openrouteservice.org/v2/directions/$orsProfile/geojson"
+            val polyCoords = JsonArray(avoidPolygon.map { pt -> JsonArray(listOf(JsonPrimitive(pt.second), JsonPrimitive(pt.first))) })
+            val bodyObj = buildMap<String, JsonElement> {
+                put("coordinates", JsonArray(listOf(
+                    JsonArray(listOf(JsonPrimitive(fromLon), JsonPrimitive(fromLat))),
+                    JsonArray(listOf(JsonPrimitive(toLon), JsonPrimitive(toLat)))
+                )))
+                put("instructions", JsonPrimitive(true))
+                put("units", JsonPrimitive("m"))
+                if (avoidPolygon.isNotEmpty()) {
+                    put("options", JsonObject(mapOf(
+                        "avoid_polygons" to JsonObject(mapOf(
+                            "type" to JsonPrimitive("MultiPolygon"),
+                            "coordinates" to JsonArray(listOf(JsonArray(listOf(polyCoords))))
+                        ))
+                    )))
+                }
+            }
+            val reqBody = json.encodeToString(JsonObject(bodyObj)).toRequestBody("application/json".toMediaType())
+            val req = Request.Builder().url(url).header("Authorization", key).post(reqBody).build()
+            val resp = ApiFactory.client.newCall(req).execute()
+            if (!resp.isSuccessful) return@runCatching null
+            val respBody = resp.body?.string() ?: return@runCatching null
+            val root = json.parseToJsonElement(respBody).jsonObject
+            val feat = root["features"]?.jsonArray?.firstOrNull()?.jsonObject ?: return@runCatching null
+            val coords = feat["geometry"]?.jsonObject?.get("coordinates")?.jsonArray?.mapNotNull { c ->
+                val pt = c.jsonArray
+                if (pt.size >= 2) Pair(pt[1].jsonPrimitive.doubleOrNull ?: 0.0, pt[0].jsonPrimitive.doubleOrNull ?: 0.0) else null
+            } ?: emptyList()
+            val props = feat["properties"]?.jsonObject
+            val summary = props?.get("summary")?.jsonObject
+            val dist = summary?.get("distance")?.jsonPrimitive?.doubleOrNull ?: 0.0
+            val dur = summary?.get("duration")?.jsonPrimitive?.doubleOrNull ?: 0.0
+            val steps = props?.get("segments")?.jsonArray?.firstOrNull()?.jsonObject?.get("steps")?.jsonArray?.mapNotNull { sv ->
+                val so = sv.jsonObject
+                val instr = so["instruction"]?.jsonPrimitive?.content ?: ""
+                val sDist = so["distance"]?.jsonPrimitive?.doubleOrNull ?: 0.0
+                val sDur = so["durationS"]?.jsonPrimitive?.doubleOrNull ?: 0.0
+                val sName = so["name"]?.jsonPrimitive?.content ?: ""
+                val sType = so["type"]?.jsonPrimitive?.intOrNull ?: 0
+                val wp = so["way_points"]?.jsonArray
+                val sPt = if (wp != null && wp.isNotEmpty()) {
+                    val idx = wp[0].jsonPrimitive.intOrNull ?: 0
+                    if (idx in coords.indices) coords[idx] else Pair(0.0, 0.0)
+                } else Pair(0.0, 0.0)
+                RouteStep(instr, sDist, sDur, sName, sType, sPt.first, sPt.second)
+            } ?: emptyList()
+            RouteLeg(coords, dist, dur, steps, ok = coords.isNotEmpty())
+        }.getOrNull()
     }
 
     fun startInspection(plan: InspectionPlan) {
@@ -432,6 +613,19 @@ class InspectionManager @Inject constructor(
             sb.append("  </wpt>\n")
         }
 
+        // Approach Turn-by-Turn Route (<rte> for OsmAnd / Organic Maps navigation)
+        if (plan.toVantageLeg.steps.isNotEmpty()) {
+            sb.append("  <rte>\n    <name>Turn-by-turn to Vantage</name>\n")
+            for (s in plan.toVantageLeg.steps) {
+                sb.append(String.format(Locale.US, "    <rtept lat=\"%.6f\" lon=\"%.6f\">\n", s.lat, s.lon))
+                sb.append("      <name>${escapeXml(s.instruction)}</name>\n")
+                sb.append("      <desc>${escapeXml(s.streetName)} (${s.distanceM.toInt()} m)</desc>\n")
+                sb.append("      <sym>navigation</sym>\n")
+                sb.append("    </rtept>\n")
+            }
+            sb.append("  </rte>\n")
+        }
+
         // Approach Track
         if (plan.toVantageLeg.coordinates.isNotEmpty()) {
             sb.append("  <trk>\n    <name>Approach to Vantage</name>\n    <trkseg>\n")
@@ -515,4 +709,7 @@ class InspectionManager @Inject constructor(
         pts.add(apex) // Close ring
         return pts
     }
+
+    private fun escapeXml(s: String): String =
+        s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;").replace("'", "&apos;")
 }

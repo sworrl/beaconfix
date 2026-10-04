@@ -125,6 +125,20 @@ InspectDialog::InspectDialog(Locator *loc, const QString &cameraId, QWidget *par
 
     mainLayout->addWidget(vantagesBox);
 
+    // 6b. Turn-by-Turn Avoidance Directions
+    m_stepsBox = new QGroupBox(QStringLiteral("Turn-by-Turn Directions (Approach to Vantage)"), this);
+    auto *sbLayout = new QVBoxLayout(m_stepsBox);
+    m_stepsTable = new QTableWidget(0, 4, this);
+    m_stepsTable->setHorizontalHeaderLabels({QStringLiteral("#"), QStringLiteral("Road / Street"), QStringLiteral("Distance"), QStringLiteral("Instruction")});
+    m_stepsTable->horizontalHeader()->setSectionResizeMode(3, QHeaderView::Stretch);
+    m_stepsTable->setSelectionBehavior(QAbstractItemView::SelectRows);
+    m_stepsTable->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    m_stepsTable->verticalHeader()->setVisible(false);
+    m_stepsTable->setMaximumHeight(140);
+    sbLayout->addWidget(m_stepsTable);
+    m_stepsBox->setVisible(false);
+    mainLayout->addWidget(m_stepsBox);
+
     // 7. Dialog Bottom Buttons
     auto *btnLayout = new QHBoxLayout;
     m_gpxBtn = new QPushButton(QIcon::fromTheme(QStringLiteral("document-save")), QStringLiteral("Export Plan as GPX…"), this);
@@ -284,8 +298,23 @@ void InspectDialog::updateUiWithPlan(const QJsonObject &plan)
                                    .arg(qRound(d1)).arg(qRound(t1 / 60.0))
                                    .arg(qRound(d2)).arg(qRound(t2 / 60.0))
                                    .arg(plan.value(QLatin1String("providerName")).toString()));
+
+        // Populate Turn-by-turn directions for approach leg
+        const QJsonArray stepsArr = toV.value(QLatin1String("steps")).toArray();
+        m_stepsTable->setRowCount(0);
+        for (int i = 0; i < stepsArr.size(); ++i) {
+            const QJsonObject s = stepsArr[i].toObject();
+            m_stepsTable->insertRow(i);
+            m_stepsTable->setItem(i, 0, new QTableWidgetItem(QString::number(i + 1)));
+            m_stepsTable->setItem(i, 1, new QTableWidgetItem(s.value(QLatin1String("streetName")).toString()));
+            m_stepsTable->setItem(i, 2, new QTableWidgetItem(QStringLiteral("%1 m").arg(qRound(s.value(QLatin1String("distanceM")).toDouble()))));
+            m_stepsTable->setItem(i, 3, new QTableWidgetItem(s.value(QLatin1String("instruction")).toString()));
+        }
+        m_stepsBox->setVisible(!stepsArr.isEmpty());
     } else {
         m_legsSummary->setText(note);
+        m_stepsTable->setRowCount(0);
+        m_stepsBox->setVisible(false);
     }
 
     m_gpxBtn->setEnabled(!vArr.isEmpty());
@@ -314,10 +343,24 @@ void InspectDialog::exportGpx()
     };
 
     const QJsonObject legs = m_currentPlan.value(QLatin1String("legs")).toObject();
-    const QList<AvoidRoute::LatLon> toV = parseCoords(legs.value(QLatin1String("toVantage")).toObject());
+    const QJsonObject toVObj = legs.value(QLatin1String("toVantage")).toObject();
+    const QList<AvoidRoute::LatLon> toV = parseCoords(toVObj);
     const QList<AvoidRoute::LatLon> away = parseCoords(legs.value(QLatin1String("away")).toObject());
 
-    const QString gpxContent = AvoidRoute::toGpx(toV, away, vantage, m_targetCam);
+    QList<AvoidRoute::Step> approachSteps;
+    for (const QJsonValue &sv : toVObj.value(QLatin1String("steps")).toArray()) {
+        const QJsonObject so = sv.toObject();
+        AvoidRoute::Step st;
+        st.distanceM = so.value(QLatin1String("distanceM")).toDouble();
+        st.durationS = so.value(QLatin1String("durationS")).toDouble();
+        st.instruction = so.value(QLatin1String("instruction")).toString();
+        st.streetName = so.value(QLatin1String("streetName")).toString();
+        st.type = so.value(QLatin1String("type")).toInt();
+        st.start = {so.value(QLatin1String("lat")).toDouble(), so.value(QLatin1String("lon")).toDouble()};
+        approachSteps.append(st);
+    }
+
+    const QString gpxContent = AvoidRoute::toGpx(toV, away, vantage, m_targetCam, approachSteps);
 
     const QString path = QFileDialog::getSaveFileName(this, QStringLiteral("Save Inspection Plan GPX"),
                                                       QStringLiteral("inspection_%1.gpx").arg(m_camId.replace(QLatin1Char(':'), QLatin1Char('_')).replace(QLatin1Char('/'), QLatin1Char('_'))),

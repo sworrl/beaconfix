@@ -97,4 +97,48 @@ class InspectionManagerTest {
         val lookDirection = (oppositeBearing + 180.0) % 360.0
         assertEquals(90.0, lookDirection, 0.001)
     }
+
+    @Test
+    fun testTurnByTurnRouteSteps() {
+        val steps = listOf(
+            RouteStep(
+                instruction = "Depart towards camera vantage point outside detection cone",
+                distanceM = 150.0,
+                durationS = 15.0,
+                streetName = "Safe Corridor",
+                type = 10,
+                lat = 37.7740,
+                lon = -122.4200
+            ),
+            RouteStep(
+                instruction = "Turn right onto safe vantage alley outside camera cone",
+                distanceM = 60.0,
+                durationS = 6.0,
+                streetName = "Vantage Alley",
+                type = 1,
+                lat = 37.7744,
+                lon = -122.4198
+            ),
+            RouteStep(
+                instruction = "Arrive at safe vantage point (35 m). Look 72° towards camera.",
+                distanceM = 0.0,
+                durationS = 0.0,
+                streetName = "Observation Station",
+                type = 4,
+                lat = 37.7746,
+                lon = -122.4199
+            )
+        )
+        val leg = RouteLeg(
+            coordinates = listOf(Pair(37.7740, -122.4200), Pair(37.7744, -122.4198), Pair(37.7746, -122.4199)),
+            distanceM = 210.0,
+            durationS = 21.0,
+            steps = steps,
+            ok = true
+        )
+        assertEquals(3, leg.steps.size)
+        assertEquals("Safe Corridor", leg.steps[0].streetName)
+        assertEquals(1, leg.steps[1].type)
+        assertTrue(leg.steps[2].instruction.contains("Look 72° towards camera"))
+    }
 }

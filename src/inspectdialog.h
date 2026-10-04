@@ -8,6 +8,7 @@
 class Locator;
 class QComboBox;
 class QDoubleSpinBox;
+class QGroupBox;
 class QLabel;
 class QPushButton;
 class QTableWidget;
@@ -42,6 +43,8 @@ private:
     QDoubleSpinBox *m_maxM = nullptr;
     QTableWidget *m_vantagesTable = nullptr;
     QLabel *m_legsSummary = nullptr;
+    QGroupBox *m_stepsBox = nullptr;
+    QTableWidget *m_stepsTable = nullptr;
     QPushButton *m_planBtn = nullptr;
     QPushButton *m_gpxBtn = nullptr;
     QPushButton *m_mapBtn = nullptr;

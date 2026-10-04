@@ -67,11 +67,21 @@ QUrl requestUrl(Provider p, const QString &key, const QString &profile = QString
 QList<QPair<QByteArray, QByteArray>> requestHeaders(Provider p, const QString &key);
 QByteArray requestBody(Provider p, LatLon a, LatLon b, const QList<Area> &areas, const QString &profile = QStringLiteral("car"));
 
+struct Step {
+    double distanceM = 0;
+    double durationS = 0;
+    QString instruction;
+    QString streetName;
+    int type = 0;                            // provider maneuver type / sign
+    LatLon start;                            // coordinate where step begins
+};
+
 struct Route {
     bool ok = false;
     QString error;
     QList<LatLon> points;
     double distanceM = 0, durationS = 0;
+    QList<Step> steps;                       // turn-by-turn directions
 };
 Route parseResponse(Provider p, int httpStatus, const QByteArray &body);
 
@@ -126,7 +136,8 @@ QList<Vantage> findVantages(const Cam &target, const QList<RoadSnap::Way> &ways,
 QList<Exposure> checkExposures(const QList<LatLon> &route, const QList<Cam> &allCams);
 
 // GPX export for inspection plan
-QString toGpx(const QList<LatLon> &toVantage, const QList<LatLon> &away, const Vantage &vantage, const Cam &cam);
+QString toGpx(const QList<LatLon> &toVantage, const QList<LatLon> &away, const Vantage &vantage, const Cam &cam,
+              const QList<Step> &approachSteps = QList<Step>());
 
 // JSON representation for API / UI
 QJsonObject inspectToJson(const InspectPlan &ip, const QString &limitsText, const QJsonArray &photos = QJsonArray());

@@ -60,7 +60,7 @@ int main(int argc, char **argv)
     // ── corridor and caps ──
     const LatLon A = at(0, 0), B = at(10000, 0);                  // 10 km east
     {
-        CHECK(std::fabs(corridorM(A, B) - 2000) < 1, "corridor: 20 % of 10 km = 2 km");
+        CHECK(std::fabs(corridorM(A, B) - 2000) < 1, "corridor: 20 %% of 10 km = 2 km");
         CHECK(corridorM(A, at(1000, 0)) == kMinCorridorM, "short trips: at least 1.5 km");
         QList<Cam> cams{cam(QStringLiteral("osm:node/10"), 5000, 30, {90}), cam(QStringLiteral("osm:node/11"), 5000, 1900, {}),
                         cam(QStringLiteral("osm:node/12"), 5000, 2500, {90}), cam(QStringLiteral("osm:node/13"), -3000, 0, {90})};
@@ -115,6 +115,19 @@ int main(int argc, char **argv)
     {
         const Route r = parseResponse(Provider::Ors, 200, orsOk);
         CHECK(r.ok && r.points.size() == 7 && r.distanceM == 10600 && r.durationS == 720, "ORS answer parsed");
+        const QByteArray orsWithSteps = QJsonDocument(QJsonObject{{"type", "FeatureCollection"}, {"features", QJsonArray{QJsonObject{
+            {"type", "Feature"}, {"geometry", QJsonObject{{"type", "LineString"}, {"coordinates", lineJson(detour)}}},
+            {"properties", QJsonObject{
+                {"summary", QJsonObject{{"distance", 10600.0}, {"duration", 720.0}}},
+                {"segments", QJsonArray{QJsonObject{
+                    {"steps", QJsonArray{
+                        QJsonObject{{"distance", 4800.0}, {"duration", 300.0}, {"type", 10}, {"instruction", "Head east on Main St"}, {"name", "Main St"}, {"way_points", QJsonArray{0, 1}}},
+                        QJsonObject{{"distance", 300.0}, {"duration", 30.0}, {"type", 0}, {"instruction", "Turn left onto Oak St avoiding ALPR"}, {"name", "Oak St"}, {"way_points", QJsonArray{1, 2}}}
+                    }}
+                }}}
+            }}}}}}).toJson();
+        const Route rSteps = parseResponse(Provider::Ors, 200, orsWithSteps);
+        CHECK(rSteps.ok && rSteps.steps.size() == 2 && rSteps.steps[1].instruction.contains(QLatin1String("avoiding ALPR")), "turn-by-turn steps parsed correctly from ORS");
         const Route g = parseResponse(Provider::GraphHopper, 200, ghOk);
         CHECK(g.ok && g.points.size() == 7 && std::fabs(g.durationS - 720) < 1e-9, "GraphHopper answer parsed (time in ms)");
         const Route e = parseResponse(Provider::Ors, 400, R"({"error":{"code":2004,"message":"Request parameters exceed the server configuration limits."}})");

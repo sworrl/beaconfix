@@ -64,14 +64,30 @@ import org.sworrl.beaconfix.ui.vm.IdentityViewModel
 import org.sworrl.beaconfix.ui.vm.RootViewModel
 import org.sworrl.beaconfix.widget.WidgetEntryPoint
 
-data class Dest(val route: String, val label: String, val icon: ImageVector, val phoneTab: Boolean)
+data class Dest(val route: String, val label: String, val icon: ImageVector? = null, val iconRes: Int = 0, val phoneTab: Boolean)
 val DESTS = listOf(
-    Dest("home", "Home", Icons.Default.Home, true), Dest("map", "Map", Icons.Default.Map, true), Dest("beacons", "Beacons", Icons.Default.Wifi, true),
-    Dest("nearby", "Places", Icons.Default.Place, true), Dest("more", "More", Icons.Default.MoreHoriz, true),
-    Dest("detector", "Detector", Icons.Default.Radar, false),
-    Dest("trip", "Trip", Icons.Default.Explore, false), Dest("events", "Events", Icons.Default.RssFeed, false), Dest("survey", "Survey", Icons.Default.Radar, false),
-    Dest("sync", "Sync", Icons.Default.Sync, false), Dest("settings", "Settings", Icons.Default.Settings, false),
+    Dest("home", "Home", icon = Icons.Default.Home, phoneTab = true),
+    Dest("map", "Map", icon = Icons.Default.Map, phoneTab = true),
+    Dest("alpr", "Dash Cam", iconRes = org.sworrl.beaconfix.R.drawable.alpr_ic_camera, phoneTab = true),
+    Dest("beacons", "Beacons", icon = Icons.Default.Wifi, phoneTab = true),
+    Dest("nearby", "Places", icon = Icons.Default.Place, phoneTab = true),
+    Dest("more", "More", icon = Icons.Default.MoreHoriz, phoneTab = true),
+    Dest("detector", "Detector", icon = Icons.Default.Radar, phoneTab = false),
+    Dest("trip", "Trip", icon = Icons.Default.Explore, phoneTab = false),
+    Dest("events", "Events", icon = Icons.Default.RssFeed, phoneTab = false),
+    Dest("survey", "Survey", icon = Icons.Default.Radar, phoneTab = false),
+    Dest("sync", "Sync", icon = Icons.Default.Sync, phoneTab = false),
+    Dest("settings", "Settings", icon = Icons.Default.Settings, phoneTab = false),
 )
+
+@Composable
+private fun DestIcon(t: Dest) {
+    if (t.icon != null) {
+        Icon(t.icon, contentDescription = t.label)
+    } else if (t.iconRes != 0) {
+        Icon(androidx.compose.ui.res.painterResource(t.iconRes), contentDescription = t.label)
+    }
+}
 
 @Composable
 fun BeaconFixRoot(launch: LaunchArgs = LaunchArgs()) {
@@ -124,10 +140,10 @@ fun BeaconFixRoot(launch: LaunchArgs = LaunchArgs()) {
     val selected: (Dest) -> Boolean = { t -> dest?.hierarchy?.any { it.route == t.route } == true }
     if (wide) {
         Row(Modifier.fillMaxSize()) {
-            NavigationRail { for (t in DESTS.filter { it.route != "more" }) NavigationRailItem(selected = selected(t), onClick = { go(t.route) }, icon = { Icon(t.icon, contentDescription = t.label) }, label = { Text(t.label) }) }
+            NavigationRail { for (t in DESTS.filter { it.route != "more" }) NavigationRailItem(selected = selected(t), onClick = { go(t.route) }, icon = { DestIcon(t) }, label = { Text(t.label) }) }
             Graph(nav, idVm, Modifier.fillMaxSize(), launch.file)
         }
-    } else Scaffold(bottomBar = { NavigationBar { for (t in DESTS.filter { it.phoneTab }) NavigationBarItem(selected = selected(t), onClick = { go(t.route) }, icon = { Icon(t.icon, contentDescription = t.label) }, label = { Text(t.label) }) } }) { pad -> Graph(nav, idVm, Modifier.padding(pad), launch.file) }
+    } else Scaffold(bottomBar = { NavigationBar { for (t in DESTS.filter { it.phoneTab }) NavigationBarItem(selected = selected(t), onClick = { go(t.route) }, icon = { DestIcon(t) }, label = { Text(t.label) }) } }) { pad -> Graph(nav, idVm, Modifier.padding(pad), launch.file) }
 }
 
 @Composable

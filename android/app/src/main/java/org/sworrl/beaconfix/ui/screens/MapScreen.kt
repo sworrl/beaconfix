@@ -652,6 +652,7 @@ fun MapScreen(
             org.sworrl.beaconfix.sightings.ui.InspectionActiveHud(
                 plan = activePlan!!,
                 guardAlert = liveGuardAlert,
+                currentLocation = latest?.let { Pair(it.lat, it.lon) },
                 onDone = { inspectVm.stopInspection() },
                 modifier = Modifier.align(Alignment.TopCenter).padding(top = 8.dp)
             )
