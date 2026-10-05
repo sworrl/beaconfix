@@ -35,6 +35,7 @@ import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -105,6 +106,7 @@ fun EspNodesScreen(
     val trackers by nodeManager.recentTrackers.collectAsState()
     val isFollowing by nodeManager.isFollowingPhone.collectAsState()
     val meshPeers by nodeManager.meshPeers.collectAsState()
+    val batteryTraining by nodeManager.batteryTraining.collectAsState()
     var editingBatteryNode by remember { mutableStateOf<MeshPeerNode?>(null) }
 
     var selectedTab by remember { mutableIntStateOf(0) }
@@ -337,14 +339,15 @@ fun EspNodesScreen(
                                             if (peer.battState == "no_battery" || peer.battMv < 1200) {
                                                 Text("USB 5V (No Batt)", color = Cyan, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.bodySmall)
                                             } else {
+                                                val trainTag = if (peer.battTrained) " [Trained]" else if (peer.battTrainPct > 0) " [${peer.battTrainPct}% trn]" else ""
                                                 Text(
-                                                    "${peer.battPct}% (${peer.battMv}mV${if (peer.charging) ", ⚡" else ""})",
+                                                    "${peer.battPct}% (${peer.battMv}mV${if (peer.charging) ", ⚡" else ""})$trainTag",
                                                     color = if (peer.battPct > 20) Green else Red,
                                                     fontWeight = FontWeight.Bold,
                                                     style = MaterialTheme.typography.bodySmall
                                                 )
                                             }
-                                            Text("${peer.battMah} mAh cell", color = Slate, style = MaterialTheme.typography.labelSmall)
+                                            Text("${peer.battMah} mAh cell${if (peer.battCycles > 0.05f) String.format(java.util.Locale.US, " · %.1f cyc", peer.battCycles) else ""}", color = Slate, style = MaterialTheme.typography.labelSmall)
                                         }
                                         Column {
                                             Text("RF & Mesh:", color = Slate, style = MaterialTheme.typography.labelSmall)
@@ -482,8 +485,9 @@ fun EspNodesScreen(
                                             Text("Power: USB (No Batt)", color = Cyan, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.bodySmall)
                                             Text("State: External 5V", color = Slate, style = MaterialTheme.typography.bodySmall)
                                         } else {
-                                            Text("Battery: ${st.batt_pct}% (${st.batt_mv}mV)", color = if (st.batt_pct > 20) Green else Red, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.bodySmall)
-                                            Text("State: ${st.batt_state}${if (st.charging) " ⚡" else ""}", color = Slate, style = MaterialTheme.typography.bodySmall)
+                                            val trainTag = if (st.batt_trained) " [Trained]" else if (st.batt_train_pct > 0) " [${st.batt_train_pct}% trn]" else ""
+                                            Text("Battery: ${st.batt_pct}% (${st.batt_mv}mV)$trainTag", color = if (st.batt_pct > 20) Green else Red, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.bodySmall)
+                                            Text("State: ${st.batt_state}${if (st.charging) " ⚡" else ""}${if (st.batt_cycles > 0.05f) String.format(java.util.Locale.US, " · %.1f cyc", st.batt_cycles) else ""}", color = Slate, style = MaterialTheme.typography.bodySmall)
                                         }
                                     }
                                 }
@@ -658,7 +662,7 @@ fun EspNodesScreen(
                         }
                     }
 
-                    // Battery Diagnostics & Troubleshooter Card
+                    // Battery Training, Diagnostics & Troubleshooter Card
                     var isBattDiagExpanded by remember { mutableStateOf(false) }
                     Card(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp)) {
                         Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -668,19 +672,54 @@ fun EspNodesScreen(
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
                                 Column(Modifier.weight(1f)) {
-                                    Text("🔍 Battery Troubleshooter (\"Can't see battery?\")", style = MaterialTheme.typography.labelLarge)
-                                    Text(
-                                        if (status?.batt_state == "no_battery" || (status?.batt_mv ?: 0) < 1200) "Status: No battery detected (USB 5V)"
-                                        else "Status: 3.7V Battery Active (${status?.batt_pct}%)",
-                                        color = if (status?.batt_state == "no_battery" || (status?.batt_mv ?: 0) < 1200) Cyan else Green,
-                                        style = MaterialTheme.typography.bodySmall
-                                    )
+                                    Text("🔋 Battery Adaptive Learning & Diagnostics", style = MaterialTheme.typography.labelLarge)
+                                    val trn = batteryTraining
+                                    val isTrn = trn?.isTrained ?: status?.batt_trained ?: false
+                                    val trnPct = trn?.trainPct ?: status?.batt_train_pct ?: 0
+                                    val cyc = trn?.cycles ?: status?.batt_cycles ?: 0f
+                                    if (status?.batt_state == "no_battery" || (status?.batt_mv ?: 0) < 1200) {
+                                        Text("Status: No battery detected (USB 5V)", color = Cyan, style = MaterialTheme.typography.bodySmall)
+                                    } else {
+                                        Text(
+                                            "Status: ${if (isTrn) "Fully Trained (100%)" else "Training ($trnPct%)"} · ${String.format(java.util.Locale.US, "%.1f", cyc)} cycles",
+                                            color = if (isTrn) Green else Gold,
+                                            style = MaterialTheme.typography.bodySmall
+                                        )
+                                    }
                                 }
-                                Text(if (isBattDiagExpanded) "▲ Hide" else "▼ Troubleshoot", color = Cyan, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                                Text(if (isBattDiagExpanded) "▲ Hide" else "▼ Details", color = Cyan, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                            }
+
+                            // Always visible Quick Actions for Battery Stats & Training
+                            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                OutlinedButton(
+                                    onClick = { nodeManager.requestBatteryStats() },
+                                    modifier = Modifier.weight(1f)
+                                ) {
+                                    Text("Refresh Stats", fontSize = 12.sp)
+                                }
+                                OutlinedButton(
+                                    onClick = { nodeManager.resetBatteryStats() },
+                                    modifier = Modifier.weight(1f),
+                                    colors = ButtonDefaults.outlinedButtonColors(contentColor = Red)
+                                ) {
+                                    Text("Reset Battery Stats", fontSize = 12.sp)
+                                }
                             }
 
                             if (isBattDiagExpanded) {
                                 Spacer(Modifier.height(4.dp))
+                                val trn = batteryTraining
+                                if (trn != null) {
+                                    Surface(color = Color(0xFF090D16), shape = RoundedCornerShape(6.dp), modifier = Modifier.fillMaxWidth()) {
+                                        Column(Modifier.padding(8.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                            Text("Learned Voltage Range: ${trn.vMin} mV (0%) ➔ ${trn.vMax} mV (100%) [Nominal: ${trn.vNom} mV]", color = Cyan, fontFamily = FontFamily.Monospace, fontSize = 11.sp)
+                                            Text("Cumulative Cycles: ${String.format(java.util.Locale.US, "%.2f", trn.cycles)} | Runtime: ${trn.runtimeSec / 60}m | Samples: ${trn.samples}", color = Slate, fontFamily = FontFamily.Monospace, fontSize = 11.sp)
+                                            Text("Confidence Score: ${trn.trainPct}% (${if (trn.isTrained) "Active Model" else "Training Model"})", color = if (trn.isTrained) Green else Gold, fontFamily = FontFamily.Monospace, fontSize = 11.sp)
+                                        }
+                                    }
+                                    Spacer(Modifier.height(4.dp))
+                                }
                                 Text("Diagnosis Checklist:", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.bodySmall)
                                 Text("1. Common Ground (GND): Is the ESP32 GND connected to TP4056 GND? If grounds are isolated, the ADC cannot read voltage and floats near 0V.", color = Slate, style = MaterialTheme.typography.bodySmall)
                                 Text("2. Divider Resistors: Verify 100kΩ between Battery (+) and GPIO 35, plus 100kΩ between GPIO 35 and GND.", color = Slate, style = MaterialTheme.typography.bodySmall)

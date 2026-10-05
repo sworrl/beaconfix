@@ -245,7 +245,7 @@ void handleCommand(const String& cmdLine) {
                        "\"screen <on|off|toggle|status>\",\"page <0-7|next|prev|cycle on|cycle off>\",\"contrast <0-255>\","
                        "\"travel <status|moving|stationary> [kmh] [hdg] [alt] [trip_km]\",\"trip <km|reset|status>\",\"alpr <test|dismiss|alert ...>\","
                        "\"wifi status\",\"wifi connect <ssid> <pass>\",\"wifi clear\","
-                       "\"gps [lat,lon,acc,...]\",\"led <pattern>\",\"batt\",\"ota\",\"reboot\"]}");
+                       "\"gps [lat,lon,acc,...]\",\"led <pattern>\",\"batt [status|stats|reset|on|off|<mah>]\",\"ota\",\"reboot\"]}");
     } else if (cmd.equalsIgnoreCase("gps") || cmd.equalsIgnoreCase("gps status")) {
         Serial.printf("{\"type\":\"gps_status\",\"hardware_detected\":%s,\"has_fix\":%s,\"lat\":%.6f,\"lon\":%.6f,\"acc\":%.1f,\"speed_kmh\":%.1f,\"alt\":%.1f,\"sats\":%u,\"hdop\":%.1f}\n",
                       GpsReceiver::instance().hasHardwareDetected() ? "true" : "false",
@@ -460,7 +460,29 @@ void handleCommand(const String& cmdLine) {
     } else if (cmd.startsWith("batt") || cmd.startsWith("battery")) {
         String args = cmd.length() > 4 ? cmd.substring(cmd.indexOf(' ') + 1) : "";
         args.trim();
-        if (args.equalsIgnoreCase("none") || args.equalsIgnoreCase("off") || args.equalsIgnoreCase("0") || args.equalsIgnoreCase("usb")) {
+        if (args.equalsIgnoreCase("reset") || args.equalsIgnoreCase("stats reset") || args.equalsIgnoreCase("reset stats") || args.equalsIgnoreCase("train reset")) {
+            BatteryMonitor::instance().resetBatteryStats();
+            const auto& s = BatteryMonitor::instance().getTrainingStats();
+            Serial.printf("{\"type\":\"ack\",\"action\":\"battery_stats_reset\",\"trained\":false,\"v_min\":%u,\"v_max\":%u,\"cycles\":%.1f,\"runtime_sec\":0}\n",
+                          s.vMin, s.vMax, s.cycles);
+        } else if (args.equalsIgnoreCase("stats") || args.equalsIgnoreCase("diag") || args.equalsIgnoreCase("info")) {
+            const auto& s = BatteryMonitor::instance().getTrainingStats();
+            Serial.printf("{\"type\":\"battery_stats\",\"has_battery\":%s,\"mah\":%u,\"mv\":%lu,\"pct\":%u,\"state\":\"%s\",\"charging\":%s,\"trained\":%s,\"train_pct\":%u,\"v_min\":%u,\"v_max\":%u,\"v_nom\":%u,\"cycles\":%.2f,\"runtime_sec\":%lu,\"samples\":%lu}\n",
+                          BatteryMonitor::instance().hasBattery() ? "true" : "false",
+                          NodeConfig::instance().getBattMah(),
+                          (unsigned long)BatteryMonitor::instance().getMilliVolts(),
+                          BatteryMonitor::instance().getPercentage(),
+                          BatteryMonitor::instance().getStateStr(),
+                          BatteryMonitor::instance().isCharging() ? "true" : "false",
+                          s.isTrained ? "true" : "false",
+                          s.trainPct,
+                          s.vMin,
+                          s.vMax,
+                          s.vNom,
+                          s.cycles,
+                          (unsigned long)s.runtimeSec,
+                          (unsigned long)s.sampleCount);
+        } else if (args.equalsIgnoreCase("none") || args.equalsIgnoreCase("off") || args.equalsIgnoreCase("0") || args.equalsIgnoreCase("usb")) {
             NodeConfig::instance().setBatteryEquipped(false);
             BatteryMonitor::instance().update();
             Serial.println("{\"type\":\"ack\",\"action\":\"battery_disabled\",\"has_battery\":false,\"power\":\"usb_5v\"}");
@@ -474,13 +496,17 @@ void handleCommand(const String& cmdLine) {
             BatteryMonitor::instance().update();
             Serial.printf("{\"type\":\"ack\",\"action\":\"battery_capacity_set\",\"mah\":%u,\"has_battery\":true}\n", mah);
         } else {
-            Serial.printf("{\"type\":\"battery_status\",\"has_battery\":%s,\"mah\":%u,\"mv\":%lu,\"pct\":%u,\"state\":\"%s\",\"charging\":%s}\n",
+            const auto& s = BatteryMonitor::instance().getTrainingStats();
+            Serial.printf("{\"type\":\"battery_status\",\"has_battery\":%s,\"mah\":%u,\"mv\":%lu,\"pct\":%u,\"state\":\"%s\",\"charging\":%s,\"trained\":%s,\"train_pct\":%u,\"cycles\":%.1f}\n",
                           BatteryMonitor::instance().hasBattery() ? "true" : "false",
                           NodeConfig::instance().getBattMah(),
                           (unsigned long)BatteryMonitor::instance().getMilliVolts(),
                           BatteryMonitor::instance().getPercentage(),
                           BatteryMonitor::instance().getStateStr(),
-                          BatteryMonitor::instance().isCharging() ? "true" : "false");
+                          BatteryMonitor::instance().isCharging() ? "true" : "false",
+                          s.isTrained ? "true" : "false",
+                          s.trainPct,
+                          s.cycles);
         }
     } else if (cmd.equalsIgnoreCase("base") || cmd.equalsIgnoreCase("mode base")) {
         NodeConfig::instance().setOpMode(OP_MODE_BASE_STATION);
@@ -704,7 +730,7 @@ void handleCommand(const String& cmdLine) {
                       BEACONFIX_FW_VERSION, BEACONFIX_BUILD_DATE);
     } else if (cmd.equalsIgnoreCase("status")) {
         Serial.printf("{\"type\":\"status\",\"version\":\"%s\",\"node\":\"%s\",\"mac\":\"%s\",\"mode\":\"%s\",\"is_base_station\":%s,\"hardware\":\"Heltec_LoRa_V3_ESP32S3\","
-                      "\"batt_mv\":%lu,\"batt_pct\":%u,\"batt_state\":\"%s\","
+                      "\"batt_mv\":%lu,\"batt_pct\":%u,\"batt_state\":\"%s\",\"batt_trained\":%s,\"batt_train_pct\":%u,\"batt_cycles\":%.2f,"
                       "\"wifi_ch\":%u,\"wifi_pps\":%u,\"total_frames\":%lu,"
                       "\"lora_freq\":%.2f,\"lora_tx\":%u,\"lora_rx\":%u,\"lora_rssi\":%d,\"power_dbm\":%d,"
                       "\"antenna_detected\":%s,\"tx_inhibited\":%s,\"ambient_rssi\":%d,"
@@ -719,6 +745,9 @@ void handleCommand(const String& cmdLine) {
                       (unsigned long)BatteryMonitor::instance().getMilliVolts(),
                       BatteryMonitor::instance().getPercentage(),
                       BatteryMonitor::instance().getStateStr(),
+                      BatteryMonitor::instance().isTrained() ? "true" : "false",
+                      BatteryMonitor::instance().getTrainingPct(),
+                      BatteryMonitor::instance().getBatteryCycles(),
                       WifiMonitor::instance().getChannel(),
                       WifiMonitor::instance().getPps(),
                       (unsigned long)WifiMonitor::instance().getTotalFrames(),
@@ -1099,7 +1128,10 @@ void loop() {
             BatteryMonitor::instance().getMilliVolts(),
             BatteryMonitor::instance().getPercentage(),
             BatteryMonitor::instance().getStateStr(),
-            BatteryMonitor::instance().isCharging()
+            BatteryMonitor::instance().isCharging(),
+            BatteryMonitor::instance().isTrained(),
+            BatteryMonitor::instance().getTrainingPct(),
+            BatteryMonitor::instance().getBatteryCycles()
         );
     }
 

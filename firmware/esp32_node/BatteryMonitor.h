@@ -1,6 +1,7 @@
 #pragma once
 #include <Arduino.h>
 #include "LedPatterns.h"
+#include "BatteryTrainer.h"
 
 enum BatteryState {
     BATT_UNKNOWN = 0,
@@ -28,6 +29,7 @@ public:
         m_batteryMv = 0;
         m_percentage = 0;
         m_state = BATT_NO_BATTERY;
+        m_trainer.begin();
         readSensor();
     }
 
@@ -50,6 +52,17 @@ public:
     bool isCharging() const { return m_state == BATT_CHARGING; }
     bool isDying() const { return m_state == BATT_DYING; }
     bool hasBattery() const { return m_state != BATT_NO_BATTERY; }
+
+    void resetBatteryStats() {
+        m_trainer.reset();
+        readSensor();
+    }
+
+    const BatteryTrainingStats& getTrainingStats() const { return m_trainer.getStats(); }
+    bool isTrained() const { return m_trainer.getStats().isTrained; }
+    uint8_t getTrainingPct() const { return m_trainer.getStats().trainPct; }
+    float getBatteryCycles() const { return m_trainer.getStats().cycles; }
+    uint32_t getBatteryRuntimeSec() const { return m_trainer.getStats().runtimeSec; }
 
     uint32_t getRawMilliVolts() const { return m_rawMv; }
 
@@ -134,34 +147,22 @@ private:
 
         m_batteryMv = m_readingsTotal / m_sampleCount;
 
-        // Determine battery state & percentage
         BatteryState oldState = m_state;
 
-        // If voltage is below 1200mV (1.2V), the ADC is either floating or GND:
-        // no 3.7V Li-ion vape battery is plugged into the divider!
+        // Determine battery state & percentage with training algorithm
         if (m_batteryMv < 1200) {
             m_percentage = 0;
             m_state = BATT_NO_BATTERY;
         } else {
-            // Estimate State of Charge % for standard 3.7V Li-ion vape cell
-            // 4.20V = 100%, 4.05V = 80%, 3.85V = 60%, 3.75V = 45%, 3.55V = 20%, 3.35V = 0%
-            if (m_batteryMv >= 4180) {
-                m_percentage = 100;
-            } else if (m_batteryMv <= 3350) {
-                m_percentage = 0;
-            } else if (m_batteryMv >= 4050) {
-                m_percentage = 80 + (uint8_t)(((m_batteryMv - 4050) * 20) / 130);
-            } else if (m_batteryMv >= 3700) {
-                m_percentage = 35 + (uint8_t)(((m_batteryMv - 3700) * 45) / 350);
-            } else {
-                m_percentage = (uint8_t)(((m_batteryMv - 3350) * 35) / 350);
-            }
+            bool charging = (m_batteryMv >= 4220);
+            bool onBattery = hasBattery() && !charging;
+            m_percentage = m_trainer.updateAndCalculatePct(m_batteryMv, charging, onBattery);
 
-            if (m_batteryMv >= 4220) {
+            if (charging) {
                 m_state = BATT_CHARGING;
-            } else if (m_batteryMv >= 4050) {
+            } else if (m_percentage >= 80) {
                 m_state = BATT_FULL;
-            } else if (m_batteryMv >= 3650) {
+            } else if (m_percentage >= 20) {
                 m_state = BATT_HALFWAY;
             } else {
                 m_state = BATT_DYING;
@@ -183,6 +184,7 @@ private:
     uint32_t m_rawMv = 0;
     uint8_t m_percentage;
     BatteryState m_state;
+    BatteryTrainer m_trainer;
 
     uint32_t m_samples[8];
     uint8_t m_sampleCount;

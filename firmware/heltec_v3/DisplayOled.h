@@ -556,8 +556,8 @@ private:
             m_u8g2->drawStr(93, 9, "CHG");
         } else if (hasBatt) {
             char pStr[8];
-            snprintf(pStr, sizeof(pStr), "%u%%", battPct);
-            m_u8g2->drawStr(89, 9, pStr);
+            snprintf(pStr, sizeof(pStr), "%u%%%s", battPct, BatteryMonitor::instance().isTrained() ? "*" : "");
+            m_u8g2->drawStr(BatteryMonitor::instance().isTrained() ? 85 : 89, 9, pStr);
 
             m_u8g2->drawFrame(110, 2, 14, 9);
             m_u8g2->drawBox(124, 5, 2, 3);
@@ -1057,29 +1057,38 @@ private:
         uint32_t mah = NodeConfig::instance().getBattMah();
 
         if (hasBatt) {
-            snprintf(buf, sizeof(buf), "Batt: %u mV (%u%%)", mv, pct);
+            const auto& s = BatteryMonitor::instance().getTrainingStats();
+            snprintf(buf, sizeof(buf), "Batt: %u mV (%u%%)%s", mv, pct, s.isTrained ? " [Trained]" : "");
+            m_u8g2->drawStr(0, 26, buf);
+
+            m_u8g2->setFont(u8g2_font_5x7_tr);
+            snprintf(buf, sizeof(buf), "Train: %u%% (%.1f cyc, %lum)", s.trainPct, s.cycles, (unsigned long)(s.runtimeSec / 60));
+            m_u8g2->drawStr(0, 36, buf);
+
+            snprintf(buf, sizeof(buf), "Range: %u-%umV (%u)", s.vMin, s.vMax, s.vNom);
+            m_u8g2->drawStr(0, 46, buf);
+
+            snprintf(buf, sizeof(buf), "ADC: %umV | %s",
+                     BatteryMonitor::instance().getRawMilliVolts(),
+                     BatteryMonitor::instance().getStateStr());
+            m_u8g2->drawStr(0, 56, buf);
         } else {
             snprintf(buf, sizeof(buf), "Power: 5V USB (No Batt)");
-        }
-        m_u8g2->drawStr(0, 26, buf);
+            m_u8g2->drawStr(0, 26, buf);
 
-        m_u8g2->setFont(u8g2_font_5x7_tr);
-        uint32_t estMins = (mah * pct * 60) / (100 * 75);
-        if (hasBatt && pct > 0) {
-            snprintf(buf, sizeof(buf), "Vol: %u mAh (~%uh %um @75mA)", mah, estMins / 60, estMins % 60);
-        } else {
+            m_u8g2->setFont(u8g2_font_5x7_tr);
             snprintf(buf, sizeof(buf), "Vol: %u mAh (Configured)", mah);
+            m_u8g2->drawStr(0, 36, buf);
+
+            snprintf(buf, sizeof(buf), "ADC: %u mV | State: %s",
+                     BatteryMonitor::instance().getRawMilliVolts(),
+                     BatteryMonitor::instance().getStateStr());
+            m_u8g2->drawStr(0, 46, buf);
+
+            snprintf(buf, sizeof(buf), "Verdict: %s",
+                     BatteryMonitor::instance().getDiagnosticVerdict());
+            m_u8g2->drawStr(0, 56, buf);
         }
-        m_u8g2->drawStr(0, 36, buf);
-
-        snprintf(buf, sizeof(buf), "ADC: %u mV | State: %s",
-                 BatteryMonitor::instance().getRawMilliVolts(),
-                 BatteryMonitor::instance().getStateStr());
-        m_u8g2->drawStr(0, 46, buf);
-
-        snprintf(buf, sizeof(buf), "Verdict: %s",
-                 BatteryMonitor::instance().getDiagnosticVerdict());
-        m_u8g2->drawStr(0, 56, buf);
 
         snprintf(buf, sizeof(buf), "Free Heap: %u KB", ESP.getFreeHeap() / 1024);
         m_u8g2->drawStr(0, 64, buf);

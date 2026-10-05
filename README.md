@@ -89,7 +89,17 @@ over your VPN only. See [deploy/README.md](deploy/README.md) and [docs/HUB.md](d
   `agent/install-on-pi.sh <user>@<pi>`. [docs/AGENT.md](docs/AGENT.md).
 - **Heltec V3 / ESP32-S3 LoRa mesh node**: an off-grid RF surveillance detector and gateway. Sniffs 802.11
   monitor frames and BLE beacons while meshing telemetry back to your desktop or Android phone over LoRa or USB.
-  Includes an OLED trip dashboard and Ed25519-signed OTA updates: `tools/flash_heltec_v3.sh`.
+  Includes an OLED trip dashboard, adaptive battery SoC learning algorithms (compensating for radio load sag,
+  tracking cell degradation cycles, and training true voltage limits), and Ed25519-signed OTA updates: `tools/flash_heltec_v3.sh`.
+
+### Hardware Node Battery Training & Diagnostics
+Battery-equipped nodes (Heltec LoRa V3 with 3.7V LiPo or standalone ESP32 monitor nodes wired to vape cells) run an adaptive learning engine that refines State of Charge (% SoC) accuracy across operational cycles:
+- **Radio Load-Sag Filtering**: An Exponential Moving Average filter eliminates momentary voltage drops caused by 150–250 mA LoRa and Wi-Fi transmit bursts.
+- **Learned Voltage Curves**: Discovers actual saturation ceilings ($V_{max}$, 4120–4260 mV) and discharge knee cutoffs ($V_{min}$, 3150–3500 mV) per cell over time instead of relying on generic lookup tables.
+- **Cycle & Runtime Tracking**: Tracks fractional Depth-of-Discharge cycles and active runtime, persisted to ESP32 NVS flash with wear-leveling rate limits.
+- **Serial Commands & Companion UI**:
+  - `batt stats` — returns detailed JSON with learned $V_{min}$, $V_{max}$, nominal voltage, cumulative cycles, and training confidence percentage.
+  - `batt reset` — resets learned calibration curves and cycle stats to defaults (also available via the **Reset Battery Stats** button in the Android companion app).
 
 ## How it gets a fix
 

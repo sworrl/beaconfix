@@ -55,6 +55,9 @@ class EspNodeManager @Inject constructor(
     private val _nodeStatus = MutableStateFlow<EspNodeStatus?>(null)
     val nodeStatus: StateFlow<EspNodeStatus?> = _nodeStatus.asStateFlow()
 
+    private val _batteryTraining = MutableStateFlow<EspBatteryTraining?>(null)
+    val batteryTraining: StateFlow<EspBatteryTraining?> = _batteryTraining.asStateFlow()
+
     private val _isFollowingPhone = MutableStateFlow(false)
     val isFollowingPhone: StateFlow<Boolean> = _isFollowingPhone.asStateFlow()
 
@@ -531,6 +534,9 @@ class EspNodeManager @Inject constructor(
                         batt_pct = o.optInt("batt_pct", 0),
                         batt_state = o.optString("batt_state", "unknown"),
                         charging = o.optBoolean("charging", false),
+                        batt_trained = o.optBoolean("batt_trained", false),
+                        batt_train_pct = o.optInt("batt_train_pct", 0),
+                        batt_cycles = o.optDouble("batt_cycles", 0.0).toFloat(),
                         attached_dev = o.optString("attached_dev", ""),
                         following = o.optBoolean("following", false),
                         has_gps = o.optBoolean("has_gps", false),
@@ -548,6 +554,9 @@ class EspNodeManager @Inject constructor(
                             battPct = o.optInt("batt_pct", existing?.battPct ?: -1),
                             battState = o.optString("batt_state", existing?.battState ?: "unknown"),
                             charging = o.optBoolean("charging", existing?.charging ?: false),
+                            battTrained = o.optBoolean("batt_trained", existing?.battTrained ?: false),
+                            battTrainPct = o.optInt("batt_train_pct", existing?.battTrainPct ?: 0),
+                            battCycles = o.optDouble("batt_cycles", (existing?.battCycles ?: 0.0f).toDouble()).toFloat(),
                             hops = 0,
                             pps = o.optLong("pps", existing?.pps ?: 0),
                             lastSeen = System.currentTimeMillis(),
@@ -582,6 +591,9 @@ class EspNodeManager @Inject constructor(
                             version = inner.optString("version", existing?.version ?: "3.10.2"),
                             battMv = inner.optInt("batt_mv", existing?.battMv ?: 0),
                             battPct = inner.optInt("batt_pct", existing?.battPct ?: -1),
+                            battTrained = inner.optBoolean("batt_trained", existing?.battTrained ?: false),
+                            battTrainPct = inner.optInt("batt_train_pct", existing?.battTrainPct ?: 0),
+                            battCycles = inner.optDouble("batt_cycles", (existing?.battCycles ?: 0.0f).toDouble()).toFloat(),
                             hops = hops,
                             via = via,
                             prevMac = prevMac,
@@ -603,12 +615,75 @@ class EspNodeManager @Inject constructor(
                 }
                 "battery" -> {
                     val cur = _nodeStatus.value ?: EspNodeStatus()
+                    val trained = o.optBoolean("batt_trained", cur.batt_trained)
+                    val trainPct = o.optInt("batt_train_pct", cur.batt_train_pct)
+                    val cycles = o.optDouble("batt_cycles", cur.batt_cycles.toDouble()).toFloat()
                     _nodeStatus.value = cur.copy(
                         batt_mv = o.optInt("mv", 0),
                         batt_pct = o.optInt("pct", 0),
                         batt_state = o.optString("state", "unknown"),
-                        charging = o.optBoolean("charging", false)
+                        charging = o.optBoolean("charging", false),
+                        batt_trained = trained,
+                        batt_train_pct = trainPct,
+                        batt_cycles = cycles
                     )
+                }
+                "battery_stats" -> {
+                    val trn = EspBatteryTraining(
+                        isTrained = o.optBoolean("trained", false),
+                        trainPct = o.optInt("train_pct", 0),
+                        vMin = o.optInt("v_min", 3250),
+                        vMax = o.optInt("v_max", 4200),
+                        vNom = o.optInt("v_nom", 3700),
+                        cycles = o.optDouble("cycles", 0.0).toFloat(),
+                        runtimeSec = o.optLong("runtime_sec", 0L),
+                        samples = o.optLong("samples", 0L),
+                        hasBattery = o.optBoolean("has_battery", true),
+                        mah = o.optInt("mah", 240)
+                    )
+                    _batteryTraining.value = trn
+                    val cur = _nodeStatus.value ?: EspNodeStatus()
+                    _nodeStatus.value = cur.copy(
+                        batt_mv = o.optInt("mv", o.optInt("calc_mv", cur.batt_mv)),
+                        batt_pct = o.optInt("pct", cur.batt_pct),
+                        batt_state = o.optString("state", cur.batt_state),
+                        charging = o.optBoolean("charging", cur.charging),
+                        batt_trained = trn.isTrained,
+                        batt_train_pct = trn.trainPct,
+                        batt_cycles = trn.cycles
+                    )
+                }
+                "battery_status" -> {
+                    val cur = _nodeStatus.value ?: EspNodeStatus()
+                    val isTrained = o.optBoolean("trained", cur.batt_trained)
+                    val trainPct = o.optInt("train_pct", cur.batt_train_pct)
+                    val cycles = o.optDouble("cycles", cur.batt_cycles.toDouble()).toFloat()
+                    _nodeStatus.value = cur.copy(
+                        batt_mv = o.optInt("mv", o.optInt("calc_mv", cur.batt_mv)),
+                        batt_pct = o.optInt("pct", cur.batt_pct),
+                        batt_state = o.optString("state", cur.batt_state),
+                        charging = o.optBoolean("charging", cur.charging),
+                        batt_trained = isTrained,
+                        batt_train_pct = trainPct,
+                        batt_cycles = cycles
+                    )
+                }
+                "ack" -> {
+                    if (o.optString("action") == "battery_stats_reset") {
+                        _batteryTraining.value = EspBatteryTraining(
+                            isTrained = false,
+                            trainPct = 0,
+                            cycles = o.optDouble("cycles", 0.0).toFloat(),
+                            vMin = o.optInt("v_min", 3250),
+                            vMax = o.optInt("v_max", 4200)
+                        )
+                        val cur = _nodeStatus.value ?: EspNodeStatus()
+                        _nodeStatus.value = cur.copy(
+                            batt_trained = false,
+                            batt_train_pct = 0,
+                            batt_cycles = 0.0f
+                        )
+                    }
                 }
                 "probe" -> {
                     val ev = EspProbeEvent(
@@ -695,6 +770,33 @@ class EspNodeManager @Inject constructor(
         val existing = _meshPeers.value[nodeName]
         if (existing != null) {
             _meshPeers.value = _meshPeers.value + (nodeName to existing.copy(battMah = mah))
+        }
+        sendCommand("batt $mah")
+    }
+
+    fun resetBatteryStats() {
+        sendCommand("batt reset")
+        scope.launch {
+            try {
+                val sock = DatagramSocket()
+                sock.broadcast = true
+                val data = "batt reset\n".toByteArray(Charsets.UTF_8)
+                sock.send(DatagramPacket(data, data.size, java.net.InetAddress.getByName("255.255.255.255"), UDP_PORT))
+                sock.close()
+            } catch (_: Exception) {}
+        }
+    }
+
+    fun requestBatteryStats() {
+        sendCommand("batt stats")
+        scope.launch {
+            try {
+                val sock = DatagramSocket()
+                sock.broadcast = true
+                val data = "batt stats\n".toByteArray(Charsets.UTF_8)
+                sock.send(DatagramPacket(data, data.size, java.net.InetAddress.getByName("255.255.255.255"), UDP_PORT))
+                sock.close()
+            } catch (_: Exception) {}
         }
     }
 

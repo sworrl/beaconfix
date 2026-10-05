@@ -3,6 +3,7 @@
 #include "HeltecV3Pins.h"
 #include "LedPatterns.h"
 #include "NodeConfig.h"
+#include "BatteryTrainer.h"
 
 enum BatteryState {
     BATT_UNKNOWN = 0,
@@ -35,6 +36,7 @@ public:
         m_percentage = 0;
         m_rawMv = 0;
         m_state = BATT_NO_BATTERY;
+        m_trainer.begin();
         readSensor();
     }
 
@@ -58,6 +60,17 @@ public:
     bool isCharging() const { return m_state == BATT_CHARGING; }
     bool isDying() const { return m_state == BATT_DYING; }
     bool hasBattery() const { return NodeConfig::instance().hasBatteryEquipped() && (m_state != BATT_NO_BATTERY); }
+
+    void resetBatteryStats() {
+        m_trainer.reset();
+        readSensor();
+    }
+
+    const BatteryTrainingStats& getTrainingStats() const { return m_trainer.getStats(); }
+    bool isTrained() const { return m_trainer.getStats().isTrained; }
+    uint8_t getTrainingPct() const { return m_trainer.getStats().trainPct; }
+    float getBatteryCycles() const { return m_trainer.getStats().cycles; }
+    uint32_t getBatteryRuntimeSec() const { return m_trainer.getStats().runtimeSec; }
 
     const char* getDiagnosticVerdict() const {
         if (m_rawMv < 50) return "DISCONNECTED_OR_PULLED_LOW";
@@ -161,28 +174,20 @@ private:
 
         BatteryState oldState = m_state;
 
-        // Determine battery state & percentage for 3.7V vape Li-ion cell
+        // Determine battery state & percentage with training algorithm
         if (m_batteryMv < 1200) {
             m_percentage = 0;
             m_state = BATT_NO_BATTERY;
         } else {
-            if (m_batteryMv >= 4180) {
-                m_percentage = 100;
-            } else if (m_batteryMv <= 3350) {
-                m_percentage = 0;
-            } else if (m_batteryMv >= 4050) {
-                m_percentage = 80 + (uint8_t)(((m_batteryMv - 4050) * 20) / 130);
-            } else if (m_batteryMv >= 3700) {
-                m_percentage = 35 + (uint8_t)(((m_batteryMv - 3700) * 45) / 350);
-            } else {
-                m_percentage = (uint8_t)(((m_batteryMv - 3350) * 35) / 350);
-            }
+            bool charging = (m_batteryMv >= 4220);
+            bool onBattery = hasBattery() && !charging;
+            m_percentage = m_trainer.updateAndCalculatePct(m_batteryMv, charging, onBattery);
 
-            if (m_batteryMv >= 4220) {
+            if (charging) {
                 m_state = BATT_CHARGING;
-            } else if (m_batteryMv >= 4050) {
+            } else if (m_percentage >= 80) {
                 m_state = BATT_FULL;
-            } else if (m_batteryMv >= 3650) {
+            } else if (m_percentage >= 20) {
                 m_state = BATT_HALFWAY;
             } else {
                 m_state = BATT_DYING;
@@ -202,6 +207,7 @@ private:
     uint32_t m_rawMv;
     uint8_t m_percentage;
     BatteryState m_state;
+    BatteryTrainer m_trainer;
 
     uint32_t m_samples[8];
     uint8_t m_sampleCount;

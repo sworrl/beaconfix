@@ -127,19 +127,22 @@ public:
         broadcastJson(buf);
     }
 
-    void emitBattery(uint32_t mv, uint8_t pct, const char* state, bool charging) {
+    void emitBattery(uint32_t mv, uint8_t pct, const char* state, bool charging,
+                     bool trained = false, uint8_t trainPct = 0, float cycles = 0.0f) {
         char buf[256];
         snprintf(buf, sizeof(buf),
-            "{\"type\":\"battery\",\"mv\":%lu,\"pct\":%u,\"state\":\"%s\",\"charging\":%s}",
-            mv, pct, state, charging ? "true" : "false");
+            "{\"type\":\"battery\",\"mv\":%lu,\"pct\":%u,\"state\":\"%s\",\"charging\":%s,\"batt_trained\":%s,\"batt_train_pct\":%u,\"batt_cycles\":%.2f}",
+            mv, pct, state, charging ? "true" : "false",
+            trained ? "true" : "false", trainPct, cycles);
         broadcastJson(buf);
     }
 
     void emitStatus(const char* nodeName, uint32_t uptimeS, uint32_t freeHeap,
                     uint8_t ch, bool hopping, uint32_t pps, uint32_t total,
                     uint32_t probes, uint32_t beacons, uint32_t deauths, int bleClients,
-                    uint32_t battMv = 3800, uint8_t battPct = 50, const char* battState = "halfway", bool charging = false) {
-        char buf[512];
+                    uint32_t battMv = 3800, uint8_t battPct = 50, const char* battState = "halfway", bool charging = false,
+                    bool battTrained = false, uint8_t battTrainPct = 0, float battCycles = 0.0f) {
+        char buf[576];
         bool hasAnt = LoraRadio::instance().hasAntenna();
         bool txInhib = LoraRadio::instance().isTxInhibited();
         int ambRssi = LoraRadio::instance().getAmbientRssi();
@@ -148,9 +151,10 @@ public:
 
         if (NodeConfig::instance().hasGpsFix()) {
             snprintf(buf, sizeof(buf),
-                "{\"type\":\"status\",\"version\":\"%s\",\"node\":\"%s\",\"uptime\":%lu,\"heap\":%lu,\"ch\":%u,\"hop\":%s,\"pps\":%lu,\"total\":%lu,\"probes\":%lu,\"beacons\":%lu,\"deauths\":%lu,\"ble\":%d,\"batt_mv\":%lu,\"batt_pct\":%u,\"batt_state\":\"%s\",\"charging\":%s,\"antenna_detected\":%s,\"tx_inhibited\":%s,\"ambient_rssi\":%d,\"traveling\":%s,\"speed_kmh\":%.1f,\"attached_dev\":\"%s\",\"following\":%s,\"has_gps\":true,\"lat\":%.6f,\"lon\":%.6f,\"acc\":%.1f}",
+                "{\"type\":\"status\",\"version\":\"%s\",\"node\":\"%s\",\"uptime\":%lu,\"heap\":%lu,\"ch\":%u,\"hop\":%s,\"pps\":%lu,\"total\":%lu,\"probes\":%lu,\"beacons\":%lu,\"deauths\":%lu,\"ble\":%d,\"batt_mv\":%lu,\"batt_pct\":%u,\"batt_state\":\"%s\",\"charging\":%s,\"batt_trained\":%s,\"batt_train_pct\":%u,\"batt_cycles\":%.2f,\"antenna_detected\":%s,\"tx_inhibited\":%s,\"ambient_rssi\":%d,\"traveling\":%s,\"speed_kmh\":%.1f,\"attached_dev\":\"%s\",\"following\":%s,\"has_gps\":true,\"lat\":%.6f,\"lon\":%.6f,\"acc\":%.1f}",
                 BEACONFIX_FW_VERSION, nodeName, uptimeS, freeHeap, ch, hopping ? "true" : "false", pps, total, probes, beacons, deauths, bleClients,
                 battMv, battPct, battState, charging ? "true" : "false",
+                battTrained ? "true" : "false", battTrainPct, battCycles,
                 hasAnt ? "true" : "false", txInhib ? "true" : "false", ambRssi,
                 traveling ? "true" : "false", speedKmh,
                 NodeConfig::instance().getAttachedDevice(),
@@ -158,9 +162,10 @@ public:
                 NodeConfig::instance().getLat(), NodeConfig::instance().getLon(), NodeConfig::instance().getAccM());
         } else {
             snprintf(buf, sizeof(buf),
-                "{\"type\":\"status\",\"version\":\"%s\",\"node\":\"%s\",\"uptime\":%lu,\"heap\":%lu,\"ch\":%u,\"hop\":%s,\"pps\":%lu,\"total\":%lu,\"probes\":%lu,\"beacons\":%lu,\"deauths\":%lu,\"ble\":%d,\"batt_mv\":%lu,\"batt_pct\":%u,\"batt_state\":\"%s\",\"charging\":%s,\"antenna_detected\":%s,\"tx_inhibited\":%s,\"ambient_rssi\":%d,\"traveling\":%s,\"speed_kmh\":%.1f,\"attached_dev\":\"%s\",\"following\":%s,\"has_gps\":false}",
+                "{\"type\":\"status\",\"version\":\"%s\",\"node\":\"%s\",\"uptime\":%lu,\"heap\":%lu,\"ch\":%u,\"hop\":%s,\"pps\":%lu,\"total\":%lu,\"probes\":%lu,\"beacons\":%lu,\"deauths\":%lu,\"ble\":%d,\"batt_mv\":%lu,\"batt_pct\":%u,\"batt_state\":\"%s\",\"charging\":%s,\"batt_trained\":%s,\"batt_train_pct\":%u,\"batt_cycles\":%.2f,\"antenna_detected\":%s,\"tx_inhibited\":%s,\"ambient_rssi\":%d,\"traveling\":%s,\"speed_kmh\":%.1f,\"attached_dev\":\"%s\",\"following\":%s,\"has_gps\":false}",
                 BEACONFIX_FW_VERSION, nodeName, uptimeS, freeHeap, ch, hopping ? "true" : "false", pps, total, probes, beacons, deauths, bleClients,
                 battMv, battPct, battState, charging ? "true" : "false",
+                battTrained ? "true" : "false", battTrainPct, battCycles,
                 hasAnt ? "true" : "false", txInhib ? "true" : "false", ambRssi,
                 traveling ? "true" : "false", speedKmh,
                 NodeConfig::instance().getAttachedDevice(),

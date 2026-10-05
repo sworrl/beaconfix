@@ -28,6 +28,9 @@ data class EspNodeStatus(
     val batt_pct: Int = 0,
     val batt_state: String = "unknown",
     val charging: Boolean = false,
+    val batt_trained: Boolean = false,
+    val batt_train_pct: Int = 0,
+    val batt_cycles: Float = 0.0f,
     val attached_dev: String = "",
     val following: Boolean = false,
     val has_gps: Boolean = false,
@@ -78,6 +81,20 @@ data class EspBleTrackerEvent(
 )
 
 @Serializable
+data class EspBatteryTraining(
+    val isTrained: Boolean = false,
+    val trainPct: Int = 0,
+    val vMin: Int = 3250,
+    val vMax: Int = 4200,
+    val vNom: Int = 3700,
+    val cycles: Float = 0.0f,
+    val runtimeSec: Long = 0,
+    val samples: Long = 0,
+    val hasBattery: Boolean = true,
+    val mah: Int = 240
+)
+
+@Serializable
 data class MeshPeerNode(
     val name: String,
     val mac: String = "",
@@ -87,6 +104,9 @@ data class MeshPeerNode(
     val battPct: Int = -1,
     val battState: String = "unknown",
     val charging: Boolean = false,
+    val battTrained: Boolean = false,
+    val battTrainPct: Int = 0,
+    val battCycles: Float = 0.0f,
     val battMah: Int = 240,
     val hops: Int = 0,
     val rssi: Int = 0,

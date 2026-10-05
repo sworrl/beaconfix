@@ -139,8 +139,10 @@ def main():
                 att_dev = pkt.get("attached_dev", "")
                 att_str = f" | Follows: {C_CYAN}{att_dev}{C_RESET}" if att_dev else ""
 
+                batt_trn = " [Trained]" if pkt.get("batt_trained") else (f" [{pkt.get('batt_train_pct')}% trn]" if pkt.get("batt_train_pct") else "")
+                batt_cyc = f" · {pkt.get('batt_cycles'):.1f} cyc" if pkt.get("batt_cycles", 0) > 0.05 else ""
                 print(f"[{ts}] {C_BOLD}{C_BLUE}[HEARTBEAT]{C_RESET} {C_BOLD}{node}{C_RESET} ({role_icon})")
-                print(f"   ├─ Power  : {batt_pct}% ({batt_mv} mV) | Wi-Fi: Ch {ch} ({pps} pps, {tot} tot)")
+                print(f"   ├─ Power  : {batt_pct}% ({batt_mv} mV){batt_trn}{batt_cyc} | Wi-Fi: Ch {ch} ({pps} pps, {tot} tot)")
                 print(f"   ├─ RF/LoRa: {ant_badge}")
                 print(f"   └─ Motion : {trav_badge}{att_str}")
                 nodes_cache[node] = pkt
@@ -160,7 +162,9 @@ def main():
                 route_desc = f" [{route}]" if route else (f" [via {via}]" if via and via != "Direct" else "")
                 print(f"[{ts}] {C_BOLD}{C_MAGENTA}[MESH RELAY]{C_RESET} {C_BOLD}{origin}{C_RESET} ({mac}) ──({hop_color}{hops} hops{route_desc}{C_RESET})──> Base Station | {inner_type}")
                 if "batt_mv" in inner:
-                    print(f"   └─ Mobile Battery: {inner.get('batt_pct', 0)}% ({inner.get('batt_mv', 0)} mV)")
+                    b_trn = " [Trained]" if inner.get("batt_trained") else (f" [{inner.get('batt_train_pct')}% trn]" if inner.get("batt_train_pct") else "")
+                    b_cyc = f" · {inner.get('batt_cycles'):.1f} cyc" if inner.get("batt_cycles", 0) > 0.05 else ""
+                    print(f"   └─ Mobile Battery: {inner.get('batt_pct', 0)}% ({inner.get('batt_mv', 0)} mV){b_trn}{b_cyc}")
                 nodes_cache[origin] = inner
 
             # ── 3. Antenna Diagnostics ────────────────────────────────────────

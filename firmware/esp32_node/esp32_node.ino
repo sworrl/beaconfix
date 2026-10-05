@@ -146,7 +146,7 @@ void handleCommand(const String& cmdLine) {
                        "\"mesh status\",\"mesh peers\",\"mesh send <text>\","
                        "\"led list\",\"led config <slot> single <pin> <role> [inv]\","
                        "\"led config <slot> rgb <r> <g> <b> <role> [inv]\",\"led clear <slot>\","
-                       "\"led <pattern>\",\"batt\",\"batt pin <gpio>\",\"batt divider <ratio>\",\"ota\",\"reboot\"]}");
+                       "\"led <pattern>\",\"batt [stats|reset|pin|divider]\",\"ota\",\"reboot\"]}");
     } else if (cmd.equalsIgnoreCase("mode") || cmd.equalsIgnoreCase("mode status")) {
         Serial.printf("{\"type\":\"op_mode\",\"mode\":\"%s\",\"is_base_station\":%s,\"hops\":%u}\n",
             NodeConfig::instance().getOpModeStr(),
@@ -226,24 +226,54 @@ void handleCommand(const String& cmdLine) {
             BatteryMonitor::instance().getMilliVolts(),
             BatteryMonitor::instance().getPercentage(),
             BatteryMonitor::instance().getStateStr(),
-            BatteryMonitor::instance().isCharging()
+            BatteryMonitor::instance().isCharging(),
+            BatteryMonitor::instance().isTrained(),
+            BatteryMonitor::instance().getTrainingPct(),
+            BatteryMonitor::instance().getBatteryCycles()
         );
-    } else if (cmd.equalsIgnoreCase("batt diag") || cmd.equalsIgnoreCase("battery diag")) {
-        Serial.printf("{\"type\":\"batt_diag\",\"pin\":%d,\"raw_mv\":%lu,\"calc_mv\":%lu,\"has_battery\":%s,\"state\":\"%s\",\"verdict\":\"%s\",\"advice\":\"%s\"}\n",
+    } else if (cmd.equalsIgnoreCase("batt reset") || cmd.equalsIgnoreCase("battery reset") || cmd.equalsIgnoreCase("batt stats reset") || cmd.equalsIgnoreCase("batt train reset")) {
+        BatteryMonitor::instance().resetBatteryStats();
+        const auto& s = BatteryMonitor::instance().getTrainingStats();
+        Serial.printf("{\"type\":\"ack\",\"action\":\"battery_stats_reset\",\"trained\":false,\"v_min\":%u,\"v_max\":%u,\"cycles\":%.1f,\"runtime_sec\":0}\n",
+                      s.vMin, s.vMax, s.cycles);
+    } else if (cmd.equalsIgnoreCase("batt diag") || cmd.equalsIgnoreCase("battery diag") || cmd.equalsIgnoreCase("batt stats") || cmd.equalsIgnoreCase("battery stats") || cmd.equalsIgnoreCase("batt info")) {
+        const auto& s = BatteryMonitor::instance().getTrainingStats();
+        Serial.printf("{\"type\":\"battery_stats\",\"pin\":%d,\"raw_mv\":%lu,\"calc_mv\":%lu,\"pct\":%u,\"has_battery\":%s,\"state\":\"%s\",\"charging\":%s,\"trained\":%s,\"train_pct\":%u,\"v_min\":%u,\"v_max\":%u,\"v_nom\":%u,\"cycles\":%.2f,\"runtime_sec\":%lu,\"samples\":%lu,\"verdict\":\"%s\",\"advice\":\"%s\"}\n",
                       BatteryMonitor::instance().getPin(),
                       (unsigned long)BatteryMonitor::instance().getRawMilliVolts(),
                       (unsigned long)BatteryMonitor::instance().getMilliVolts(),
+                      BatteryMonitor::instance().getPercentage(),
                       BatteryMonitor::instance().hasBattery() ? "true" : "false",
                       BatteryMonitor::instance().getStateStr(),
+                      BatteryMonitor::instance().isCharging() ? "true" : "false",
+                      s.isTrained ? "true" : "false",
+                      s.trainPct,
+                      s.vMin,
+                      s.vMax,
+                      s.vNom,
+                      s.cycles,
+                      (unsigned long)s.runtimeSec,
+                      (unsigned long)s.sampleCount,
                       BatteryMonitor::instance().getDiagnosticVerdict(),
                       BatteryMonitor::instance().getDiagnosticAdvice());
     } else if (cmd.equalsIgnoreCase("batt") || cmd.equalsIgnoreCase("battery")) {
+        const auto& s = BatteryMonitor::instance().getTrainingStats();
         Telemetry::instance().emitBattery(
             BatteryMonitor::instance().getMilliVolts(),
             BatteryMonitor::instance().getPercentage(),
             BatteryMonitor::instance().getStateStr(),
             BatteryMonitor::instance().isCharging()
         );
+        Serial.printf("{\"type\":\"battery_status\",\"pin\":%d,\"calc_mv\":%lu,\"pct\":%u,\"has_battery\":%s,\"state\":\"%s\",\"charging\":%s,\"trained\":%s,\"train_pct\":%u,\"cycles\":%.1f}\n",
+                      BatteryMonitor::instance().getPin(),
+                      (unsigned long)BatteryMonitor::instance().getMilliVolts(),
+                      BatteryMonitor::instance().getPercentage(),
+                      BatteryMonitor::instance().hasBattery() ? "true" : "false",
+                      BatteryMonitor::instance().getStateStr(),
+                      BatteryMonitor::instance().isCharging() ? "true" : "false",
+                      s.isTrained ? "true" : "false",
+                      s.trainPct,
+                      s.cycles);
     } else if (cmd.startsWith("batt pin ")) {
         int p = cmd.substring(9).toInt();
         BatteryMonitor::instance().setPin(p);
@@ -881,7 +911,10 @@ void loop() {
             BatteryMonitor::instance().getMilliVolts(),
             BatteryMonitor::instance().getPercentage(),
             BatteryMonitor::instance().getStateStr(),
-            BatteryMonitor::instance().isCharging()
+            BatteryMonitor::instance().isCharging(),
+            BatteryMonitor::instance().isTrained(),
+            BatteryMonitor::instance().getTrainingPct(),
+            BatteryMonitor::instance().getBatteryCycles()
         );
     }
 
