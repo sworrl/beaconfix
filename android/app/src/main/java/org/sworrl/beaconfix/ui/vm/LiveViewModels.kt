@@ -44,7 +44,17 @@ import javax.inject.Inject
 data class PhoneFix(val fix: FixEntity? = null, val place: String = "", val countryCode: String = "", val sun: org.sworrl.beaconfix.ui.SunCalc.Times? = null, val timezone: String = java.util.TimeZone.getDefault().id)
 
 @HiltViewModel
-class LiveViewModel @Inject constructor(private val live: DesktopLive, db: AppDatabase, val status: CollectorStatus, private val prefs: Prefs, @ApplicationContext private val ctx: Context, val refits: org.sworrl.beaconfix.estimate.RefitBus, val ranging: org.sworrl.beaconfix.ranging.RangingRepository, val snapper: org.sworrl.beaconfix.route.RoadSnapper) : ViewModel() {
+class LiveViewModel @Inject constructor(
+    private val live: DesktopLive,
+    db: AppDatabase,
+    val status: CollectorStatus,
+    private val prefs: Prefs,
+    @ApplicationContext private val ctx: Context,
+    val refits: org.sworrl.beaconfix.estimate.RefitBus,
+    val ranging: org.sworrl.beaconfix.ranging.RangingRepository,
+    val snapper: org.sworrl.beaconfix.route.RoadSnapper,
+    val locationSource: org.sworrl.beaconfix.collector.LocationSource
+) : ViewModel() {
     val ranges: StateFlow<Map<String, org.sworrl.beaconfix.ranging.RangeSession>> = ranging.sessions
     /** local refits also appear in the ticker, as the desktop's do */
     val localRefits: StateFlow<List<org.sworrl.beaconfix.estimate.RefitEvent>> = refits.events.let { f -> MutableStateFlow<List<org.sworrl.beaconfix.estimate.RefitEvent>>(emptyList()).also { st -> viewModelScope.launch { f.collect { e -> st.value = (st.value + e).takeLast(30) } } } }
@@ -66,9 +76,28 @@ class LiveViewModel @Inject constructor(private val live: DesktopLive, db: AppDa
     val flockCameras: StateFlow<List<org.sworrl.beaconfix.data.api.FlockCameraDto>> = views.map { vs -> vs.flatMap { it.flockCameras }.distinctBy { it.id } }.flowOn(Dispatchers.Default).stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
     val collectorOn: StateFlow<Boolean> = prefs.collectorOn.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), false)
     val refreshing = MutableStateFlow(false)
+    val desktopHeatmap = MutableStateFlow<List<org.sworrl.beaconfix.data.api.RoutePointDto>>(emptyList())
+    fun loadHeatmap() = viewModelScope.launch { desktopHeatmap.value = live.fetchRouteHeatmap() }
+    val doomBatteryMode: StateFlow<org.sworrl.beaconfix.data.DoomBatteryMode> = prefs.doomBatteryMode.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), org.sworrl.beaconfix.data.DoomBatteryMode.DEFAULT)
+    fun setDoomBatteryMode(mode: org.sworrl.beaconfix.data.DoomBatteryMode) = viewModelScope.launch { prefs.setDoomBatteryMode(mode) }
 
     init {
         viewModelScope.launch { phoneRaw.collect { f -> phoneEnriched.value = enrich(f) } }
+        viewModelScope.launch {
+            locationSource.updates(intervalMs = 1500L, minDistanceM = 1.0f).collect { loc ->
+                if (loc.latitude != 0.0 && loc.longitude != 0.0 && (!loc.hasAccuracy() || loc.accuracy <= 100f)) {
+                    val f = org.sworrl.beaconfix.data.db.FixEntity(
+                        time = loc.time.takeIf { it > 0 } ?: System.currentTimeMillis(),
+                        lat = loc.latitude,
+                        lon = loc.longitude,
+                        acc = if (loc.hasAccuracy()) loc.accuracy.toDouble() else 8.0,
+                        source = "phone-live",
+                        provider = loc.provider ?: "gps"
+                    )
+                    phoneEnriched.value = enrich(f)
+                }
+            }
+        }
         refresh()
     }
     fun refresh(what: Set<String> = setOf("location", "trip", "pois", "events", "emergency")) = viewModelScope.launch { refreshing.value = true; try { live.refreshAll(what) } finally { refreshing.value = false } }

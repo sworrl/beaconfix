@@ -126,6 +126,18 @@ fun AlprScreen(onBack: () -> Unit, vm: AlprViewModel = hiltViewModel()) {
         if (missing.isEmpty()) vm.setEnabled(true) else ask.launch(missing.toTypedArray())
     }
 
+    val espManager = remember {
+        runCatching {
+            dagger.hilt.android.EntryPointAccessors.fromApplication(
+                ctx.applicationContext,
+                org.sworrl.beaconfix.widget.WidgetEntryPoint::class.java
+            ).espNodeManager()
+        }.getOrNull()
+    }
+    val espConn by (espManager?.connectionState ?: kotlinx.coroutines.flow.MutableStateFlow(org.sworrl.beaconfix.node.EspConnectionState.DISCONNECTED)).collectAsState()
+    val espStatus by (espManager?.nodeStatus ?: kotlinx.coroutines.flow.MutableStateFlow(null)).collectAsState()
+    val espProbes by (espManager?.recentProbes ?: kotlinx.coroutines.flow.MutableStateFlow(emptyList())).collectAsState()
+
     if (scanning) {
         QrScanner("Point the camera at the pairing QR on FalconEyez (Settings → Phones → Pair a phone)", onResult = { text ->
             scanning = false
@@ -151,6 +163,8 @@ fun AlprScreen(onBack: () -> Unit, vm: AlprViewModel = hiltViewModel()) {
         if (permNote.isNotEmpty()) Text(permNote, Modifier.padding(horizontal = 20.dp, vertical = 4.dp), color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
 
         LivePlateScanner(vm, cfg)
+
+        EspMonitorCard(espConn, espStatus, espProbes.size)
 
         InfoCard("Background Dash Cam (Screen Off)") {
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -546,13 +560,19 @@ fun LivePlateScanner(vm: AlprViewModel, cfg: AlprConfig, modifier: Modifier = Mo
                         val sw = det.box.w * scale
                         val sh = det.box.h * scale
 
-                        val boxColor = if (det.hotlist) Red else Green
+                        val topColor = if (det.hotlist) Color(0xFFFF3B30) else Color(0xFF00E5FF)
+                        val botColor = if (det.hotlist) Color(0xFFFF9500) else Color(0xFF32D75F)
+                        val grad = androidx.compose.ui.graphics.Brush.verticalGradient(
+                            colors = listOf(topColor, botColor),
+                            startY = sy,
+                            endY = sy + sh
+                        )
                         drawRoundRect(
-                            color = boxColor,
+                            brush = grad,
                             topLeft = Offset(sx, sy),
                             size = Size(sw, sh),
-                            cornerRadius = CornerRadius(8f, 8f),
-                            style = Stroke(width = 3.dp.toPx())
+                            cornerRadius = CornerRadius(minOf(sw, sh) * 0.4f, minOf(sw, sh) * 0.4f),
+                            style = Stroke(width = 4.dp.toPx())
                         )
 
                         if (det.text.isNotEmpty()) {
@@ -691,3 +711,63 @@ fun LivePlateScanner(vm: AlprViewModel, cfg: AlprConfig, modifier: Modifier = Mo
         }
     }
 }
+
+@Composable
+private fun EspMonitorCard(
+    conn: org.sworrl.beaconfix.node.EspConnectionState,
+    status: org.sworrl.beaconfix.node.EspNodeStatus?,
+    probesCount: Int
+) {
+    Card(
+        Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = when (conn) {
+                org.sworrl.beaconfix.node.EspConnectionState.CONNECTED_BLE,
+                org.sworrl.beaconfix.node.EspConnectionState.CONNECTED_UDP,
+                org.sworrl.beaconfix.node.EspConnectionState.CONNECTED_USB -> Green.copy(alpha = 0.12f)
+                else -> MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f)
+            }
+        )
+    ) {
+        Row(
+            Modifier.fillMaxWidth().padding(12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("📡", fontSize = 20.sp)
+                Column {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text(
+                            if (conn != org.sworrl.beaconfix.node.EspConnectionState.DISCONNECTED)
+                                (status?.node?.ifEmpty { "ESP32 Monitor Node" } ?: "ESP32 Monitor Node")
+                            else "ESP32 Monitor Node",
+                            fontWeight = FontWeight.Bold
+                        )
+                        if (conn != org.sworrl.beaconfix.node.EspConnectionState.DISCONNECTED) {
+                            val badge = when (conn) {
+                                org.sworrl.beaconfix.node.EspConnectionState.CONNECTED_BLE -> "BT LINK"
+                                org.sworrl.beaconfix.node.EspConnectionState.CONNECTED_USB -> "USB LINK"
+                                else -> "WIFI LINK"
+                            }
+                            org.sworrl.beaconfix.ui.Chip(badge, Green)
+                        }
+                    }
+                    Text(
+                        if (conn != org.sworrl.beaconfix.node.EspConnectionState.DISCONNECTED)
+                            "Ch ${status?.ch ?: 1}${if (status?.hop == true) " (auto-hop)" else ""} · ${status?.pps ?: 0} pkts/s · $probesCount probes heard"
+                        else "Sniffs Wi-Fi & BLE probe requests in monitor mode while traveling",
+                        color = Slate,
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+            }
+            Text(
+                if (conn != org.sworrl.beaconfix.node.EspConnectionState.DISCONNECTED) "🟢 Online" else "⚪ Standby",
+                style = MaterialTheme.typography.labelSmall,
+                color = if (conn != org.sworrl.beaconfix.node.EspConnectionState.DISCONNECTED) Green else Slate
+            )
+        }
+    }
+}
+

@@ -29,10 +29,14 @@ your devices unless you point it at your own hub.
 - **Sightings log** — every camera pass and every public record of your plate being *searched*
   (released Flock audit logs via HaveIBeenFlocked, checked with a privacy-preserving hashed prefix) is
   stored with its metrics, images and a link to its source. Backfilled over your whole route history.
-- **On-phone ALPR dash cam** — plate detection and OCR on the phone, per-vehicle tracking, multi-frame
-  fusion, hotlist matching for AMBER / Silver / Blue alerts that works offline.
+- **On-phone ALPR dash cam and live scanner**: real-time viewfinder with immediate plate bounding boxes,
+  short-shutter frame analysis, per-vehicle tracking, multi-frame OCR fusion, and offline hotlist matching
+  for AMBER / Silver / Blue alerts.
 - **Camera-avoidance routing** — routes that steer around ALPR camera cones (OpenRouteService or
   GraphHopper, with your own free API key).
+- **LoRa mesh and ESP32 radio nodes**: Heltec V3 and ESP32-S3 hardware monitors sniffing Wi-Fi deauth
+  frames, rogue probe requests, and surveillance beacons in promiscuous mode; multi-hop LoRa mesh
+  relaying telemetry, OLED trip dashboards, and Ed25519-signed OTA updates.
 - **Your devices, linked in seconds** — QR or LAN discovery with Bluetooth-style numeric comparison;
   nothing to type. Optional hub over WireGuard with an end-to-end encrypted API (X25519 +
   ChaCha20-Poly1305).
@@ -83,6 +87,9 @@ over your VPN only. See [deploy/README.md](deploy/README.md) and [docs/HUB.md](d
   [docs/RANGING.md](docs/RANGING.md) §6.
 - **Raspberry Pi agent** — a GPS HAT as a precise position witness, BLE radio and NTP server:
   `agent/install-on-pi.sh <user>@<pi>`. [docs/AGENT.md](docs/AGENT.md).
+- **Heltec V3 / ESP32-S3 LoRa mesh node**: an off-grid RF surveillance detector and gateway. Sniffs 802.11
+  monitor frames and BLE beacons while meshing telemetry back to your desktop or Android phone over LoRa or USB.
+  Includes an OLED trip dashboard and Ed25519-signed OTA updates: `tools/flash_heltec_v3.sh`.
 
 ## How it gets a fix
 
@@ -169,6 +176,10 @@ KWin Night Light follows your position, and locale hints are exposed to other wi
 | D-Bus `org.sworrl.BeaconFix` | properties, methods and signals — [docs/DBUS.md](docs/DBUS.md) |
 | CLI | `beaconfix --help` |
 | Android app `org.sworrl.beaconfix` | [android/README.md](android/README.md) |
+| `firmware/heltec_v3/` | Heltec WiFi LoRa 32 V3 firmware: LoRa mesh, promiscuous Wi-Fi, BLE scanner, OLED dashboard |
+| `firmware/esp32_node/` | ESP32-S3 node firmware: Wi-Fi monitor, BLE surveillance sniffing, signed mesh OTA |
+| `tools/esp32_autolink.py` | auto-detection daemon bridging USB serial nodes and LoRa mesh to the BeaconFix API |
+| `tools/mesh_flash.py` | over-the-air firmware distributor with Ed25519 cryptographic chunk signing |
 | Pi agent | [docs/AGENT.md](docs/AGENT.md) |
 | `tools/train-plate-detector/` | a clean (MIT code + CC BY data) retraining pipeline for the plate detector |
 

@@ -405,6 +405,10 @@ QByteArray html()
         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
         Telegram
       </button>
+      <button class="nav-btn" onclick="switchTab('nodesTab', this); loadEspPorts();">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12.55a11 11 0 0 1 14.08 0"/><path d="M1.42 9a16 16 0 0 1 21.16 0"/><path d="M8.53 16.11a6 6 0 0 1 6.95 0"/><line x1="12" y1="20" x2="12.01" y2="20"/></svg>
+        ESP32 Nodes
+      </button>
     </nav>
 
     <div class="header-actions">
@@ -591,6 +595,229 @@ QByteArray html()
             <button type="button" class="btn btn-danger" id="tgUnpairBtn" style="display:none;" onclick="unpairTelegram()">Unpair Chat</button>
           </form>
         </div>
+      </div>
+    </div>
+
+    <!-- ESP32 Nodes Tab -->
+    <div id="nodesTab" class="tab-content" style="padding: 20px; max-width: 1000px; margin: 0 auto; width: 100%;">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 20px; flex-wrap:wrap; gap:12px;">
+        <div>
+          <h2 style="font-size:1.4rem; font-weight:700;">ESP32 Sniffer & Monitor Nodes</h2>
+          <p style="font-size:0.85rem; color:var(--text-muted); margin-top:4px;">Manage wireless promiscuous monitor nodes, 3.7V vape battery telemetry, and network flashing.</p>
+        </div>
+        <button class="btn btn-primary" onclick="flashEspNode()" id="btnFlashEsp" style="display:flex; align-items:center; gap:8px;">
+          ⚡ Flash Connected ESP32
+        </button>
+      </div>
+
+      <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; margin-bottom: 24px;">
+        <div class="card" style="padding:16px;">
+          <h3 style="font-size:1rem; font-weight:600; margin-bottom:12px; color:var(--accent);">Connected Serial Ports</h3>
+          <div id="espPortsList" style="font-family:monospace; font-size:0.85rem; color:var(--text-muted);">Scanning ports...</div>
+          <button class="btn" style="margin-top:12px; font-size:0.8rem; padding:4px 10px;" onclick="loadEspPorts()">🔄 Refresh Ports</button>
+        </div>
+        <div class="card" style="padding:16px;">
+          <h3 style="font-size:1rem; font-weight:600; margin-bottom:12px; color:var(--success);">Telemetry & Auto-Naming</h3>
+          <p style="font-size:0.85rem; color:var(--text-muted); line-height:1.6;">
+            • <b>Reddit-Style Name:</b> e.g. <code>SwiftFalconRanger4821</code> (auto-seeded from MAC, customizable in NVS)<br>
+            • <b>Wi-Fi SoftAP:</b> SSID matches Node Name @ <code>192.168.4.1</code><br>
+            • <b>Web OTA & Config:</b> <a href="http://192.168.4.1/" target="_blank" style="color:var(--accent);">http://192.168.4.1/</a><br>
+            • <b>UDP Broadcast:</b> Port <code>47824</code> | <b>BLE NUS:</b> UUID <code>6E400001-...</code><br>
+            • <b>Vape Battery:</b> Pin GPIO 35 (2:1 divider, 100kΩ/100kΩ)
+          </p>
+        </div>
+      </div>
+
+      <!-- Node Battery Capacity & Runtime Estimation Card -->
+      <div class="card" style="padding:18px; margin-bottom:24px;">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; flex-wrap:wrap; gap:10px;">
+          <div>
+            <h3 style="font-size:1.1rem; font-weight:700; color:var(--success);">🔋 Node Battery Volume & Runtime Estimation</h3>
+            <p style="font-size:0.82rem; color:var(--text-muted); margin-top:2px;">
+              Configure battery volume (mAh) for each node (e.g. 240 mAh for Heltec V3) to compute accurate runtime estimation and drain telemetry.
+            </p>
+          </div>
+          <button class="btn" onclick="loadNodeBatteries()" style="font-size:0.8rem; padding:4px 10px;">🔄 Refresh Batteries</button>
+        </div>
+        <div id="nodeBatteriesList" style="display:grid; grid-template-columns:repeat(auto-fit, minmax(280px, 1fr)); gap:12px;">
+          <div style="color:var(--text-muted); font-size:0.85rem;">Scanning active nodes...</div>
+        </div>
+      </div>
+
+      <!-- 3D Nameplate Generator & Node Minting Card (NAMEPLATE_SPEC.md) -->
+      <div class="card" style="padding:18px; margin-bottom:24px;">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; flex-wrap:wrap; gap:10px;">
+          <div>
+            <h3 style="font-size:1.1rem; font-weight:700; color:var(--accent);">🏷 3D Nameplate Generator & Node Minting (NAMEPLATE_SPEC.md)</h3>
+            <p style="font-size:0.82rem; color:var(--text-muted); margin-top:2px;">
+              Generate slide-and-clip 3D-printable nameplate STLs for Heltec V3 and ESP32 enclosure retention rails.
+            </p>
+          </div>
+          <button class="btn btn-primary" onclick="mintNewNodeWeb()" style="display:flex; align-items:center; gap:6px;">
+            ✨ Mint New Node & 3D STL
+          </button>
+        </div>
+
+        <div style="background:#090d16; border:1px solid var(--card-border); border-radius:8px; padding:14px; margin-bottom:16px;">
+          <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(180px, 1fr)); gap:12px; align-items:end;">
+            <div>
+              <label style="display:block; font-size:0.75rem; color:var(--text-muted); margin-bottom:4px;">Node / Plate Text</label>
+              <input type="text" id="nameplateInputName" placeholder="e.g. CosmicFalconMaster9463" style="width:100%; padding:8px 12px; background:var(--surface); border:1px solid var(--card-border); border-radius:6px; color:#fff; font-family:monospace; font-size:0.85rem;">
+            </div>
+            <div>
+              <label style="display:block; font-size:0.75rem; color:var(--text-muted); margin-bottom:4px;">Rail Width / Units</label>
+              <select id="nameplateInputUnits" style="width:100%; padding:8px 12px; background:var(--surface); border:1px solid var(--card-border); border-radius:6px; color:#fff; font-size:0.85rem;">
+                <option value="4" selected>4U (31.7 mm) — Full Span</option>
+                <option value="3">3U (23.7 mm) — 3-Unit Tile</option>
+                <option value="2">2U (15.7 mm) — 2-Unit Tile</option>
+                <option value="1">1U (7.7 mm) — 1-Unit Tile</option>
+              </select>
+            </div>
+            <div>
+              <label style="display:block; font-size:0.75rem; color:var(--text-muted); margin-bottom:4px;">Text Style</label>
+              <select id="nameplateInputMode" style="width:100%; padding:8px 12px; background:var(--surface); border:1px solid var(--card-border); border-radius:6px; color:#fff; font-size:0.85rem;">
+                <option value="false" selected>Full Name (Debossed)</option>
+                <option value="true">Short Callsign (e.g. CF94)</option>
+              </select>
+            </div>
+            <div>
+              <button class="btn" onclick="generateNameplateWeb()" style="width:100%; padding:8px 14px; display:flex; align-items:center; justify-content:center; gap:6px;">
+                🖨 Generate Nameplate STL
+              </button>
+            </div>
+          </div>
+          <div id="nameplateResult" style="display:none; margin-top:12px; padding:10px 14px; background:rgba(56,189,248,0.1); border:1px solid rgba(56,189,248,0.3); border-radius:6px; font-size:0.82rem;"></div>
+        </div>
+
+        <div>
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+            <h4 style="font-size:0.9rem; font-weight:600; color:var(--text);">Minted 3D Nameplates Library</h4>
+            <button class="btn" style="font-size:0.75rem; padding:3px 8px;" onclick="loadNameplatesWeb()">🔄 Refresh STLs</button>
+          </div>
+          <div id="nameplatesList" style="display:grid; grid-template-columns:repeat(auto-fill, minmax(280px, 1fr)); gap:10px;">
+            <div style="color:var(--text-muted); font-size:0.8rem;">Loading nameplates...</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Hardware & Wiring Guide Card -->
+      <div class="card" style="padding:18px; margin-bottom:24px;">
+        <h3 style="font-size:1.1rem; font-weight:700; color:var(--accent); margin-bottom:8px;">📐 Hardware Wiring & Pinout Safety Matrix</h3>
+        <p style="font-size:0.82rem; color:var(--text-muted); margin-bottom:14px;">
+          Where to wire and <b>where NOT to wire</b> external LEDs and 3.7V vape Li-ion batteries.
+        </p>
+
+        <table style="width:100%; border-collapse:collapse; margin-bottom:16px; font-size:0.82rem;">
+          <thead>
+            <tr style="border-bottom:1px solid var(--card-border); text-align:left; color:var(--text-muted);">
+              <th style="padding:8px;">Category</th>
+              <th style="padding:8px;">GPIO Pins</th>
+              <th style="padding:8px;">Designated Function</th>
+              <th style="padding:8px;">Safety Instructions</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr style="border-bottom:1px solid rgba(255,255,255,0.05);">
+              <td style="padding:8px; color:var(--success); font-weight:600;">✅ Safe LED Outputs</td>
+              <td style="padding:8px; font-family:monospace;">GPIO 2, 4, 16, 17, 18, 19, 21, 22, 23, 25, 26, 27, 32, 33</td>
+              <td style="padding:8px;">Single LEDs & 4-Pin RGB (R, G, B)</td>
+              <td style="padding:8px;">Always use 220Ω - 330Ω current limiting resistor!</td>
+            </tr>
+            <tr style="border-bottom:1px solid rgba(255,255,255,0.05);">
+              <td style="padding:8px; color:#f59e0b; font-weight:600;">⚡ Input-Only (ADC)</td>
+              <td style="padding:8px; font-family:monospace;">GPIO 34, 35, 36 (VP), 39 (VN)</td>
+              <td style="padding:8px;">Battery Voltage Monitoring (GPIO 35 default)</td>
+              <td style="padding:8px;"><b>Input ONLY!</b> Cannot output high/low for LEDs.</td>
+            </tr>
+            <tr style="border-bottom:1px solid rgba(255,255,255,0.05);">
+              <td style="padding:8px; color:#ef4444; font-weight:600;">❌ Boot Strapping</td>
+              <td style="padding:8px; font-family:monospace;">GPIO 0, 12, 15</td>
+              <td style="padding:8px;">Internal Boot Control</td>
+              <td style="padding:8px;">Do not pull LOW at boot or board enters ROM download mode.</td>
+            </tr>
+            <tr style="border-bottom:1px solid rgba(255,255,255,0.05);">
+              <td style="padding:8px; color:#ef4444; font-weight:600;">❌ USB Serial Port</td>
+              <td style="padding:8px; font-family:monospace;">GPIO 1 (TX0), GPIO 3 (RX0)</td>
+              <td style="padding:8px;">USB CP2102 Serial Bridge</td>
+              <td style="padding:8px;">Wiring LEDs here interferes with flashing & telemetry!</td>
+            </tr>
+            <tr>
+              <td style="padding:8px; color:#ef4444; font-weight:600;">❌ SPI Flash Memory</td>
+              <td style="padding:8px; font-family:monospace;">GPIO 6, 7, 8, 9, 10, 11</td>
+              <td style="padding:8px;">Internal SPI Flash Bus</td>
+              <td style="padding:8px;"><b>NEVER CONNECT!</b> Causes instant board freeze or flash brick.</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <!-- Visual Wiring ASCII Schematics -->
+        <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(280px, 1fr)); gap:12px;">
+          <div style="background:#090d16; border:1px dashed var(--card-border); border-radius:8px; padding:12px; font-family:monospace; font-size:0.75rem; color:#38bdf8; overflow-x:auto;">
+<b>🔋 3.7V Vape Battery Divider (GPIO 35)</b>
+[3.7V Vape Pouch Cell]
+  (+) Red Wire   ──> TP4056 B+ ──> OUT+ ──> ESP32 VIN (5V)
+  (-) Black Wire ──> TP4056 B- ──> OUT- ──> ESP32 GND
+
+[100kΩ/100kΩ Precision Divider]:
+  Vape (+) ──[100kΩ]──┬──> ESP32 GPIO 35
+                      │
+                  [100kΩ]
+                      │
+  ESP32 GND ──────────┴─────────────────
+          </div>
+
+          <div style="background:#090d16; border:1px dashed var(--card-border); border-radius:8px; padding:12px; font-family:monospace; font-size:0.75rem; color:#38bdf8; overflow-x:auto;">
+<b>💡 Single LED (Waterproof Case Satellite)</b>
+ESP32 GPIO 4 ──[ 330Ω Resistor ]──> Anode (+) [Long leg]
+                                    Cathode (-) [Flat edge]
+ESP32 GND    ─────────────────────> Ground
+
+<b>Multi-LED Roles:</b>
+• <b>Mirror:</b> Mirrors internal status/heartbeat
+• <b>Battery-Only:</b> Full-time battery level gauge
+• <b>Sniffer:</b> Wi-Fi probe/beacon strobe
+• <b>Tracker:</b> BLE AirTag/Tile alarm
+          </div>
+
+          <div style="background:#090d16; border:1px dashed var(--card-border); border-radius:8px; padding:12px; font-family:monospace; font-size:0.75rem; color:#38bdf8; overflow-x:auto;">
+<b>🌈 4-Pin RGB LED (Common Cathode / Anode)</b>
+[Common Cathode (GND Common)]:
+  Pin 1 (Red)   ──[ 330Ω ]──> ESP32 GPIO 18
+  Pin 2 (Common)────────────> ESP32 GND
+  Pin 3 (Green) ──[ 220Ω ]──> ESP32 GPIO 19
+  Pin 4 (Blue)  ──[ 220Ω ]──> ESP32 GPIO 23
+
+[RGB Full-Time Battery Indication]:
+  • Full: Solid Green  • Dying: Rapid Red
+  • Half: Solid Yellow • Charge: Cyan Breath
+  • USB (No Batt): Soft Ice Blue Dual-Tick
+          </div>
+        </div>
+      </div>
+
+      <!-- Battery Diagnostic Troubleshooter Card -->
+      <div class="card" style="padding:18px; margin-bottom:24px;">
+        <h3 style="font-size:1.1rem; font-weight:700; color:var(--accent); margin-bottom:8px;">🔍 Battery Diagnostics & Troubleshooter</h3>
+        <p style="font-size:0.82rem; color:var(--text-muted); margin-bottom:12px;">
+          Troubleshoot "Why can't the ESP see my battery?" when wiring recovered 3.7V vape pouch cells.
+        </p>
+        <div style="background:#090d16; border:1px solid var(--card-border); border-radius:8px; padding:14px; font-size:0.82rem; line-height:1.6;">
+          <b style="color:var(--accent);">Diagnosis & Checklist:</b>
+          <ol style="margin:8px 0 0 18px; color:var(--text-muted);">
+            <li><b style="color:#f8fafc;">Common Ground (GND):</b> The ESP32 GND and TP4056 GND <i>must</i> be physically tied together. If grounds are isolated, the ADC has no voltage reference and floats near 0V.</li>
+            <li><b style="color:#f8fafc;">Precision Voltage Divider:</b> Check resistor 1 (100kΩ) between Battery Positive (+) and GPIO 35, and resistor 2 (100kΩ) between GPIO 35 and ESP32 GND.</li>
+            <li><b style="color:#f8fafc;">Vape Cell Protection Tripped:</b> Single-cell vape batteries have safety protection chips that disconnect the cell if depleted below ~2.5V. Plug the TP4056 into USB-C for 15 minutes to awaken the cell.</li>
+            <li><b style="color:#f8fafc;">USB-Only Operation:</b> If the node is powered via USB 5V without a battery attached, the firmware automatically detects this (< 1.2V), sets <code>batt_state: "no_battery"</code>, and plays a calm dual-tick pattern instead of false dying alarms.</li>
+          </ol>
+        </div>
+      </div>
+
+      <div class="card" style="padding:16px;">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+          <h3 style="font-size:1rem; font-weight:600;">Flashing & Telemetry Console</h3>
+          <span id="flashStatusBadge" class="badge" style="display:none; background:var(--surface); padding:2px 8px; border-radius:4px; font-size:0.75rem;"></span>
+        </div>
+        <pre id="espConsole" style="background:#090d16; border:1px solid var(--card-border); border-radius:8px; padding:12px; font-family:monospace; font-size:0.8rem; color:#38bdf8; max-height:280px; overflow-y:auto; white-space:pre-wrap;">Ready to flash or monitor ESP32 nodes.</pre>
       </div>
     </div>
   </main>
@@ -1189,6 +1416,193 @@ QByteArray html()
       try { await postTelegram({ unpair: true }); } catch (err) { alert('Error: ' + err); }
     }
 
+    async function loadEspPorts() {
+      const el = document.getElementById('espPortsList');
+      if (!el) return;
+      try {
+        const res = await fetch('/api/v1/esp/ports');
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const data = await res.json();
+        if (!data.ports || data.ports.length === 0) {
+          el.innerHTML = '<span style="color:var(--warning);">No ESP32 serial devices detected.</span>';
+        } else {
+          el.innerHTML = data.ports.map(p => `<div>🔌 <b>${p.id}</b> → <span style="color:var(--accent);">${p.target || p.path}</span></div>`).join('');
+        }
+      } catch (e) {
+        el.innerHTML = `<span style="color:var(--danger);">Error loading ports: ${e.message}</span>`;
+      }
+    }
+
+    async function flashEspNode() {
+      const btn = document.getElementById('btnFlashEsp');
+      const con = document.getElementById('espConsole');
+      const badge = document.getElementById('flashStatusBadge');
+      if (btn) btn.disabled = true;
+      if (badge) { badge.style.display = 'inline'; badge.textContent = 'Flashing...'; badge.style.color = 'var(--warning)'; }
+      if (con) con.textContent = 'Starting firmware flash...\nUploading signed binary to connected ESP32...';
+
+      try {
+        const res = await fetch('/api/v1/esp/flash', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({})
+        });
+        const data = await res.json();
+        if (data.ok) {
+          if (badge) { badge.textContent = 'Flashed Successfully'; badge.style.color = 'var(--success)'; }
+          if (con) con.textContent = '⚡ ESP32 flashed successfully!\n\n' + (data.output || 'Upload verified.');
+        } else {
+          if (badge) { badge.textContent = 'Flash Failed'; badge.style.color = 'var(--danger)'; }
+          if (con) con.textContent = '❌ Flash error: ' + (data.error || 'Failed') + '\n\n' + (data.details || '');
+        }
+      } catch (e) {
+        if (badge) { badge.textContent = 'Error'; badge.style.color = 'var(--danger)'; }
+        if (con) con.textContent = 'Network error: ' + e.message;
+      } finally {
+        if (btn) btn.disabled = false;
+        loadEspPorts();
+      }
+    }
+
+    async function loadNodeBatteries() {
+      const el = document.getElementById('nodeBatteriesList');
+      if (!el) return;
+      try {
+        const res = await fetch('/api/v1/nodes');
+        const data = await res.json();
+        const nodes = data.nodes || [];
+        if (nodes.length === 0) {
+          el.innerHTML = '<div style="color:var(--text-muted); font-size:0.85rem;">No active mesh nodes discovered yet.</div>';
+          return;
+        }
+        el.innerHTML = nodes.map(n => {
+          const mah = n.battMah || 240;
+          const pct = n.battPct >= 0 ? n.battPct : '—';
+          const mv = n.battMv > 0 ? n.battMv + ' mV' : 'USB 5V';
+          const est = n.estRuntimeMins > 0 ? `~${(n.estRuntimeMins/60).toFixed(1)}h remaining` : (n.charging ? 'Charging' : 'USB Powered');
+          return `
+            <div style="background:#090d16; border:1px solid var(--card-border); border-radius:8px; padding:12px;">
+              <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+                <b style="color:var(--accent); font-family:monospace; font-size:0.85rem;">${n.name}</b>
+                <span style="font-size:0.75rem; background:rgba(255,255,255,0.06); padding:2px 6px; border-radius:4px;">${n.role || 'node'}</span>
+              </div>
+              <div style="font-size:0.8rem; color:var(--text-muted); margin-bottom:8px;">
+                Power: <span style="color:#fff; font-weight:600;">${pct}%</span> (${mv}) · <span style="color:var(--success);">${est}</span>
+              </div>
+              <div style="display:flex; gap:6px; align-items:center;">
+                <input type="number" id="battInput_${n.name}" value="${mah}" min="50" max="50000" step="10" style="width:90px; padding:4px 8px; background:var(--surface); border:1px solid var(--card-border); border-radius:4px; color:#fff; font-size:0.8rem;">
+                <span style="font-size:0.75rem; color:var(--text-muted);">mAh</span>
+                <button class="btn" style="padding:4px 8px; font-size:0.75rem;" onclick="saveNodeBattery('${n.name}', document.getElementById('battInput_${n.name}').value)">Save</button>
+                <button class="btn" style="padding:4px 8px; font-size:0.75rem;" onclick="saveNodeBattery('${n.name}', 240)" title="Set Heltec V3 stock LiPo capacity">240mAh</button>
+              </div>
+            </div>
+          `;
+        }).join('');
+      } catch (e) {
+        el.innerHTML = '<div style="color:var(--danger); font-size:0.85rem;">Error loading nodes: ' + e.message + '</div>';
+      }
+    }
+
+    async function saveNodeBattery(name, mah) {
+      try {
+        const res = await fetch('/api/v1/nodes/battery', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: name, mah: parseInt(mah, 10) })
+        });
+        const data = await res.json();
+        if (data.ok) {
+          loadNodeBatteries();
+        } else {
+          alert('Failed to set battery capacity: ' + (data.error || 'error'));
+        }
+      } catch (e) {
+        alert('Network error: ' + e.message);
+      }
+    }
+
+    async function loadNameplatesWeb() {
+      const el = document.getElementById('nameplatesList');
+      if (!el) return;
+      try {
+        const res = await fetch('/api/v1/nodes/nameplate');
+        const data = await res.json();
+        const plates = data.nameplates || [];
+        if (plates.length === 0) {
+          el.innerHTML = '<div style="color:var(--text-muted); font-size:0.8rem;">No nameplates generated yet. Click "Mint New Node" or "Generate" above!</div>';
+          return;
+        }
+        el.innerHTML = plates.map(p => {
+          const kb = (p.sizeBytes / 1024).toFixed(0);
+          return `
+            <div style="background:#090d16; border:1px solid var(--card-border); border-radius:6px; padding:10px; display:flex; justify-content:space-between; align-items:center;">
+              <div>
+                <b style="font-size:0.8rem; font-family:monospace; color:#fff;">${p.fileName}</b>
+                <div style="font-size:0.72rem; color:var(--text-muted);">${kb} KB · 45° retention rail STL</div>
+              </div>
+              <a href="/api/v1/nodes/nameplate/download?file=${encodeURIComponent(p.fileName)}" class="btn" style="padding:4px 10px; font-size:0.75rem; text-decoration:none;" download>
+                ⬇ STL
+              </a>
+            </div>
+          `;
+        }).join('');
+      } catch (e) {
+        el.innerHTML = '<div style="color:var(--danger); font-size:0.8rem;">Error loading nameplates: ' + e.message + '</div>';
+      }
+    }
+
+    async function generateNameplateWeb() {
+      const name = document.getElementById('nameplateInputName').value.trim();
+      const units = parseInt(document.getElementById('nameplateInputUnits').value, 10);
+      const shortMode = document.getElementById('nameplateInputMode').value === 'true';
+      const resEl = document.getElementById('nameplateResult');
+
+      if (resEl) { resEl.style.display = 'block'; resEl.textContent = 'Generating 3D nameplate STL with OpenSCAD...'; }
+      try {
+        const res = await fetch('/api/v1/nodes/nameplate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: name, units: units, short: shortMode })
+        });
+        const data = await res.json();
+        if (data.ok) {
+          if (resEl) {
+            resEl.innerHTML = `✅ Generated <b>${data.stlFileName}</b> (${data.width_mm}×${data.height_mm}×${data.thickness_mm} mm) · Plate text: <code>${data.text}</code> — <a href="/api/v1/nodes/nameplate/download?file=${encodeURIComponent(data.stlFileName)}" style="color:var(--accent); font-weight:600;" download>Download STL</a>`;
+          }
+          loadNameplatesWeb();
+        } else {
+          if (resEl) resEl.textContent = '❌ Generation failed: ' + (data.error || 'Unknown error');
+        }
+      } catch (e) {
+        if (resEl) resEl.textContent = '❌ Error: ' + e.message;
+      }
+    }
+
+    async function mintNewNodeWeb() {
+      const resEl = document.getElementById('nameplateResult');
+      if (resEl) { resEl.style.display = 'block'; resEl.textContent = 'Minting new node name from dictionaries and building 3D nameplate STL...'; }
+      try {
+        const res = await fetch('/api/v1/nodes/mint', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ role: 'mobile', units: 4 })
+        });
+        const data = await res.json();
+        if (data.ok) {
+          if (resEl) {
+            resEl.innerHTML = `🎉 Minted node <b>${data.name}</b> (Callsign: <code>${data.callsign}</code>)! 3D Nameplate saved: <b>${data.stlFileName}</b> — <a href="/api/v1/nodes/nameplate/download?file=${encodeURIComponent(data.stlFileName)}" style="color:var(--accent); font-weight:600;" download>Download STL</a>`;
+          }
+          document.getElementById('nameplateInputName').value = data.name;
+          loadNameplatesWeb();
+          loadNodeBatteries();
+        } else {
+          if (resEl) resEl.textContent = '❌ Minting failed: ' + (data.error || 'Unknown error');
+        }
+      } catch (e) {
+        if (resEl) resEl.textContent = '❌ Error: ' + e.message;
+      }
+    }
+
     // Startup
     window.addEventListener('DOMContentLoaded', () => {
       initMap();
@@ -1198,6 +1612,8 @@ QByteArray html()
       fetchPlates();
       fetchEncounters();
       fetchAudits();
+      loadNodeBatteries();
+      loadNameplatesWeb();
 
       // Poll every 4 seconds for real-time updates
       setInterval(() => {

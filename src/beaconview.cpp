@@ -15,6 +15,11 @@
 #include <QTableWidget>
 #include <QTabWidget>
 #include <QVBoxLayout>
+#include <QFormLayout>
+#include <QComboBox>
+#include <QSpinBox>
+#include <QLineEdit>
+#include <QDir>
 #include <QMessageBox>
 #include <QFontMetrics>
 #include <QActionGroup>
@@ -119,6 +124,7 @@ BeaconView::BeaconView(Locator *loc, TileSource *tiles, QWidget *parent) : QWidg
     m_showImported = s.value("map/showImported", true).toBool();
     m_showLegend = s.value("map/showLegend", false).toBool();
     m_showHeatmap = s.value("map/showHeatmap", true).toBool();
+    m_heatmapOpacity = s.value("map/heatmapOpacity", 0.45).toDouble();
     m_showFlockCameras = s.value("map/showFlockCameras", true).toBool();
     m_showApCircles = s.value("map/showApCircles", true).toBool();
     m_camKick.setSingleShot(true);
@@ -168,6 +174,7 @@ BeaconView::BeaconView(Locator *loc, TileSource *tiles, QWidget *parent) : QWidg
     });
     connect(m_loc, &Locator::FixChanged, this, [this] { if (m_follow) recenter(); update(); });
     connect(m_loc, &Locator::scanUpdated, this, [this] { m_apEstAt.invalidate(); rebuildLabelCache(); if (m_follow && m_autoZoom) fitBeacons(); update(); });
+    connect(m_loc, &Locator::meshNodesChanged, this, [this] { update(); });
     connect(m_loc, &Locator::eventLogged, this, &BeaconView::onEvent);
     for (const BeaconEvent &e : m_loc->events())               // what happened before this view opened
         onEvent(QString::fromUtf8(QJsonDocument(e.toJson()).toJson(QJsonDocument::Compact)));
@@ -535,6 +542,7 @@ void BeaconView::paintEvent(QPaintEvent *e)
         p.drawText(rect(), Qt::AlignCenter, QStringLiteral("Listening for beacons…"));
         p.setFont(font());
     }
+    drawUnsetNodes(p);
     drawHud(p);
     prof.lap("hud");
     drawControls(p);
@@ -1683,6 +1691,15 @@ void BeaconView::setShowHeatmap(bool on)
     update();
 }
 
+void BeaconView::setHeatmapOpacity(double op)
+{
+    op = qBound(0.1, op, 1.0);
+    if (std::abs(m_heatmapOpacity - op) < 0.01) return;
+    m_heatmapOpacity = op;
+    QSettings().setValue("map/heatmapOpacity", op);
+    update();
+}
+
 void BeaconView::setShowFlockCameras(bool on)
 {
     if (m_showFlockCameras == on) return;
@@ -1720,6 +1737,7 @@ void BeaconView::drawHeatmap(QPainter &p)
     const double scale = std::pow(2.0, m_zoom - m_heat.zoom);
     p.save();
     p.setRenderHint(QPainter::SmoothPixmapTransform, std::abs(scale - 1) > 1e-6);
+    p.setOpacity(m_heatmapOpacity);
     p.drawImage(QRectF(toScreen(m_heat.tl), QSizeF(m_heat.img.width() * scale, m_heat.img.height() * scale)), m_heat.img);
     p.restore();
 }
@@ -2267,6 +2285,40 @@ void BeaconView::mouseReleaseEvent(QMouseEvent *e)
         break;
     case HitCamera: m_selKind = HitCamera; m_selItem = h.items.first(); break;
     case HitAnchor: break;
+    case HitUnsetNodes: {
+        const QList<MeshNodeInfo> unset = m_loc->unsetNodes();
+        if (!unset.isEmpty()) {
+            QMenu menu(this);
+            menu.setTitle(QStringLiteral("Place Mesh Node"));
+            double clat, clon; unmerc(m_center, &clat, &clon);
+            for (const auto &n : unset) {
+                menu.addAction(QStringLiteral("📡 Place %1 at Map Centre (%2, %3)")
+                                   .arg(n.name).arg(clat, 0, 'f', 5).arg(clon, 0, 'f', 5),
+                               this, [this, n, clat, clon] {
+                    m_loc->placeMeshNode(n.name, clat, clon);
+                });
+                if (m_loc->fix().valid) {
+                    const Fix &f = m_loc->fix();
+                    menu.addAction(QStringLiteral("📍 Place %1 at My Position (%2, %3)")
+                                       .arg(n.name).arg(f.lat, 0, 'f', 5).arg(f.lon, 0, 'f', 5),
+                                   this, [this, n, f] {
+                        m_loc->placeMeshNode(n.name, f.lat, f.lon);
+                    });
+                }
+                menu.addAction(QStringLiteral("🔗 Follow / Attach to Device…"), this, [this, n] {
+                    attachDeviceFor(n.name);
+                });
+                menu.addAction(QStringLiteral("🔋 Set Battery Volume (%1 mAh)…").arg(n.battMah), this, [this, n] {
+                    configureBatteryVolumeFor(n.name);
+                });
+                menu.addAction(QStringLiteral("🖨 Generate 3D Nameplate for %1…").arg(n.name), this, [this, n] {
+                    generateNameplateFor(n.name);
+                });
+            }
+            menu.exec(QCursor::pos());
+        }
+        break;
+    }
     case HitNone: break;
     }
     update();
@@ -2382,6 +2434,38 @@ void BeaconView::contextMenuEvent(QContextMenuEvent *e)
         QDesktopServices::openUrl(QUrl(QStringLiteral("https://www.openstreetmap.org/?mlat=%1&mlon=%2#map=17/%1/%2").arg(lat).arg(lon))); });
     menu.addAction(QIcon::fromTheme(QStringLiteral("mark-location")), QStringLiteral("Centre here"), this, [this, lat, lon] { focusOn(lat, lon, m_zoom); });
     menu.addAction(QIcon::fromTheme(QStringLiteral("network-wireless")), QStringLiteral("Place an antenna here…"), this, [this, lat, lon] { placeAnchorAt(lat, lon); });
+    const QList<MeshNodeInfo> allNodes = m_loc->meshNodes();
+    if (!allNodes.isEmpty()) {
+        QMenu *nodeSub = menu.addMenu(QIcon::fromTheme(QStringLiteral("network-wireless")), QStringLiteral("📡 Place Mesh Node Here…"));
+        for (const auto &n : allNodes) {
+            QString label = n.name;
+            if (!n.hasLocation) label += QStringLiteral(" (unset)");
+            if (n.battPct >= 0) label += QStringLiteral(" · %1%🔋").arg(n.battPct);
+            if (n.role == QLatin1String("base_station")) label += QStringLiteral(" [Base]");
+            nodeSub->addAction(label, this, [this, n, lat, lon] {
+                m_loc->placeMeshNode(n.name, lat, lon);
+            });
+        }
+    }
+    {
+        QMenu *plateSub = menu.addMenu(QIcon::fromTheme(QStringLiteral("printer")), QStringLiteral("🏷 Mesh Nodes & 3D Nameplates"));
+        plateSub->addAction(QIcon::fromTheme(QStringLiteral("list-add")), QStringLiteral("✨ Mint New Mesh Node & 3D Nameplate…"), this, [this] {
+            mintNewNodeDialog();
+        });
+        if (!allNodes.isEmpty()) {
+            QMenu *genSub = plateSub->addMenu(QIcon::fromTheme(QStringLiteral("document-export")), QStringLiteral("🖨 Generate 3D Nameplate for…"));
+            for (const auto &n : allNodes) {
+                genSub->addAction(QStringLiteral("%1 (%2)").arg(n.name, n.role == QLatin1String("base_station") ? QStringLiteral("Base") : QStringLiteral("Node")), this, [this, n] {
+                    generateNameplateFor(n.name);
+                });
+            }
+        }
+        plateSub->addAction(QIcon::fromTheme(QStringLiteral("folder")), QStringLiteral("📁 Open Nameplates Directory (~/.local/share/beaconfix/nameplates)"), this, [] {
+            const QString dir = QDir::homePath() + QStringLiteral("/.local/share/beaconfix/nameplates");
+            QDir().mkpath(dir);
+            QDesktopServices::openUrl(QUrl::fromLocalFile(dir));
+        });
+    }
     {   // docs/SIGHTINGS.md §8
         QMenu *route = menu.addMenu(QIcon::fromTheme(QStringLiteral("routeplanning"), QIcon::fromTheme(QStringLiteral("go-jump"))), QStringLiteral("Route avoiding ALPRs"));
         route->addAction(QStringLiteral("To here (from %1)").arg(m_haveRouteStart ? QStringLiteral("the chosen start") : QStringLiteral("my position")), this,
@@ -2410,6 +2494,16 @@ void BeaconView::contextMenuEvent(QContextMenuEvent *e)
     QAction *heat = menu.addAction(QStringLiteral("Show route heat map"));
     heat->setCheckable(true); heat->setChecked(m_showHeatmap);
     connect(heat, &QAction::toggled, this, &BeaconView::setShowHeatmap);
+    if (m_showHeatmap) {
+        QMenu *heatMenu = menu.addMenu(QStringLiteral("Heatmap Opacity (%1%)").arg(qRound(m_heatmapOpacity * 100)));
+        const double opLevels[] = {0.25, 0.35, 0.45, 0.60, 0.75, 1.0};
+        for (double op : opLevels) {
+            QAction *act = heatMenu->addAction(QStringLiteral("%1%%2").arg(qRound(op * 100)).arg(op == 0.45 ? QStringLiteral(" (Default - Detail Visible)") : QString()));
+            act->setCheckable(true);
+            act->setChecked(std::abs(m_heatmapOpacity - op) < 0.04);
+            connect(act, &QAction::triggered, this, [this, op] { setHeatmapOpacity(op); });
+        }
+    }
     QAction *cams = menu.addAction(QStringLiteral("Show surveillance cameras"));
     cams->setCheckable(true); cams->setChecked(m_showFlockCameras);
     connect(cams, &QAction::toggled, this, &BeaconView::setShowFlockCameras);
@@ -2467,7 +2561,22 @@ void BeaconView::showItemMenu(const Hit &h, const QPoint &globalPos)
         if (idx >= all.size()) return;
         const BfAnchor a = all[idx];
         const QString coords = QStringLiteral("%1, %2").arg(a.lat, 0, 'f', 7).arg(a.lon, 0, 'f', 7);
-        menu.addSection(a.name.isEmpty() ? a.kind : a.name);
+        if (a.kind == QLatin1String("esp32-node")) {
+            const QString curDev = m_loc->nodeAttachedDevice(a.name);
+            menu.addAction(QIcon::fromTheme(QStringLiteral("network-connect")),
+                           curDev.isEmpty()
+                               ? QStringLiteral("🔗 Follow / Attach to Device (Phone GPS)…")
+                               : QStringLiteral("🔗 Attached to %1 (Change…)").arg(curDev),
+                           this, [this, a] {
+                attachDeviceFor(a.name);
+            });
+            menu.addAction(QIcon::fromTheme(QStringLiteral("battery")), QStringLiteral("🔋 Set Battery Volume (%1 mAh)…").arg(m_loc->nodeBatteryCapacity(a.name)), this, [this, a] {
+                configureBatteryVolumeFor(a.name);
+            });
+            menu.addAction(QIcon::fromTheme(QStringLiteral("printer")), QStringLiteral("🖨 Generate 3D Nameplate STL (NAMEPLATE_SPEC.md)…"), this, [this, a] {
+                generateNameplateFor(a.name);
+            });
+        }
         menu.addAction(QIcon::fromTheme(QStringLiteral("document-edit")), QStringLiteral("Edit anchor…"), this, [this, idx] { editAnchor(idx); });
         menu.addAction(QIcon::fromTheme(QStringLiteral("edit-copy")), QStringLiteral("Copy %1").arg(coords), this, [coords] { QApplication::clipboard()->setText(coords); });
         menu.addAction(QIcon::fromTheme(QStringLiteral("edit-delete")), QStringLiteral("Remove anchor"), this, [this, a] {
@@ -2528,6 +2637,8 @@ static QColor anchorColor(const QString &kind)
     if (kind == QLatin1String("gnss")) return C_ACTIVE;
     if (kind == QLatin1String("rtt-responder")) return C_TRAVEL;
     if (kind == QLatin1String("ble")) return QColor(0x9d, 0x8c, 0xff);
+    if (kind == QLatin1String("esp32-node")) return QColor(0x35, 0xd6, 0xff);
+    if (kind == QLatin1String("fixed-point")) return QColor(0xff, 0xd1, 0x66);
     return C_IGNORED;
 }
 
@@ -2549,14 +2660,105 @@ void BeaconView::drawAnchors(QPainter &p)
         p.setPen(QPen(Qt::white, 1)); p.setBrush(Qt::NoBrush); p.drawPath(d);
         if (a.ref) { p.setPen(QPen(col, 1.4)); p.drawEllipse(at, 11, 11); }
         if (a.headingAssumed) { p.setFont(small); p.setPen(C_TRAVEL); p.drawText(QRectF(at.x() + 7, at.y() - 16, 14, 14), Qt::AlignCenter, QStringLiteral("?")); }
+        if (a.kind == QLatin1String("esp32-node")) {
+            int battPct = -1;
+            int battMah = 240;
+            int estMins = 0;
+            bool isBase = a.name.contains(QLatin1String("Master"), Qt::CaseInsensitive);
+            for (const auto &n : m_loc->meshNodes()) {
+                if (n.name == a.name || a.id == (QStringLiteral("esp32-") + n.name.toLower())) {
+                    battPct = n.battPct;
+                    battMah = n.battMah;
+                    estMins = n.estRuntimeMins;
+                    if (n.role == QLatin1String("base_station")) isBase = true;
+                    break;
+                }
+            }
+            QFont emoji = font(); emoji.setPointSizeF(font().pointSizeF() * 1.15);
+            p.setFont(emoji);
+            p.setPen(Qt::white);
+            p.drawText(QRectF(at.x() - 12, at.y() - 24, 24, 24), Qt::AlignCenter, isBase ? QStringLiteral("🏠") : QStringLiteral("📡"));
+            if (battPct >= 0) {
+                p.setFont(small);
+                p.setPen(battPct > 20 ? QColor(0x7c, 0xf2, 0xc4) : QColor(0xff, 0x52, 0x52));
+                QString battTxt = QStringLiteral("%1%🔋").arg(battPct);
+                if (estMins > 0) battTxt += QStringLiteral(" (~%1h)").arg(double(estMins) / 60.0, 0, 'f', 1);
+                p.drawText(QRectF(at.x() - 60, at.y() - 36, 120, 12), Qt::AlignCenter, battTxt);
+            }
+            const QString attachedDev = m_loc->nodeAttachedDevice(a.name);
+            if (!attachedDev.isEmpty()) {
+                p.setFont(small);
+                p.setPen(QColor(0x35, 0xd6, 0xff));
+                p.drawText(QRectF(at.x() - 80, at.y() - (battPct >= 0 ? 48 : 36), 160, 12), Qt::AlignCenter, QStringLiteral("📱 %1").arg(attachedDev));
+            }
+        }
         const bool hovered = m_hover >= 0 && m_hover < m_hits.size() && m_hits[m_hover].kind == HitAnchor && m_hits[m_hover].items.value(0) == i;
         if (m_zoom >= 16 || hovered || (i == m_anchorDrag && m_anchorMoved)) {
             p.setFont(small); p.setPen(C_TEXT);
-            const QString label = (a.name.isEmpty() ? a.kind : a.name) + (hovered ? QStringLiteral(" · ±%1 m%2").arg(a.accM, 0, 'g', 2).arg(a.rv ? QStringLiteral(" · RV") : QString()) : QString());
-            p.drawText(QRectF(at.x() - 100, at.y() + 9, 200, 14), Qt::AlignCenter, label);
+            QString label = (a.name.isEmpty() ? a.kind : a.name);
+            if (a.kind == QLatin1String("esp32-node")) {
+                const int cap = m_loc->nodeBatteryCapacity(a.name);
+                if (cap > 0) label += QStringLiteral(" · %1 mAh").arg(cap);
+            }
+            if (hovered) {
+                for (const auto &n : m_loc->meshNodes()) {
+                    if (n.name == a.name || a.id == (QStringLiteral("esp32-") + n.name.toLower())) {
+                        if (n.hops == 0) label += QStringLiteral(" · Direct Gateway");
+                        else if (n.hops == 1) label += QStringLiteral(" · 1 hop (Direct)");
+                        else if (!n.routePath.isEmpty()) label += QStringLiteral(" · %1 hops (%2)").arg(n.hops).arg(n.routePath);
+                        else label += QStringLiteral(" · %1 hops").arg(n.hops);
+                        break;
+                    }
+                }
+                label += QStringLiteral(" · ±%1 m%2").arg(a.accM, 0, 'g', 2).arg(a.rv ? QStringLiteral(" · RV") : QString());
+            }
+            p.drawText(QRectF(at.x() - 120, at.y() + 9, 240, 14), Qt::AlignCenter, label);
         }
         m_hits.append({HitAnchor, at, 9, {i}});
     }
+}
+
+void BeaconView::drawUnsetNodes(QPainter &p)
+{
+    const QList<MeshNodeInfo> unset = m_loc->unsetNodes();
+    if (unset.isEmpty()) {
+        m_unsetNodesRect = QRectF();
+        return;
+    }
+
+    QFont small = font(); small.setPointSizeF(font().pointSizeF() * 0.85); small.setBold(true);
+
+    QString text;
+    if (unset.size() == 1) {
+        const MeshNodeInfo &n = unset.first();
+        text = QStringLiteral("📡 %1 (Position Unset%2) — Click to Place")
+                   .arg(n.name, n.battPct >= 0 ? QStringLiteral(" · %1%🔋").arg(n.battPct) : QString());
+    } else {
+        QStringList names;
+        for (const auto &n : unset) names << n.name;
+        text = QStringLiteral("📡 %1 Nodes Online (Position Unset): %2 — Click to Place")
+                   .arg(unset.size()).arg(names.join(QStringLiteral(", ")));
+    }
+
+    p.setFont(small);
+    const double tw = p.fontMetrics().horizontalAdvance(text) + 24;
+    const double h = 26;
+    const double x = (width() - tw) / 2.0;
+    const double y = 8;
+    m_unsetNodesRect = QRectF(x, y, tw, h);
+
+    p.save();
+    p.setRenderHint(QPainter::Antialiasing);
+    // Background pill with golden alert border
+    p.setPen(QPen(QColor(0xff, 0xd1, 0x66), 1.2));
+    p.setBrush(QColor(12, 18, 30, 235));
+    p.drawRoundedRect(m_unsetNodesRect, 13, 13);
+
+    p.setPen(QColor(0xff, 0xd1, 0x66));
+    p.drawText(m_unsetNodesRect, Qt::AlignCenter, text);
+    p.restore();
+
+    m_hits.append({HitUnsetNodes, m_unsetNodesRect.center(), 20, {}});
 }
 
 // Devices closer than a few pixels at this zoom (the phone 60 cm from the desktop): drawn in a to-scale inset
@@ -2963,3 +3165,292 @@ void BeaconView::drawInspectPlan(QPainter &p)
 
     p.restore();
 }
+
+void BeaconView::generateNameplateFor(const QString &nodeName)
+{
+    QDialog dlg(this);
+    dlg.setWindowTitle(QStringLiteral("3D Nameplate Generator (NAMEPLATE_SPEC.md)"));
+    auto *layout = new QVBoxLayout(&dlg);
+
+    auto *intro = new QLabel(QStringLiteral("<b>Generate 3D-Printable Slide-and-Clip Nameplate</b><br>"
+                                           "Fits the standardized enclosure rail (NAMEPLATE_SPEC.md) for node <b>%1</b>.").arg(nodeName.toHtmlEscaped()));
+    intro->setWordWrap(true);
+    layout->addWidget(intro);
+
+    auto *form = new QFormLayout;
+    auto *nameEdit = new QLineEdit(nodeName);
+    form->addRow(QStringLiteral("Node Name:"), nameEdit);
+
+    auto *unitsCombo = new QComboBox;
+    unitsCombo->addItem(QStringLiteral("4U (31.7 mm) — Full Length (Recommended)"), 4);
+    unitsCombo->addItem(QStringLiteral("3U (23.7 mm) — 3-Unit Tile"), 3);
+    unitsCombo->addItem(QStringLiteral("2U (15.7 mm) — 2-Unit Tile"), 2);
+    unitsCombo->addItem(QStringLiteral("1U (7.7 mm) — Single Character"), 1);
+    form->addRow(QStringLiteral("Rail Width:"), unitsCombo);
+
+    auto *modeCombo = new QComboBox;
+    modeCombo->addItem(QStringLiteral("Full Name (Debossed Text)"), false);
+    modeCombo->addItem(QStringLiteral("Short 4-Char Callsign (e.g. CF94)"), true);
+    form->addRow(QStringLiteral("Text Format:"), modeCombo);
+
+    auto *specs = new QLabel(QStringLiteral("• Nominal Height: 7.2 mm | Thickness: 1.4 mm<br>"
+                                           "• Retention: 45° bevels (0.8 mm inset) | Deboss: 0.4 mm<br>"
+                                           "• Output Directory: ~/.local/share/beaconfix/nameplates/"));
+    specs->setStyleSheet(QStringLiteral("color: palette(mid); font-size: 11px;"));
+    layout->addLayout(form);
+    layout->addWidget(specs);
+
+    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+    buttons->button(QDialogButtonBox::Ok)->setText(QStringLiteral("🖨 Generate STL"));
+    layout->addWidget(buttons);
+    connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+
+    if (dlg.exec() != QDialog::Accepted) return;
+
+    const QString text = nameEdit->text().trimmed();
+    const int units = unitsCombo->currentData().toInt();
+    const bool shortMode = modeCombo->currentData().toBool();
+
+    QJsonObject res = m_loc->generateNameplate(text, units, shortMode);
+    if (res.value(QStringLiteral("ok")).toBool()) {
+        const QString stlPath = res.value(QStringLiteral("stl")).toString();
+        const QString plateText = res.value(QStringLiteral("text")).toString();
+        const double w = res.value(QStringLiteral("width_mm")).toDouble();
+        const double h = res.value(QStringLiteral("height_mm")).toDouble();
+        const double t = res.value(QStringLiteral("thickness_mm")).toDouble();
+
+        QMessageBox msg(this);
+        msg.setWindowTitle(QStringLiteral("3D Nameplate Generated"));
+        msg.setIcon(QMessageBox::Information);
+        msg.setText(QStringLiteral("<h3>3D Nameplate STL Created!</h3>"
+                                  "<p><b>Node:</b> %1 (plate text: <code>%2</code>)<br>"
+                                  "<b>Dimensions:</b> %3 × %4 × %5 mm (45° rail bevels)<br>"
+                                  "<b>STL File:</b> <code>%6</code></p>")
+                    .arg(text.toHtmlEscaped(), plateText.toHtmlEscaped())
+                    .arg(w, 0, 'f', 1).arg(h, 0, 'f', 1).arg(t, 0, 'f', 1)
+                    .arg(stlPath.toHtmlEscaped()));
+        auto *openFolder = msg.addButton(QStringLiteral("Open Directory"), QMessageBox::ActionRole);
+        auto *copyPath = msg.addButton(QStringLiteral("Copy Path"), QMessageBox::ActionRole);
+        msg.addButton(QMessageBox::Ok);
+        msg.exec();
+
+        if (msg.clickedButton() == openFolder) {
+            QDesktopServices::openUrl(QUrl::fromLocalFile(QFileInfo(stlPath).path()));
+        } else if (msg.clickedButton() == copyPath) {
+            QApplication::clipboard()->setText(stlPath);
+        }
+    } else {
+        QMessageBox::critical(this, QStringLiteral("Generation Failed"),
+                              QStringLiteral("Failed to generate nameplate STL:\n%1")
+                              .arg(res.value(QStringLiteral("error")).toString()));
+    }
+}
+
+void BeaconView::mintNewNodeDialog()
+{
+    QDialog dlg(this);
+    dlg.setWindowTitle(QStringLiteral("Mint New Mesh Node & 3D Nameplate"));
+    auto *layout = new QVBoxLayout(&dlg);
+
+    auto *intro = new QLabel(QStringLiteral("<b>Mint New LoRa/ESP32 Mesh Node</b><br>"
+                                           "Mints a memorable name from official 64-word dictionaries, "
+                                           "registers it in BeaconFix, and creates its 3D-printable slide-and-clip nameplate STL."));
+    intro->setWordWrap(true);
+    layout->addWidget(intro);
+
+    auto *form = new QFormLayout;
+    auto *nameEdit = new QLineEdit;
+    nameEdit->setPlaceholderText(QStringLiteral("Leave empty to auto-mint from dictionary"));
+    form->addRow(QStringLiteral("Custom Name:"), nameEdit);
+
+    auto *roleCombo = new QComboBox;
+    roleCombo->addItem(QStringLiteral("📡 Mobile Mesh Node"), QStringLiteral("mobile"));
+    roleCombo->addItem(QStringLiteral("🏠 Base Station (Fixed / Host)"), QStringLiteral("base_station"));
+    form->addRow(QStringLiteral("Node Role:"), roleCombo);
+
+    auto *unitsCombo = new QComboBox;
+    unitsCombo->addItem(QStringLiteral("4U (31.7 mm) — Full Span"), 4);
+    unitsCombo->addItem(QStringLiteral("3U (23.7 mm)"), 3);
+    unitsCombo->addItem(QStringLiteral("2U (15.7 mm)"), 2);
+    unitsCombo->addItem(QStringLiteral("1U (7.7 mm)"), 1);
+    form->addRow(QStringLiteral("Nameplate Size:"), unitsCombo);
+
+    auto *modeCombo = new QComboBox;
+    modeCombo->addItem(QStringLiteral("Full Name (e.g. TitanPumaBeacon1607)"), false);
+    modeCombo->addItem(QStringLiteral("Short 4-Char Callsign (e.g. TP07)"), true);
+    form->addRow(QStringLiteral("Plate Text:"), modeCombo);
+
+    layout->addLayout(form);
+
+    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+    buttons->button(QDialogButtonBox::Ok)->setText(QStringLiteral("✨ Mint & Generate STL"));
+    layout->addWidget(buttons);
+    connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+
+    if (dlg.exec() != QDialog::Accepted) return;
+
+    const QString customName = nameEdit->text().trimmed();
+    const QString role = roleCombo->currentData().toString();
+    const int units = unitsCombo->currentData().toInt();
+    const bool shortMode = modeCombo->currentData().toBool();
+
+    QJsonObject res = m_loc->mintMeshNode(customName, role, units, shortMode);
+    if (res.value(QStringLiteral("ok")).toBool()) {
+        const QString mintedName = res.value(QStringLiteral("name")).toString();
+        const QString callsign = res.value(QStringLiteral("callsign")).toString();
+        const QString stlPath = res.value(QStringLiteral("stl")).toString();
+
+        QMessageBox msg(this);
+        msg.setWindowTitle(QStringLiteral("Node Minted Successfully"));
+        msg.setIcon(QMessageBox::Information);
+        msg.setText(QStringLiteral("<h3>Node Successfully Minted!</h3>"
+                                  "<p><b>Name:</b> <code>%1</code><br>"
+                                  "<b>Callsign:</b> <code>%2</code><br>"
+                                  "<b>Role:</b> %3<br>"
+                                  "<b>Nameplate STL:</b> <code>%4</code></p>"
+                                  "<p>The node is now registered in the mesh node database and ready to be placed on the map.</p>")
+                    .arg(mintedName.toHtmlEscaped(), callsign.toHtmlEscaped(), role.toHtmlEscaped(), stlPath.toHtmlEscaped()));
+        auto *openFolder = msg.addButton(QStringLiteral("Open Directory"), QMessageBox::ActionRole);
+        msg.addButton(QMessageBox::Ok);
+        msg.exec();
+
+        if (msg.clickedButton() == openFolder) {
+            QDesktopServices::openUrl(QUrl::fromLocalFile(QFileInfo(stlPath).path()));
+        }
+        update();
+    } else {
+        QMessageBox::critical(this, QStringLiteral("Minting Failed"),
+                              QStringLiteral("Failed to mint node:\n%1")
+                              .arg(res.value(QStringLiteral("error")).toString()));
+    }
+}
+
+void BeaconView::configureBatteryVolumeFor(const QString &nodeName)
+{
+    const int currentMah = m_loc->nodeBatteryCapacity(nodeName);
+    QDialog dlg(this);
+    dlg.setWindowTitle(QStringLiteral("Configure Battery Volume (mAh)"));
+    auto *layout = new QVBoxLayout(&dlg);
+
+    auto *intro = new QLabel(QStringLiteral("<b>Set Battery Volume for %1</b><br>"
+                                           "Configures the battery cell capacity (mAh) to accurately calculate remaining runtime and power consumption.")
+                             .arg(nodeName.toHtmlEscaped()));
+    intro->setWordWrap(true);
+    layout->addWidget(intro);
+
+    auto *form = new QFormLayout;
+    auto *presetCombo = new QComboBox;
+    presetCombo->addItem(QStringLiteral("Heltec V3 Mini LiPo — 240 mAh (Default)"), 240);
+    presetCombo->addItem(QStringLiteral("Vape Li-ion Pouch Cell — 450 mAh"), 450);
+    presetCombo->addItem(QStringLiteral("18350 Li-ion Cell — 900 mAh"), 900);
+    presetCombo->addItem(QStringLiteral("18650 Li-ion Cell — 2600 mAh"), 2600);
+    presetCombo->addItem(QStringLiteral("21700 Li-ion Cell — 5000 mAh"), 5000);
+    presetCombo->addItem(QStringLiteral("Custom Capacity…"), -1);
+    form->addRow(QStringLiteral("Common Presets:"), presetCombo);
+
+    auto *spin = new QSpinBox;
+    spin->setRange(10, 50000);
+    spin->setSuffix(QStringLiteral(" mAh"));
+    spin->setSingleStep(10);
+    spin->setValue(currentMah > 0 ? currentMah : 240);
+    form->addRow(QStringLiteral("Battery Capacity:"), spin);
+
+    layout->addLayout(form);
+
+    connect(presetCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [presetCombo, spin] {
+        int val = presetCombo->currentData().toInt();
+        if (val > 0) spin->setValue(val);
+    });
+
+    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+    layout->addWidget(buttons);
+    connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+
+    if (dlg.exec() != QDialog::Accepted) return;
+
+    const int mah = spin->value();
+    m_loc->setNodeBatteryCapacity(nodeName, mah);
+    update();
+}
+
+void BeaconView::attachDeviceFor(const QString &nodeName)
+{
+    const QString currentAttached = m_loc->nodeAttachedDevice(nodeName);
+
+    QDialog dlg(this);
+    dlg.setWindowTitle(QStringLiteral("Follow / Attach to Device: %1").arg(nodeName));
+    auto *layout = new QVBoxLayout(&dlg);
+
+    auto *intro = new QLabel(QStringLiteral("<b>Follow / Attach Mesh Node to a Host Device</b><br>"
+                                           "Pair this LoRa / ESP32 node with your phone or this desktop. "
+                                           "The node will inherit real-time GPS coordinates directly from the host device, "
+                                           "or maintain microsecond-precision clock synchronization for seamless track reconciliation."));
+    intro->setWordWrap(true);
+    layout->addWidget(intro);
+
+    auto *form = new QFormLayout;
+    auto *deviceCombo = new QComboBox;
+    deviceCombo->addItem(QStringLiteral("— None (Independent / Fixed / Base Station) —"), QString());
+    deviceCombo->addItem(QStringLiteral("💻 This Computer (%1)").arg(m_loc->deviceName()), m_loc->deviceName());
+
+    const QList<DevicePos> devs = m_loc->devicePositions();
+    for (const DevicePos &d : devs) {
+        if (d.device.isEmpty() || d.device == m_loc->deviceName()) continue;
+        QString label = QStringLiteral("📱 %1").arg(d.device);
+        if (!d.kind.isEmpty()) label += QStringLiteral(" (%1)").arg(d.kind);
+        if (d.online) label += QStringLiteral(" [Online]");
+        deviceCombo->addItem(label, d.device);
+    }
+    deviceCombo->addItem(QStringLiteral("✏ Custom Device Name…"), QStringLiteral("__CUSTOM__"));
+
+    int matchIdx = 0;
+    if (!currentAttached.isEmpty()) {
+        for (int i = 0; i < deviceCombo->count(); ++i) {
+            if (deviceCombo->itemData(i).toString() == currentAttached) {
+                matchIdx = i;
+                break;
+            }
+        }
+        if (matchIdx == 0) {
+            deviceCombo->insertItem(deviceCombo->count() - 1, QStringLiteral("📱 %1 (Current)").arg(currentAttached), currentAttached);
+            matchIdx = deviceCombo->count() - 2;
+        }
+    }
+    deviceCombo->setCurrentIndex(matchIdx);
+    form->addRow(QStringLiteral("Host Device:"), deviceCombo);
+
+    auto *customEdit = new QLineEdit;
+    customEdit->setPlaceholderText(QStringLiteral("e.g. Pixel 8 Pro, iPhone, Laptop"));
+    customEdit->setVisible(deviceCombo->currentData().toString() == QLatin1String("__CUSTOM__"));
+    form->addRow(QStringLiteral("Custom Name:"), customEdit);
+
+    connect(deviceCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [deviceCombo, customEdit] {
+        customEdit->setVisible(deviceCombo->currentData().toString() == QLatin1String("__CUSTOM__"));
+    });
+
+    layout->addLayout(form);
+
+    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+    layout->addWidget(buttons);
+    connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+
+    if (dlg.exec() != QDialog::Accepted) return;
+
+    QString chosen = deviceCombo->currentData().toString();
+    if (chosen == QLatin1String("__CUSTOM__")) {
+        chosen = customEdit->text().trimmed();
+    }
+
+    if (chosen.isEmpty()) {
+        m_loc->detachNode(nodeName);
+    } else {
+        m_loc->attachNodeToDevice(nodeName, chosen);
+    }
+    update();
+}
+
+

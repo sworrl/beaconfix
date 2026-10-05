@@ -157,6 +157,13 @@ class DesktopLive @Inject constructor(
         return cams
     }
 
+    suspend fun fetchRouteHeatmap(): List<org.sworrl.beaconfix.data.api.RoutePointDto> { 
+        val d = store.paired().firstOrNull() ?: return emptyList() 
+        val auth = store.auth(d) ?: return emptyList() 
+        val api = org.sworrl.beaconfix.data.api.ApiFactory.create(d.host, d.port, d.tls) 
+        return runCatching { api.routeHeatmap(auth).body()?.points ?: emptyList() }.getOrDefault(emptyList()) 
+    }
+
     suspend fun syncNationwideUs(): Boolean {
         val d = store.paired().firstOrNull() ?: return false
         val auth = store.auth(d) ?: return false

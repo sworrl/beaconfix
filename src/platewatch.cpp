@@ -536,7 +536,7 @@ void PlateWatch::fetchWebcam(const PlateEvents::Camera &cam)
             *probe = [this, camId, id, page, probe](int n) {
                 if (n > 3) { m_stillBusy[camId] -= 1; flushStills(camId); return; }
                 const QString s = QStringLiteral("https://vtc%1.roadsummary.com/rtplive/%2/playlist.m3u8").arg(n).arg(id);
-                QNetworkReply *pr = get(QUrl(s), QByteArray(), {{"Referer", "https://wv511.org/"}});
+                QNetworkReply *pr = get(QUrl(s), QByteArray(), {{"Referer", "https://wv511.org/"}, {"User-Agent", "Mozilla/5.0"}});
                 connect(pr, &QNetworkReply::finished, this, [this, pr, camId, s, page, probe, n] {
                     pr->deleteLater();
                     if (pr->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt() == 200 && pr->readAll().startsWith("#EXTM3U")) {
@@ -580,8 +580,10 @@ void PlateWatch::grabStream(const QString &camId, const QString &streamUrl, cons
         flushStills(camId);
     });
     QTimer::singleShot(25000, p, [p] { if (p->state() != QProcess::NotRunning) p->kill(); });
-    p->start(ffmpeg, {QStringLiteral("-nostdin"), QStringLiteral("-loglevel"), QStringLiteral("error"), QStringLiteral("-headers"),
-                      QStringLiteral("Referer: %1\r\n").arg(referer), QStringLiteral("-i"), streamUrl, QStringLiteral("-frames:v"), QStringLiteral("1"),
+    p->start(ffmpeg, {QStringLiteral("-nostdin"), QStringLiteral("-loglevel"), QStringLiteral("error"),
+                      QStringLiteral("-user_agent"), QStringLiteral("Mozilla/5.0"),
+                      QStringLiteral("-headers"), QStringLiteral("Referer: %1\r\n").arg(referer),
+                      QStringLiteral("-i"), streamUrl, QStringLiteral("-frames:v"), QStringLiteral("1"),
                       QStringLiteral("-f"), QStringLiteral("image2pipe"), QStringLiteral("-vcodec"), QStringLiteral("png"), QStringLiteral("pipe:1")});
 }
 

@@ -58,6 +58,9 @@
 #include <QUrl>
 #include <QVBoxLayout>
 #include <cmath>
+#include <QSplitter>
+#include <QCryptographicHash>
+#include <QUdpSocket>
 #include "sightingsview.h"
 
 // Sorts by the number in Qt::UserRole rather than the display text
@@ -79,7 +82,7 @@ static QPixmap qrPixmap(const QString &text, int scale = 5) { return QPixmap::fr
 
 MainWindow::MainWindow(Locator *loc, TileSource *tiles, QWidget *parent) : QMainWindow(parent), m_loc(loc), m_tiles(tiles)
 {
-    setWindowTitle(QStringLiteral("BeaconFix"));
+    setWindowTitle(QStringLiteral("BeaconFix v3.10.0"));
     setWindowIcon(appIcon());
     resize(1100, 720);
 
@@ -237,10 +240,23 @@ MainWindow::MainWindow(Locator *loc, TileSource *tiles, QWidget *parent) : QMain
         show(); raise(); activateWindow();
     });
 
+    m_nodesTab = buildNodes();
+    tabs->addTab(m_nodesTab, QIcon::fromTheme(QStringLiteral("network-mesh")), QStringLiteral("Nodes"));
+
     tabs->addTab(buildSettings(), QIcon::fromTheme(QStringLiteral("configure")), QStringLiteral("Settings"));
-    if (m_loc->apiServer()) tabs->addTab(buildDevices(), QIcon::fromTheme(QStringLiteral("network-connect")), QStringLiteral("Devices"));
+    if (m_loc->apiServer()) {
+        m_devicesTab = buildDevices();
+        tabs->addTab(m_devicesTab, QIcon::fromTheme(QStringLiteral("network-connect")), QStringLiteral("Devices"));
+    }
     m_identityTab = buildIdentity();
     tabs->addTab(m_identityTab, QIcon::fromTheme(QStringLiteral("user-identity")), QStringLiteral("Identity"));
+    connect(tabs, &QTabWidget::currentChanged, this, [this](int idx) {
+        if (m_nodesTab && m_tabs && m_tabs->widget(idx) == m_nodesTab) {
+            refreshNodes();
+        } else if (m_devicesTab && m_tabs && m_tabs->widget(idx) == m_devicesTab) {
+            refreshDevices();
+        }
+    });
     outer->addWidget(tabs, 1);
     setCentralWidget(central);
 
@@ -255,6 +271,11 @@ MainWindow::MainWindow(Locator *loc, TileSource *tiles, QWidget *parent) : QMain
     connect(m_loc, &Locator::achievementUnlocked, this, [this](const QString &, const QString &) { refreshTrip(); });
     connect(m_loc, &Locator::scanUpdated, this, &MainWindow::refreshTrip);
     connect(m_loc, &Locator::scanUpdated, this, &MainWindow::refreshAps);
+    connect(m_loc, &Locator::meshNodesChanged, this, [this] {
+        if (m_nodesTab && m_tabs && m_tabs->currentWidget() == m_nodesTab) {
+            refreshNodes();
+        }
+    });
     connect(m_loc, &Locator::poisUpdated, this, &MainWindow::refreshPois);
     connect(m_loc, &Locator::FixChanged, this, &MainWindow::refreshPois);
     connect(m_loc, &Locator::probeStarted, this, [this] { m_refresh->setEnabled(false); });
@@ -1144,7 +1165,12 @@ QWidget *MainWindow::buildDevices()
         sv->addWidget(sb);
         show.exec();
     });
-    pairRow->addWidget(m_linkBtn); pairRow->addStretch(1); pairRow->addWidget(tokenBtn);
+    auto *mintBtn = new QPushButton(QIcon::fromTheme(QStringLiteral("printer")), QStringLiteral("Mint Node & Nameplate…"));
+    mintBtn->setToolTip(QStringLiteral("Mint a new node name from the 64-word dictionaries, register it in the mesh, and generate a 3D-printable slide-and-clip nameplate STL (NAMEPLATE_SPEC.md)."));
+    connect(mintBtn, &QPushButton::clicked, this, [this] {
+        if (m_map) m_map->mintNewNodeDialog();
+    });
+    pairRow->addWidget(m_linkBtn); pairRow->addWidget(mintBtn); pairRow->addStretch(1); pairRow->addWidget(tokenBtn);
     v->addLayout(pairRow);
 
     v->addWidget(new QLabel(QStringLiteral("<b>Link requests</b> — a phone that picked this PC; Link only if it shows the same code")));
@@ -1167,6 +1193,23 @@ QWidget *MainWindow::buildDevices()
     m_devTable->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
     m_devTable->verticalHeader()->hide(); m_devTable->setSelectionMode(QAbstractItemView::NoSelection);
     v->addWidget(m_devTable, 1);
+
+    auto *nodesBanner = new QFrame;
+    nodesBanner->setFrameShape(QFrame::StyledPanel);
+    nodesBanner->setStyleSheet(QStringLiteral("QFrame { background-color: rgba(53, 214, 255, 0.08); border: 1px solid rgba(53, 214, 255, 0.3); border-radius: 6px; padding: 6px; }"));
+    auto *nbLay = new QHBoxLayout(nodesBanner);
+    nbLay->setContentsMargins(10, 8, 10, 8);
+    auto *nbText = new QLabel(QStringLiteral("📡 <b>Looking for LoRa & ESP32 Mesh Nodes?</b> Real-time mesh topology, battery telemetry, GPS following, and 3D nameplates now have their own dedicated <b>Nodes</b> tab."));
+    nbText->setStyleSheet(QStringLiteral("color: #e0e0e0;"));
+    nbLay->addWidget(nbText, 1);
+    auto *gotoNodesBtn = new QPushButton(QIcon::fromTheme(QStringLiteral("network-mesh")), QStringLiteral("Open Nodes Tab →"));
+    gotoNodesBtn->setStyleSheet(QStringLiteral("font-weight: bold; padding: 4px 12px;"));
+    connect(gotoNodesBtn, &QPushButton::clicked, this, [this] {
+        if (m_tabs && m_nodesTab) m_tabs->setCurrentWidget(m_nodesTab);
+    });
+    nbLay->addWidget(gotoNodesBtn);
+    v->addWidget(nodesBanner);
+
 
     auto *knownHead = new QHBoxLayout;
     knownHead->addWidget(new QLabel(QStringLiteral("<b>Known devices (ours)</b> — from the UniFi export; pairing from these is approved automatically")));
@@ -1215,7 +1258,14 @@ QWidget *MainWindow::buildDevices()
         m_accessLog->appendPlainText(QStringLiteral("%1  %2  %3 %4 → %5").arg(e.time.toString(QStringLiteral("HH:mm:ss")), e.ip.leftJustified(15), e.method.leftJustified(4), e.path).arg(e.status));
     });
     connect(api, &ApiServer::linkChanged, this, &MainWindow::refreshDevices);
-    m_devTimer = nullptr;
+    m_devTimer = new QTimer(this);
+    m_devTimer->setInterval(3000);
+    connect(m_devTimer, &QTimer::timeout, this, [this] {
+        if (m_devicesTab && m_tabs && m_tabs->currentWidget() == m_devicesTab) {
+            refreshDevices();
+        }
+    });
+    m_devTimer->start();
     for (const ApiServer::AccessEntry &e : api->accessLog())
         m_accessLog->appendPlainText(QStringLiteral("%1  %2  %3 %4 → %5").arg(e.time.toString(QStringLiteral("HH:mm:ss")), e.ip.leftJustified(15), e.method.leftJustified(4), e.path).arg(e.status));
     refreshDevices();
@@ -1224,6 +1274,7 @@ QWidget *MainWindow::buildDevices()
 
 void MainWindow::refreshDevices()
 {
+    if (m_devicesTab && m_tabs && m_tabs->currentWidget() != m_devicesTab) return;
     ApiServer *api = m_loc->apiServer();
     if (!api) return;
     const QJsonObject st = api->statusJson();
@@ -1348,7 +1399,374 @@ void MainWindow::refreshDevices()
     }
     m_knownTable->setSortingEnabled(true);
     m_knownTable->resizeColumnsToContents(); m_knownTable->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
+
 }
+
+// ── Nodes: LoRa & ESP32 Mesh Network (Telemetry, Topology, 3D Nameplates) ───────
+QWidget *MainWindow::buildNodes()
+{
+    auto *w = new QWidget;
+    auto *v = new QVBoxLayout(w);
+    v->setContentsMargins(10, 10, 10, 10);
+    v->setSpacing(8);
+
+    // Top status banner card
+    auto *bannerFrame = new QFrame;
+    bannerFrame->setObjectName(QStringLiteral("meshBannerFrame"));
+    bannerFrame->setStyleSheet(QStringLiteral("QFrame#meshBannerFrame { background-color: rgba(53, 214, 255, 0.08); border: 1px solid rgba(53, 214, 255, 0.3); border-radius: 6px; padding: 6px; }"));
+    auto *bLay = new QHBoxLayout(bannerFrame);
+    bLay->setContentsMargins(10, 8, 10, 8);
+
+    auto *bLeft = new QVBoxLayout;
+    m_nodesStatusBanner = new QLabel(QStringLiteral("<b style='font-size:14px; color:#35d6ff;'>LoRa & Wi-Fi Mesh Network</b>  ·  <span style='color:#6cff8a;'>● Active Mesh</span>  ·  <span style='color:#ffd700;'>Stratum 1 Clock Master</span>"));
+    auto *subDesc = new QLabel(QStringLiteral("Autonomous store-and-forward mesh routing · 60 BPM human resting cardiac LED heartbeat sync · 915 MHz LoRa (SX1262 PA +22dBm) + 2.4 GHz Promiscuous Monitor"));
+    subDesc->setStyleSheet(QStringLiteral("color: #a0a0a0; font-size: 11px;"));
+    bLeft->addWidget(m_nodesStatusBanner);
+    bLeft->addWidget(subDesc);
+    bLay->addLayout(bLeft, 1);
+
+    m_nodesSummaryLabel = new QLabel(QStringLiteral("Nodes: 0 · 0 online"));
+    m_nodesSummaryLabel->setStyleSheet(QStringLiteral("font-weight: bold; font-size: 12px; color: #ffffff; padding: 4px 8px; background: rgba(0,0,0,0.25); border-radius: 4px;"));
+    bLay->addWidget(m_nodesSummaryLabel, 0, Qt::AlignVCenter);
+    v->addWidget(bannerFrame);
+
+    // Action Toolbar
+    auto *tb = new QHBoxLayout;
+    tb->setSpacing(6);
+
+    auto *mintBtn = new QPushButton(QIcon::fromTheme(QStringLiteral("printer")), QStringLiteral("Mint Node & Nameplate…"));
+    mintBtn->setToolTip(QStringLiteral("Mint a new node name from the 64-word dictionaries, register it in the mesh, and generate a 3D-printable slide-and-clip nameplate STL (NAMEPLATE_SPEC.md)."));
+    { QFont f = mintBtn->font(); f.setBold(true); mintBtn->setFont(f); }
+    connect(mintBtn, &QPushButton::clicked, this, [this] {
+        if (m_map) m_map->mintNewNodeDialog();
+    });
+    tb->addWidget(mintBtn);
+
+    auto *openPlatesBtn = new QPushButton(QIcon::fromTheme(QStringLiteral("folder")), QStringLiteral("Open Nameplates Folder"));
+    openPlatesBtn->setToolTip(QStringLiteral("Open ~/.local/share/beaconfix/nameplates in system file manager"));
+    connect(openPlatesBtn, &QPushButton::clicked, this, [] {
+        const QString dir = QDir::homePath() + QStringLiteral("/.local/share/beaconfix/nameplates");
+        QDir().mkpath(dir);
+        QDesktopServices::openUrl(QUrl::fromLocalFile(dir));
+    });
+    tb->addWidget(openPlatesBtn);
+
+    auto *syncClockBtn = new QPushButton(QIcon::fromTheme(QStringLiteral("chronometer")), QStringLiteral("Broadcast Clock Sync"));
+    syncClockBtn->setToolTip(QStringLiteral("Broadcast microsecond epoch time to connected Base Station and mesh nodes for sub-ms cardiac sync"));
+    connect(syncClockBtn, &QPushButton::clicked, this, [this] {
+        const qint64 nowUs = QDateTime::currentDateTimeUtc().toMSecsSinceEpoch() * 1000;
+        const QByteArray cmd = QStringLiteral("time %1\n").arg(nowUs).toUtf8();
+        QUdpSocket sock;
+        sock.writeDatagram(cmd, QHostAddress::LocalHost, 47825);
+        sock.writeDatagram(cmd, QHostAddress::Broadcast, 47824);
+        if (m_nodesEventLog) {
+            m_nodesEventLog->appendPlainText(QStringLiteral("[%1] ⏱ Broadcasted epoch clock sync: %2 us (Stratum 1)").arg(QDateTime::currentDateTime().toString(QStringLiteral("HH:mm:ss"))).arg(nowUs));
+        }
+        statusBar()->showMessage(QStringLiteral("Broadcasted epoch clock sync to mesh nodes"), 3000);
+    });
+    tb->addWidget(syncClockBtn);
+
+    auto *otaBtn = new QPushButton(QIcon::fromTheme(QStringLiteral("system-software-update")), QStringLiteral("Mesh OTA Update…"));
+    otaBtn->setToolTip(QStringLiteral("Initiate autonomous cryptographic Mesh OTA broadcast to update remote nodes to latest signed v3.10.2 firmware"));
+    connect(otaBtn, &QPushButton::clicked, this, [this] {
+        const QString binPath = QStringLiteral("/home/user/Documents/GitHub/beaconfix/firmware/heltec_v3/build/heltec_v3.ino.bin");
+        const QString sigPath = binPath + QStringLiteral(".sig");
+        if (!QFile::exists(binPath) || !QFile::exists(sigPath)) {
+            QMessageBox::warning(this, QStringLiteral("Mesh OTA"), QStringLiteral("Compiled firmware binary or signature missing.\nPlease build firmware/heltec_v3 first."));
+            return;
+        }
+        QFile fBin(binPath);
+        if (!fBin.open(QIODevice::ReadOnly)) return;
+        const QByteArray binData = fBin.readAll();
+        const QString shaHex = QString::fromUtf8(QCryptographicHash::hash(binData, QCryptographicHash::Sha256).toHex());
+        QFile fSig(sigPath);
+        if (!fSig.open(QIODevice::ReadOnly)) return;
+        const QString sigHex = QString::fromUtf8(fSig.readAll().toHex());
+        const int size = binData.size();
+
+        if (QMessageBox::question(this, QStringLiteral("Trigger Mesh OTA"),
+            QStringLiteral("Broadcast signed firmware v3.10.2 manifest to mesh?\n\nSize: %1 bytes (%2 chunks)\nSHA256: %3...\nSignature: %4 bytes\n\nThis will trigger autonomous round-robin mesh propagation.")
+            .arg(size).arg(192).arg(shaHex.left(16)).arg(sigHex.size() / 2)) != QMessageBox::Yes) {
+            return;
+        }
+
+        const QString cmd = QStringLiteral("mesh ota manifest %1 192 %2 %3 3.10.2 1\n").arg(size).arg(shaHex).arg(sigHex);
+        QUdpSocket sock;
+        sock.writeDatagram(cmd.toUtf8(), QHostAddress::LocalHost, 47825);
+        sock.writeDatagram(cmd.toUtf8(), QHostAddress::Broadcast, 47824);
+        if (m_nodesEventLog) {
+            m_nodesEventLog->appendPlainText(QStringLiteral("[%1] 🚀 Primed mesh with signed v3.10.2 manifest (%2 bytes, 192 chunks)").arg(QDateTime::currentDateTime().toString(QStringLiteral("HH:mm:ss"))).arg(size));
+        }
+        statusBar()->showMessage(QStringLiteral("Primed mesh with v3.10.2 OTA manifest"), 4000);
+    });
+    tb->addWidget(otaBtn);
+
+    auto *abortOtaBtn = new QPushButton(QIcon::fromTheme(QStringLiteral("process-stop")), QStringLiteral("Abort OTA"));
+    abortOtaBtn->setToolTip(QStringLiteral("Send emergency abort command to stop active OTA transfer and restore Wi-Fi on seeder/receivers"));
+    connect(abortOtaBtn, &QPushButton::clicked, this, [this] {
+        const QByteArray cmd("mesh ota abort\n");
+        QUdpSocket sock;
+        sock.writeDatagram(cmd, QHostAddress::LocalHost, 47825);
+        sock.writeDatagram(cmd, QHostAddress::Broadcast, 47824);
+        if (m_nodesEventLog) {
+            m_nodesEventLog->appendPlainText(QStringLiteral("[%1] 🛑 Sent mesh OTA abort command").arg(QDateTime::currentDateTime().toString(QStringLiteral("HH:mm:ss"))));
+        }
+        statusBar()->showMessage(QStringLiteral("Sent mesh OTA abort command"), 3000);
+    });
+    tb->addWidget(abortOtaBtn);
+
+    tb->addStretch(1);
+
+    auto *refreshBtn = new QPushButton(QIcon::fromTheme(QStringLiteral("view-refresh")), QStringLiteral("Refresh"));
+    connect(refreshBtn, &QPushButton::clicked, this, &MainWindow::refreshNodes);
+    tb->addWidget(refreshBtn);
+
+    v->addLayout(tb);
+
+    // Splitter for Table and Live Log
+    auto *splitter = new QSplitter(Qt::Vertical);
+
+    // Nodes Table
+    m_nodesTable = new QTableWidget(0, 10);
+    m_nodesTable->setHorizontalHeaderLabels({
+        QStringLiteral("Status"),
+        QStringLiteral("Node Name"),
+        QStringLiteral("Role & Mode"),
+        QStringLiteral("Hardware"),
+        QStringLiteral("Firmware"),
+        QStringLiteral("Power / Battery"),
+        QStringLiteral("RF & Mesh"),
+        QStringLiteral("Location / Follow"),
+        QStringLiteral("3D Nameplate"),
+        QStringLiteral("Actions")
+    });
+    m_nodesTable->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Stretch);
+    m_nodesTable->verticalHeader()->hide();
+    m_nodesTable->setSelectionBehavior(QAbstractItemView::SelectRows);
+    m_nodesTable->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    m_nodesTable->setAlternatingRowColors(true);
+    splitter->addWidget(m_nodesTable);
+
+    // Lower Panel: Live Log & Telemetry
+    auto *logWidget = new QWidget;
+    auto *logLay = new QVBoxLayout(logWidget);
+    logLay->setContentsMargins(0, 4, 0, 0);
+
+    auto *logHeader = new QHBoxLayout;
+    logHeader->addWidget(new QLabel(QStringLiteral("<b>Live Mesh Telemetry & OTA Log</b> (UDP 47824 / Port 47825)")));
+    logHeader->addStretch(1);
+    auto *clearLogBtn = new QPushButton(QIcon::fromTheme(QStringLiteral("edit-clear")), QStringLiteral("Clear Log"));
+    connect(clearLogBtn, &QPushButton::clicked, this, [this] { if (m_nodesEventLog) m_nodesEventLog->clear(); });
+    logHeader->addWidget(clearLogBtn);
+    logLay->addLayout(logHeader);
+
+    m_nodesEventLog = new QPlainTextEdit;
+    m_nodesEventLog->setReadOnly(true);
+    m_nodesEventLog->setMaximumBlockCount(200);
+    {
+        QFont mono = m_nodesEventLog->font();
+        mono.setFamily(QStringLiteral("monospace"));
+        mono.setStyleHint(QFont::Monospace);
+        m_nodesEventLog->setFont(mono);
+    }
+    logLay->addWidget(m_nodesEventLog, 1);
+    splitter->addWidget(logWidget);
+
+    splitter->setStretchFactor(0, 3);
+    splitter->setStretchFactor(1, 1);
+    v->addWidget(splitter, 1);
+
+    refreshNodes();
+    return w;
+}
+
+void MainWindow::refreshNodes()
+{
+    if (!m_nodesTable) return;
+    const QList<MeshNodeInfo> nodes = m_loc->meshNodes();
+    const QDateTime now = QDateTime::currentDateTime();
+    const QString plateDir = QDir::homePath() + QStringLiteral("/.local/share/beaconfix/nameplates/");
+
+    int onlineCount = 0;
+    m_nodesTable->setRowCount(nodes.size());
+
+    for (int i = 0; i < nodes.size(); ++i) {
+        const MeshNodeInfo &n = nodes[i];
+        const qint64 ageSecs = n.lastSeen.isValid() ? n.lastSeen.secsTo(now) : 999999;
+        const bool isOnline = n.online && ageSecs < 180;
+        if (isOnline) onlineCount++;
+
+        // 0. Status
+        auto *stItem = new QTableWidgetItem;
+        if (isOnline) {
+            stItem->setText(QStringLiteral("🟢 Online"));
+            stItem->setForeground(QColor(0x6c, 0xff, 0x8a));
+        } else if (ageSecs < 600) {
+            stItem->setText(QStringLiteral("🟡 Stale (%1m)").arg(ageSecs / 60));
+            stItem->setForeground(QColor(0xff, 0xd7, 0x00));
+        } else {
+            stItem->setText(QStringLiteral("🔴 Offline"));
+            stItem->setForeground(QColor(0xff, 0x55, 0x55));
+        }
+        stItem->setTextAlignment(Qt::AlignCenter);
+        m_nodesTable->setItem(i, 0, stItem);
+
+        // 1. Node Name
+        auto *nameItem = new QTableWidgetItem(n.name);
+        { QFont f = nameItem->font(); f.setBold(true); nameItem->setFont(f); }
+        m_nodesTable->setItem(i, 1, nameItem);
+
+        // 2. Role & Mode
+        QString roleStr;
+        if (n.role == QLatin1String("base_station") || n.name.contains(QLatin1String("Master"), Qt::CaseInsensitive)) {
+            roleStr = QStringLiteral("Base Station 🏠");
+        } else if (n.following && !n.attachedDevice.isEmpty()) {
+            roleStr = QStringLiteral("Follows %1 📱").arg(n.attachedDevice);
+        } else if (n.traveling && n.speedKmh > 0) {
+            roleStr = QStringLiteral("Vehicle Anchor 🚗 (%1 km/h)").arg(n.speedKmh, 0, 'f', 0);
+        } else {
+            roleStr = QStringLiteral("Mobile Node 📡");
+        }
+        if (!n.antennaDetected || n.txInhibited) roleStr += QStringLiteral(" ⚠️ No Ant");
+        auto *roleItem = new QTableWidgetItem(roleStr);
+        if (!n.antennaDetected || n.txInhibited) roleItem->setForeground(QColor(0xff, 0xa7, 0x26));
+        else if (n.following) roleItem->setForeground(QColor(0x35, 0xd6, 0xff));
+        m_nodesTable->setItem(i, 2, roleItem);
+
+        // 3. Hardware
+        QString hwStr = n.name.contains(QLatin1String("Falcon"), Qt::CaseInsensitive) || n.name.contains(QLatin1String("Cheetah"), Qt::CaseInsensitive)
+            ? QStringLiteral("Heltec V3 (ESP32-S3 + SX1262)")
+            : QStringLiteral("ESP32-WROOM-32");
+        auto *hwItem = new QTableWidgetItem(hwStr);
+        m_nodesTable->setItem(i, 3, hwItem);
+
+        // 4. Firmware
+        QString ver = n.fwVersion.startsWith(QLatin1Char('v')) ? n.fwVersion : QStringLiteral("v%1").arg(n.fwVersion.isEmpty() ? QStringLiteral("3.10.0") : n.fwVersion);
+        auto *verItem = new QTableWidgetItem(ver);
+        verItem->setTextAlignment(Qt::AlignCenter);
+        verItem->setForeground(QColor(0x35, 0xd6, 0xff));
+        m_nodesTable->setItem(i, 4, verItem);
+
+        // 5. Power / Battery
+        const int capMah = m_loc->nodeBatteryCapacity(n.name);
+        QString powerStr;
+        if (capMah > 0 && n.battPct >= 0 && n.battState != QLatin1String("no_battery") && n.battState != QLatin1String("absent")) {
+            powerStr = QStringLiteral("%1% 🔋 (%2 mV · %3 mAh)").arg(n.battPct).arg(n.battMv).arg(capMah);
+            if (n.estRuntimeMins > 0) powerStr += QStringLiteral(" ~%1h").arg(double(n.estRuntimeMins) / 60.0, 0, 'f', 1);
+        } else if (n.battMv > 0 && n.battState != QLatin1String("no_battery") && n.battState != QLatin1String("absent")) {
+            powerStr = QStringLiteral("%1 mV 🔋 (%2 mAh)").arg(n.battMv).arg(capMah);
+        } else {
+            powerStr = QStringLiteral("USB / 5V (No Battery)");
+        }
+        auto *pwrItem = new QTableWidgetItem(powerStr);
+        if (n.battPct > 20) pwrItem->setForeground(QColor(0x6c, 0xff, 0x8a));
+        else if (n.battPct >= 0) pwrItem->setForeground(QColor(0xff, 0x55, 0x55));
+        m_nodesTable->setItem(i, 5, pwrItem);
+
+        // 6. RF & Mesh
+        QString rfStr;
+        if (n.isUsb) {
+            rfStr = QStringLiteral("🔌 USB (%1) · 📡 LoRa Gateway").arg(n.usbPort.isEmpty() ? QStringLiteral("Local") : n.usbPort);
+        } else if (n.hops == 0) {
+            rfStr = QStringLiteral("0 hops (Direct Gateway)");
+        } else if (n.hops == 1) {
+            rfStr = QStringLiteral("1 hop (Direct Link)");
+            if (n.rssi != 0) rfStr += QStringLiteral(" · %1 dBm").arg(n.rssi);
+        } else {
+            QString routeDesc = n.routePath;
+            if (routeDesc.isEmpty()) {
+                if (!n.viaNode.isEmpty() && n.viaNode != QStringLiteral("Direct")) routeDesc = QStringLiteral("via %1").arg(n.viaNode);
+                else if (!n.prevHopMac.isEmpty()) routeDesc = QStringLiteral("via %1").arg(n.prevHopMac);
+            }
+            if (!routeDesc.isEmpty()) {
+                rfStr = QStringLiteral("%1 hops (%2)").arg(n.hops).arg(routeDesc);
+            } else {
+                rfStr = QStringLiteral("%1 hops").arg(n.hops);
+            }
+            if (n.rssi != 0) rfStr += QStringLiteral(" · %1 dBm").arg(n.rssi);
+        }
+        if (n.pps > 0) rfStr += QStringLiteral(" · %1 pps").arg(n.pps);
+        auto *rfItem = new QTableWidgetItem(rfStr);
+        if (n.isUsb) rfItem->setForeground(QColor(0x35, 0xd6, 0xff));
+        m_nodesTable->setItem(i, 6, rfItem);
+
+        // 7. Location / Follow
+        QString locStr = QStringLiteral("Unset (tap Place)");
+        if (n.following && !n.attachedDevice.isEmpty()) {
+            locStr = QStringLiteral("Streaming from %1").arg(n.attachedDevice);
+        } else if (n.hasLocation && (n.lat != 0.0 || n.lon != 0.0)) {
+            locStr = QStringLiteral("%1, %2 (±%3m)").arg(n.lat, 0, 'f', 5).arg(n.lon, 0, 'f', 5).arg(n.accM, 0, 'f', 0);
+        }
+        auto *locItem = new QTableWidgetItem(locStr);
+        if (n.hasLocation || n.following) locItem->setForeground(QColor(0x6c, 0xff, 0x8a));
+        m_nodesTable->setItem(i, 7, locItem);
+
+        // 8. 3D Nameplate
+        const QString stlName = QStringLiteral("nameplate_%1.stl").arg(n.name);
+        const QString stlPath = plateDir + stlName;
+        const bool hasStl = QFile::exists(stlPath);
+        auto *stlItem = new QTableWidgetItem(hasStl ? stlName : QStringLiteral("not generated"));
+        if (hasStl) stlItem->setForeground(QColor(0x35, 0xd6, 0xff));
+        m_nodesTable->setItem(i, 8, stlItem);
+
+        // 9. Actions Widget
+        auto *cell = new QWidget;
+        auto *h = new QHBoxLayout(cell);
+        h->setContentsMargins(2, 0, 2, 0);
+        h->setSpacing(4);
+        const QString nodeName = n.name;
+
+        auto *followBtn = new QPushButton(n.following ? QStringLiteral("📱 %1…").arg(n.attachedDevice) : QStringLiteral("🔗 Follow…"));
+        followBtn->setToolTip(QStringLiteral("Assign this node to follow a host device (phone/desktop) and share GPS fixes"));
+        connect(followBtn, &QPushButton::clicked, this, [this, nodeName] {
+            if (m_map) m_map->attachDeviceFor(nodeName);
+        });
+        h->addWidget(followBtn);
+
+        auto *battBtn = new QPushButton(QIcon::fromTheme(QStringLiteral("battery")), QStringLiteral("🔋 %1 mAh…").arg(capMah));
+        battBtn->setToolTip(QStringLiteral("Configure battery capacity (volume in mAh) for this node"));
+        connect(battBtn, &QPushButton::clicked, this, [this, nodeName] {
+            if (m_map) m_map->configureBatteryVolumeFor(nodeName);
+        });
+        h->addWidget(battBtn);
+
+        auto *genBtn = new QPushButton(QIcon::fromTheme(QStringLiteral("printer")), hasStl ? QStringLiteral("Re-generate STL") : QStringLiteral("🖨 Generate STL"));
+        connect(genBtn, &QPushButton::clicked, this, [this, nodeName] {
+            if (m_map) m_map->generateNameplateFor(nodeName);
+        });
+        h->addWidget(genBtn);
+
+        if (hasStl) {
+            auto *openBtn = new QPushButton(QIcon::fromTheme(QStringLiteral("folder")), QStringLiteral("Open STL"));
+            connect(openBtn, &QPushButton::clicked, this, [stlPath] {
+                QDesktopServices::openUrl(QUrl::fromLocalFile(stlPath));
+            });
+            h->addWidget(openBtn);
+        }
+
+        auto *pingBtn = new QPushButton(QStringLiteral("💓 Blink"));
+        pingBtn->setToolTip(QStringLiteral("Trigger heartbeat LED cadence to physically locate and verify this node"));
+        connect(pingBtn, &QPushButton::clicked, this, [this, nodeName] {
+            const QByteArray cmd("led heartbeat\n");
+            QUdpSocket sock;
+            sock.writeDatagram(cmd, QHostAddress::LocalHost, 47825);
+            sock.writeDatagram(cmd, QHostAddress::Broadcast, 47824);
+            statusBar()->showMessage(QStringLiteral("Triggered heartbeat blink on %1").arg(nodeName), 2000);
+        });
+        h->addWidget(pingBtn);
+
+        m_nodesTable->setCellWidget(i, 9, cell);
+    }
+
+    m_nodesTable->resizeColumnsToContents();
+    m_nodesTable->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Stretch);
+
+    if (m_nodesSummaryLabel) {
+        m_nodesSummaryLabel->setText(QStringLiteral("Nodes: %1 · %2 online · Stratum 1 Master").arg(nodes.size()).arg(onlineCount));
+    }
+}
+
+
 
 // ── Identity tab (docs/IDENTITY.md) ────────────────────────────────────────────
 QWidget *MainWindow::buildIdentity()

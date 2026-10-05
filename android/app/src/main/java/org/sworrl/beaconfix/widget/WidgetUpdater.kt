@@ -66,9 +66,8 @@ private val Context.widgetStore: DataStore<Preferences> by preferencesDataStore(
 private val KEY = stringPreferencesKey("state")
 private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
 
-/** Hilt entry point for code that Hilt does not inject (Glance widgets and their action callbacks). */
 @EntryPoint @InstallIn(SingletonComponent::class)
-interface WidgetEntryPoint { fun updater(): WidgetUpdater; fun syncScheduler(): SyncScheduler; fun prefs(): Prefs; fun help(): org.sworrl.beaconfix.help.HelpRepository; fun alertManager(): org.sworrl.beaconfix.detector.DetectorAlertManager }
+interface WidgetEntryPoint { fun updater(): WidgetUpdater; fun syncScheduler(): SyncScheduler; fun prefs(): Prefs; fun help(): org.sworrl.beaconfix.help.HelpRepository; fun alertManager(): org.sworrl.beaconfix.detector.DetectorAlertManager; fun espNodeManager(): org.sworrl.beaconfix.node.EspNodeManager }
 
 /**
  * Builds the [WidgetState] from the database, prefs, the collector's last scan and the paired desktop, renders the map

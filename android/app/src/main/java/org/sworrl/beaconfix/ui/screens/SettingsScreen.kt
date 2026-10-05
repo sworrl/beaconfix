@@ -50,13 +50,39 @@ fun SettingsScreen(
         SettingsPlacesSection(placesVm)
         SystemHealthCard(compact = false)
         org.sworrl.beaconfix.backup.BackupCard(onRestore = onImport, onIdentity = onIdentity)
+        val doomMode by vm.doomBatteryMode.collectAsState()
+        var showDoomDialog by remember { mutableStateOf(false) }
         InfoCard("Collector") {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) { Text("Collect in the background"); Switch(ui.collectorOn, { vm.setCollector(it) }) }
+            Row(
+                Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("DOOM battery profile", style = MaterialTheme.typography.bodyMedium, fontWeight = androidx.compose.ui.text.font.FontWeight.Bold)
+                    Text(doomMode.title + " · " + doomMode.tag, style = MaterialTheme.typography.bodySmall, color = Slate)
+                }
+                org.sworrl.beaconfix.ui.DoomBatteryChip(
+                    mode = doomMode,
+                    onClick = { showDoomDialog = true }
+                )
+            }
             Text("Scan every ${ui.interval} s", style = MaterialTheme.typography.bodyMedium)
             Slider(ui.interval.toFloat(), { vm.setInterval(it.toInt()) }, valueRange = 15f..600f, steps = 38)
             Text("Ignore fixes worse than ±${ui.maxAcc} m", style = MaterialTheme.typography.bodyMedium)
             Slider(ui.maxAcc.toFloat(), { vm.setMaxAcc(it.toInt()) }, valueRange = 10f..300f, steps = 28)
             Text("Battery: the collector holds a foreground service only while enabled; each cycle is one Wi-Fi scan and one location request.", color = Slate, style = MaterialTheme.typography.bodySmall)
+        }
+        if (showDoomDialog) {
+            org.sworrl.beaconfix.ui.DoomBatteryDialog(
+                currentMode = doomMode,
+                onSelectMode = { mode ->
+                    vm.setDoomBatteryMode(mode)
+                    showDoomDialog = false
+                },
+                onDismiss = { showDoomDialog = false }
+            )
         }
         InfoCard("Home networks") {
             Text("Networks that travel with you (your router, hotspot). Matched against SSID and BSSID, one glob per line. Pulled from the desktop on sync.", color = Slate, style = MaterialTheme.typography.bodySmall)

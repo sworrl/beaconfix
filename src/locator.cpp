@@ -102,6 +102,52 @@ QJsonObject DevicePos::toJson() const
             {"lastSeen", lastSeen.toString(Qt::ISODate)}};
 }
 
+QJsonObject MeshNodeInfo::toJson() const
+{
+    const qint64 age = lastSeen.isValid() ? lastSeen.secsTo(QDateTime::currentDateTime()) : -1;
+    QJsonObject o;
+    o[QStringLiteral("name")] = name;
+    o[QStringLiteral("mac")] = mac;
+    o[QStringLiteral("role")] = role;
+    o[QStringLiteral("fwVersion")] = fwVersion;
+    o[QStringLiteral("battMv")] = battMv;
+    o[QStringLiteral("battPct")] = battPct;
+    o[QStringLiteral("battMah")] = battMah;
+    o[QStringLiteral("estRuntimeMins")] = estRuntimeMins;
+    o[QStringLiteral("battState")] = battState;
+    o[QStringLiteral("charging")] = charging;
+    o[QStringLiteral("hops")] = hops;
+    o[QStringLiteral("viaNode")] = viaNode;
+    o[QStringLiteral("prevHopMac")] = prevHopMac;
+    o[QStringLiteral("routePath")] = routePath;
+    o[QStringLiteral("rssi")] = rssi;
+    o[QStringLiteral("pps")] = pps;
+    o[QStringLiteral("online")] = online;
+    o[QStringLiteral("hasLocation")] = hasLocation;
+    o[QStringLiteral("unset")] = !hasLocation;
+    o[QStringLiteral("attachedDevice")] = attachedDevice;
+    o[QStringLiteral("following")] = following;
+    o[QStringLiteral("antennaDetected")] = antennaDetected;
+    o[QStringLiteral("txInhibited")] = txInhibited;
+    o[QStringLiteral("ambientRssi")] = ambientRssi;
+    o[QStringLiteral("traveling")] = traveling;
+    o[QStringLiteral("speedKmh")] = speedKmh;
+    o[QStringLiteral("headingDeg")] = headingDeg;
+    o[QStringLiteral("isUsb")] = isUsb;
+    o[QStringLiteral("usbPort")] = usbPort;
+    o[QStringLiteral("transport")] = transport;
+    if (lastGpsSync.isValid()) o[QStringLiteral("lastGpsSync")] = lastGpsSync.toString(Qt::ISODateWithMs);
+    o[QStringLiteral("ageS")] = double(age);
+    if (lastSeen.isValid()) o[QStringLiteral("lastSeen")] = lastSeen.toString(Qt::ISODateWithMs);
+    if (hasLocation) {
+        o[QStringLiteral("lat")] = lat;
+        o[QStringLiteral("lon")] = lon;
+        o[QStringLiteral("accM")] = accM;
+        o[QStringLiteral("anchorId")] = anchorId;
+    }
+    return o;
+}
+
 // ── Locator ───────────────────────────────────────────────────────────────────
 // ~15 m cells this host scanned from, with the time span (misses: docs/GRADING.md §1.7)
 static QString scanCellKey(double lat, double lon, int *ky = nullptr)
@@ -228,6 +274,7 @@ Locator::Locator(bool standalone, QObject *parent) : QObject(parent), m_standalo
             notify(QStringLiteral("BeaconFix"), what, QStringLiteral("preferences-system-time"));
         });
     }
+    initMeshUdp();
     const bool anyJson = QFile::exists(stateDir() + "/aps.json") || QFile::exists(stateDir() + "/history.jsonl") || QFile::exists(stateDir() + "/pois.json")
                       || QFile::exists(stateDir() + "/elev.json") || QFile::exists(stateDir() + "/achievements.json");
     loadState();
@@ -1204,6 +1251,8 @@ QString Locator::StateJson() const
     for (const BeaconEvent &e : m_events) events.append(e.toJson());
     o["events"] = events;
     o["linkedDevices"] = linkedDevices();
+    o["meshNodes"] = meshNodesJson();
+    o["unsetNodes"] = unsetNodesJson();
     if (m_hubClient) o["hub"] = m_hubClient->statusJson();     // this node's link to the hub (docs/SECURE-API.md)
     o["anchors"] = anchorsJson();
     o["features"] = QJsonArray::fromStringList(features());
@@ -1848,6 +1897,48 @@ void Locator::accept(Fix cand, const QString &ipCity)
     }
     const Fix prev = m_fix;
     m_fix = cand;
+    bool desktopFollowersMoved = false;
+    for (auto it = m_meshNodes.begin(); it != m_meshNodes.end(); ++it) {
+        if (it->following && (it->attachedDevice == ourDeviceName() || it->attachedDevice.compare(QLatin1String("desktop"), Qt::CaseInsensitive) == 0 || it->attachedDevice.compare(QLatin1String("local"), Qt::CaseInsensitive) == 0 || it->attachedDevice.compare(QLatin1String("this-computer"), Qt::CaseInsensitive) == 0)) {
+            it->lat = cand.lat;
+            it->lon = cand.lon;
+            it->accM = cand.accuracy > 0 ? cand.accuracy : 5.0;
+            it->hasLocation = true;
+            it->lastGpsSync = QDateTime::currentDateTime();
+            desktopFollowersMoved = true;
+            if (!it->anchorId.isEmpty()) {
+                for (BfAnchor &a : m_anchors) {
+                    if (a.id == it->anchorId) {
+                        a.lat = cand.lat;
+                        a.lon = cand.lon;
+                        a.accM = it->accM;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    if (desktopFollowersMoved) {
+        if (m_nodeUdp) {
+            Stats tst = stats();
+            double tripKm = tst.distanceTripKm > 0 ? tst.distanceTripKm : tst.distanceTodayKm;
+            double spdKmh = tst.speedKmh > 0 ? tst.speedKmh : 0.0;
+            double hdgDeg = tst.headingDeg >= 0 ? tst.headingDeg : -1.0;
+            double elevM = cand.hasElevation() ? cand.elevation : 0.0;
+            QString cmd = QStringLiteral("gps %1,%2,%3,%4,%5,%6,0,%7\n")
+                .arg(cand.lat, 0, 'f', 6)
+                .arg(cand.lon, 0, 'f', 6)
+                .arg(cand.accuracy > 0 ? cand.accuracy : 5.0, 0, 'f', 1)
+                .arg(spdKmh / 3.6, 0, 'f', 2)
+                .arg(hdgDeg, 0, 'f', 1)
+                .arg(elevM, 0, 'f', 1)
+                .arg(tripKm, 0, 'f', 2);
+            m_nodeUdp->writeDatagram(cmd.toUtf8(), QHostAddress::Broadcast, 47824);
+            QString tcmd = QStringLiteral("trip %1\n").arg(tripKm, 0, 'f', 2);
+            m_nodeUdp->writeDatagram(tcmd.toUtf8(), QHostAddress::Broadcast, 47824);
+        }
+        emit meshNodesChanged();
+    }
     appendHistory(m_fix);
     saveState();
     emit FixChanged();
@@ -3336,6 +3427,35 @@ void Locator::noteDevicePosition(const QString &device, const QString &kind, dou
         ev.text = QStringLiteral("%1 moved%2%3").arg(device, d.place.isEmpty() ? QString() : QStringLiteral(" to ") + d.place, dist >= 0 ? QStringLiteral(", %1 away").arg(dist < 1000 ? QStringLiteral("%1 m").arg(qRound(dist)) : QStringLiteral("%1 km").arg(dist / 1000, 0, 'f', 1)) : QString());
         logEvent(ev);
     }
+
+    bool meshFollowersMoved = false;
+    for (auto it = m_meshNodes.begin(); it != m_meshNodes.end(); ++it) {
+        if (it->following && it->attachedDevice.compare(device, Qt::CaseInsensitive) == 0) {
+            it->lat = lat;
+            it->lon = lon;
+            it->accM = acc > 0 ? acc : 5.0;
+            it->hasLocation = true;
+            it->lastGpsSync = QDateTime::currentDateTime();
+            meshFollowersMoved = true;
+            if (!it->anchorId.isEmpty()) {
+                for (BfAnchor &a : m_anchors) {
+                    if (a.id == it->anchorId) {
+                        a.lat = lat;
+                        a.lon = lon;
+                        a.accM = it->accM;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    if (meshFollowersMoved) {
+        if (m_nodeUdp) {
+            QString cmd = QStringLiteral("gps %1,%2,%3\n").arg(lat, 0, 'f', 6).arg(lon, 0, 'f', 6).arg(acc > 0 ? acc : 5.0, 0, 'f', 1);
+            m_nodeUdp->writeDatagram(cmd.toUtf8(), QHostAddress::Broadcast, 47824);
+        }
+        emit meshNodesChanged();
+    }
     emit scanUpdated();
 }
 
@@ -3350,6 +3470,23 @@ QJsonArray Locator::linkedDevices() const
         o["kind"] = kindForDevice(d.device, d.kind);
         if (m_fix.valid) o["distanceM"] = distanceM(m_fix.lat, m_fix.lon, d.lat, d.lon);
         if (m_ranging) { const QJsonObject r = m_ranging->estimateJson(d.device); if (!r.isEmpty()) o["range"] = r; }   // measured, not fix-to-fix
+        arr.append(o);
+    }
+    const QDateTime now = QDateTime::currentDateTime();
+    for (const MeshNodeInfo &mn : m_meshNodes) {
+        if (mn.lastSeen.isValid() && mn.lastSeen.secsTo(now) > 300) continue;
+        QJsonObject o = mn.toJson();
+        o[QStringLiteral("device")] = mn.name;
+        o[QStringLiteral("kind")] = QStringLiteral("esp32-node");
+        o[QStringLiteral("role")] = mn.role;
+        o[QStringLiteral("online")] = mn.online;
+        o[QStringLiteral("unset")] = !mn.hasLocation;
+        if (mn.hasLocation) {
+            o[QStringLiteral("lat")] = mn.lat;
+            o[QStringLiteral("lon")] = mn.lon;
+            o[QStringLiteral("acc")] = mn.accM;
+            if (m_fix.valid) o[QStringLiteral("distanceM")] = distanceM(m_fix.lat, m_fix.lon, mn.lat, mn.lon);
+        }
         arr.append(o);
     }
     return arr;
@@ -4137,6 +4274,21 @@ void Locator::anchorsChanged()
         if (anchorFix(f) && (std::fabs(f.lat - m_fix.lat) > 1e-9 || std::fabs(f.lon - m_fix.lon) > 1e-9 || f.accuracy != m_fix.accuracy)) {
             m_fix.lat = f.lat; m_fix.lon = f.lon; m_fix.accuracy = f.accuracy; m_fix.source = f.source; m_fix.provider = f.provider;
             saveState(); emit FixChanged();
+        }
+    }
+    // Update mesh nodes with anchor positions
+    for (auto it = m_meshNodes.begin(); it != m_meshNodes.end(); ++it) {
+        for (const BfAnchor &a : m_anchors) {
+            if (!a.deleted && (a.name.compare(it.key(), Qt::CaseInsensitive) == 0 || a.id.compare(QStringLiteral("esp32-") + it.key(), Qt::CaseInsensitive) == 0)) {
+                if (std::abs(a.lat) > 0.0001 || std::abs(a.lon) > 0.0001) {
+                    it.value().hasLocation = true;
+                    it.value().lat = a.lat;
+                    it.value().lon = a.lon;
+                    it.value().accM = a.accM;
+                    it.value().anchorId = a.id;
+                }
+                break;
+            }
         }
     }
     emit scanUpdated();
@@ -5469,4 +5621,447 @@ QString Locator::AlprSummaryJson() const
 {
     return QString::fromUtf8(QJsonDocument(alprSummary()).toJson(QJsonDocument::Compact));
 }
+
+// ── Mesh & ESP32 / Heltec LoRa nodes (UDP 47824) ────────────────────────────
+void Locator::initMeshUdp()
+{
+    m_meshUpdateTimer.setSingleShot(true);
+    m_meshUpdateTimer.setInterval(500);
+    connect(&m_meshUpdateTimer, &QTimer::timeout, this, [this] {
+        emit meshNodesChanged();
+    });
+
+    m_nodeUdp = new QUdpSocket(this);
+    bool bound = m_nodeUdp->bind(QHostAddress::AnyIPv4, 47824, QUdpSocket::ShareAddress | QUdpSocket::ReuseAddressHint);
+    if (!bound) {
+        qWarning("beaconfix: could not bind UDP 47824: %s", qPrintable(m_nodeUdp->errorString()));
+    } else {
+        connect(m_nodeUdp, &QUdpSocket::readyRead, this, [this]() {
+            while (m_nodeUdp->hasPendingDatagrams()) {
+                QByteArray datagram;
+                datagram.resize(int(m_nodeUdp->pendingDatagramSize()));
+                QHostAddress sender;
+                quint16 senderPort = 0;
+                m_nodeUdp->readDatagram(datagram.data(), datagram.size(), &sender, &senderPort);
+                processMeshPacket(datagram, sender);
+            }
+        });
+    }
+}
+
+void Locator::processMeshPacket(const QByteArray &data, const QHostAddress &sender)
+{
+    Q_UNUSED(sender);
+    QJsonDocument doc = QJsonDocument::fromJson(data.trimmed());
+    if (!doc.isObject()) return;
+    const QJsonObject o = doc.object();
+    const QString type = o.value(QStringLiteral("type")).toString();
+    const QDateTime now = QDateTime::currentDateTime();
+
+    QString nodeName;
+    if (type == QLatin1String("status")) {
+        nodeName = o.value(QStringLiteral("node")).toString();
+        if (nodeName.isEmpty()) return;
+        MeshNodeInfo &n = m_meshNodes[nodeName];
+        n.name = nodeName;
+        n.lastSeen = now;
+        n.online = true;
+        if (o.contains(QStringLiteral("mac")) && !o.value(QStringLiteral("mac")).toString().isEmpty()) {
+            n.mac = o.value(QStringLiteral("mac")).toString();
+        }
+        if (o.contains(QStringLiteral("is_usb")) && o.value(QStringLiteral("is_usb")).toBool()) {
+            n.isUsb = true;
+            n.usbPort = o.value(QStringLiteral("usb_port")).toString();
+            n.transport = QStringLiteral("usb_mesh_dual");
+        } else if (sender.isLoopback()) {
+            n.isUsb = true;
+            n.transport = QStringLiteral("usb_mesh_dual");
+        }
+        if (o.contains(QStringLiteral("mode"))) {
+            n.role = o.value(QStringLiteral("mode")).toString();
+        } else if (nodeName.contains(QLatin1String("Master"), Qt::CaseInsensitive)) {
+            n.role = QStringLiteral("base_station");
+        }
+        if (o.contains(QStringLiteral("version"))) n.fwVersion = o.value(QStringLiteral("version")).toString();
+        if (o.contains(QStringLiteral("batt_mv"))) n.battMv = o.value(QStringLiteral("batt_mv")).toInt();
+        if (o.contains(QStringLiteral("batt_pct"))) n.battPct = o.value(QStringLiteral("batt_pct")).toInt();
+        if (o.contains(QStringLiteral("batt_state"))) n.battState = o.value(QStringLiteral("batt_state")).toString();
+        if (o.contains(QStringLiteral("charging"))) n.charging = o.value(QStringLiteral("charging")).toBool();
+        if (o.contains(QStringLiteral("pps"))) n.pps = o.value(QStringLiteral("pps")).toInt();
+        if (o.contains(QStringLiteral("attached_dev"))) {
+            n.attachedDevice = o.value(QStringLiteral("attached_dev")).toString();
+            n.following = o.value(QStringLiteral("following")).toBool(!n.attachedDevice.isEmpty());
+        } else {
+            n.attachedDevice = nodeAttachedDevice(nodeName);
+            n.following = !n.attachedDevice.isEmpty();
+        }
+        if (o.contains(QStringLiteral("antenna_detected"))) n.antennaDetected = o.value(QStringLiteral("antenna_detected")).toBool(true);
+        if (o.contains(QStringLiteral("tx_inhibited"))) n.txInhibited = o.value(QStringLiteral("tx_inhibited")).toBool(false);
+        if (o.contains(QStringLiteral("ambient_rssi"))) n.ambientRssi = o.value(QStringLiteral("ambient_rssi")).toInt(-110);
+        if (o.contains(QStringLiteral("traveling"))) n.traveling = o.value(QStringLiteral("traveling")).toBool(false);
+        if (o.contains(QStringLiteral("speed_kmh"))) n.speedKmh = o.value(QStringLiteral("speed_kmh")).toDouble(-1.0);
+        if (o.contains(QStringLiteral("heading"))) n.headingDeg = o.value(QStringLiteral("heading")).toDouble(-1.0);
+        if (o.value(QStringLiteral("has_gps")).toBool() && o.contains(QStringLiteral("lat")) && o.contains(QStringLiteral("lon"))) {
+            n.lat = o.value(QStringLiteral("lat")).toDouble();
+            n.lon = o.value(QStringLiteral("lon")).toDouble();
+            n.accM = o.value(QStringLiteral("acc")).toDouble(5.0);
+            n.hasLocation = true;
+            n.lastGpsSync = now;
+        }
+    } else if (type == QLatin1String("mesh_telemetry")) {
+        nodeName = o.value(QStringLiteral("origin")).toString();
+        if (nodeName.isEmpty() || nodeName == QLatin1String("Unknown")) return;
+        MeshNodeInfo &n = m_meshNodes[nodeName];
+        n.name = nodeName;
+        n.lastSeen = now;
+        n.online = true;
+        if (o.contains(QStringLiteral("mac"))) n.mac = o.value(QStringLiteral("mac")).toString();
+        if (o.contains(QStringLiteral("hops"))) n.hops = o.value(QStringLiteral("hops")).toInt();
+        if (o.contains(QStringLiteral("via"))) n.viaNode = o.value(QStringLiteral("via")).toString();
+        if (o.contains(QStringLiteral("prev_mac"))) n.prevHopMac = o.value(QStringLiteral("prev_mac")).toString();
+        if (o.contains(QStringLiteral("route"))) {
+            n.routePath = o.value(QStringLiteral("route")).toString();
+        } else {
+            if (n.hops <= 1) n.routePath = QStringLiteral("Direct");
+            else if (!n.viaNode.isEmpty() && n.viaNode != QStringLiteral("Direct")) n.routePath = QStringLiteral("via %1").arg(n.viaNode);
+            else if (!n.prevHopMac.isEmpty()) n.routePath = QStringLiteral("via %1").arg(n.prevHopMac);
+        }
+        QJsonObject inner = o.value(QStringLiteral("data")).toObject();
+        if (inner.contains(QStringLiteral("version"))) n.fwVersion = inner.value(QStringLiteral("version")).toString();
+        if (inner.contains(QStringLiteral("batt_mv"))) n.battMv = inner.value(QStringLiteral("batt_mv")).toInt();
+        if (inner.contains(QStringLiteral("batt_pct"))) n.battPct = inner.value(QStringLiteral("batt_pct")).toInt();
+        if (inner.contains(QStringLiteral("mode"))) n.role = inner.value(QStringLiteral("mode")).toString();
+        if (inner.contains(QStringLiteral("antenna_detected"))) n.antennaDetected = inner.value(QStringLiteral("antenna_detected")).toBool(true);
+        if (inner.contains(QStringLiteral("tx_inhibited"))) n.txInhibited = inner.value(QStringLiteral("tx_inhibited")).toBool(false);
+        if (inner.contains(QStringLiteral("ambient_rssi"))) n.ambientRssi = inner.value(QStringLiteral("ambient_rssi")).toInt(-110);
+        if (inner.contains(QStringLiteral("traveling"))) n.traveling = inner.value(QStringLiteral("traveling")).toBool(false);
+        if (inner.contains(QStringLiteral("speed_kmh"))) n.speedKmh = inner.value(QStringLiteral("speed_kmh")).toDouble(-1.0);
+        if (inner.contains(QStringLiteral("heading"))) n.headingDeg = inner.value(QStringLiteral("heading")).toDouble(-1.0);
+    } else if (type == QLatin1String("beacon") || type == QLatin1String("probe")) {
+        const QString ssid = o.value(QStringLiteral("ssid")).toString();
+        static const QRegularExpression s_nodeNameRx(QStringLiteral("^[A-Z][a-z]+[A-Z][a-z]+[A-Z][a-z]+[0-9]{4}$"));
+        if (ssid.startsWith(QLatin1String("BeaconFix-")) || ssid.startsWith(QLatin1String("BF-")) ||
+            ssid.startsWith(QLatin1String("BF_")) || s_nodeNameRx.match(ssid).hasMatch()) {
+            nodeName = ssid;
+            MeshNodeInfo &n = m_meshNodes[nodeName];
+            n.name = nodeName;
+            n.mac = o.value(QStringLiteral("bssid")).toString();
+            n.rssi = o.value(QStringLiteral("rssi")).toInt();
+            n.lastSeen = now;
+            n.online = true;
+            if (o.contains(QStringLiteral("lat")) && o.contains(QStringLiteral("lon"))) {
+                n.lat = o.value(QStringLiteral("lat")).toDouble();
+                n.lon = o.value(QStringLiteral("lon")).toDouble();
+                n.accM = o.value(QStringLiteral("acc")).toDouble(5.0);
+                n.hasLocation = true;
+                n.lastGpsSync = now;
+            }
+        }
+    }
+
+    if (!nodeName.isEmpty()) {
+        MeshNodeInfo &n = m_meshNodes[nodeName];
+        n.battMah = nodeBatteryCapacity(nodeName);
+        if (n.battPct > 0 && n.battMah > 0) {
+            n.estRuntimeMins = (n.battMah * n.battPct * 60) / (100 * 75);
+        } else if (n.charging || n.battState == QLatin1String("charging")) {
+            n.estRuntimeMins = -1;
+        } else {
+            n.estRuntimeMins = 0;
+        }
+        if (n.attachedDevice.isEmpty()) {
+            n.attachedDevice = nodeAttachedDevice(nodeName);
+            n.following = !n.attachedDevice.isEmpty();
+        }
+        if (!n.hasLocation) {
+            if (n.following && !n.attachedDevice.isEmpty()) {
+                if (n.attachedDevice == ourDeviceName() || n.attachedDevice == QLatin1String("desktop") || n.attachedDevice == QLatin1String("local")) {
+                    if (m_fix.valid) {
+                        n.lat = m_fix.lat; n.lon = m_fix.lon; n.accM = m_fix.accuracy; n.hasLocation = true; n.lastGpsSync = now;
+                    }
+                } else if (m_devicePos.contains(n.attachedDevice)) {
+                    const DevicePos &dp = m_devicePos[n.attachedDevice];
+                    if (dp.lat != 0 || dp.lon != 0) {
+                        n.lat = dp.lat; n.lon = dp.lon; n.accM = dp.acc; n.hasLocation = true; n.lastGpsSync = now;
+                    }
+                }
+            }
+            if (!n.hasLocation) {
+                for (const BfAnchor &a : m_anchors) {
+                    if (!a.deleted && (a.name == nodeName || a.id == (QStringLiteral("esp32-") + nodeName.toLower()) ||
+                        a.name.compare(nodeName, Qt::CaseInsensitive) == 0)) {
+                        if (std::abs(a.lat) > 0.0001 || std::abs(a.lon) > 0.0001) {
+                            n.hasLocation = true;
+                            n.lat = a.lat;
+                            n.lon = a.lon;
+                            n.accM = a.accM;
+                            n.anchorId = a.id;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if (!m_meshUpdateTimer.isActive()) {
+            m_meshUpdateTimer.start();
+        }
+    }
+}
+
+static bool isBeaconFixNodeName(const QString &name, bool isUsb)
+{
+    if (isUsb) return true;
+    if (name.startsWith(QLatin1String("BeaconFix-")) || name.startsWith(QLatin1String("BF-")) || name.startsWith(QLatin1String("BF_"))) return true;
+    static const QRegularExpression rx(QStringLiteral("^[A-Z][a-z]+[A-Z][a-z]+[A-Z][a-z]+[0-9]{4}$"));
+    return rx.match(name).hasMatch();
+}
+
+QList<MeshNodeInfo> Locator::meshNodes() const
+{
+    QList<MeshNodeInfo> list;
+    for (const MeshNodeInfo &n : m_meshNodes) {
+        if (isBeaconFixNodeName(n.name, n.isUsb)) list.append(n);
+    }
+    return list;
+}
+
+QJsonArray Locator::meshNodesJson() const
+{
+    QJsonArray arr;
+    for (const MeshNodeInfo &n : m_meshNodes) {
+        if (isBeaconFixNodeName(n.name, n.isUsb)) arr.append(n.toJson());
+    }
+    return arr;
+}
+
+QList<MeshNodeInfo> Locator::unsetNodes() const
+{
+    QList<MeshNodeInfo> list;
+    const QDateTime now = QDateTime::currentDateTime();
+    for (const MeshNodeInfo &n : m_meshNodes) {
+        if (!n.hasLocation && n.lastSeen.isValid() && n.lastSeen.secsTo(now) < 300) {
+            list.append(n);
+        }
+    }
+    return list;
+}
+
+QJsonArray Locator::unsetNodesJson() const
+{
+    QJsonArray arr;
+    for (const MeshNodeInfo &n : unsetNodes()) arr.append(n.toJson());
+    return arr;
+}
+
+bool Locator::placeMeshNode(const QString &name, double lat, double lon, double accM)
+{
+    if (name.isEmpty() || (std::abs(lat) < 0.0001 && std::abs(lon) < 0.0001)) return false;
+    QJsonObject o;
+    QString anchorId = QStringLiteral("esp32-") + name.toLower();
+    for (const BfAnchor &a : m_anchors) {
+        if (a.name == name || a.id == anchorId) {
+            anchorId = a.id;
+            break;
+        }
+    }
+    o[QStringLiteral("id")] = anchorId;
+    o[QStringLiteral("name")] = name;
+    o[QStringLiteral("kind")] = QStringLiteral("esp32-node");
+    o[QStringLiteral("lat")] = lat;
+    o[QStringLiteral("lon")] = lon;
+    o[QStringLiteral("accM")] = accM > 0 ? accM : 1.0;
+    o[QStringLiteral("placedBy")] = QStringLiteral("desktop-map");
+    o[QStringLiteral("placedAt")] = QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs);
+    o[QStringLiteral("source")] = QStringLiteral("map-pick");
+
+    bool ok = false;
+    QString err;
+    setAnchor(o, QStringLiteral("desktop"), &ok, &err);
+    if (ok) {
+        if (m_meshNodes.contains(name)) {
+            MeshNodeInfo &n = m_meshNodes[name];
+            n.hasLocation = true;
+            n.lat = lat;
+            n.lon = lon;
+            n.accM = accM;
+            n.anchorId = anchorId;
+        }
+        emit meshNodesChanged();
+    }
+    return ok;
+}
+
+bool Locator::setNodeBatteryCapacity(const QString &name, int mah)
+{
+    if (name.isEmpty() || mah <= 0) return false;
+    QSettings s;
+    s.setValue(QStringLiteral("node_batt_mah/") + name, mah);
+    if (m_meshNodes.contains(name)) {
+        MeshNodeInfo &n = m_meshNodes[name];
+        n.battMah = mah;
+        if (n.battPct > 0) {
+            n.estRuntimeMins = (n.battMah * n.battPct * 60) / (100 * 75);
+        }
+    }
+    emit meshNodesChanged();
+    return true;
+}
+
+int Locator::nodeBatteryCapacity(const QString &name) const
+{
+    if (name.isEmpty()) return 240;
+    QSettings s;
+    return s.value(QStringLiteral("node_batt_mah/") + name, 240).toInt();
+}
+
+bool Locator::attachNodeToDevice(const QString &name, const QString &deviceName)
+{
+    if (name.isEmpty()) return false;
+    QSettings s;
+    const QString dev = deviceName.trimmed();
+    if (dev.isEmpty()) {
+        s.remove(QStringLiteral("node_attached_dev/") + name);
+    } else {
+        s.setValue(QStringLiteral("node_attached_dev/") + name, dev);
+    }
+
+    if (m_meshNodes.contains(name)) {
+        MeshNodeInfo &n = m_meshNodes[name];
+        n.attachedDevice = dev;
+        n.following = !dev.isEmpty();
+        if (n.following) {
+            if (dev == ourDeviceName() || dev.compare(QLatin1String("desktop"), Qt::CaseInsensitive) == 0 || dev.compare(QLatin1String("local"), Qt::CaseInsensitive) == 0) {
+                if (m_fix.valid) {
+                    n.lat = m_fix.lat; n.lon = m_fix.lon; n.accM = m_fix.accuracy; n.hasLocation = true; n.lastGpsSync = QDateTime::currentDateTime();
+                }
+            } else if (m_devicePos.contains(dev)) {
+                const DevicePos &d = m_devicePos[dev];
+                if (d.lat != 0 || d.lon != 0) {
+                    n.lat = d.lat; n.lon = d.lon; n.accM = d.acc; n.hasLocation = true; n.lastGpsSync = QDateTime::currentDateTime();
+                }
+            }
+        }
+    }
+
+    // Broadcast attach command to node via UDP 47824
+    if (m_nodeUdp) {
+        QByteArray cmd = dev.isEmpty()
+            ? QByteArray("detach\n")
+            : (QStringLiteral("attach ") + dev + QLatin1Char('\n')).toUtf8();
+        m_nodeUdp->writeDatagram(cmd, QHostAddress::Broadcast, 47824);
+    }
+    emit meshNodesChanged();
+    return true;
+}
+
+bool Locator::detachNode(const QString &name)
+{
+    return attachNodeToDevice(name, QString());
+}
+
+QString Locator::nodeAttachedDevice(const QString &name) const
+{
+    if (name.isEmpty()) return QString();
+    QSettings s;
+    return s.value(QStringLiteral("node_attached_dev/") + name, QString()).toString();
+}
+
+void Locator::injectNodeGps(const QString &name, double lat, double lon, double accM)
+{
+    if (name.isEmpty() || (std::abs(lat) < 0.0001 && std::abs(lon) < 0.0001)) return;
+    if (m_meshNodes.contains(name)) {
+        MeshNodeInfo &n = m_meshNodes[name];
+        n.lat = lat;
+        n.lon = lon;
+        n.accM = accM > 0 ? accM : 5.0;
+        n.hasLocation = true;
+        n.lastGpsSync = QDateTime::currentDateTime();
+        if (!n.anchorId.isEmpty()) {
+            for (BfAnchor &a : m_anchors) {
+                if (a.id == n.anchorId) {
+                    a.lat = lat;
+                    a.lon = lon;
+                    a.accM = n.accM;
+                    break;
+                }
+            }
+        }
+    }
+    if (m_nodeUdp) {
+        QString cmd = QStringLiteral("gps %1,%2,%3\n").arg(lat, 0, 'f', 6).arg(lon, 0, 'f', 6).arg(accM > 0 ? accM : 5.0, 0, 'f', 1);
+        m_nodeUdp->writeDatagram(cmd.toUtf8(), QHostAddress::Broadcast, 47824);
+    }
+    emit meshNodesChanged();
+}
+
+QJsonObject Locator::generateNameplate(const QString &name, int units, bool shortMode, const QString &mac)
+{
+    QProcess proc;
+    QString script = QCoreApplication::applicationDirPath() + QStringLiteral("/../tools/nameplate_generator.py");
+    if (!QFile::exists(script)) {
+        script = QStringLiteral("/home/user/Documents/GitHub/beaconfix/tools/nameplate_generator.py");
+    }
+    QStringList args;
+    args << QStringLiteral("--json");
+    if (!name.trimmed().isEmpty()) {
+        args << QStringLiteral("--name") << name.trimmed();
+    } else {
+        args << QStringLiteral("--mint");
+    }
+    args << QStringLiteral("--units") << QString::number(qBound(1, units, 4));
+    if (shortMode) args << QStringLiteral("--short");
+    if (!mac.trimmed().isEmpty()) args << QStringLiteral("--mac") << mac.trimmed();
+
+    proc.start(QStringLiteral("python3"), QStringList{script} << args);
+    if (!proc.waitForFinished(15000)) {
+        proc.kill();
+        return QJsonObject{{QStringLiteral("ok"), false}, {QStringLiteral("error"), QStringLiteral("Nameplate generation timed out")}};
+    }
+    const QByteArray stdOut = proc.readAllStandardOutput().trimmed();
+    QJsonDocument doc = QJsonDocument::fromJson(stdOut);
+    if (doc.isObject()) return doc.object();
+    return QJsonObject{
+        {QStringLiteral("ok"), false},
+        {QStringLiteral("error"), QStringLiteral("Failed to parse generator output")},
+        {QStringLiteral("output"), QString::fromUtf8(stdOut)}
+    };
+}
+
+QJsonObject Locator::mintMeshNode(const QString &customName, const QString &role, int units, bool shortMode, const QString &mac)
+{
+    QJsonObject res = generateNameplate(customName, units, shortMode, mac);
+    if (res.value(QStringLiteral("ok")).toBool()) {
+        QString mintedName = res.value(QStringLiteral("name")).toString();
+        if (!mintedName.isEmpty()) {
+            MeshNodeInfo n;
+            n.name = mintedName;
+            n.role = role.trimmed().isEmpty() ? QStringLiteral("mobile") : role.trimmed();
+            n.online = true;
+            n.hasLocation = false;
+            n.lastSeen = QDateTime::currentDateTime();
+            n.mac = mac.trimmed();
+            m_meshNodes[mintedName] = n;
+            emit meshNodesChanged();
+        }
+    }
+    return res;
+}
+
+QJsonArray Locator::listNameplates() const
+{
+    QProcess proc;
+    QString script = QCoreApplication::applicationDirPath() + QStringLiteral("/../tools/nameplate_generator.py");
+    if (!QFile::exists(script)) {
+        script = QStringLiteral("/home/user/Documents/GitHub/beaconfix/tools/nameplate_generator.py");
+    }
+    proc.start(QStringLiteral("python3"), QStringList{script, QStringLiteral("--list"), QStringLiteral("--json")});
+    if (proc.waitForFinished(5000)) {
+        QJsonDocument doc = QJsonDocument::fromJson(proc.readAllStandardOutput().trimmed());
+        if (doc.isObject() && doc.object().contains(QStringLiteral("nameplates"))) {
+            return doc.object().value(QStringLiteral("nameplates")).toArray();
+        }
+    }
+    return QJsonArray();
+}
+
 

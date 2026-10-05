@@ -51,6 +51,8 @@ public:
     void setShowImported(bool on);           // the imported history track (Timeline / WiGLE / GPX / KML)
     bool showHeatmap() const { return m_showHeatmap; }
     void setShowHeatmap(bool on);
+    double heatmapOpacity() const { return m_heatmapOpacity; }
+    void setHeatmapOpacity(double op);
     bool showFlockCameras() const { return m_showFlockCameras; }
     void setShowFlockCameras(bool on);
     bool showApCircles() const { return m_showApCircles; }
@@ -66,6 +68,10 @@ public:
     void inspectCamera(const QString &cameraId);
     void showInspectPlan(const QJsonObject &plan);
     void clearInspectPlan();
+    void generateNameplateFor(const QString &nodeName);
+    void mintNewNodeDialog();
+    void configureBatteryVolumeFor(const QString &nodeName);
+    void attachDeviceFor(const QString &nodeName);
     // Grade colours (Okabe–Ito, colour-blind safe): A–F, R (region only), M (mobile); grey otherwise
     static QColor gradeColor(const QString &grade);
     static QColor gradeTextColor(const QString &grade);   // black or white, whichever reads on gradeColor()
@@ -85,7 +91,7 @@ protected:
     void resizeEvent(QResizeEvent *) override;
 
 private:
-    enum HitKind { HitNone, HitBeacon, HitPoi, HitCluster, HitButton, HitAnchor, HitCamera };
+    enum HitKind { HitNone, HitBeacon, HitPoi, HitCluster, HitButton, HitAnchor, HitCamera, HitUnsetNodes };
     struct Hit { HitKind kind; QPointF pos; double radius; QList<int> items; int button = -1; };
 
     // Web-Mercator, normalised to [0,1]²
@@ -202,6 +208,9 @@ private:
     QList<QPointF> m_poiPos;                                    // per POI index, this frame (null = hidden)
     double  m_phase = 0, m_sweep = 0;
     bool    m_showHeatmap = true;
+    double  m_heatmapOpacity = 0.45;
+    void    drawUnsetNodes(QPainter &p);
+    QRectF  m_unsetNodesRect;
     bool    m_showFlockCameras = true;
     bool    m_showApCircles = true;
     QList<Fix> m_routeFixes;

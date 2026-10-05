@@ -31,6 +31,7 @@ Item {
     property bool showSsids: true              // Wi-Fi names beside the beacons
     property bool showEvents: true             // event animations + ticker
     property bool showHeatmap: true            // cumulative route heatmap
+    property real heatmapOpacity: (Plasmoid.configuration.heatmapOpacity !== undefined && Plasmoid.configuration.heatmapOpacity > 0) ? Plasmoid.configuration.heatmapOpacity : 0.45
     property bool showCameras: true            // Flock Safety & surveillance cameras
     property var  routeSegments: []            // precomputed route polylines: fast, stutter-free, spike-free
                                                // (rebuilt by the src Connections below: routeFixes, else the track)
@@ -104,7 +105,30 @@ Item {
     property bool secPanel: false
     property bool showDevices: true             // linked devices (phone, laptop) on the map
     readonly property var linked: src.linkedDevices || []
-    function deviceGlyph(k) { return k === "android" ? "📱" : k === "laptop" ? "💻" : k === "desktop" ? "🖥" : "📍" }
+    function deviceGlyph(k, role) {
+        if (k === "esp32-node" || k === "node" || k === "mesh") {
+            return (role === "base_station" || role === "base") ? "🏠" : "📡"
+        }
+        return k === "android" ? "📱" : k === "laptop" ? "💻" : k === "desktop" ? "🖥" : "📍"
+    }
+
+    function placeMeshNode(name, lat, lon) {
+        var a = {
+            id: "esp32-" + String(name).toLowerCase(),
+            name: name,
+            kind: "esp32-node",
+            lat: lat,
+            lon: lon,
+            heightM: 1.0,
+            accM: 1.0,
+            bssids: [],
+            rv: false,
+            placedBy: "widget",
+            placedAt: new Date().toISOString(),
+            source: "map-pick"
+        }
+        src.saveAnchor(a)
+    }
 
     // ── surveyed antenna anchors: placed with the picker, ground truth for the maths ──
     readonly property var antennas: src.antennaAnchors || []
@@ -113,12 +137,13 @@ Item {
     property bool draggingAnchor: false
     readonly property var anchorKinds: [
         {k: "this-computer", t: "This computer's Wi-Fi antenna"},
+        {k: "esp32-node",    t: "Mesh Node / Base Station"},
         {k: "wifi-ap",       t: "A Wi-Fi access point / router"},
         {k: "rtt-responder", t: "A Wi-Fi RTT responder"},
         {k: "ble",           t: "A Bluetooth device"},
         {k: "custom",        t: "Something else"}]
     function lonOf(mx) { var x = mx - Math.floor(mx); return x * 360 - 180 }
-    function anchorColor(k) { return k === "this-computer" ? "#7cf2c4" : k === "wifi-ap" ? "#35d6ff" : k === "rtt-responder" ? "#ffd166" : k === "ble" ? "#c9a0ff" : "#e6edf7" }
+    function anchorColor(k) { return k === "this-computer" ? "#7cf2c4" : k === "esp32-node" ? "#ffd166" : k === "wifi-ap" ? "#35d6ff" : k === "rtt-responder" ? "#ffd166" : k === "ble" ? "#c9a0ff" : "#e6edf7" }
     function anchorScreen(a) { var m = merc(a.lat, a.lon); return Qt.point(sx(m.x), sy(m.y)) }
     function anchorAt(px, py) {
         var list = antennas.slice(); if (editAnchor && editAnchor.isNew) list.push(editAnchor)
@@ -1050,7 +1075,7 @@ Item {
     TileLayer { id: contourTiles; ovKey: "K"; visible: map.layerIndex === 2 && map.showContours; opacity: 0.7; transform: itemM }
     TileLayer { id: roadTiles; ovKey: "R"; visible: map.layerIndex === 2; transform: itemM }
     TileLayer { id: labelTiles; labels: true; visible: map.layerIndex === 2; transform: itemM }
-    TileLayer { id: heatLayer; heat: true; visible: map.showHeatmap && map.heatTiles; transform: itemM }
+    TileLayer { id: heatLayer; heat: true; visible: map.showHeatmap && map.heatTiles; opacity: map.heatmapOpacity; transform: itemM }
 
     // ── overlay: track, accuracy ring, beacons ──────────────────────────────
     // Painted for the camera in `pref` (plus a margin beyond the edges) and carried along by paintM between
@@ -1167,30 +1192,16 @@ Item {
                     }
 
                     if (nVis > 0) {
-                        // Wide ambient heat glow, then the vibrant core travel route (the same path)
-                        ctx.strokeStyle = "rgba(255, 145, 0, 0.20)"; ctx.lineWidth = 14; ctx.stroke()
-                        ctx.strokeStyle = "rgba(255, 234, 0, 0.75)"; ctx.lineWidth = 3.5; ctx.stroke()
-
-                        // Subtle road nodes at medium-high zoom (single path for all dots, over the painted margin too)
-                        if (map.zoom >= 13) {
-                            var nMinX = -map.ovMarginX - 10, nMaxX = map.width + map.ovMarginX + 10
-                            var nMinY = -map.ovMarginY - 10, nMaxY = map.height + map.ovMarginY + 10
-                            ctx.beginPath()
-                            for (var nsi = 0; nsi < rSegs.length; nsi++) {
-                                var ns = rSegs[nsi], npts = ns.pts
-                                if (ns.maxMx < vMinX || ns.minMx > vMaxX || ns.maxMy < vMinY || ns.minMy > vMaxY) continue
-                                if (!npts || npts.length < 2) continue
-                                var nstep = Math.max(1, Math.floor(npts.length / 50))
-                                for (var nj = 0; nj < npts.length; nj += nstep) {
-                                    var nx = map.sx(npts[nj].mx), ny = map.sy(npts[nj].my)
-                                    if (nx < nMinX || nx > nMaxX || ny < nMinY || ny > nMaxY) continue
-                                    ctx.moveTo(nx + 2.5, ny)
-                                    ctx.arc(nx, ny, 2.5, 0, Math.PI * 2)
-                                }
-                            }
-                            ctx.fillStyle = "rgba(255, 255, 255, 0.45)"
-                            ctx.fill()
-                        }
+                        // Continuous density heatmap scaled by user-selected heatmapOpacity
+                        var hAlpha = Math.max(0.05, Math.min(1.0, map.heatmapOpacity))
+                        ctx.strokeStyle = "rgba(53, 214, 255, " + (0.15 * hAlpha).toFixed(3) + ")"
+                        ctx.lineWidth = 18; ctx.stroke()
+                        ctx.strokeStyle = "rgba(108, 255, 138, " + (0.35 * hAlpha).toFixed(3) + ")"
+                        ctx.lineWidth = 9; ctx.stroke()
+                        ctx.strokeStyle = "rgba(255, 145, 0, " + (0.50 * hAlpha).toFixed(3) + ")"
+                        ctx.lineWidth = 4; ctx.stroke()
+                        ctx.strokeStyle = "rgba(255, 255, 255, " + (0.75 * hAlpha).toFixed(3) + ")"
+                        ctx.lineWidth = 1.5; ctx.stroke()
                     }
                     ctx.restore()
                 }
@@ -1221,25 +1232,31 @@ Item {
                     ctx.strokeStyle = "rgba(53,214,255,0.5)"; ctx.lineWidth = 1.5; ctx.stroke()
                     ctx.setLineDash([])
                 }
-                // linked devices: where the phone / laptop last reported itself
+                // linked devices: where the phone / laptop / mesh node last reported itself
                 if (map.showDevices) {
                     var ld = map.linked
                     for (var di = 0; di < ld.length; di++) {
                         var dv = ld[di]; if (!dv || dv.lat === undefined) continue
+                        if (Math.abs(dv.lat) < 0.0001 && Math.abs(dv.lon) < 0.0001) continue
                         var dm = map.merc(dv.lat, dv.lon), dx = map.sx(dm.x), dy = map.sy(dm.y)
                         var dAcc = Math.max(6, (dv.acc || 30) / mpp), stale = (dv.ageS || 0) > 3600
                         var dAlpha = stale ? 0.35 : dv.online ? 1 : 0.7
+                        var isNode = (dv.kind === "esp32-node" || dv.kind === "node" || dv.kind === "mesh")
+                        var isBase = (dv.role === "base_station" || dv.role === "base")
+                        var nodeCol = isBase ? "#ffd166" : (isNode ? "#35d6ff" : "#7cf2c4")
                         ctx.globalAlpha = dAlpha
                         var dist = map.haversine(src.lat, src.lon, dv.lat, dv.lon)
-                        if (dist < 2000) { ctx.setLineDash([4, 4]); ctx.strokeStyle = "rgba(124,242,196,0.5)"; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(mx, my); ctx.lineTo(dx, dy); ctx.stroke(); ctx.setLineDash([]) }
-                        ctx.beginPath(); ctx.arc(dx, dy, dAcc, 0, Math.PI * 2); ctx.fillStyle = "rgba(124,242,196,0.08)"; ctx.fill(); ctx.strokeStyle = "rgba(124,242,196,0.45)"; ctx.setLineDash([3, 3]); ctx.stroke(); ctx.setLineDash([])
-                        ctx.beginPath(); ctx.arc(dx, dy, 7, 0, Math.PI * 2); ctx.fillStyle = "#0b101a"; ctx.fill(); ctx.strokeStyle = "#7cf2c4"; ctx.lineWidth = 1.5; ctx.stroke()
+                        if (dist < 2000) { ctx.setLineDash([4, 4]); ctx.strokeStyle = isNode ? "rgba(53,214,255,0.4)" : "rgba(124,242,196,0.5)"; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(mx, my); ctx.lineTo(dx, dy); ctx.stroke(); ctx.setLineDash([]) }
+                        ctx.beginPath(); ctx.arc(dx, dy, dAcc, 0, Math.PI * 2); ctx.fillStyle = isNode ? "rgba(53,214,255,0.06)" : "rgba(124,242,196,0.08)"; ctx.fill(); ctx.strokeStyle = isNode ? "rgba(53,214,255,0.45)" : "rgba(124,242,196,0.45)"; ctx.setLineDash([3, 3]); ctx.stroke(); ctx.setLineDash([])
+                        ctx.beginPath(); ctx.arc(dx, dy, 7, 0, Math.PI * 2); ctx.fillStyle = "#0b101a"; ctx.fill(); ctx.strokeStyle = nodeCol; ctx.lineWidth = 1.5; ctx.stroke()
                         ctx.globalAlpha = 1
-                        marks.push({x: dx, y: dy + 0.5, t: map.deviceGlyph(dv.kind), c: "#e6edf7", px: 10, h: 1, a: dAlpha})
-                        // name and how old (the distance is on its card): a device not heard for 6 h keeps a faint marker, no name
+                        marks.push({x: dx, y: dy + 0.5, t: map.deviceGlyph(dv.kind, dv.role), c: "#e6edf7", px: 10, h: 1, a: dAlpha})
+                        // name, role, battery %, and how old
                         if (!stale || (dv.ageS || 0) < 21600) {
-                            var dl = (dv.device || dv.identityName || "device") + (dv.ageS !== undefined && dv.ageS >= 600 ? " · " + map.ageText(dv.ageS) : "")
-                            umarks.push({x: dx + 10, y: dy - 9, t: dl, c: "#7cf2c4", px: 10, b: 1, o: 1, a: dAlpha})
+                            var bInfo = (dv.battPct !== undefined && dv.battPct >= 0) ? (" · 🔋" + dv.battPct + "%" + (dv.battMah ? (" · " + dv.battMah + "mAh") : "")) : ""
+                            var rInfo = isBase ? " · Base" : ""
+                            var dl = (dv.device || dv.identityName || "device") + rInfo + bInfo + (dv.ageS !== undefined && dv.ageS >= 600 ? " · " + map.ageText(dv.ageS) : "")
+                            umarks.push({x: dx + 10, y: dy - 9, t: dl, c: nodeCol, px: 10, b: 1, o: 1, a: dAlpha})
                         }
                     }
                 }
@@ -2404,6 +2421,68 @@ Item {
             }
         }
     }
+    // ── Unset Mesh Nodes alert banner ─────────────────────────────────────
+    Rectangle {
+        id: unsetNodesBanner
+        visible: (map.src.unsetNodes || []).length > 0
+        anchors {
+            horizontalCenter: parent.horizontalCenter
+            top: parent.top
+            topMargin: Kirigami.Units.smallSpacing + 6
+        }
+        z: 22
+        radius: 14
+        color: Qt.rgba(0.08, 0.12, 0.20, 0.95)
+        border.color: "#ffd166"
+        border.width: 1.2
+        implicitWidth: unsetRow.implicitWidth + 24
+        implicitHeight: 28
+
+        RowLayout {
+            id: unsetRow
+            anchors.centerIn: parent
+            spacing: 8
+            PC3.Label {
+                text: "📡"
+                font.pixelSize: 12
+            }
+            PC3.Label {
+                text: {
+                    var un = map.src.unsetNodes || []
+                    if (un.length === 1) return `${un[0].name} (Position Unset)`
+                    return `${un.length} Nodes Online (Position Unset)`
+                }
+                color: "#ffd166"
+                font.bold: true
+                font.pixelSize: Kirigami.Theme.smallFont.pixelSize
+            }
+            Rectangle {
+                width: 1; height: 14; color: Qt.rgba(1, 1, 1, 0.2)
+            }
+            PC3.Label {
+                text: "Click to Place at View Center"
+                color: "#35d6ff"
+                font.bold: true
+                font.pixelSize: Kirigami.Theme.smallFont.pixelSize
+            }
+        }
+
+        MouseArea {
+            anchors.fill: parent
+            cursorShape: Qt.PointingHandCursor
+            hoverEnabled: true
+            onClicked: {
+                var un = map.src.unsetNodes || []
+                if (un.length > 0) {
+                    var node = un[0]
+                    var lat = map.latOf(map.cy)
+                    var lon = map.lonOf(map.cx)
+                    map.placeMeshNode(node.name, lat, lon)
+                }
+            }
+        }
+    }
+
     Rectangle {                                 // overview caption (city / state) while touring
         anchors { horizontalCenter: parent.horizontalCenter; top: parent.top; topMargin: Kirigami.Units.largeSpacing }
         visible: opacity > 0; opacity: map.caption ? 1 : 0; z: 6
@@ -2419,6 +2498,17 @@ Item {
         property real my: 0.5
         PC3.MenuItem { text: "Replay last refinement"; enabled: map.lastRefit !== null; onTriggered: map.replayRefit() }
         PC3.MenuItem { text: "Linked devices"; checkable: true; checked: map.showDevices; onTriggered: { map.showDevices = !map.showDevices; overlay.requestPaint() } }
+        PC3.MenuItem {
+            text: "📡 Place Mesh Node Here…"
+            icon.name: "network-wireless"
+            visible: (map.src.unsetNodes || []).length > 0 || (map.src.meshNodes || []).length > 0
+            onTriggered: {
+                var un = map.src.unsetNodes || []
+                var nodeToPlace = un.length > 0 ? un[0].name : "Mesh Node"
+                var lat = map.latOf(ctxMenu.my), lon = map.lonOf(ctxMenu.mx)
+                map.placeMeshNode(nodeToPlace, lat, lon)
+            }
+        }
         PC3.MenuItem { text: "Place an antenna here…"; icon.name: "network-wireless"; onTriggered: map.ctxPlaceAntenna() }
         PC3.MenuSeparator {}
         PC3.MenuItem { text: "Centre here"; icon.name: "zoom-fit-best"; onTriggered: map.ctxCentre() }
@@ -2522,6 +2612,21 @@ Item {
             checkable: true
             checked: map.showHeatmap
             onTriggered: { map.showHeatmap = !map.showHeatmap; overlay.requestPaint() }
+        }
+        PC3.MenuItem {
+            text: `Heatmap Opacity: ${Math.round(map.heatmapOpacity * 100)}%`
+            enabled: map.showHeatmap
+            onTriggered: {
+                var ops = [0.25, 0.35, 0.45, 0.60, 0.75, 1.0]
+                var curIdx = 2
+                for (var i = 0; i < ops.length; i++) {
+                    if (Math.abs(ops[i] - map.heatmapOpacity) < 0.04) { curIdx = i; break }
+                }
+                var nextOp = ops[(curIdx + 1) % ops.length]
+                map.heatmapOpacity = nextOp
+                Plasmoid.configuration.heatmapOpacity = nextOp
+                overlay.requestPaint()
+            }
         }
         PC3.MenuItem {
             text: "Flock & Surveillance Cameras"

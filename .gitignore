@@ -1,4 +1,5 @@
 build*/
+**/build/
 *.deb
 *.rpm
 _CPack_Packages/
@@ -7,3 +8,7 @@ CPackSourceConfig.cmake
 install_manifest.txt
 __pycache__/
 *.pyc
+*.key
+tools/keys/*.key
+android/.gradle/
+android/app/build/

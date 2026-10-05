@@ -67,6 +67,7 @@ class Prefs @Inject constructor(@ApplicationContext private val ctx: Context) {
         val routingOrsKey = stringPreferencesKey("routing_ors_key")
         val routingGraphhopperKey = stringPreferencesKey("routing_graphhopper_key")
         val routingProvider = stringPreferencesKey("routing_provider")
+        val doomBatteryMode = stringPreferencesKey("doom_battery_mode")
     }
     val collectorOn: Flow<Boolean> = ctx.store.data.map { it[K.collectorOn] ?: false }
     val collectIntervalSec: Flow<Int> = ctx.store.data.map { it[K.collectInterval] ?: 60 }
@@ -181,6 +182,10 @@ class Prefs @Inject constructor(@ApplicationContext private val ctx: Context) {
     /** Routing provider ("ors" or "graphhopper"). */
     val routingProvider: Flow<String> = ctx.store.data.map { it[K.routingProvider] ?: "ors" }
     suspend fun setRoutingProvider(p: String) = ctx.store.edit { it[K.routingProvider] = p }
+
+    /** OG DOOM battery usage profile. */
+    val doomBatteryMode: Flow<DoomBatteryMode> = ctx.store.data.map { DoomBatteryMode.fromId(it[K.doomBatteryMode]) }
+    suspend fun setDoomBatteryMode(mode: DoomBatteryMode) = ctx.store.edit { it[K.doomBatteryMode] = mode.id }
 
     companion object {
         val UNITS = setOf("auto", "metric", "imperial")

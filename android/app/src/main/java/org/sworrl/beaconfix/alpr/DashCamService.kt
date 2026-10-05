@@ -80,6 +80,7 @@ class DashCamService : LifecycleService() {
     @Inject lateinit var passFrames: org.sworrl.beaconfix.sightings.DashFrameBuffer
     @Inject lateinit var prefs: org.sworrl.beaconfix.data.Prefs
     @Volatile private var privateInspection = false
+    @Volatile private var doomMode = org.sworrl.beaconfix.data.DoomBatteryMode.DEFAULT
 
     private val main = Handler(Looper.getMainLooper())
     private lateinit var executor: ExecutorService
@@ -134,6 +135,11 @@ class DashCamService : LifecycleService() {
             prefs.privateInspectionActive.collect { active ->
                 privateInspection = active
                 reconcile()
+            }
+        }
+        lifecycleScope.launch {
+            prefs.doomBatteryMode.collect { mode ->
+                doomMode = mode
             }
         }
         if (Build.VERSION.SDK_INT >= 30) lifecycleScope.launch {
@@ -351,7 +357,8 @@ class DashCamService : LifecycleService() {
             if (!capturing) return
             val cfg = settings.value
             val step = ThermalPolicy.step(ThermalPolicy.level(headroom, if (Build.VERSION.SDK_INT >= 29) thermal else 0), cfg.tileCols, cfg.accurateOcr)
-            val interval = 1000L / cfg.targetFps.coerceIn(1, 4) * step.intervalFactor
+            val effectiveFps = minOf(cfg.targetFps, doomMode.alprFps).coerceIn(1, 4)
+            val interval = 1000L / effectiveFps * step.intervalFactor
             val now = SystemClock.elapsedRealtime()
             val p = pipeline(cfg) ?: return
             val wall = System.currentTimeMillis()

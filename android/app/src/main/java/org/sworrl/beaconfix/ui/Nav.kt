@@ -68,10 +68,11 @@ data class Dest(val route: String, val label: String, val icon: ImageVector? = n
 val DESTS = listOf(
     Dest("home", "Home", icon = Icons.Default.Home, phoneTab = true),
     Dest("map", "Map", icon = Icons.Default.Map, phoneTab = true),
+    Dest("esp_nodes", "Nodes", icon = Icons.Default.RssFeed, phoneTab = true),
     Dest("alpr", "Dash Cam", iconRes = org.sworrl.beaconfix.R.drawable.alpr_ic_camera, phoneTab = true),
     Dest("beacons", "Beacons", icon = Icons.Default.Wifi, phoneTab = true),
-    Dest("nearby", "Places", icon = Icons.Default.Place, phoneTab = true),
     Dest("more", "More", icon = Icons.Default.MoreHoriz, phoneTab = true),
+    Dest("nearby", "Places", icon = Icons.Default.Place, phoneTab = false),
     Dest("detector", "Detector", icon = Icons.Default.Radar, phoneTab = false),
     Dest("trip", "Trip", icon = Icons.Default.Explore, phoneTab = false),
     Dest("events", "Events", icon = Icons.Default.RssFeed, phoneTab = false),
@@ -130,7 +131,7 @@ fun BeaconFixRoot(launch: LaunchArgs = LaunchArgs()) {
             "help" -> nav.navigate("help?focus="); "help_peds" -> nav.navigate("help?focus=peds"); "find_rv" -> nav.navigate("home") { popUpTo("home"); launchSingleTop = true }
             "share_location" -> shareVm.shareLocation(ctx)
             "sighting" -> launch.sightingUid?.let { nav.navigate("sighting/" + android.net.Uri.encode(it)) } ?: nav.navigate("sightings")
-            "identity", "widgets", "import", "map", "beacons", "survey", "settings", "trip", "events", "nearby", "more", "sync_tab", "anchors", "detector", "hub", "alpr", "link", "sightings", "licenses" -> nav.navigate(if (launch.action == "sync_tab") "sync" else launch.action)
+            "identity", "widgets", "import", "map", "beacons", "survey", "settings", "trip", "events", "nearby", "more", "sync_tab", "anchors", "detector", "hub", "alpr", "link", "sightings", "licenses", "esp_nodes" -> nav.navigate(if (launch.action == "sync_tab") "sync" else launch.action)
         }
     }
     val wide = currentWindowAdaptiveInfo().windowSizeClass.windowWidthSizeClass != WindowWidthSizeClass.COMPACT
@@ -176,6 +177,7 @@ private fun Graph(nav: NavHostController, idVm: IdentityViewModel, modifier: Mod
         }
         composable("identity") { IdentityScreen(onBack = { nav.popBackStack() }, onLink = { nav.navigate("link") }, vm = idVm) }
         composable("anchors") { org.sworrl.beaconfix.ui.screens.AnchorsScreen(onBack = { nav.popBackStack() }, onMap = { nav.navigate("map") }) }
+        composable("esp_nodes") { org.sworrl.beaconfix.ui.screens.EspNodesScreen(onBack = { nav.popBackStack() }) }
         composable("widgets") { WidgetGalleryScreen(onBack = { nav.popBackStack() }) }
         composable("import") { ImportScreen(onBack = { nav.popBackStack() }, incoming = incomingFile) }
     }

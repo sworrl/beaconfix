@@ -97,7 +97,7 @@ class AnchorRepository @Inject constructor(private val db: AppDatabase, private 
         fun encode(a: AnchorDto): String = json.encodeToString(AnchorDto.serializer(), a)
         fun entity(a: AnchorDto, dirty: Boolean) = AnchorEntity(a.id, encode(a), a.name, a.kind, a.lat, a.lon, a.rv, a.ref, a.deleted == true, a.placedAt, a.seq ?: 0, dirty)
         fun isoNow(): String = DateTimeFormatter.ISO_INSTANT.format(Instant.now().atOffset(ZoneOffset.UTC).withNano(0))
-        val KINDS = listOf("this-computer" to "This computer", "wifi-ap" to "Wi-Fi access point", "ble" to "Bluetooth beacon", "rtt-responder" to "Wi-Fi RTT responder", "custom" to "Custom")
+        val KINDS = listOf("fixed-point" to "Fixed known point (anchor)", "esp32-node" to "ESP32 monitor node", "this-computer" to "This computer", "wifi-ap" to "Wi-Fi access point", "ble" to "Bluetooth beacon", "rtt-responder" to "Wi-Fi RTT responder", "custom" to "Custom")
         fun normalise(a: AnchorDto): AnchorDto = a.copy(
             kind = a.kind.ifEmpty { "custom" }, name = a.name.trim().take(64).ifEmpty { KINDS.firstOrNull { it.first == a.kind.ifEmpty { "custom" } }?.second ?: "Anchor" },
             bssids = a.bssids.map { it.uppercase().trim() }.filter { it.length == 17 }.distinct(), accM = a.accM.coerceIn(0.05, 500.0),

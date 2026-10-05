@@ -20,6 +20,7 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QNetworkInterface>
+#include <QProcess>
 #include <QRandomGenerator>
 #include <openssl/rand.h>
 #include <QRegularExpression>
@@ -1571,7 +1572,149 @@ void ApiServer::serve(QTcpSocket *s, const Request &r, Device *dev, const QStrin
         finish(200, QJsonObject{{"deleted", id}});
         return;
     }
+    if (ep == QLatin1String("nodes") || ep == QLatin1String("nodes/status")) {
+        if (!get) { finish(405, QJsonObject{{"error", "method not allowed"}}, {"Allow: GET"}); return; }
+        finish(200, QJsonObject{{"nodes", m_loc->meshNodesJson()}});
+        return;
+    }
+    if (ep == QLatin1String("nodes/unset")) {
+        if (!get) { finish(405, QJsonObject{{"error", "method not allowed"}}, {"Allow: GET"}); return; }
+        finish(200, QJsonObject{{"unset", m_loc->unsetNodesJson()}});
+        return;
+    }
+    if (ep == QLatin1String("nodes/place")) {
+        if (!post) { finish(405, QJsonObject{{"error", "method not allowed"}}, {"Allow: POST"}); return; }
+        const QJsonDocument d = QJsonDocument::fromJson(r.body);
+        if (!d.isObject()) { finish(400, QJsonObject{{"error", "JSON object required"}}); return; }
+        const QJsonObject o = d.object();
+        const QString name = o.value(QStringLiteral("name")).toString();
+        const double lat = o.value(QStringLiteral("lat")).toDouble();
+        const double lon = o.value(QStringLiteral("lon")).toDouble();
+        const double accM = o.value(QStringLiteral("accM")).toDouble(1.0);
+        if (name.isEmpty() || (std::abs(lat) < 0.0001 && std::abs(lon) < 0.0001)) {
+            finish(400, QJsonObject{{"error", "name, lat, lon required"}}); return;
+        }
+        if (m_loc->placeMeshNode(name, lat, lon, accM)) {
+            finish(200, QJsonObject{{"placed", true}, {"name", name}, {"lat", lat}, {"lon", lon}});
+        } else {
+            finish(500, QJsonObject{{"error", "failed to place node"}});
+        }
+        return;
+    }
+    if (ep == QLatin1String("nodes/mint")) {
+        if (!post) { finish(405, QJsonObject{{"error", "method not allowed"}}, {"Allow: POST"}); return; }
+        const QJsonObject b = QJsonDocument::fromJson(r.body).object();
+        const QString name = b.value(QStringLiteral("name")).toString().trimmed();
+        const QString role = b.value(QStringLiteral("role")).toString(QStringLiteral("mobile")).trimmed();
+        const int units = b.value(QStringLiteral("units")).toInt(4);
+        const bool shortMode = b.value(QStringLiteral("short")).toBool(false);
+        const QString mac = b.value(QStringLiteral("mac")).toString().trimmed();
+        QJsonObject res = m_loc->mintMeshNode(name, role, units, shortMode, mac);
+        finish(res.value(QStringLiteral("ok")).toBool() ? 200 : 500, res);
+        return;
+    }
+    if (ep == QLatin1String("nodes/battery")) {
+        if (get) {
+            const QUrlQuery q(r.query);
+            const QString name = q.queryItemValue(QStringLiteral("name"));
+            if (name.isEmpty()) { finish(400, QJsonObject{{"error", "name parameter required"}}); return; }
+            const int mah = m_loc->nodeBatteryCapacity(name);
+            finish(200, QJsonObject{{"ok", true}, {"name", name}, {"mah", mah}});
+            return;
+        }
+        if (post) {
+            const QJsonObject b = QJsonDocument::fromJson(r.body).object();
+            const QString name = b.value(QStringLiteral("name")).toString().trimmed();
+            const int mah = b.value(QStringLiteral("mah")).toInt(0);
+            if (name.isEmpty() || mah <= 0) { finish(400, QJsonObject{{"error", "valid name and positive mah required"}}); return; }
+            if (m_loc->setNodeBatteryCapacity(name, mah)) {
+                finish(200, QJsonObject{{"ok", true}, {"name", name}, {"mah", mah}});
+            } else {
+                finish(500, QJsonObject{{"error", "failed to set battery capacity"}});
+            }
+            return;
+        }
+        finish(405, QJsonObject{{"error", "method not allowed"}}, {"Allow: GET, POST"});
+        return;
+    }
+    if (ep == QLatin1String("nodes/attach")) {
+        if (get) {
+            const QUrlQuery q(r.query);
+            const QString name = q.queryItemValue(QStringLiteral("name"));
+            if (name.isEmpty()) { finish(400, QJsonObject{{"error", "name parameter required"}}); return; }
+            const QString dev = m_loc->nodeAttachedDevice(name);
+            finish(200, QJsonObject{{"ok", true}, {"name", name}, {"attachedDevice", dev}, {"following", !dev.isEmpty()}});
+            return;
+        }
+        if (post) {
+            const QJsonObject b = QJsonDocument::fromJson(r.body).object();
+            const QString name = b.value(QStringLiteral("name")).toString().trimmed();
+            const QString device = b.value(QStringLiteral("device")).toString().trimmed();
+            const bool follow = b.value(QStringLiteral("follow")).toBool(true);
+            if (name.isEmpty()) { finish(400, QJsonObject{{"error", "valid name required"}}); return; }
+            const QString targetDev = follow ? device : QString();
+            if (m_loc->attachNodeToDevice(name, targetDev)) {
+                finish(200, QJsonObject{{"ok", true}, {"name", name}, {"attachedDevice", targetDev}, {"following", !targetDev.isEmpty()}});
+            } else {
+                finish(500, QJsonObject{{"error", "failed to attach node to device"}});
+            }
+            return;
+        }
+        finish(405, QJsonObject{{"error", "method not allowed"}}, {"Allow: GET, POST"});
+        return;
+    }
+    if (ep == QLatin1String("nodes/gps")) {
+        if (!post) { finish(405, QJsonObject{{"error", "method not allowed"}}, {"Allow: POST"}); return; }
+        const QJsonObject b = QJsonDocument::fromJson(r.body).object();
+        const QString name = b.value(QStringLiteral("name")).toString().trimmed();
+        const double lat = b.value(QStringLiteral("lat")).toDouble();
+        const double lon = b.value(QStringLiteral("lon")).toDouble();
+        const double acc = b.value(QStringLiteral("acc")).toDouble(5.0);
+        if (name.isEmpty() || (std::abs(lat) < 0.0001 && std::abs(lon) < 0.0001)) {
+            finish(400, QJsonObject{{"error", "valid name and coordinates required"}});
+            return;
+        }
+        m_loc->injectNodeGps(name, lat, lon, acc);
+        finish(200, QJsonObject{{"ok", true}, {"name", name}, {"lat", lat}, {"lon", lon}, {"acc", acc}});
+        return;
+    }
+    if (ep == QLatin1String("nodes/nameplate")) {
+        if (get) {
+            finish(200, QJsonObject{{QStringLiteral("ok"), true}, {QStringLiteral("nameplates"), m_loc->listNameplates()}});
+            return;
+        }
+        if (post) {
+            const QJsonObject b = QJsonDocument::fromJson(r.body).object();
+            const QString name = b.value(QStringLiteral("name")).toString().trimmed();
+            const int units = b.value(QStringLiteral("units")).toInt(4);
+            const bool shortMode = b.value(QStringLiteral("short")).toBool(false);
+            const QString mac = b.value(QStringLiteral("mac")).toString().trimmed();
+            QJsonObject res = m_loc->generateNameplate(name, units, shortMode, mac);
+            finish(res.value(QStringLiteral("ok")).toBool() ? 200 : 500, res);
+            return;
+        }
+        finish(405, QJsonObject{{"error", "method not allowed"}}, {"Allow: GET, POST"});
+        return;
+    }
+    if (ep == QLatin1String("nodes/nameplate/download")) {
+        if (!get) { finish(405, QJsonObject{{"error", "method not allowed"}}, {"Allow: GET"}); return; }
+        const QUrlQuery q(r.query);
+        QString fn = q.queryItemValue(QStringLiteral("file"));
+        if (fn.isEmpty()) { finish(400, QJsonObject{{"error", "file parameter required"}}); return; }
+        fn = QFileInfo(fn).fileName();
+        if (!fn.endsWith(QLatin1String(".stl"), Qt::CaseInsensitive)) { finish(400, QJsonObject{{"error", "only .stl files allowed"}}); return; }
+        const QString path = QDir::homePath() + QStringLiteral("/.local/share/beaconfix/nameplates/") + fn;
+        QFile file(path);
+        if (!file.open(QIODevice::ReadOnly)) { finish(404, QJsonObject{{"error", "file not found"}}); return; }
+        const QByteArray content = file.readAll();
+        logAccess(s, r.method, r.path, 200);
+        replyRaw(s, 200, "model/stl", content, {
+            QStringLiteral("Content-Disposition: attachment; filename=\"%1\"").arg(fn).toUtf8()
+        });
+        return;
+    }
     // ── the estimator: calibration, device offsets, BSSID groups, grade counts, where to sample next (docs/GRADING.md) ──
+
     if (ep == QLatin1String("estimator")) {
         if (!get) { finish(405, QJsonObject{{"error", "method not allowed"}}, {"Allow: GET"}); return; }
         finish(200, m_loc->estimatorJson());
@@ -1938,6 +2081,70 @@ void ApiServer::serve(QTcpSocket *s, const Request &r, Device *dev, const QStrin
         QJsonArray arr;
         for (const PlateAudit &aud : m_loc->plateAudits(plate, limit)) arr.append(aud.toJson());
         finish(200, QJsonObject{{"audits", arr}, {"count", arr.size()}});
+        return;
+    }
+    // ── ESP32 Hardware Monitor Nodes ──
+    if (ep == QLatin1String("esp/ports") || ep == QLatin1String("esp/status")) {
+        if (!get) { finish(405, QJsonObject{{"error", "method not allowed"}}, {"Allow: GET"}); return; }
+        QJsonArray ports;
+        QDir byId(QStringLiteral("/dev/serial/by-id"));
+        if (byId.exists()) {
+            for (const QString &entry : byId.entryList(QDir::Files | QDir::System)) {
+                const QString full = QStringLiteral("/dev/serial/by-id/") + entry;
+                ports.append(QJsonObject{
+                    {QStringLiteral("id"), entry},
+                    {QStringLiteral("path"), full},
+                    {QStringLiteral("target"), QFile::symLinkTarget(full)}
+                });
+            }
+        }
+        finish(200, QJsonObject{
+            {QStringLiteral("ok"), true},
+            {QStringLiteral("ports"), ports},
+            {QStringLiteral("count"), ports.size()}
+        });
+        return;
+    }
+    if (ep == QLatin1String("esp/flash")) {
+        if (!post) { finish(405, QJsonObject{{"error", "method not allowed"}}, {"Allow: POST"}); return; }
+        if (!control) { finish(403, QJsonObject{{"error", "control scope required"}}); return; }
+        const QJsonObject b = QJsonDocument::fromJson(r.body).object();
+        const QString reqPort = b.value(QLatin1String("port")).toString().trimmed();
+
+        QProcess proc;
+        QString script = QCoreApplication::applicationDirPath() + QStringLiteral("/../tools/flash_esp32.sh");
+        if (!QFile::exists(script)) {
+            script = QStringLiteral("/home/user/Documents/GitHub/beaconfix/tools/flash_esp32.sh");
+        }
+        QStringList args;
+        if (!reqPort.isEmpty()) args << reqPort;
+        args << QStringLiteral("--no-compile");
+
+        proc.start(script, args);
+        if (!proc.waitForFinished(60000)) {
+            proc.kill();
+            finish(500, QJsonObject{{"ok", false}, {"error", "flashing timed out after 60s"}});
+            return;
+        }
+
+        const int exitCode = proc.exitCode();
+        const QString stdOut = QString::fromUtf8(proc.readAllStandardOutput());
+        const QString stdErr = QString::fromUtf8(proc.readAllStandardError());
+
+        if (exitCode == 0) {
+            finish(200, QJsonObject{
+                {QStringLiteral("ok"), true},
+                {QStringLiteral("status"), QStringLiteral("flashed")},
+                {QStringLiteral("output"), stdOut.trimmed()}
+            });
+        } else {
+            finish(500, QJsonObject{
+                {QStringLiteral("ok"), false},
+                {QStringLiteral("error"), QStringLiteral("flash failed")},
+                {QStringLiteral("exitCode"), exitCode},
+                {QStringLiteral("details"), stdErr.isEmpty() ? stdOut.trimmed() : stdErr.trimmed()}
+            });
+        }
         return;
     }
     if (ep == QLatin1String("flock/summary")) {

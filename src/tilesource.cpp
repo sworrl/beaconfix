@@ -417,58 +417,128 @@ void TileSource::serveHeat(QTcpSocket *s, quint64 gen, int z, int x, int y)
 }
 
 // Zoomed out, the route (glow + core) shows where you travel. Zoomed in, where APs get pinpointed, a stroke through
-// every Wi-Fi fix taken at home is a scribble that buries the map: there the path is a faint hairline and each fix
-// a small dot — the vantage points the estimates were made from, and where more samples would help.
+// Route density heatmap rasterization: round-capped, antialiased density strokes + fix stamps
+static void addHeatStroke(QImage &img, const QPointF &a, const QPointF &b, double hw, int v)
+{
+    const int W = img.width(), H = img.height();
+    const double dx = b.x() - a.x(), dy = b.y() - a.y(), len2 = dx * dx + dy * dy, m = hw + 1;
+    const int y0 = qMax(0, int(std::floor(qMin(a.y(), b.y()) - m))), y1 = qMin(H - 1, int(std::ceil(qMax(a.y(), b.y()) + m)));
+    for (int y = y0; y <= y1; ++y) {
+        const double py = y + 0.5;
+        double xa = qMin(a.x(), b.x()), xb = qMax(a.x(), b.x());
+        if (std::abs(dy) > 1e-9) {
+            const double t0 = qBound(0.0, (py - m - a.y()) / dy, 1.0), t1 = qBound(0.0, (py + m - a.y()) / dy, 1.0);
+            xa = qMin(a.x() + dx * t0, a.x() + dx * t1); xb = qMax(a.x() + dx * t0, a.x() + dx * t1);
+        }
+        const int x0 = qMax(0, int(std::floor(xa - m))), x1 = qMin(W - 1, int(std::ceil(xb + m)));
+        uchar *row = img.scanLine(y);
+        for (int x = x0; x <= x1; ++x) {
+            const double px = x + 0.5;
+            const double t = len2 > 0 ? qBound(0.0, ((px - a.x()) * dx + (py - a.y()) * dy) / len2, 1.0) : 0.0;
+            const double ex = a.x() + t * dx - px, ey = a.y() + t * dy - py;
+            const double cov = hw + 0.5 - std::sqrt(ex * ex + ey * ey);
+            if (cov > 0) row[x] = uchar(qMin(255, row[x] + int(v * qMin(cov, 1.0) + 0.5)));
+        }
+    }
+}
+
+static const QVector<QRgb> kHeatRamp = []{
+    QVector<QRgb> r(256);
+    for (int i = 0; i < 256; ++i) {
+        if (i == 0) {
+            r[i] = 0;
+        } else if (i < 40) {
+            const double t = i / 40.0;
+            r[i] = qRgba(0, int(80 * t), int(220 * t + 35), int(140 * t));
+        } else if (i < 100) {
+            const double t = (i - 40) / 60.0;
+            r[i] = qRgba(int(40 * t), int(80 * (1 - t) + 210 * t), int(255 * (1 - t) + 120 * t), int(140 + 40 * t));
+        } else if (i < 170) {
+            const double t = (i - 100) / 70.0;
+            r[i] = qRgba(int(40 * (1 - t) + 255 * t), int(210 * (1 - t) + 230 * t), int(120 * (1 - t)), int(180 + 35 * t));
+        } else {
+            const double t = (i - 170) / 85.0;
+            r[i] = qRgba(255, int(230 * (1 - t) + 70 * t), int(200 * t * t), int(215 + 40 * t));
+        }
+        r[i] = qPremultiply(r[i]);
+    }
+    return r;
+}();
+
+// True continuous density heatmap for route tiles: renders smooth density accumulation into Alpha8
+// and colors with kHeatRamp, keeping map and building detail completely legible
 QByteArray TileSource::renderHeat(const HeatSnap &snap, int z, int x, int y)
 {
-    const double n = double(1 << z) * 256, ox = x * 256.0, oy = y * 256.0, pad = 10;
+    const double n = double(1 << z) * 256, ox = x * 256.0, oy = y * 256.0, pad = 16;
     const double bx0 = (ox - pad) / n, by0 = (oy - pad) / n, bx1 = (ox + 256 + pad) / n, by1 = (oy + 256 + pad) / n;
-    const bool close = z >= 16;
-    QPainterPath path;
+
+    QImage alphaMap(256, 256, QImage::Format_Alpha8);
+    alphaMap.fill(0);
+    bool hasData = false;
+
+    // 1. Draw route segments into alphaMap with wide ambient glow and warm core
+    const double glowW = (z <= 15) ? 7.0 : 10.0;
+    const double coreW = (z <= 15) ? 2.5 : 3.5;
+
     for (const HeatLine &hl : snap.lines) {
         if (hl.box.right() < bx0 || hl.box.left() > bx1 || hl.box.bottom() < by0 || hl.box.top() > by1) continue;
         const QList<QPointF> &pts = hl.pts;
+        if (pts.size() < 2) continue;
         QPointF last(pts[0].x() * n - ox, pts[0].y() * n - oy);
-        bool down = false;
         for (int i = 1; i < pts.size(); ++i) {
             const QPointF q(pts[i].x() * n - ox, pts[i].y() * n - oy);
-            if (i < pts.size() - 1 && std::abs(q.x() - last.x()) + std::abs(q.y() - last.y()) < 1.5) continue;
+            if (i < pts.size() - 1 && std::abs(q.x() - last.x()) + std::abs(q.y() - last.y()) < 1.2) continue;
             const bool out = (last.x() < -pad && q.x() < -pad) || (last.x() > 256 + pad && q.x() > 256 + pad)
                           || (last.y() < -pad && q.y() < -pad) || (last.y() > 256 + pad && q.y() > 256 + pad);
-            if (out) down = false;
-            else { if (!down) { path.moveTo(last); down = true; } path.lineTo(q); }
+            if (!out) {
+                addHeatStroke(alphaMap, last, q, glowW, 30);
+                addHeatStroke(alphaMap, last, q, coreW, 70);
+                hasData = true;
+            }
             last = q;
         }
     }
-    QList<QPointF> dots;
-    if (close)
-        for (const QPointF &p : snap.points) {
-            const QPointF q(p.x() * n - ox, p.y() * n - oy);
-            if (q.x() > -4 && q.x() < 260 && q.y() > -4 && q.y() < 260) dots.append(q);
-        }
-    if (path.isEmpty() && dots.isEmpty()) return {};
-    QImage img(256, 256, QImage::Format_ARGB32_Premultiplied);
-    img.fill(Qt::transparent);
-    {
-        QPainter p(&img);
-        p.setRenderHint(QPainter::Antialiasing);
-        p.setBrush(Qt::NoBrush);
-        if (!close) {
-            const double glow = z <= 15 ? 10 : 6, core = z <= 15 ? 2.5 : 1.8;
-            p.setPen(QPen(QColor(255, 145, 0, z <= 15 ? 40 : 30), glow, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));   // ambient glow
-            p.drawPath(path);
-            p.setPen(QPen(QColor(255, 214, 0, z <= 15 ? 170 : 140), core, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));  // the route
-            p.drawPath(path);
-        } else {
-            p.setPen(QPen(QColor(255, 214, 0, 70), 1.0, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
-            p.drawPath(path);
-            const double r = z >= 20 ? 3.0 : z >= 19 ? 2.5 : 2.0;
-            p.setPen(QPen(QColor(0, 0, 0, 110), 0.8)); p.setBrush(QColor(255, 196, 0, 150));
-            for (const QPointF &q : std::as_const(dots)) p.drawEllipse(q, r, r);
+
+    // 2. Add fix point stamps (vantage points & fix density)
+    const double r = qBound(6.0, 18.0 - z * 0.5, 14.0);
+    const int R = int(std::ceil(r)), side = 2 * R + 1;
+    QList<uchar> stamp(side * side);
+    for (int dy = -R; dy <= R; ++dy) {
+        for (int dx = -R; dx <= R; ++dx) {
+            const double d = std::hypot(dx, dy) / r;
+            stamp[(dy + R) * side + dx + R] = uchar(qRound(d < 0.6 ? 28 - 16 * d / 0.6 : d < 1.0 ? 12 * (1.0 - d) / 0.4 : 0.0));
         }
     }
-    QByteArray png; QBuffer b(&png); b.open(QIODevice::WriteOnly);
-    img.save(&b, "PNG");
+
+    for (const QPointF &pt : snap.points) {
+        if (pt.x() < bx0 || pt.x() > bx1 || pt.y() < by0 || pt.y() > by1) continue;
+        const int px = qRound(pt.x() * n - ox), py = qRound(pt.y() * n - oy);
+        if (px < -R || px > 256 + R || py < -R || py > 256 + R) continue;
+        const int x0 = qMax(0, px - R), x1 = qMin(255, px + R);
+        for (int rowY = qMax(0, py - R); rowY <= qMin(255, py + R); ++rowY) {
+            uchar *row = alphaMap.scanLine(rowY);
+            const uchar *k = stamp.constData() + (rowY - py + R) * side + (x0 - px + R);
+            for (int colX = x0; colX <= x1; ++colX, ++k) {
+                row[colX] = uchar(qMin(255, row[colX] + *k));
+            }
+        }
+        hasData = true;
+    }
+
+    if (!hasData) return {};
+
+    // 3. Colorize through true continuous heat gradient ramp
+    QImage colorized(256, 256, QImage::Format_ARGB32_Premultiplied);
+    for (int y = 0; y < 256; ++y) {
+        const uchar *srcLine = alphaMap.constScanLine(y);
+        QRgb *dstLine = reinterpret_cast<QRgb *>(colorized.scanLine(y));
+        for (int x = 0; x < 256; ++x) dstLine[x] = kHeatRamp[srcLine[x]];
+    }
+
+    QByteArray png;
+    QBuffer b(&png);
+    b.open(QIODevice::WriteOnly);
+    colorized.save(&b, "PNG");
     return png;
 }
 

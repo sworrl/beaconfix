@@ -11,7 +11,8 @@
 namespace Anchors {
 
 const QStringList kKinds = {QStringLiteral("this-computer"), QStringLiteral("wifi-ap"), QStringLiteral("ble"),
-                            QStringLiteral("rtt-responder"), QStringLiteral("gnss"), QStringLiteral("custom")};
+                            QStringLiteral("rtt-responder"), QStringLiteral("gnss"), QStringLiteral("fixed-point"),
+                            QStringLiteral("esp32-node"), QStringLiteral("custom")};
 static constexpr double kMPerDeg = 111320.0;
 static const double kNaN = std::numeric_limits<double>::quiet_NaN();
 

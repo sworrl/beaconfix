@@ -97,18 +97,97 @@ fun AnchorEditorSheet(a: AnchorDto, vm: AnchorsViewModel) {
     var name by remember(a.id) { mutableStateOf(a.name) }
     var height by remember(a.id) { mutableStateOf(a.heightM?.let { fmt(it) } ?: "") }
     var acc by remember(a.id) { mutableStateOf(fmt(a.accM)) }
+    var latStr by remember(a.id) { mutableStateOf(if (a.lat != 0.0) String.format(java.util.Locale.US, "%.8f", a.lat) else "") }
+    var lonStr by remember(a.id) { mutableStateOf(if (a.lon != 0.0) String.format(java.util.Locale.US, "%.8f", a.lon) else "") }
+    var altStr by remember(a.id) { mutableStateOf(a.alt?.let { String.format(java.util.Locale.US, "%.2f", it) } ?: "") }
+    var pasteCoords by remember(a.id) { mutableStateOf("") }
     var showAll by remember { mutableStateOf(false) }
     LaunchedEffect(a.id) { if (scan.isEmpty()) vm.rescan(fresh = false) }
     val groups = remember(scan) { AnchorRepository.groups(scan) }
     val chosen = a.bssids.toSet()
-    fun commit(): AnchorDto = a.copy(name = name, heightM = height.trim().toDoubleOrNull(), accM = acc.trim().toDoubleOrNull() ?: a.accM)
+
+    fun parseCoordString(raw: String) {
+        val parts = raw.trim().split(Regex("[,;\\s]+")).filter { it.isNotEmpty() }
+        if (parts.size >= 2) {
+            val pLat = parts[0].toDoubleOrNull()
+            val pLon = parts[1].toDoubleOrNull()
+            if (pLat != null && pLon != null && pLat in -90.0..90.0 && pLon in -180.0..180.0) {
+                latStr = String.format(java.util.Locale.US, "%.8f", pLat)
+                lonStr = String.format(java.util.Locale.US, "%.8f", pLon)
+                if (parts.size >= 3) {
+                    parts[2].toDoubleOrNull()?.let { altStr = String.format(java.util.Locale.US, "%.2f", it) }
+                }
+            }
+        }
+    }
+
+    fun commit(): AnchorDto {
+        val parsedLat = latStr.trim().toDoubleOrNull() ?: a.lat
+        val parsedLon = lonStr.trim().toDoubleOrNull() ?: a.lon
+        val parsedAlt = altStr.trim().toDoubleOrNull() ?: a.alt
+        return a.copy(
+            name = name,
+            lat = parsedLat,
+            lon = parsedLon,
+            alt = parsedAlt,
+            heightM = height.trim().toDoubleOrNull(),
+            accM = acc.trim().toDoubleOrNull() ?: a.accM,
+            source = if (parsedLat != a.lat || parsedLon != a.lon) "manual-coords" else a.source
+        )
+    }
+
     ModalBottomSheet(onDismissRequest = { vm.clearAveraging(); vm.edit(null) }, sheetState = sheet) {
         Column(Modifier.verticalScroll(rememberScrollState()).padding(horizontal = 16.dp).padding(bottom = 24.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text(if (a.id.isEmpty()) "Place an antenna here" else "Edit anchor", style = MaterialTheme.typography.titleLarge)
-            Text(if (a.lat == 0.0 && a.lon == 0.0) "no position yet — average GNSS below or pick on the map" else "%.6f, %.6f · ±${fmt(a.accM)} m · ${a.source}".format(a.lat, a.lon), color = Slate, style = MaterialTheme.typography.bodySmall)
-            OutlinedTextField(name, { name = it }, Modifier.fillMaxWidth(), label = { Text("Name") }, placeholder = { Text("Wi-Fi antenna") }, singleLine = true)
+            Text(if (a.id.isEmpty()) "Place an antenna / fixed point" else "Edit anchor", style = MaterialTheme.typography.titleLarge)
+            val curLat = latStr.toDoubleOrNull() ?: a.lat
+            val curLon = lonStr.toDoubleOrNull() ?: a.lon
+            Text(if (curLat == 0.0 && curLon == 0.0) "No position yet — enter detailed coords below, average GNSS, or pick on map" else "%.8f, %.8f · ±${fmt(acc.toDoubleOrNull() ?: a.accM)} m · ${a.source}".format(curLat, curLon), color = Slate, style = MaterialTheme.typography.bodySmall)
+
+            OutlinedTextField(name, { name = it }, Modifier.fillMaxWidth(), label = { Text("Name") }, placeholder = { Text("Fixed Anchor Node, Wi-Fi antenna…") }, singleLine = true)
+
+            // ── Fixed Known Reference Point card ──
+            Card(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                Text("Fixed Known Point (Anchor)", fontWeight = FontWeight.Bold)
+                                if (a.ref) Chip("FIXED REF", Gold)
+                            }
+                            Text("Ground truth anchor for multilateration and triangulation. Other nodes and ranging rings calculate relative to this surveyed point.", color = Slate, style = MaterialTheme.typography.bodySmall)
+                        }
+                        Switch(a.ref, { isRef ->
+                            vm.update(a.copy(ref = isRef, kind = if (isRef && (a.kind == "custom" || a.kind.isEmpty())) "fixed-point" else a.kind))
+                        })
+                    }
+                }
+            }
+
             Text("What is there", style = MaterialTheme.typography.labelLarge)
-            FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) { for ((k, label) in AnchorRepository.KINDS) FilterChip(selected = a.kind == k, onClick = { vm.update(a.copy(kind = k)) }, label = { Text(label) }) }
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                for ((k, label) in AnchorRepository.KINDS) FilterChip(selected = a.kind == k, onClick = { vm.update(a.copy(kind = k)) }, label = { Text(label) })
+            }
+
+            // ── Detailed Coordinates Editor ──
+            Card(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text("Detailed Coordinates (Editor)", style = MaterialTheme.typography.labelLarge)
+                    Text("Enter precise surveyed coordinates (up to 8 decimals) or paste from maps / GIS.", color = Slate, style = MaterialTheme.typography.bodySmall)
+
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedTextField(latStr, { latStr = it }, Modifier.weight(1f), label = { Text("Latitude") }, placeholder = { Text("e.g. 37.7749295") }, singleLine = true)
+                        OutlinedTextField(lonStr, { lonStr = it }, Modifier.weight(1f), label = { Text("Longitude") }, placeholder = { Text("-122.4194155") }, singleLine = true)
+                    }
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedTextField(altStr, { altStr = it }, Modifier.weight(1f), label = { Text("Altitude (m ASL)") }, placeholder = { Text("e.g. 120.5") }, singleLine = true)
+                        OutlinedTextField(acc, { acc = it }, Modifier.weight(1f), label = { Text("Accuracy ±m") }, placeholder = { Text("1.0") }, singleLine = true)
+                    }
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                        OutlinedTextField(pasteCoords, { pasteCoords = it }, Modifier.weight(1f), label = { Text("Paste 'lat, lon'") }, placeholder = { Text("37.774929, -122.419415") }, singleLine = true)
+                        OutlinedButton(onClick = { parseCoordString(pasteCoords); pasteCoords = "" }, enabled = pasteCoords.isNotBlank()) { Text("Apply") }
+                    }
+                }
+            }
 
             // ── BSSIDs: the current scan grouped by box ──
             Row(verticalAlignment = Alignment.CenterVertically) { Text("Radios this anchor transmits", style = MaterialTheme.typography.labelLarge, modifier = Modifier.weight(1f)); TextButton(onClick = { vm.rescan(true) }) { Text(if (scanning) "scanning…" else "Rescan") } }
@@ -126,30 +205,44 @@ fun AnchorEditorSheet(a: AnchorDto, vm: AnchorsViewModel) {
 
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedTextField(height, { height = it }, Modifier.weight(1f), label = { Text("Height above floor (m)") }, singleLine = true)
-                OutlinedTextField(acc, { acc = it }, Modifier.weight(1f), label = { Text("Placement ±m") }, singleLine = true)
             }
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) { Column(Modifier.weight(1f)) { Text("Moves with the RV"); Text("Kept at its offset from the reference anchor when the RV moves.", color = Slate, style = MaterialTheme.typography.bodySmall) }; Switch(a.rv, { vm.update(a.copy(rv = it)) }) }
-            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) { Column(Modifier.weight(1f)) { Text("RV reference"); Text("The one anchor the others are measured from (normally the desktop's antenna).", color = Slate, style = MaterialTheme.typography.bodySmall) }; Switch(a.ref, { vm.update(a.copy(ref = it)) }) }
 
             // ── precise position: average GNSS ──
             Card(Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Text("Use my position", style = MaterialTheme.typography.labelLarge)
-                    Text("Stand next to the antenna and hold still: fixes are averaged for up to a minute and the running accuracy is shown.", color = Slate, style = MaterialTheme.typography.bodySmall)
+                    Text("Average GNSS at this spot", style = MaterialTheme.typography.labelLarge)
+                    Text("Stand next to the antenna and hold still: fixes are averaged for up to a minute and running accuracy is shown.", color = Slate, style = MaterialTheme.typography.bodySmall)
                     val av = averaging
                     if (av == null) OutlinedButton(onClick = { vm.startAveraging() }) { Text("Start averaging") }
                     else {
                         Text(if (av.n == 0) (av.error.ifEmpty { "waiting for the first fix…" }) else "${av.n} fixes · ±${fmt(av.acc)} m · ${av.elapsedS} s" + (av.alt?.let { " · ${it.toInt()} m ASL" } ?: ""), color = if (av.n > 0) Green else Slate)
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            if (!av.done) OutlinedButton(onClick = { vm.stopAveraging()?.let { r -> vm.update(a.copy(lat = r.lat, lon = r.lon, accM = r.acc, alt = r.alt, source = "gps-average")); acc = fmt(r.acc) } }) { Text("Stop & use") }
-                            else if (av.n > 0) OutlinedButton(onClick = { vm.update(a.copy(lat = av.lat, lon = av.lon, accM = av.acc, alt = av.alt, source = "gps-average")); acc = fmt(av.acc); vm.clearAveraging() }) { Text("Use ±${fmt(av.acc)} m") }
+                            if (!av.done) OutlinedButton(onClick = {
+                                vm.stopAveraging()?.let { r ->
+                                    vm.update(a.copy(lat = r.lat, lon = r.lon, accM = r.acc, alt = r.alt, source = "gps-average"))
+                                    latStr = String.format(java.util.Locale.US, "%.8f", r.lat)
+                                    lonStr = String.format(java.util.Locale.US, "%.8f", r.lon)
+                                    r.alt?.let { altStr = String.format(java.util.Locale.US, "%.2f", it) }
+                                    acc = fmt(r.acc)
+                                }
+                            }) { Text("Stop & use") }
+                            else if (av.n > 0) OutlinedButton(onClick = {
+                                vm.update(a.copy(lat = av.lat, lon = av.lon, accM = av.acc, alt = av.alt, source = "gps-average"))
+                                latStr = String.format(java.util.Locale.US, "%.8f", av.lat)
+                                lonStr = String.format(java.util.Locale.US, "%.8f", av.lon)
+                                av.alt?.let { altStr = String.format(java.util.Locale.US, "%.2f", it) }
+                                acc = fmt(av.acc)
+                                vm.clearAveraging()
+                            }) { Text("Use ±${fmt(av.acc)} m") }
                             TextButton(onClick = { vm.clearAveraging() }) { Text("Discard") }
                         }
                     }
                 }
             }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-                Button(onClick = { vm.save(commit()) }, enabled = a.lat != 0.0 || a.lon != 0.0) { Text("Save anchor") }
+                val canSave = (latStr.toDoubleOrNull() ?: a.lat) != 0.0 || (lonStr.toDoubleOrNull() ?: a.lon) != 0.0
+                Button(onClick = { vm.save(commit()) }, enabled = canSave) { Text("Save anchor") }
                 if (a.id.isNotEmpty()) OutlinedButton(onClick = { vm.delete(a.id) }) { Text("Delete") }
                 Spacer(Modifier.weight(1f)); TextButton(onClick = { vm.clearAveraging(); vm.edit(null) }) { Text("Cancel") }
             }

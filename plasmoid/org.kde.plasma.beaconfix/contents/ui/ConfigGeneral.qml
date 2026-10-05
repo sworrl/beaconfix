@@ -19,6 +19,7 @@ Kirigami.FormLayout {
     property alias cfg_animatedMap: cineCheck.checked
     property alias cfg_tourMinutes: tourSpin.value
     property alias cfg_spotlightMinutes: spotSpin.value
+    property alias cfg_heatmapOpacity: heatSlider.value
 
     RowLayout {
         Kirigami.FormData.label: "Read state every:"
@@ -29,6 +30,15 @@ Kirigami.FormLayout {
         id: layerCombo
         Kirigami.FormData.label: "Map style:"
         model: ["Dark (OpenStreetMap, night filter)", "Streets (OpenStreetMap)", "Satellite (Esri)", "Topographic (OpenTopoMap)"]
+    }
+    RowLayout {
+        Kirigami.FormData.label: "Heatmap opacity:"
+        QQC2.Slider {
+            id: heatSlider
+            from: 0.10; to: 1.00; stepSize: 0.05
+            implicitWidth: 160
+        }
+        QQC2.Label { text: Math.round(heatSlider.value * 100) + "%" + (Math.abs(heatSlider.value - 0.45) < 0.03 ? " (Default - street detail clear)" : "") }
     }
     QQC2.CheckBox {
         id: placeCheck

@@ -144,6 +144,8 @@ class SettingsViewModel @Inject constructor(private val prefs: Prefs, @Applicati
     fun setHome(text: String) = viewModelScope.launch { prefs.setHomePatterns(text.lines().map { it.trim() }.filter { it.isNotEmpty() }.toSet()) }
     fun setRoutingOrsKey(key: String) = viewModelScope.launch { prefs.setRoutingOrsKey(key.trim()) }
     fun setRoutingGraphhopperKey(key: String) = viewModelScope.launch { prefs.setRoutingGraphhopperKey(key.trim()) }
+    val doomBatteryMode: StateFlow<org.sworrl.beaconfix.data.DoomBatteryMode> = prefs.doomBatteryMode.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), org.sworrl.beaconfix.data.DoomBatteryMode.DEFAULT)
+    fun setDoomBatteryMode(mode: org.sworrl.beaconfix.data.DoomBatteryMode) = viewModelScope.launch { prefs.setDoomBatteryMode(mode) }
     fun setRoutingProvider(provider: String) = viewModelScope.launch { prefs.setRoutingProvider(provider) }
 }
 

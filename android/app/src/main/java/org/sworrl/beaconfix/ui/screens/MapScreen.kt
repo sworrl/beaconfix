@@ -7,6 +7,8 @@ import android.graphics.Color as AColor
 import android.graphics.drawable.BitmapDrawable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
+import org.sworrl.beaconfix.ui.DoomBatteryChip
+import org.sworrl.beaconfix.ui.DoomBatteryDialog
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -27,11 +29,13 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import kotlin.math.roundToInt
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.semantics.contentDescription
@@ -98,6 +102,7 @@ fun MapScreen(
     val ctx = LocalContext.current
     val aps by live.mapAps.collectAsState(); val track by live.phoneTrack.collectAsState(); val desk by live.desktopTrack.collectAsState()
     val views by live.views.collectAsState(); val me by live.phone.collectAsState()
+    val desktopHeatmap by live.desktopHeatmap.collectAsState()
     val anchorsList by anchorsVm.anchors.collectAsState(); val editing by anchorsVm.editing.collectAsState()
     val ranges by live.ranges.collectAsState()
     val flockCameras by live.flockCameras.collectAsState()
@@ -106,8 +111,12 @@ fun MapScreen(
     val isInspectLoading by inspectVm.loading.collectAsState()
     val liveGuardAlert by inspectVm.liveGuardAlert.collectAsState()
     val inspectionSheetState = androidx.compose.material3.rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    val doomBatteryMode by live.doomBatteryMode.collectAsState()
+    var showDoomBatteryDialog by rememberSaveable { mutableStateOf(false) }
     var anchorsLayer by remember { mutableStateOf(true) }
     var heatmapLayer by remember { mutableStateOf(true) }
+    var heatmapOpacity by rememberSaveable { mutableFloatStateOf(0.35f) }
+    LaunchedEffect(heatmapLayer) { if (heatmapLayer) live.loadHeatmap() }
     var camerasLayer by remember { mutableStateOf(true) }
     var circlesLayer by rememberSaveable { mutableStateOf(true) }
     var selectedApBssid by remember { mutableStateOf<String?>(null) }
@@ -142,6 +151,7 @@ fun MapScreen(
     val hubDevices by hubVm.devices.collectAsState()
     DisposableEffect(hubVm) { hubVm.live(true); onDispose { hubVm.live(false) } }
     val devices = remember(views, hubDevices, devicesLayer) { if (devicesLayer) org.sworrl.beaconfix.net.HubLive.merge(views.flatMap { v -> v.devices + (v.location?.takeIf { it.valid }?.let { l -> listOf(org.sworrl.beaconfix.data.api.LinkedDevice(v.desktop.name.ifEmpty { v.desktop.hostname }, "desktop", "", "", l.lat, l.lon, l.accuracy, l.time, l.ageS, l.source, true)) } ?: emptyList()) }.distinctBy { it.device }, hubDevices) else emptyList() }
+    val unsetNodes = remember(devices) { devices.filter { (it.kind == "esp32-node" || it.kind == "node" || it.kind == "mesh") && (it.lat == 0.0 && it.lon == 0.0) } }
     // the RV = the desktop's last known fix (FixDao.lastDesktop(): the desktop track is newest first), when no live desktop position is drawn
     val rvLabel = desk.firstOrNull()?.let { stringResource(R.string.map_rv_pin, ago(it.time)) } ?: ""
     val rvPin = desk.firstOrNull()?.takeIf { devicesLayer && views.none { v -> v.location?.valid == true } }?.let { PlacesOverlay.RvPin(it.lat, it.lon, it.acc, rvLabel) }
@@ -196,30 +206,41 @@ fun MapScreen(
         if (follow && latest != null) m.controller.animateTo(GeoPoint(latest.lat, latest.lon))
     }
     // Traveled routes: road-snapped vehicular tracks and natural footpaths, then the desktop's recent track
-    LaunchedEffect(map, routeSegments, if (routeSegments.isEmpty()) phone else null, desk, heatmapLayer) {
+    LaunchedEffect(map, routeSegments, if (routeSegments.isEmpty()) phone else null, desk, desktopHeatmap, heatmapLayer, heatmapOpacity) {
         val m = map ?: return@LaunchedEffect
-        val (segments, deskSegs) = withContext(Dispatchers.Default) {
-            val s = if (routeSegments.isNotEmpty()) routeSegments.map { seg -> seg.mode to seg.points.map { GeoPoint(it.lat, it.lon) } }
-                else splitIntoSegments(phone).map { org.sworrl.beaconfix.collector.MotionMode.IN_VEHICLE to it }
-            s to splitIntoSegments(desk)
+        val segments = withContext(Dispatchers.Default) {
+            if (routeSegments.isNotEmpty()) routeSegments.map { seg -> seg.mode to seg.points.map { GeoPoint(it.lat, it.lon) } }
+            else splitIntoSegments(phone).map { org.sworrl.beaconfix.collector.MotionMode.IN_VEHICLE to it }
         }
+        val deskSegs = withContext(Dispatchers.Default) { splitIntoSegments(desk) }
+        val deskHeatmapSegs = withContext(Dispatchers.Default) { splitRoutePointsIntoSegments(desktopHeatmap) }
+        
         layers.attribution?.routing = routeSegments.any { s -> s.points.any { it.isSnapped } }
         m.refill(layers.tracks) { out ->
-            // Route Heatmap overlay: ambient heat glow & vibrant core along discrete travel segments
+            // Route Heatmap overlay: smooth ambient heat glow & core along travel routes
+            // Opacity is adjustable so satellite/map imagery and building detail remain completely visible
             if (heatmapLayer) {
-                for ((_, pts) in segments) {
-                    if (pts.size < 2) continue
-                    out.add(Polyline(m).apply {
-                        setPoints(pts)
-                        outlinePaint.color = AColor.parseColor("#33FF9100")
-                        outlinePaint.strokeWidth = 14f
-                    })
-                    out.add(Polyline(m).apply {
-                        setPoints(pts)
-                        outlinePaint.color = AColor.parseColor("#88FFEA00")
-                        outlinePaint.strokeWidth = 5f
-                    })
+                val glowAlpha = (heatmapOpacity * 0.40f * 255).roundToInt().coerceIn(8, 255)
+                val coreAlpha = (heatmapOpacity * 0.85f * 255).roundToInt().coerceIn(16, 255)
+                val glowCol = AColor.argb(glowAlpha, 255, 145, 0)
+                val coreCol = AColor.argb(coreAlpha, 255, 220, 0)
+
+                val drawHeat = { pts: List<GeoPoint> ->
+                    if (pts.size >= 2) {
+                        out.add(Polyline(m).apply {
+                            setPoints(pts)
+                            outlinePaint.color = glowCol
+                            outlinePaint.strokeWidth = 14f
+                        })
+                        out.add(Polyline(m).apply {
+                            setPoints(pts)
+                            outlinePaint.color = coreCol
+                            outlinePaint.strokeWidth = 3.5f
+                        })
+                    }
                 }
+                segments.forEach { drawHeat(it.second) }
+                deskHeatmapSegs.forEach { drawHeat(it) }
             }
 
             // Road-snapped vehicular centerlines and pedestrian footpaths
@@ -229,27 +250,29 @@ fun MapScreen(
                     out.add(Polyline(m).apply {
                         setPoints(pts)
                         outlinePaint.color = AColor.parseColor("#00E5FF")
-                        outlinePaint.strokeWidth = 3.5f
+                        outlinePaint.strokeWidth = 2.8f
                     })
                 } else {
                     out.add(Polyline(m).apply {
                         setPoints(pts)
                         outlinePaint.color = AColor.parseColor("#6CFF8A")
-                        outlinePaint.strokeWidth = 3.5f
+                        outlinePaint.strokeWidth = 2.8f
                         outlinePaint.pathEffect = android.graphics.DashPathEffect(floatArrayOf(10f, 8f), 0f)
                     })
                 }
             }
 
-            // Desktop recent track (segmented cleanly if moved)
-            for (pts in deskSegs) {
-                if (pts.size < 2) continue
-                out.add(Polyline(m).apply {
-                    setPoints(pts)
-                    outlinePaint.color = AColor.parseColor("#FFD166")
-                    outlinePaint.strokeWidth = 4f
-                    outlinePaint.pathEffect = android.graphics.DashPathEffect(floatArrayOf(8f, 6f), 0f)
-                })
+            // Desktop recent track: only drawn when heatmap is disabled, preventing yellow line clutter over buildings
+            if (!heatmapLayer) {
+                for (pts in deskSegs) {
+                    if (pts.size < 2) continue
+                    out.add(Polyline(m).apply {
+                        setPoints(pts)
+                        outlinePaint.color = AColor.parseColor("#FFD166")
+                        outlinePaint.strokeWidth = 3.5f
+                        outlinePaint.pathEffect = android.graphics.DashPathEffect(floatArrayOf(8f, 6f), 0f)
+                    })
+                }
             }
         }
     }
@@ -505,11 +528,24 @@ fun MapScreen(
         m.refill(layers.devices) { out ->
             for (dv in devices) {
                 if (dv.lat == 0.0 && dv.lon == 0.0) continue
-                val gp = GeoPoint(dv.lat, dv.lon); val glyph = if (dv.kind == "android" || dv.kind == "phone") "📱" else "💻"
+                val gp = GeoPoint(dv.lat, dv.lon)
+                val isNode = dv.kind == "esp32-node" || dv.kind == "node" || dv.kind == "mesh"
+                val isBase = dv.role == "base_station" || dv.role == "base"
+                val glyph = when {
+                    isBase -> "🏠"
+                    isNode -> "📡"
+                    dv.kind == "android" || dv.kind == "phone" -> "📱"
+                    dv.kind == "desktop" -> "🖥"
+                    else -> "💻"
+                }
                 val age = dv.ageS?.let { a -> if (a < 90) "now" else if (a < 3600) "${(a / 60).toInt()} min" else "${(a / 3600).toInt()} h" } ?: ""
-                if (dv.acc > 0) out.add(Polygon(m).apply { points = Polygon.pointsAsCircle(gp, dv.acc.coerceIn(5.0, 2000.0)); fillPaint.color = AColor.parseColor("#1AFFD166"); outlinePaint.color = AColor.parseColor("#FFD166"); outlinePaint.strokeWidth = 1.2f })
-                latest?.let { me0 -> val dist = org.sworrl.beaconfix.estimate.Geo.distanceM(me0.lat, me0.lon, dv.lat, dv.lon); if (dist < 2000) out.add(Polyline(m).apply { setPoints(listOf(GeoPoint(me0.lat, me0.lon), gp)); outlinePaint.color = AColor.parseColor("#AAFFD166"); outlinePaint.strokeWidth = 3f; outlinePaint.pathEffect = android.graphics.DashPathEffect(floatArrayOf(12f, 10f), 0f); title = "${dist.toInt()} m to ${dv.device}" }) }
-                out.add(Marker(m).apply { position = gp; setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER); icon = labelIcon(m, cache, glyph, (dv.identityName.ifEmpty { dv.device }) + (if (age.isNotEmpty()) " · $age" else ""), AColor.parseColor(if (dv.online) "#FFD166" else "#9FB0C8"), false, big = true); title = dv.device; snippet = "${dv.kind}${if (dv.identityName.isNotEmpty()) " · ${dv.identityName}" else ""}\n±${dv.acc.toInt()} m · ${dv.source}${if (age.isNotEmpty()) " · $age ago" else ""}${if (dv.beacons > 0) "\nhears ${dv.beacons} beacons" else ""}" })
+                val battInfo = if (dv.battPct >= 0) " · 🔋${dv.battPct}%" else ""
+                val roleInfo = if (isBase) " · Base" else ""
+                val labelText = (dv.identityName.ifEmpty { dv.device }) + roleInfo + battInfo + (if (age.isNotEmpty()) " · $age" else "")
+                val nodeColor = if (isBase) "#FFD166" else if (isNode) "#35D6FF" else if (dv.online) "#7CF2C4" else "#9FB0C8"
+                if (dv.acc > 0) out.add(Polygon(m).apply { points = Polygon.pointsAsCircle(gp, dv.acc.coerceIn(5.0, 2000.0)); fillPaint.color = AColor.parseColor(if (isNode) "#1A35D6FF" else "#1AFFD166"); outlinePaint.color = AColor.parseColor(nodeColor); outlinePaint.strokeWidth = 1.2f })
+                latest?.let { me0 -> val dist = org.sworrl.beaconfix.estimate.Geo.distanceM(me0.lat, me0.lon, dv.lat, dv.lon); if (dist < 2000) out.add(Polyline(m).apply { setPoints(listOf(GeoPoint(me0.lat, me0.lon), gp)); outlinePaint.color = AColor.parseColor(if (isNode) "#AA35D6FF" else "#AAFFD166"); outlinePaint.strokeWidth = 3f; outlinePaint.pathEffect = android.graphics.DashPathEffect(floatArrayOf(12f, 10f), 0f); title = "${dist.toInt()} m to ${dv.device}" }) }
+                out.add(Marker(m).apply { position = gp; setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER); icon = labelIcon(m, cache, glyph, labelText, AColor.parseColor(nodeColor), false, big = true); title = dv.device; snippet = "${dv.kind}${if (dv.identityName.isNotEmpty()) " · ${dv.identityName}" else ""}${if (isBase) " · Base Station" else ""}${if (dv.battPct >= 0) " · Batt: ${dv.battPct}%" else ""}\n±${dv.acc.toInt()} m · ${dv.source}${if (age.isNotEmpty()) " · $age ago" else ""}${if (dv.beacons > 0) "\nhears ${dv.beacons} beacons" else ""}" })
             }
         }
     }
@@ -519,7 +555,14 @@ fun MapScreen(
         m.refill(layers.anchors) { out ->
             if (anchorsLayer) for (an in anchorsList) {
                 val gp = GeoPoint(an.lat, an.lon)
-                out.add(Polygon(m).apply { points = Polygon.pointsAsCircle(gp, an.accM.coerceIn(0.3, 500.0)); fillPaint.color = AColor.parseColor("#22B388FF"); outlinePaint.color = AColor.parseColor("#B388FF"); outlinePaint.strokeWidth = 1.5f })
+                val isRef = an.ref || an.kind == "fixed-point"
+                val ringCol = if (isRef) "#FFD166" else "#B388FF"
+                out.add(Polygon(m).apply {
+                    points = Polygon.pointsAsCircle(gp, an.accM.coerceIn(0.3, 500.0))
+                    fillPaint.color = AColor.parseColor(if (isRef) "#28FFD166" else "#22B388FF")
+                    outlinePaint.color = AColor.parseColor(ringCol)
+                    outlinePaint.strokeWidth = if (isRef) 2.5f else 1.5f
+                })
                 val mk = anchorMarkers.getOrPut(an.id) { Marker(m).apply {
                     isDraggable = true; setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
                     setOnMarkerDragListener(object : Marker.OnMarkerDragListener {
@@ -530,8 +573,11 @@ fun MapScreen(
                     setOnMarkerClickListener { mm, _ -> anchorsVm.anchors.value.firstOrNull { it.id == an.id }?.let { anchorsVm.edit(it) }; mm.showInfoWindow(); true }
                 } }
                 if (an.id !in dragging) mk.position = gp
-                mk.icon = labelIcon(m, cache, "⌖", an.name + (if (an.rv) " ·RV" else ""), AColor.parseColor(if (an.ref) "#FFD166" else "#B388FF"), false, big = true)
-                mk.title = an.name; mk.snippet = "${kindName(an.kind)} · ±${an.accM} m · ${an.source}" + (if (an.bssids.isNotEmpty()) "\n${an.bssids.joinToString(" ")}" else "") + "\nlong-press to drag · tap to edit"
+                val glyph = if (isRef) "⚓" else if (an.kind == "esp32-node") "📡" else "⌖"
+                val badge = if (isRef) " · FIXED REF" else if (an.rv) " · RV" else ""
+                mk.icon = labelIcon(m, cache, glyph, an.name + badge, AColor.parseColor(if (isRef) "#FFD166" else "#B388FF"), false, big = true)
+                mk.title = an.name + (if (isRef) " [Fixed Ground Truth]" else "")
+                mk.snippet = "${kindName(an.kind)} · ±${an.accM} m · ${an.source}" + (if (an.bssids.isNotEmpty()) "\n${an.bssids.joinToString(" ")}" else "") + "\nlong-press to drag · tap to edit"
                 out.add(mk)
             }
         }
@@ -588,16 +634,54 @@ fun MapScreen(
                     if (aps.any { FixGrade.graded(it) }) Text("  " + stringResource(R.string.fit_map_legend) + "  ", style = MaterialTheme.typography.labelSmall)
                 }
             }
-            Row(modifier = Modifier.horizontalScroll(rememberScrollState())) {
+            Row(modifier = Modifier.horizontalScroll(rememberScrollState()), verticalAlignment = Alignment.CenterVertically) {
+                DoomBatteryChip(
+                    mode = doomBatteryMode,
+                    onClick = { showDoomBatteryDialog = true },
+                    modifier = Modifier.padding(end = 6.dp)
+                )
                 FilterChip(selected = labels, onClick = { labels = !labels }, label = { Text("Aa") })
                 FilterChip(selected = devicesLayer, onClick = { devicesLayer = !devicesLayer }, label = { Text("Devices") }, modifier = Modifier.padding(start = 6.dp))
                 MapStyleChip(style, { placesVm.setStyle(it) }, Modifier.padding(start = 6.dp))
                 FilterChip(selected = anchorsLayer, onClick = { anchorsLayer = !anchorsLayer }, label = { Text("⌖") }, modifier = Modifier.padding(start = 6.dp))
-                FilterChip(selected = heatmapLayer, onClick = { heatmapLayer = !heatmapLayer }, label = { Text("Heatmap") }, modifier = Modifier.padding(start = 6.dp))
+                FilterChip(selected = heatmapLayer, onClick = { heatmapLayer = !heatmapLayer }, label = { Text("Heatmap" + if (heatmapLayer) " ${(heatmapOpacity * 100).toInt()}%" else "") }, modifier = Modifier.padding(start = 6.dp))
+                if (heatmapLayer) {
+                    FilterChip(
+                        selected = false,
+                        onClick = {
+                            heatmapOpacity = when {
+                                heatmapOpacity < 0.30f -> 0.40f
+                                heatmapOpacity < 0.55f -> 0.70f
+                                heatmapOpacity < 0.85f -> 1.0f
+                                else -> 0.20f
+                            }
+                        },
+                        label = { Text("Opacity: ${(heatmapOpacity * 100).toInt()}%") },
+                        modifier = Modifier.padding(start = 4.dp)
+                    )
+                }
                 FilterChip(selected = camerasLayer, onClick = { camerasLayer = !camerasLayer }, label = { Text("Cameras") }, modifier = Modifier.padding(start = 6.dp))
                 FilterChip(selected = circlesLayer, onClick = { circlesLayer = !circlesLayer }, label = { Text("Circles") }, modifier = Modifier.padding(start = 6.dp))
             }
             MapFilterRow(filter, { placesVm.setFilter(it) })
+            if (unsetNodes.isNotEmpty()) {
+                Surface(
+                    onClick = {
+                        mapRef?.let { m ->
+                            val target = unsetNodes.first()
+                            anchorsVm.newAt(m.mapCenter.latitude, m.mapCenter.longitude, 1.0, "map-pick", "esp32-node")
+                        }
+                    },
+                    modifier = Modifier.padding(top = 4.dp),
+                    color = MaterialTheme.colorScheme.tertiaryContainer,
+                    shape = MaterialTheme.shapes.small,
+                    tonalElevation = 4.dp
+                ) {
+                    Row(modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Text("📡 ${if (unsetNodes.size == 1) "${unsetNodes.first().device} (Position Unset)" else "${unsetNodes.size} Mesh Nodes Unset"} — Tap to Place Here", style = MaterialTheme.typography.labelSmall, fontWeight = androidx.compose.ui.text.font.FontWeight.Bold, color = MaterialTheme.colorScheme.onTertiaryContainer)
+                    }
+                }
+            }
         }
         RefitOverlay(mapRef, live.refits.events, onTicker = { ticker = it })
         // below map resolution (the ring would be a few pixels): a proximity inset drawn to scale
@@ -613,7 +697,19 @@ fun MapScreen(
                 androidx.compose.material3.DropdownMenuItem(text = { Text("Replay last refit animation") }, onClick = { menu = false; live.replayLastRefit() })
                 androidx.compose.material3.DropdownMenuItem(text = { Text(if (follow) "Stop following" else "Follow my position") }, onClick = { menu = false; follow = !follow })
                 androidx.compose.material3.DropdownMenuItem(text = { Text(if (labels) "Hide names" else "Show names") }, onClick = { menu = false; labels = !labels })
+                if (unsetNodes.isNotEmpty()) {
+                    androidx.compose.material3.DropdownMenuItem(
+                        text = { Text("📡 Place ${unsetNodes.first().device} at map centre") },
+                        onClick = {
+                            menu = false
+                            mapRef?.let { m ->
+                                anchorsVm.newAt(m.mapCenter.latitude, m.mapCenter.longitude, 1.0, "map-pick", "esp32-node")
+                            }
+                        }
+                    )
+                }
                 androidx.compose.material3.DropdownMenuItem(text = { Text("Place an antenna at the map centre") }, onClick = { menu = false; mapRef?.let { m -> anchorsVm.newAt(m.mapCenter.latitude, m.mapCenter.longitude) } })
+                androidx.compose.material3.DropdownMenuItem(text = { Text("⚓ Place Fixed Known Point (Anchor)") }, onClick = { menu = false; mapRef?.let { m -> anchorsVm.newAt(m.mapCenter.latitude, m.mapCenter.longitude, 0.5, "map-pick", "fixed-point") } })
                 androidx.compose.material3.DropdownMenuItem(text = { Text("Place an antenna at my position (GNSS average)") }, onClick = { menu = false; anchorsVm.newAt(0.0, 0.0, 1.0, "gps-average"); anchorsVm.startAveraging() })
                 androidx.compose.material3.DropdownMenuItem(text = { Column { Text(stringResource(R.string.map_prefetch)); if (prefetchTo == null) Text(stringResource(R.string.map_prefetch_needs_control), style = MaterialTheme.typography.labelSmall) } },
                     enabled = prefetchTo != null, onClick = { menu = false; placesVm.prefetch() })
@@ -655,6 +751,17 @@ fun MapScreen(
                 currentLocation = latest?.let { Pair(it.lat, it.lon) },
                 onDone = { inspectVm.stopInspection() },
                 modifier = Modifier.align(Alignment.TopCenter).padding(top = 8.dp)
+            )
+        }
+
+        if (showDoomBatteryDialog) {
+            DoomBatteryDialog(
+                currentMode = doomBatteryMode,
+                onSelectMode = { mode ->
+                    live.setDoomBatteryMode(mode)
+                    showDoomBatteryDialog = false
+                },
+                onDismiss = { showDoomBatteryDialog = false }
             )
         }
     }
@@ -837,7 +944,7 @@ private fun splitIntoSegments(fixes: List<org.sworrl.beaconfix.data.db.FixEntity
                 lastAdded = null
             } else if (lastAdded != null) {
                 val dLast = org.sworrl.beaconfix.estimate.Geo.distanceM(lastAdded.latitude, lastAdded.longitude, f.lat, f.lon)
-                if (dLast < 15.0) {
+                if (dLast < 25.0) {
                     lastFix = f
                     continue
                 }
@@ -852,3 +959,30 @@ private fun splitIntoSegments(fixes: List<org.sworrl.beaconfix.data.db.FixEntity
     return segments
 }
 
+
+private fun splitRoutePointsIntoSegments(fixes: List<org.sworrl.beaconfix.data.api.RoutePointDto>): List<List<org.osmdroid.util.GeoPoint>> {
+    if (fixes.size < 2) return emptyList()
+
+    val segments = mutableListOf<List<org.osmdroid.util.GeoPoint>>()
+    var cur = mutableListOf<org.osmdroid.util.GeoPoint>()
+    var lastAdded: org.osmdroid.util.GeoPoint? = null
+
+    for (f in fixes) {
+        val gp = org.osmdroid.util.GeoPoint(f.lat, f.lon)
+        if (lastAdded != null) {
+            val dist = org.sworrl.beaconfix.estimate.Geo.distanceM(lastAdded.latitude, lastAdded.longitude, f.lat, f.lon)
+            if (dist > 4000.0) {
+                if (cur.size > 1) segments.add(cur)
+                cur = mutableListOf()
+                lastAdded = null
+            } else if (dist < 25.0) {
+                continue
+            }
+        }
+        cur.add(gp)
+        lastAdded = gp
+    }
+
+    if (cur.size > 1) segments.add(cur)
+    return segments
+}

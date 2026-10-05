@@ -102,17 +102,35 @@ class LivePassTracker @Inject constructor(
     private val frames: DashFrameBuffer,
     private val prefs: Prefs,
     private val inspectionManager: InspectionManager,
+    private val espNodeManager: org.sworrl.beaconfix.node.EspNodeManager,
+    private val cameraCache: FlockCameraCache,
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val lock = Mutex()
     private val tracker = LiveTracker()
     private var fetched: List<PassCamera> = emptyList()
+    private var cachedCameras: List<PassCamera> = emptyList()
     private var fetchedAt = 0L; private var fetchedLat = 0.0; private var fetchedLon = 0.0
     @Volatile private var fetching = false
     private val stillFetched = HashSet<String>()
     private val webcamStill = HashMap<String, LocalImage>()
     private var prev: RouteFix? = null
     private var lastDrivingSaved = 0L
+
+    init {
+        scope.launch {
+            cachedCameras = cameraCache.getPassCameras()
+        }
+        scope.launch {
+            desktopLive.views.collect { views ->
+                val fc = views.values.flatMap { it.flockCameras }.filter { !it.stale }
+                if (fc.isNotEmpty()) {
+                    cameraCache.updateCameras(fc)
+                    cachedCameras = cameraCache.getPassCameras()
+                }
+            }
+        }
+    }
 
     /** A fix from the collector or the dash cam. Cheap: the work runs on a background dispatcher. */
     fun onLocation(loc: Location) {
@@ -132,6 +150,17 @@ class LivePassTracker @Inject constructor(
         if (p0 != null && fix.timeMs <= p0.timeMs) return
         prev = fix
         noteDriving(p0, fix)
+
+        // Stream high-precision GPS and travel/motion kinematics to connected Heltec / ESP32 node
+        espNodeManager.sendGpsFix(
+            lat = fix.lat,
+            lon = fix.lon,
+            accM = (fix.acc ?: 5.0).toFloat(),
+            speedMps = (fix.speedMps ?: -1.0).toFloat(),
+            headingDeg = (fix.bearingDeg ?: -1.0).toFloat(),
+            altM = 0.0f
+        )
+
         ensureCameras(fix)
         // the desktop's neighbourhood: ±0.004° lat, ±0.005° lon
         val nearby = cameras().filter { abs(it.lat - fix.lat) <= 0.004 && abs(it.lon - fix.lon) <= 0.005 }
@@ -149,6 +178,18 @@ class LivePassTracker @Inject constructor(
             if (a.cam.type == "webcam" && a.cam.webcam != null && stillFetched.add(a.cam.id) && prefs.webcamStills.first()) {
                 val cam = a.cam
                 scope.launch { fetchWebcam(cam)?.let { img -> lock.withLock { webcamStill[cam.id] = img } } }
+            }
+            // Send approaching proximity alert to node when within 150m of ALPR camera
+            for (c in nearby) {
+                if (c.type == "alpr") {
+                    val dist = PassDetector.distanceM(c.lat, c.lon, fix.lat, fix.lon)
+                    if (dist <= 150.0) {
+                        val op = c.operator.ifBlank { c.manufacturer.ifBlank { "Flock Safety" } }
+                        val mdl = c.model.ifBlank { if (op.contains("Flock", true)) "Falcon" else "ALPR" }
+                        espNodeManager.sendAlprProximity(op, mdl, dist.toFloat())
+                        break
+                    }
+                }
             }
         }
         for (p in done) { stillFetched.remove(p.camera.id); emit(p) }
@@ -171,7 +212,27 @@ class LivePassTracker @Inject constructor(
         val row = PlateEvents.fromPass(p, if (dashcam) PlateEvents.SRC_DASHCAM else PlateEvents.SRC_PHONE_LIVE, repo.activePlate().orEmpty(),
             plateInferred = true, device = repo.deviceName, leaky = leaky != null, leakyMatch = leaky, now = System.currentTimeMillis(), extraMetrics = extra)
         repo.recordLocal(row, images)
-        if (p.cameraType == "alpr") HibfWatcher.nudge(ctx)       // a Flock / leaky pass shortens the watch interval
+        if (p.cameraType == "alpr") {
+            HibfWatcher.nudge(ctx) // a Flock / leaky pass shortens the watch interval
+
+            // Send ALPR alert to Heltec node -> triggers OLED splash screen & alert LED
+            val op = p.camera.operator.ifBlank { p.camera.manufacturer.ifBlank { "Flock Safety" } }
+            val mdl = p.camera.model.ifBlank { if (op.contains("Flock", true)) "Falcon" else "ALPR" }
+            val dist = p.distanceM.toFloat()
+            val conf = p.confidence.coerceIn(1, 100)
+            val facingInt = if (p.facing == true) 1 else if (p.facing == false) -1 else 0
+            val spd = (p.speedKmh ?: ((prev?.speedMps ?: 0.0) * 3.6)).toFloat()
+            espNodeManager.sendAlprAlert(
+                operator = op,
+                model = mdl,
+                distanceM = dist,
+                confidence = conf,
+                facing = facingInt,
+                speedKmh = spd,
+                lat = p.camera.lat,
+                lon = p.camera.lon
+            )
+        }
     }
 
     /** §3.3: WebP lossless at the analysed resolution (Android 11+); PNG — also lossless — on older phones. */
@@ -212,12 +273,11 @@ class LivePassTracker @Inject constructor(
         if (v * 3.6 > DRIVING_KMH && fix.timeMs - lastDrivingSaved > 60_000L) { lastDrivingSaved = fix.timeMs; prefs.setLastDrivingAt(fix.timeMs) }
     }
 
-    /** The desktop's cameras around us (refreshed every 5 km / 30 min) plus whatever the open screens loaded. */
+    /** The desktop's cameras around us (refreshed every 5 km / 30 min) plus whatever the open screens loaded and persistent cache. */
     private fun cameras(): List<PassCamera> {
         // a stale camera (its source no longer confirms it) keeps its past passes but gets no new ones
         val shown = desktopLive.views.value.values.flatMap { it.flockCameras }.filter { !it.stale }.map { PlateEvents.camera(it) }
-        if (shown.isEmpty()) return fetched
-        return (fetched + shown).distinctBy { it.id }
+        return (fetched + shown + cachedCameras).distinctBy { it.id }
     }
 
     private fun ensureCameras(fix: RouteFix) {
@@ -232,6 +292,8 @@ class LivePassTracker @Inject constructor(
                     val r = runCatching { desktops.api(d).flockCameras(auth, fix.lat, fix.lon, FETCH_KM, 3000) }.getOrNull() ?: continue
                     val list = r.body()?.cameras ?: continue
                     lock.withLock { fetched = list.filter { !it.stale }.map { PlateEvents.camera(it) }; fetchedAt = fix.timeMs; fetchedLat = fix.lat; fetchedLon = fix.lon }
+                    cameraCache.updateCameras(list)
+                    cachedCameras = cameraCache.getPassCameras()
                     ok = true
                     break
                 }

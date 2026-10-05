@@ -52,10 +52,16 @@ object PlateEvents {
         val tags = c.tags ?: JsonObject(emptyMap())
         val type = c.cameraType?.lowercase()?.takeIf { it in PassDetector.TYPES } ?: PassDetector.classifyCamera(c.model, c.source, c.id, tags)
         val webcam = c.webcam?.takeIf { it.startsWith("http://") || it.startsWith("https://") } ?: PassDetector.webcamUrl(tags).ifEmpty { null }
+        val mfg = c.manufacturer?.takeIf { it.isNotBlank() }
+            ?: (tags["manufacturer"] as? JsonPrimitive)?.contentOrNull?.takeIf { it.isNotBlank() }
+            ?: ""
+        val op = c.operatorName?.takeIf { it.isNotBlank() }
+            ?: (tags["operator"] as? JsonPrimitive)?.contentOrNull?.takeIf { it.isNotBlank() }
+            ?: ""
         // the state (§4.4 matching): addr:state, else ", TX" at the end of the notes (as the desktop does)
         val st = (tags["addr:state"] as? JsonPrimitive)?.contentOrNull ?: Hibf.stateFromText(c.notes)
         val withState = if (st.isNullOrEmpty() || tags.containsKey("addr:state")) tags else JsonObject(tags + ("_state" to JsonPrimitive(st)))
-        return PassCamera(c.id, c.lat, c.lon, c.model, c.operatorName, c.source, c.direction, c.detectionMethod, c.notes, type, webcam, withState, c.confidence, c.manufacturer, c.trust)
+        return PassCamera(c.id, c.lat, c.lon, c.model, op, c.source, c.direction, c.detectionMethod, c.notes, type, webcam, withState, c.confidence, mfg, c.trust)
     }
 
     /** The camera's two-letter state, when known (§4.4). */

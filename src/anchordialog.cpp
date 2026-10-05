@@ -16,6 +16,8 @@
 #include <algorithm>
 
 static const char *const kKindLabels[][2] = {
+    {"fixed-point", "Fixed known point (anchor for triangulation)"},
+    {"esp32-node", "ESP32 monitor node (telemetry anchor)"},
     {"this-computer", "This computer's antenna (the RTT responder / BLE advertiser)"},
     {"wifi-ap", "A Wi-Fi access point (router, mesh node)"},
     {"rtt-responder", "Another Wi-Fi RTT responder"},

@@ -6,6 +6,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.os.Build
+import android.os.PowerManager
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleService
@@ -16,11 +17,14 @@ import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import org.sworrl.beaconfix.data.DoomBatteryMode
 import org.sworrl.beaconfix.data.Prefs
 import org.sworrl.beaconfix.estimate.ScanSample
 import javax.inject.Inject
@@ -84,16 +88,34 @@ class CollectorService : LifecycleService() {
     @Inject lateinit var notifier: org.sworrl.beaconfix.widget.StatusNotifier
     @Inject lateinit var ranging: org.sworrl.beaconfix.ranging.RangingRepository
     @Inject lateinit var hubPresence: org.sworrl.beaconfix.net.HubPresence
+    @Inject lateinit var espNodeManager: org.sworrl.beaconfix.node.EspNodeManager
+    @Inject lateinit var db: org.sworrl.beaconfix.data.db.AppDatabase
     private var loop: Job? = null
     private var locationJob: Job? = null
     private var motionStatusJob: Job? = null
+    private var collectorWake: PowerManager.WakeLock? = null
+    private var doomModeJob: Job? = null
 
     override fun onCreate() {
         super.onCreate()
+        val pm = getSystemService(PowerManager::class.java)
+        collectorWake = pm?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "beaconfix:doom_collector")?.apply { setReferenceCounted(false) }
+        doomModeJob = lifecycleScope.launch {
+            combine(prefs.doomBatteryMode, prefs.collectorOn) { mode, on -> mode to on }
+                .distinctUntilChanged()
+                .collect { (mode, on) ->
+                    if (mode.holdWakeLock && on) {
+                        if (collectorWake?.isHeld == false) collectorWake?.acquire()
+                    } else {
+                        if (collectorWake?.isHeld == true) collectorWake?.release()
+                    }
+                }
+        }
         // the pref drives the loop; the notification (and the service) stay either way
         lifecycleScope.launch { prefs.collectorOn.distinctUntilChanged().collect { on -> if (on) startLoop() else stopLoop() } }
         lifecycleScope.launch { prefs.statusNotification.distinctUntilChanged().collect { show -> if (!show && !status.state.value.survey) stopSelf() } }
         lifecycleScope.launch { ranging.presence(true) }
+        espNodeManager.startAutoConnect()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -127,11 +149,28 @@ class CollectorService : LifecycleService() {
         if (loop == null) loop = lifecycleScope.launch { run() }
         if (locationJob == null) {
             locationJob = lifecycleScope.launch {
-                runCatching {
-                    location.updates(intervalMs = 4000L, minDistanceM = 3f).collect { loc ->
-                        motion.onLocationUpdate(loc)
-                        hubPresence.offer(loc.latitude, loc.longitude, loc.accuracy.toDouble(), loc.time, "gps", if (loc.hasSpeed()) loc.speed else null)
-                        livePasses.onLocation(loc)      // docs/SIGHTINGS.md §2: phone-live camera passes
+                prefs.doomBatteryMode.distinctUntilChanged().collectLatest { doomMode ->
+                    runCatching {
+                        location.updates(intervalMs = doomMode.gpsIntervalMs, minDistanceM = doomMode.gpsMinDistanceM).collect { loc ->
+                            motion.onLocationUpdate(loc)
+                            hubPresence.offer(loc.latitude, loc.longitude, loc.accuracy.toDouble(), loc.time, "gps", if (loc.hasSpeed()) loc.speed else null)
+                            livePasses.onLocation(loc)      // docs/SIGHTINGS.md §2: phone-live camera passes
+
+                            // Persist live GPS fixes into Room database so phone position and track update in real time while driving
+                            if (loc.latitude != 0.0 && loc.longitude != 0.0 && (!loc.hasAccuracy() || loc.accuracy <= 150f)) {
+                                val now = System.currentTimeMillis()
+                                val fixTime = loc.time.takeIf { it > 0 } ?: now
+                                val fix = org.sworrl.beaconfix.data.db.FixEntity(
+                                    time = fixTime,
+                                    lat = loc.latitude,
+                                    lon = loc.longitude,
+                                    acc = if (loc.hasAccuracy()) loc.accuracy.toDouble() else 10.0,
+                                    source = "phone-gps",
+                                    provider = loc.provider ?: "fused"
+                                )
+                                db.fixes().insert(fix)
+                            }
+                        }
                     }
                 }
             }
@@ -156,6 +195,7 @@ class CollectorService : LifecycleService() {
         loop?.cancel(); loop = null
         locationJob?.cancel(); locationJob = null
         motionStatusJob?.cancel(); motionStatusJob = null
+        if (collectorWake?.isHeld == true) collectorWake?.release()
         status.update { it.copy(running = false, survey = false) }
         refreshNotification()
     }
@@ -165,10 +205,17 @@ class CollectorService : LifecycleService() {
         while (currentCoroutineContext().isActive) {
             val survey = status.state.value.survey
             val motionStatus = motion.status.value
+            val doomMode = prefs.doomBatteryMode.first()
             val interval = if (survey) {
                 if (scanner.throttlingOn()) 30_000L else 4_000L
             } else {
-                motionStatus.suggestedIntervalMs
+                when (doomMode) {
+                    DoomBatteryMode.IM_TOO_YOUNG_TO_DIE -> if (motionStatus.mode == MotionMode.STATIONARY) doomMode.wifiStationaryIntervalMs else doomMode.wifiMovingIntervalMs
+                    DoomBatteryMode.HEY_NOT_TOO_ROUGH -> if (motionStatus.mode == MotionMode.STATIONARY) doomMode.wifiStationaryIntervalMs else doomMode.wifiMovingIntervalMs
+                    DoomBatteryMode.HURT_ME_PLENTY -> motionStatus.suggestedIntervalMs
+                    DoomBatteryMode.ULTRA_VIOLENCE -> if (motionStatus.mode == MotionMode.STATIONARY) doomMode.wifiStationaryIntervalMs else doomMode.wifiMovingIntervalMs
+                    DoomBatteryMode.NIGHTMARE -> if (scanner.throttlingOn()) 10_000L else doomMode.wifiMovingIntervalMs
+                }
             }
             try {
                 recorder.scanAndRecord(fresh = true)
@@ -198,8 +245,11 @@ class CollectorService : LifecycleService() {
         loop?.cancel(); loop = null
         locationJob?.cancel(); locationJob = null
         motionStatusJob?.cancel(); motionStatusJob = null
+        doomModeJob?.cancel(); doomModeJob = null
+        if (collectorWake?.isHeld == true) collectorWake?.release()
         status.update { it.copy(presence = false, running = false, survey = false) }
         runCatching { ranging.presence(false) }
+        runCatching { espNodeManager.stopAutoConnect() }
         widgets.touch("collector")
         super.onDestroy()
     }

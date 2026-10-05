@@ -149,7 +149,7 @@ data class ObservationDto(val bssid: String, val ssid: String = "", val dbm: Int
 @Serializable data class PeerDto(val host: String = "", val port: Int = 47822, val name: String = "", val hostname: String = "", val kind: String = "", val id: String = "", val version: String = "", val pairing: Boolean = false, val features: List<String> = emptyList())
 @Serializable data class PeersDto(val peers: List<PeerDto> = emptyList())
 @Serializable data class HelloIdentity(val id: String = "", val name: String = "")
-@Serializable data class LinkedDevice(val device: String = "", val kind: String = "", val identityId: String = "", val identityName: String = "", val lat: Double = 0.0, val lon: Double = 0.0, val acc: Double = -1.0, val time: String = "", val ageS: Double? = null, val source: String = "", val online: Boolean = true, val beacons: Int = 0)
+@Serializable data class LinkedDevice(val device: String = "", val kind: String = "", val identityId: String = "", val identityName: String = "", val lat: Double = 0.0, val lon: Double = 0.0, val acc: Double = -1.0, val time: String = "", val ageS: Double? = null, val source: String = "", val online: Boolean = true, val beacons: Int = 0, val role: String = "", val battPct: Int = -1)
 @Serializable data class DevicesPositions(val devices: List<LinkedDevice> = emptyList())
 @Serializable data class DevicePositionBody(val lat: Double, val lon: Double, val acc: Double, val time: String, val beacons: Int = 0, val source: String = "gps")
 

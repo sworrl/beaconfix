@@ -68,6 +68,15 @@ private:
     QCheckBox *m_apiEnabled; QSpinBox *m_apiPort; QLabel *m_apiStatus; QPushButton *m_linkBtn;
     QTableWidget *m_pendingTable, *m_devTable, *m_knownTable; QPlainTextEdit *m_accessLog; class QTimer *m_devTimer; QCheckBox *m_knownOnly;
     QTableWidget *m_linkTable = nullptr;
+    QWidget *m_devicesTab = nullptr;
+    // Nodes (Mesh Network & Hardware Nodes)
+    QWidget *m_nodesTab = nullptr;
+    QTableWidget *m_nodesTable = nullptr;
+    QLabel *m_nodesStatusBanner = nullptr;
+    QLabel *m_nodesSummaryLabel = nullptr;
+    QPlainTextEdit *m_nodesEventLog = nullptr;
+    QWidget *buildNodes();
+    void refreshNodes();
     // System (OS integration)
     QCheckBox *m_osTz, *m_osGeo, *m_osNight, *m_osLocale; QLabel *m_osStatus;
     // Identity

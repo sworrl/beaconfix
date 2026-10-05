@@ -19,6 +19,7 @@
 #include <QStringList>
 #include <QTimer>
 #include <QRegularExpression>
+#include <QUdpSocket>
 
 struct Fix {
     bool      valid = false;
@@ -169,6 +170,44 @@ struct DevicePos {
     QDateTime time, lastSeen;
     int beacons = 0;
     bool online = false;
+    QJsonObject toJson() const;
+};
+
+// ESP32 and Heltec LoRa mesh nodes: monitor mode status, battery telemetry, and placement
+struct MeshNodeInfo {
+    QString   name;
+    QString   mac;
+    QString   role = QStringLiteral("mobile"); // "base_station" or "mobile"
+    QString   fwVersion = QStringLiteral("3.10.0"); // Firmware release version
+    int       battMv = 0;
+    int       battPct = -1;
+    QString   battState;                      // "full", "discharging", "charging", "absent"
+    bool      charging = false;
+    int       battMah = 240;                  // battery volume / capacity in mAh (default 240 for Heltec V3)
+    int       estRuntimeMins = 0;             // estimated battery runtime in minutes
+    int       hops = 0;
+    QString   viaNode;                        // Intermediate relay node name (e.g. "ObsidianCheetahNavi2717")
+    QString   prevHopMac;                     // Last hop transmitter MAC
+    QString   routePath;                      // Route path (e.g. "Direct", "via ObsidianCheetahNavi2717")
+    int       rssi = 0;
+    int       pps = 0;
+    QDateTime lastSeen;
+    bool      online = false;
+    bool      hasLocation = false;
+    double    lat = 0, lon = 0, accM = 1.0;
+    QString   anchorId;
+    QString   attachedDevice;                 // Assigned follow device name (e.g. "Pixel 8 Pro", or empty)
+    bool      following = false;              // True if actively following attached device GPS
+    QDateTime lastGpsSync;                    // Last GPS injection timestamp
+    bool      antennaDetected = true;         // LoRa 915MHz antenna hardware presence
+    bool      txInhibited = false;            // +22dBm LoRa PA transmit inhibited for protection
+    int       ambientRssi = -110;             // Ambient RF floor in dBm
+    bool      traveling = false;              // Moving vs stationary status
+    double    speedKmh = -1.0;                // Live traveling speed in km/h
+    double    headingDeg = -1.0;              // Traveling heading course in degrees
+    bool      isUsb = false;                  // Directly attached to host USB
+    QString   usbPort;                        // Local serial port (e.g. "/dev/ttyUSB0")
+    QString   transport = QStringLiteral("mesh"); // "usb", "mesh", "usb_mesh_dual", "ble"
     QJsonObject toJson() const;
 };
 
@@ -463,6 +502,21 @@ public:
     QJsonArray linkedDevices() const;
     QJsonArray apsJson() const;                          // the beacons heard now, as in StateJson "aps" (GET /api/v1/aps pages it)
     QList<DevicePos> devicePositions() const { return m_devicePos.values(); }
+    // ESP32 and Heltec LoRa mesh nodes
+    QList<MeshNodeInfo> meshNodes() const;
+    QJsonArray meshNodesJson() const;
+    QList<MeshNodeInfo> unsetNodes() const;
+    QJsonArray unsetNodesJson() const;
+    bool placeMeshNode(const QString &name, double lat, double lon, double accM = 1.0);
+    bool setNodeBatteryCapacity(const QString &name, int mah);
+    int  nodeBatteryCapacity(const QString &name) const;
+    bool attachNodeToDevice(const QString &name, const QString &deviceName);
+    bool detachNode(const QString &name);
+    QString nodeAttachedDevice(const QString &name) const;
+    void injectNodeGps(const QString &name, double lat, double lon, double accM = 5.0);
+    QJsonObject generateNameplate(const QString &name = QString(), int units = 4, bool shortMode = false, const QString &mac = QString());
+    QJsonObject mintMeshNode(const QString &customName = QString(), const QString &role = QStringLiteral("mobile"), int units = 4, bool shortMode = false, const QString &mac = QString());
+    QJsonArray listNameplates() const;
     void    noteDevicePosition(const QString &device, const QString &kind, double lat, double lon, double acc, const QDateTime &time, const QString &source, int beacons,
                                const QString &identityId = QString(), const QString &identityName = QString(), const QString &place = QString());
     void    noteDeviceSeen(const QString &device, const QString &kind = QString());
@@ -584,6 +638,7 @@ signals:
     void probeStarted();
     void probeFinished(bool ok, const QString &message);
     void scanUpdated();
+    void meshNodesChanged();
     void poisUpdated();
     void flockCamerasUpdated();
     void cameraPassed(const QString &encounterJson);      // a new plate event worth an alert (JSON: the plate_events row)
@@ -692,6 +747,12 @@ private:
     bool tryInternal(const QList<AccessPoint> &usable);
     QHash<QString, int> apFlags() const;    // bit0 home, bit1 travelling, bit2 ignored, per known BSSID
     int apFlag(const QString &bssid) const;  // the same for one BSSID (saveRecord: no pass over every record)
+    // Mesh Nodes
+    QUdpSocket *m_nodeUdp = nullptr;
+    QHash<QString, MeshNodeInfo> m_meshNodes;
+    QTimer m_meshUpdateTimer;
+    void initMeshUdp();
+    void processMeshPacket(const QByteArray &data, const QHostAddress &sender);
     // Anchors
     QList<BfAnchor> m_anchors;
     QHash<QString, BfAnchor> m_pins;         // BSSID → anchor

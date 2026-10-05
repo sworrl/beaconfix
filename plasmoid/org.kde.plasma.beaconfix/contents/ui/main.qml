@@ -43,6 +43,8 @@ PlasmoidItem {
     property var    track:    []
     property var    knownDevices: []
     property var    linkedDevices: []
+    property var    meshNodes: []
+    property var    unsetNodes: []
     // Surveyed antenna anchors: the desktop's list merged with ones placed in this widget that the
     // desktop has not stored yet (kept in the widget config and pushed as soon as it supports anchors).
     property var    antennaAnchors: []
@@ -188,6 +190,8 @@ PlasmoidItem {
                 root.knownDevices = d.knownDevices || []
                 var ldj = JSON.stringify(d.linkedDevices || [])
                 if (ldj !== root._linkedJson) { root._linkedJson = ldj; root.linkedDevices = d.linkedDevices || [] }
+                root.meshNodes = d.meshNodes || []
+                root.unsetNodes = d.unsetNodes || []
                 root.anchorsSupported = (d.features || []).indexOf("anchors") >= 0 || d.anchors !== undefined
                 var anj = JSON.stringify(d.anchors || [])
                 if (anj !== root._anchorsJson) { root._anchorsJson = anj; root._deskAnchors = d.anchors || [] }

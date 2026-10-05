@@ -38,8 +38,8 @@ android {
         applicationId = "org.sworrl.beaconfix"
         minSdk = 26
         targetSdk = 35
-        versionCode = 9
-        versionName = "1.6.0"
+        versionCode = 10
+        versionName = "3.10.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables { useSupportLibrary = true }
         // The hub a fresh install assumes before enrolment (an invite carries the real one). Set yours outside the repo:
