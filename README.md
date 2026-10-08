@@ -34,9 +34,9 @@ your devices unless you point it at your own hub.
   for AMBER / Silver / Blue alerts.
 - **Camera-avoidance routing** — routes that steer around ALPR camera cones (OpenRouteService or
   GraphHopper, with your own free API key).
-- **LoRa mesh and ESP32 radio nodes**: Heltec V3 and ESP32-S3 hardware monitors sniffing Wi-Fi deauth
-  frames, rogue probe requests, and surveillance beacons in promiscuous mode; multi-hop LoRa mesh
-  relaying telemetry, OLED trip dashboards, and Ed25519-signed OTA updates.
+- **ESP32 and Heltec V3 radio nodes**: small boards that watch Wi-Fi (probes, beacons, deauths) and BLE in
+  promiscuous mode and mesh what they hear back to you over ESP-NOW (and LoRa on the Heltec). OTA updates are
+  signed with your own key.
 - **Your devices, linked in seconds** — QR or LAN discovery with Bluetooth-style numeric comparison;
   nothing to type. Optional hub over WireGuard with an end-to-end encrypted API (X25519 +
   ChaCha20-Poly1305).
@@ -87,19 +87,43 @@ over your VPN only. See [deploy/README.md](deploy/README.md) and [docs/HUB.md](d
   [docs/RANGING.md](docs/RANGING.md) §6.
 - **Raspberry Pi agent** — a GPS HAT as a precise position witness, BLE radio and NTP server:
   `agent/install-on-pi.sh <user>@<pi>`. [docs/AGENT.md](docs/AGENT.md).
-- **Heltec V3 / ESP32-S3 LoRa mesh node**: an off-grid RF surveillance detector and gateway. Sniffs 802.11
-  monitor frames and BLE beacons while meshing telemetry back to your desktop or Android phone over LoRa or USB.
-  Includes an OLED trip dashboard, adaptive battery SoC learning algorithms (compensating for radio load sag,
-  tracking cell degradation cycles, and training true voltage limits), and Ed25519-signed OTA updates: `tools/flash_heltec_v3.sh`.
+- **ESP32 / Heltec V3 mesh nodes**: `tools/flash_esp32.sh` or `tools/flash_heltec_v3.sh` with the board on USB.
+  See [Mesh nodes](#mesh-nodes) below.
 
-### Hardware Node Battery Training & Diagnostics
-Battery-equipped nodes (Heltec LoRa V3 with 3.7V LiPo or standalone ESP32 monitor nodes wired to vape cells) run an adaptive learning engine that refines State of Charge (% SoC) accuracy across operational cycles:
-- **Radio Load-Sag Filtering**: An Exponential Moving Average filter eliminates momentary voltage drops caused by 150–250 mA LoRa and Wi-Fi transmit bursts.
-- **Learned Voltage Curves**: Discovers actual saturation ceilings ($V_{max}$, 4120–4260 mV) and discharge knee cutoffs ($V_{min}$, 3150–3500 mV) per cell over time instead of relying on generic lookup tables.
-- **Cycle & Runtime Tracking**: Tracks fractional Depth-of-Discharge cycles and active runtime, persisted to ESP32 NVS flash with wear-leveling rate limits.
-- **Serial Commands & Companion UI**:
-  - `batt stats` — returns detailed JSON with learned $V_{min}$, $V_{max}$, nominal voltage, cumulative cycles, and training confidence percentage.
-  - `batt reset` — resets learned calibration curves and cycle stats to defaults (also available via the **Reset Battery Stats** button in the Android companion app).
+## Mesh nodes
+
+The nodes sniff Wi-Fi and BLE and pass what they hear along an ESP-NOW mesh (plus LoRa on the Heltec V3). Any
+node that has a USB or BLE client acts as the gateway for the rest, so you only need one of them within reach.
+
+How the desktop hears them:
+
+- **USB**: plug one in. The `beaconfix-esp32-bridge` user service (`tools/esp32_autolink.py`) finds it.
+- **BLE**: the same service links to up to 4 nodes in Bluetooth range (needs `python3-bleak`; `--no-ble` turns
+  it off). The Android app links over BLE too and relays what it hears onto the LAN.
+- **WiFi**: a node on your WiFi broadcasts on UDP 47824. A node that isn't on WiFi still shows up as present
+  when the desktop's WiFi scan sees its access point (the SSID is the node's name).
+
+A node goes offline after 2 minutes of silence.
+
+### Firmware signing keys
+
+Each install signs its own firmware. The first time you run a flash script (or `tools/sign_firmware.py --init`)
+it makes an ECDSA P-256 keypair in `tools/keys/` and writes the public half into `firmware/*/FwPublicKey.h`.
+Neither is committed. Boards you flash after that only take OTA updates signed with your key, and the
+signing step refuses a binary that was built for a different key.
+
+Back up `tools/keys/firmware_sign.key`. If you lose it, the boards you flashed need USB to take a new one.
+
+OTA without USB: join the node's open access point (its name) and send the signed image to its web server,
+`curl -F update=@firmware.bin -F signature=@firmware.bin.sig http://192.168.4.1/update`, or use
+`tools/mesh_flash.py` through a USB-connected node to reach the rest of the mesh.
+
+### Battery
+
+Battery nodes (a Heltec V3 with its LiPo, or an ESP32 wired to a cell) learn their own empty and full voltages
+over a few charge cycles instead of using a stock table, and filter out the dips from radio transmits. Boards
+with no battery say so, and the apps show "USB power" for them. Serial or BLE commands: `batt stats` shows what
+it has learned so far, `batt reset` starts over (also a button in the Android app).
 
 ## How it gets a fix
 
@@ -187,9 +211,10 @@ KWin Night Light follows your position, and locale hints are exposed to other wi
 | CLI | `beaconfix --help` |
 | Android app `org.sworrl.beaconfix` | [android/README.md](android/README.md) |
 | `firmware/heltec_v3/` | Heltec WiFi LoRa 32 V3 firmware: LoRa mesh, promiscuous Wi-Fi, BLE scanner, OLED dashboard |
-| `firmware/esp32_node/` | ESP32-S3 node firmware: Wi-Fi monitor, BLE surveillance sniffing, signed mesh OTA |
-| `tools/esp32_autolink.py` | auto-detection daemon bridging USB serial nodes and LoRa mesh to the BeaconFix API |
-| `tools/mesh_flash.py` | over-the-air firmware distributor with Ed25519 cryptographic chunk signing |
+| `firmware/esp32_node/` | ESP32 node firmware: Wi-Fi monitor, BLE scanner, ESP-NOW mesh, signed OTA |
+| `tools/esp32_autolink.py` | the bridge service: USB and BLE links to nodes, relayed to the desktop on UDP 47824 |
+| `tools/sign_firmware.py` | makes your firmware signing key (`--init`), signs and verifies images |
+| `tools/mesh_flash.py` | sends a signed image over the mesh through a USB-connected node |
 | Pi agent | [docs/AGENT.md](docs/AGENT.md) |
 | `tools/train-plate-detector/` | a clean (MIT code + CC BY data) retraining pipeline for the plate detector |
 

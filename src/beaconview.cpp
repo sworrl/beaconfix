@@ -2440,7 +2440,7 @@ void BeaconView::contextMenuEvent(QContextMenuEvent *e)
         for (const auto &n : allNodes) {
             QString label = n.name;
             if (!n.hasLocation) label += QStringLiteral(" (unset)");
-            if (n.battPct >= 0) label += QStringLiteral(" · %1%🔋").arg(n.battPct);
+            if (n.hasBattery() && n.battPct >= 0) label += QStringLiteral(" · %1%🔋").arg(n.battPct);
             if (n.role == QLatin1String("base_station")) label += QStringLiteral(" [Base]");
             nodeSub->addAction(label, this, [this, n, lat, lon] {
                 m_loc->placeMeshNode(n.name, lat, lon);
@@ -2660,24 +2660,24 @@ void BeaconView::drawAnchors(QPainter &p)
         p.setPen(QPen(Qt::white, 1)); p.setBrush(Qt::NoBrush); p.drawPath(d);
         if (a.ref) { p.setPen(QPen(col, 1.4)); p.drawEllipse(at, 11, 11); }
         if (a.headingAssumed) { p.setFont(small); p.setPen(C_TRAVEL); p.drawText(QRectF(at.x() + 7, at.y() - 16, 14, 14), Qt::AlignCenter, QStringLiteral("?")); }
+        // The mesh node behind an esp32-node anchor, if we've heard of it
+        MeshNodeInfo node;
+        bool haveNode = false;
         if (a.kind == QLatin1String("esp32-node")) {
-            int battPct = -1;
-            int battMah = 240;
-            int estMins = 0;
-            bool isBase = a.name.contains(QLatin1String("Master"), Qt::CaseInsensitive);
             for (const auto &n : m_loc->meshNodes()) {
-                if (n.name == a.name || a.id == (QStringLiteral("esp32-") + n.name.toLower())) {
-                    battPct = n.battPct;
-                    battMah = n.battMah;
-                    estMins = n.estRuntimeMins;
-                    if (n.role == QLatin1String("base_station")) isBase = true;
-                    break;
-                }
+                if (n.name == a.name || a.id == (QStringLiteral("esp32-") + n.name.toLower())) { node = n; haveNode = true; break; }
             }
+        }
+        if (a.kind == QLatin1String("esp32-node")) {
+            const int battPct = haveNode && node.hasBattery() ? node.battPct : -1;
+            const int estMins = haveNode ? node.estRuntimeMins : 0;
+            const bool isBase = haveNode && node.role == QLatin1String("base_station");   // names are random words, not roles
             QFont emoji = font(); emoji.setPointSizeF(font().pointSizeF() * 1.15);
             p.setFont(emoji);
             p.setPen(Qt::white);
+            p.setOpacity(haveNode && node.online ? 1.0 : 0.45);
             p.drawText(QRectF(at.x() - 12, at.y() - 24, 24, 24), Qt::AlignCenter, isBase ? QStringLiteral("🏠") : QStringLiteral("📡"));
+            p.setOpacity(1.0);
             if (battPct >= 0) {
                 p.setFont(small);
                 p.setPen(battPct > 20 ? QColor(0x7c, 0xf2, 0xc4) : QColor(0xff, 0x52, 0x52));
@@ -2696,20 +2696,12 @@ void BeaconView::drawAnchors(QPainter &p)
         if (m_zoom >= 16 || hovered || (i == m_anchorDrag && m_anchorMoved)) {
             p.setFont(small); p.setPen(C_TEXT);
             QString label = (a.name.isEmpty() ? a.kind : a.name);
-            if (a.kind == QLatin1String("esp32-node")) {
+            if (haveNode && node.hasBattery()) {
                 const int cap = m_loc->nodeBatteryCapacity(a.name);
                 if (cap > 0) label += QStringLiteral(" · %1 mAh").arg(cap);
             }
             if (hovered) {
-                for (const auto &n : m_loc->meshNodes()) {
-                    if (n.name == a.name || a.id == (QStringLiteral("esp32-") + n.name.toLower())) {
-                        if (n.hops == 0) label += QStringLiteral(" · Direct Gateway");
-                        else if (n.hops == 1) label += QStringLiteral(" · 1 hop (Direct)");
-                        else if (!n.routePath.isEmpty()) label += QStringLiteral(" · %1 hops (%2)").arg(n.hops).arg(n.routePath);
-                        else label += QStringLiteral(" · %1 hops").arg(n.hops);
-                        break;
-                    }
-                }
+                if (haveNode) label += QStringLiteral(" · %1 · %2").arg(node.online ? QStringLiteral("online") : QStringLiteral("offline"), node.linkText());
                 label += QStringLiteral(" · ±%1 m%2").arg(a.accM, 0, 'g', 2).arg(a.rv ? QStringLiteral(" · RV") : QString());
             }
             p.drawText(QRectF(at.x() - 120, at.y() + 9, 240, 14), Qt::AlignCenter, label);
@@ -2732,7 +2724,7 @@ void BeaconView::drawUnsetNodes(QPainter &p)
     if (unset.size() == 1) {
         const MeshNodeInfo &n = unset.first();
         text = QStringLiteral("📡 %1 (Position Unset%2) — Click to Place")
-                   .arg(n.name, n.battPct >= 0 ? QStringLiteral(" · %1%🔋").arg(n.battPct) : QString());
+                   .arg(n.name, n.hasBattery() && n.battPct >= 0 ? QStringLiteral(" · %1%🔋").arg(n.battPct) : QString());
     } else {
         QStringList names;
         for (const auto &n : unset) names << n.name;

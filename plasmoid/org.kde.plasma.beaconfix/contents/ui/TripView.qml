@@ -135,6 +135,48 @@ Flickable {
                 }
             }
         }
+        // Mesh Nodes
+        ColumnLayout {
+            Layout.fillWidth: true
+            spacing: Kirigami.Units.smallSpacing
+            visible: (trip.src.meshNodes || []).length > 0
+
+            PC3.Label { text: "Mesh Nodes"; color: "#a29bfe"; font.bold: true }
+
+            Repeater {
+                model: trip.src.meshNodes || []
+                delegate: RowLayout {
+                    required property var modelData
+                    Layout.fillWidth: true; spacing: Kirigami.Units.smallSpacing
+                    Rectangle { width: 8; height: 8; radius: 4; color: modelData.online ? "#6cff8a" : modelData.lastSeen ? "#ff4f4f" : "#9fb0c8" }
+                    ColumnLayout {
+                        Layout.fillWidth: true; spacing: 0
+                        PC3.Label { Layout.fillWidth: true; text: modelData.name; color: "#e6edf7"; font.bold: true; elide: Text.ElideRight }
+                        PC3.Label {
+                            Layout.fillWidth: true; color: "#9fb0c8"; font.pixelSize: Kirigami.Theme.smallFont.pixelSize; elide: Text.ElideRight
+                            text: {
+                                var s = modelData.online ? "Online" : "Offline"
+                                if (modelData.online) {
+                                    if (modelData.hasBattery && modelData.battPct >= 0) {
+                                        s += " · " + modelData.battPct + "%"
+                                        if (modelData.battMv > 0) s += " (" + (modelData.battMv / 1000.0).toFixed(2) + "V)"
+                                        if (modelData.estRuntimeMins > 0) s += " (~" + trip.dur(modelData.estRuntimeMins * 60) + " left)"
+                                    } else if (!modelData.hasBattery) {
+                                        s += " · USB power"
+                                    }
+                                    if (modelData.link) s += " · " + modelData.link
+                                } else if (modelData.lastSeen) {
+                                    s += " · Last seen " + trip.dmy(modelData.lastSeen)
+                                } else {
+                                    s += " · never seen"
+                                }
+                                return s
+                            }
+                        }
+                    }
+                }
+            }
+        }
         // Stops
         PC3.Label { text: "Stops"; color: "#35d6ff"; font.bold: true }
         Repeater {

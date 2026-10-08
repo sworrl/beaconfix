@@ -178,7 +178,8 @@ struct MeshNodeInfo {
     QString   name;
     QString   mac;
     QString   role = QStringLiteral("mobile"); // "base_station" or "mobile"
-    QString   fwVersion = QStringLiteral("3.10.0"); // Firmware release version
+    QString   fwVersion;                      // Firmware release version (empty until the node reports one)
+    QString   hardware;                       // Board as the firmware reports it ("ESP32", "Heltec V3"); empty if unknown
     int       battMv = 0;
     int       battPct = -1;
     QString   battState;                      // "full", "discharging", "charging", "absent"
@@ -208,6 +209,12 @@ struct MeshNodeInfo {
     bool      isUsb = false;                  // Directly attached to host USB
     QString   usbPort;                        // Local serial port (e.g. "/dev/ttyUSB0")
     QString   transport = QStringLiteral("mesh"); // "usb", "mesh", "usb_mesh_dual", "ble"
+    // No-battery boards report batt_pct 0 and a floating ~0.3 V; mesh-relayed telemetry carries no batt_state
+    bool hasBattery() const {
+        if (battState == QLatin1String("no_battery") || battState == QLatin1String("absent")) return false;
+        return battMv > 0 ? battMv >= 2500 : battPct >= 0;
+    }
+    QString linkText() const;                 // "USB (/dev/ttyUSB0)", "BLE", "Direct", "3 hops · via X", "never seen"
     QJsonObject toJson() const;
 };
 
@@ -753,6 +760,8 @@ private:
     QTimer m_meshUpdateTimer;
     void initMeshUdp();
     void processMeshPacket(const QByteArray &data, const QHostAddress &sender);
+    void noteMeshNodeAps(const QList<AccessPoint> &aps);
+    void expireMeshNodes();
     // Anchors
     QList<BfAnchor> m_anchors;
     QHash<QString, BfAnchor> m_pins;         // BSSID → anchor

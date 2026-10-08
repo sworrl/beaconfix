@@ -15,10 +15,12 @@ When an ESP32 is plugged in:
 """
 
 import argparse
+import asyncio
 import glob
 import hashlib
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -97,6 +99,81 @@ def get_esp32_ports() -> Set[str]:
         ports.add(os.path.realpath(p))
 
     return ports
+
+
+def handle_alert(data: dict, origin: str, verbose: bool = True):
+    store_and_forward_enqueue({"type": "alert", "origin": origin, "data": data, "ts": time.time()})
+    if any(k in data for k in ["alpr", "camera_pass", "operator", "plate", "plate_event"]):
+        try:
+            lat = float(data.get("lat", 0.0))
+            lon = float(data.get("lon", 0.0))
+            if lat == 0.0 and lon == 0.0:
+                try:
+                    req_st = urllib.request.Request(f"{BEACONFIX_API}/api/v1/state")
+                    with urllib.request.urlopen(req_st, timeout=1.0) as resp:
+                        st = json.loads(resp.read().decode())
+                        loc = st.get("location", {})
+                        lat = float(loc.get("lat", 0.0))
+                        lon = float(loc.get("lon", 0.0))
+                except Exception:
+                    pass
+
+            camera_id = data.get("camera_id") or data.get("cam_id") or data.get("id") or f"rf-{origin.lower()}-{int(time.time())}"
+            mfg = data.get("manufacturer") or ""
+            op = data.get("operator") or mfg or "Flock Safety"
+            mdl = data.get("model") or ("Falcon" if "flock" in op.lower() else "ALPR")
+            ev = {
+                "kind": "camera_pass",
+                "camera_id": camera_id,
+                "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "operator": op,
+                "model": mdl,
+                "distanceM": float(data.get("distance_m", data.get("dist", 45.0))),
+                "lat": lat,
+                "lon": lon,
+                "confidence": int(data.get("conf", 95)),
+                "source": f"mesh-{origin.lower()}"
+            }
+            body = json.dumps({"device": origin, "events": [ev]}).encode()
+            req = urllib.request.Request(f"{BEACONFIX_API}/api/v1/plate-events", data=body,
+                                         headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=1.5) as r:
+                if verbose:
+                    print(f"[*] Ingested ALPR alert from {origin} to database (HTTP {r.status})", file=sys.stderr)
+        except Exception:
+            pass
+    trigger_hub_sync()
+
+def handle_tracker(data: dict, origin: str, verbose: bool = True):
+    store_and_forward_enqueue({"type": "tracker", "origin": origin, "data": data, "ts": time.time()})
+    try:
+        obs = {
+            "mac": data.get("mac", ""),
+            "kind": data.get("kind", "tracker"),
+            "rssi": int(data.get("rssi", -70)),
+            "source": f"mesh-{origin.lower()}",
+            "time": time.time()
+        }
+        body = json.dumps({"device": origin, "observations": [obs]}).encode()
+        req = urllib.request.Request(f"{BEACONFIX_API}/api/v1/db/observations", data=body,
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=1.5) as r:
+            pass
+    except Exception:
+        pass
+
+
+def firmware_version(hw_type: int) -> str:
+    """The version the built binary reports, from its NodeConfig.h (was hard-coded and went stale)."""
+    tree = "heltec_v3" if hw_type == 1 else "esp32_node"
+    try:
+        with open(os.path.join(DIR, f"firmware/{tree}/NodeConfig.h")) as f:
+            m = re.search(r'#define BEACONFIX_FW_VERSION "([^"]+)"', f.read())
+            if m:
+                return m.group(1)
+    except OSError:
+        pass
+    return "0.0.0"
 
 
 class EspDeviceWorker(threading.Thread):
@@ -199,73 +276,12 @@ class EspDeviceWorker(threading.Thread):
                     sha_hex = hashlib.sha256(f.read()).hexdigest()
                 with open(sig_file, "rb") as f:
                     sig_hex = f.read().hex()
-                cmd = f"mesh ota manifest {size} 192 {sha_hex} {sig_hex} 3.10.2 {hw_type}\n"
+                cmd = f"mesh ota manifest {size} 192 {sha_hex} {sig_hex} {firmware_version(hw_type)} {hw_type}\n"
                 self.ser.write(cmd.encode())
                 time.sleep(0.05)
                 if self.verbose:
-                    print(f"[*] Primed {self.node_name} with firmware v3.10.2 manifest for HW {hw_type} ({size:,} bytes)", file=sys.stderr)
+                    print(f"[*] Primed {self.node_name} with firmware v{firmware_version(hw_type)} manifest for HW {hw_type} ({size:,} bytes)", file=sys.stderr)
         except Exception as e:
-            pass
-
-    def handle_alert(self, data: dict, origin: str):
-        store_and_forward_enqueue({"type": "alert", "origin": origin, "data": data, "ts": time.time()})
-        if any(k in data for k in ["alpr", "camera_pass", "operator", "plate", "plate_event"]):
-            try:
-                lat = float(data.get("lat", 0.0))
-                lon = float(data.get("lon", 0.0))
-                if lat == 0.0 and lon == 0.0:
-                    try:
-                        req_st = urllib.request.Request(f"{BEACONFIX_API}/api/v1/state")
-                        with urllib.request.urlopen(req_st, timeout=1.0) as resp:
-                            st = json.loads(resp.read().decode())
-                            loc = st.get("location", {})
-                            lat = float(loc.get("lat", 0.0))
-                            lon = float(loc.get("lon", 0.0))
-                    except Exception:
-                        pass
-
-                camera_id = data.get("camera_id") or data.get("cam_id") or data.get("id") or f"rf-{origin.lower()}-{int(time.time())}"
-                mfg = data.get("manufacturer") or ""
-                op = data.get("operator") or mfg or "Flock Safety"
-                mdl = data.get("model") or ("Falcon" if "flock" in op.lower() else "ALPR")
-                ev = {
-                    "kind": "camera_pass",
-                    "camera_id": camera_id,
-                    "time": time.strftime("%Y-%m-%d %H:%M:%S"),
-                    "operator": op,
-                    "model": mdl,
-                    "distanceM": float(data.get("distance_m", data.get("dist", 45.0))),
-                    "lat": lat,
-                    "lon": lon,
-                    "confidence": int(data.get("conf", 95)),
-                    "source": f"mesh-{origin.lower()}"
-                }
-                body = json.dumps({"device": origin, "events": [ev]}).encode()
-                req = urllib.request.Request(f"{BEACONFIX_API}/api/v1/plate-events", data=body,
-                                             headers={"Content-Type": "application/json"})
-                with urllib.request.urlopen(req, timeout=1.5) as r:
-                    if self.verbose:
-                        print(f"[*] Ingested ALPR alert from {origin} to database (HTTP {r.status})", file=sys.stderr)
-            except Exception:
-                pass
-        trigger_hub_sync()
-
-    def handle_tracker(self, data: dict, origin: str):
-        store_and_forward_enqueue({"type": "tracker", "origin": origin, "data": data, "ts": time.time()})
-        try:
-            obs = {
-                "mac": data.get("mac", ""),
-                "kind": data.get("kind", "tracker"),
-                "rssi": int(data.get("rssi", -70)),
-                "source": f"mesh-{origin.lower()}",
-                "time": time.time()
-            }
-            body = json.dumps({"device": origin, "observations": [obs]}).encode()
-            req = urllib.request.Request(f"{BEACONFIX_API}/api/v1/db/observations", data=body,
-                                         headers={"Content-Type": "application/json"})
-            with urllib.request.urlopen(req, timeout=1.5) as r:
-                pass
-        except Exception:
             pass
 
     def push_host_telemetry(self):
@@ -422,10 +438,10 @@ class EspDeviceWorker(threading.Thread):
                             registered = True
                     elif t == "alert":
                         print(f"[!] ALERT from {self.node_name}: {line}", file=sys.stderr)
-                        self.handle_alert(data, self.node_name)
+                        handle_alert(data, self.node_name, self.verbose)
                     elif t == "ble_tracker":
                         print(f"[*] TRACKER spotted by {self.node_name}: {data.get('kind')} {data.get('mac')}", file=sys.stderr)
-                        self.handle_tracker(data, self.node_name)
+                        handle_tracker(data, self.node_name, self.verbose)
                     elif t == "mesh_telemetry":
                         origin = data.get("origin", "Unknown")
                         origin_mac = data.get("mac", "")
@@ -438,9 +454,9 @@ class EspDeviceWorker(threading.Thread):
                             self.register_with_beaconfix(origin, inner)
                             registered_origins.add(origin)
                         if inner_type == "alert":
-                            self.handle_alert(inner, origin)
+                            handle_alert(inner, origin, self.verbose)
                         elif inner_type == "ble_tracker":
-                            self.handle_tracker(inner, origin)
+                            handle_tracker(inner, origin, self.verbose)
                     elif t == "mesh_ota_remote_status":
                         mac = data.get("mac", "")
                         node = data.get("node", "RemoteNode")
@@ -480,7 +496,148 @@ class EspDeviceWorker(threading.Thread):
         self.udp_sock.close()
 
 
-def autolink_loop(auto_flash=False):
+NUS_SERVICE = "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
+NUS_RX = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"   # we write commands here
+NUS_TX = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"   # node notifies telemetry here
+NODE_NAME_RX = re.compile(r"^(BeaconFix-|BF-|BF_)|^[A-Z][a-z]+[A-Z][a-z]+[A-Z][a-z]+[0-9]{4}$")
+BLE_MAX_LINKS = 4
+
+
+class BleNodeLink:
+    """One BLE NUS link to a node. The node becomes a mesh gateway while we're subscribed, so this
+    also carries every other node it hears over ESP-NOW (mesh_telemetry). Lines are relayed to UDP
+    47824 exactly like the USB path, tagged transport "ble" so the desktop doesn't call them USB."""
+
+    def __init__(self, address: str, name: str, verbose: bool = True):
+        self.address = address
+        self.node_name = name
+        self.verbose = verbose
+        self.buf = b""
+        self.framed = False          # firmware that newline-terminates and chunks lines to the MTU
+        self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+
+    def feed(self, data: bytes):
+        if data.endswith(b"\n"):
+            self.framed = True
+        if not self.framed and data.startswith(b"{"):
+            # Older firmware sends one notify per line, cut at MTU-3: each "{" starts a fresh line
+            self.buf = b""
+        self.buf += data
+        while b"\n" in self.buf:
+            line, self.buf = self.buf.split(b"\n", 1)
+            self.handle_line(line)
+        if not self.framed and self.buf:
+            try:
+                json.loads(self.buf)
+            except ValueError:
+                pass
+            else:
+                self.handle_line(self.buf)
+                self.buf = b""
+        if len(self.buf) > 8192:
+            self.buf = b""
+
+    def handle_line(self, raw: bytes):
+        line = raw.decode("utf-8", errors="replace").strip()
+        if not line.startswith("{"):
+            return
+        try:
+            data = json.loads(line)
+        except ValueError:
+            return
+        t = data.get("type")
+        if t == "status":
+            self.node_name = data.get("node", self.node_name)
+            data["is_usb"] = False
+            data["transport"] = "ble"
+        elif t == "alert":
+            handle_alert(data, self.node_name, self.verbose)
+        elif t == "ble_tracker":
+            handle_tracker(data, self.node_name, self.verbose)
+        elif t == "mesh_telemetry":
+            data["via_link"] = "ble"
+            data["gateway"] = self.node_name
+            inner = data.get("data", {})
+            origin = data.get("origin", "Unknown")
+            if inner.get("type") == "alert":
+                handle_alert(inner, origin, self.verbose)
+            elif inner.get("type") == "ble_tracker":
+                handle_tracker(inner, origin, self.verbose)
+        try:
+            self.udp_sock.sendto((json.dumps(data) + "\n").encode("utf-8"), ("255.255.255.255", UDP_PORT))
+        except OSError:
+            pass
+
+    async def run(self):
+        from bleak import BleakClient
+        done = asyncio.Event()
+        client = BleakClient(self.address, disconnected_callback=lambda _c: done.set(), timeout=15.0)
+        try:
+            await client.connect()
+            await client.start_notify(NUS_TX, lambda _ch, d: self.feed(bytes(d)))
+            print(f"[+] BLE link up: {self.node_name} ({self.address})", file=sys.stderr)
+            # Only "status" until framing is known: older firmware's newline-terminated command
+            # replies would otherwise make its unterminated telemetry look framed
+            await client.write_gatt_char(NUS_RX, b"status\n", response=False)
+            synced = False
+            while not done.is_set():
+                if self.framed and not synced:
+                    await client.write_gatt_char(NUS_RX, f"time {int(time.time() * 1000000)}\n".encode(), response=False)
+                    synced = True
+                try:
+                    await asyncio.wait_for(done.wait(), timeout=25.0)
+                except asyncio.TimeoutError:
+                    synced = False   # periodic re-sync, like the USB path
+        except Exception as e:
+            print(f"[!] BLE link {self.node_name} ({self.address}): {e}", file=sys.stderr)
+        finally:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+            self.udp_sock.close()
+            print(f"[*] BLE link down: {self.node_name}", file=sys.stderr)
+
+
+def ble_loop(usb_workers: Dict[str, "EspDeviceWorker"], verbose: bool = True):
+    """Find nodes advertising NUS (or a node name) and hold a link to each, up to BLE_MAX_LINKS."""
+    try:
+        from bleak import BleakScanner
+    except ImportError:
+        print("[!] BLE linking off: python3-bleak is not installed", file=sys.stderr)
+        return
+
+    async def main():
+        links: Dict[str, asyncio.Task] = {}
+        retry_at: Dict[str, float] = {}
+        while True:
+            try:
+                found = await BleakScanner.discover(timeout=6.0, return_adv=True)
+            except Exception as e:
+                print(f"[!] BLE scan failed: {e}", file=sys.stderr)
+                await asyncio.sleep(30)
+                continue
+            for addr in [a for a, t in links.items() if t.done()]:
+                del links[addr]
+                retry_at[addr] = time.time() + 15
+            usb_names = {w.node_name for w in list(usb_workers.values())}
+            for addr, (dev, adv) in found.items():
+                name = adv.local_name or dev.name or ""
+                has_nus = NUS_SERVICE in [u.lower() for u in adv.service_uuids]
+                if not (has_nus or NODE_NAME_RX.match(name)) or not name:
+                    continue
+                if addr in links or name in usb_names or time.time() < retry_at.get(addr, 0):
+                    continue
+                if len(links) >= BLE_MAX_LINKS:
+                    break
+                links[addr] = asyncio.create_task(BleNodeLink(addr, name, verbose).run())
+            await asyncio.sleep(20)
+
+    asyncio.run(main())
+
+
+def autolink_loop(auto_flash=False, ble=True):
     print(f"[*] BeaconFix ESP32 Auto-Link Daemon running...", file=sys.stderr)
     print(f"[*] Relaying UDP broadcasts on port {UDP_PORT}", file=sys.stderr)
     print(f"[*] WireGuard Uplink active: {WIREGUARD_HUB_URL} via wg0", file=sys.stderr)
@@ -505,6 +662,9 @@ def autolink_loop(auto_flash=False):
             print(f"[!] Command listener error: {e}", file=sys.stderr)
 
     threading.Thread(target=cmd_listener, daemon=True).start()
+
+    if ble:
+        threading.Thread(target=ble_loop, args=(active_workers,), daemon=True).start()
 
     while True:
         try:
@@ -539,8 +699,9 @@ def autolink_loop(auto_flash=False):
 def main():
     p = argparse.ArgumentParser(description="BeaconFix ESP32 Auto-Link Daemon")
     p.add_argument("--auto-flash", action="store_true", help="Automatically compile and flash any freshly plugged-in ESP32")
+    p.add_argument("--no-ble", action="store_true", help="Don't link nodes over Bluetooth LE")
     args = p.parse_args()
-    autolink_loop(auto_flash=args.auto_flash)
+    autolink_loop(auto_flash=args.auto_flash, ble=not args.no_ble)
 
 
 if __name__ == "__main__":

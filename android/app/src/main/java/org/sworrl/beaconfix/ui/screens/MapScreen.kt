@@ -538,14 +538,15 @@ fun MapScreen(
                     dv.kind == "desktop" -> "🖥"
                     else -> "💻"
                 }
-                val age = dv.ageS?.let { a -> if (a < 90) "now" else if (a < 3600) "${(a / 60).toInt()} min" else "${(a / 3600).toInt()} h" } ?: ""
-                val battInfo = if (dv.battPct >= 0) " · 🔋${dv.battPct}%" else ""
+                val age = dv.ageS?.let { a -> if (a < 0) "never" else if (a < 90) "now" else if (a < 3600) "${(a / 60).toInt()} min" else "${(a / 3600).toInt()} h" } ?: ""
+                val hasBatt = dv.battPct >= 0 && org.sworrl.beaconfix.node.hasBattery(dv.battState, dv.battMv, dv.battPct)
+                val battInfo = if (hasBatt) " · 🔋${dv.battPct}%" else ""
                 val roleInfo = if (isBase) " · Base" else ""
                 val labelText = (dv.identityName.ifEmpty { dv.device }) + roleInfo + battInfo + (if (age.isNotEmpty()) " · $age" else "")
-                val nodeColor = if (isBase) "#FFD166" else if (isNode) "#35D6FF" else if (dv.online) "#7CF2C4" else "#9FB0C8"
+                val nodeColor = if ((isNode || isBase) && !dv.online) "#9FB0C8" else if (isBase) "#FFD166" else if (isNode) "#35D6FF" else if (dv.online) "#7CF2C4" else "#9FB0C8"
                 if (dv.acc > 0) out.add(Polygon(m).apply { points = Polygon.pointsAsCircle(gp, dv.acc.coerceIn(5.0, 2000.0)); fillPaint.color = AColor.parseColor(if (isNode) "#1A35D6FF" else "#1AFFD166"); outlinePaint.color = AColor.parseColor(nodeColor); outlinePaint.strokeWidth = 1.2f })
                 latest?.let { me0 -> val dist = org.sworrl.beaconfix.estimate.Geo.distanceM(me0.lat, me0.lon, dv.lat, dv.lon); if (dist < 2000) out.add(Polyline(m).apply { setPoints(listOf(GeoPoint(me0.lat, me0.lon), gp)); outlinePaint.color = AColor.parseColor(if (isNode) "#AA35D6FF" else "#AAFFD166"); outlinePaint.strokeWidth = 3f; outlinePaint.pathEffect = android.graphics.DashPathEffect(floatArrayOf(12f, 10f), 0f); title = "${dist.toInt()} m to ${dv.device}" }) }
-                out.add(Marker(m).apply { position = gp; setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER); icon = labelIcon(m, cache, glyph, labelText, AColor.parseColor(nodeColor), false, big = true); title = dv.device; snippet = "${dv.kind}${if (dv.identityName.isNotEmpty()) " · ${dv.identityName}" else ""}${if (isBase) " · Base Station" else ""}${if (dv.battPct >= 0) " · Batt: ${dv.battPct}%" else ""}\n±${dv.acc.toInt()} m · ${dv.source}${if (age.isNotEmpty()) " · $age ago" else ""}${if (dv.beacons > 0) "\nhears ${dv.beacons} beacons" else ""}" })
+                out.add(Marker(m).apply { position = gp; setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER); icon = labelIcon(m, cache, glyph, labelText, AColor.parseColor(nodeColor), false, big = true); title = dv.device; snippet = "${dv.kind}${if (dv.identityName.isNotEmpty()) " · ${dv.identityName}" else ""}${if (isBase) " · Base Station" else ""}${if (hasBatt) " · Batt: ${dv.battPct}%" else ""}\n±${dv.acc.toInt()} m · ${dv.source}${if (age.isNotEmpty()) " · $age${if (age != "never") " ago" else ""}" else ""}${if (dv.beacons > 0) "\nhears ${dv.beacons} beacons" else ""}" })
             }
         }
     }

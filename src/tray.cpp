@@ -119,6 +119,9 @@ Tray::Tray(Locator *loc, QObject *parent) : QObject(parent), m_loc(loc)
     QAction *link = m_menu.addAction(QIcon::fromTheme(QStringLiteral("insert-link")), QStringLiteral("Link a device…"));   // QR / mDNS, nothing typed (docs/LINKING.md)
     connect(link, &QAction::triggered, this, &Tray::openLinkRequested);
 
+    m_meshMenu = m_menu.addMenu(QIcon::fromTheme(QStringLiteral("network-wireless")), QStringLiteral("Mesh Network"));
+    m_meshMenu->menuAction()->setVisible(false);
+
     m_intervalMenu = m_menu.addMenu(QIcon::fromTheme(QStringLiteral("chronometer")), QStringLiteral("Check every"));
     auto *grp = new QActionGroup(this);
     for (int m : {5, 10, 15, 30, 60}) {
@@ -137,6 +140,7 @@ Tray::Tray(Locator *loc, QObject *parent) : QObject(parent), m_loc(loc)
 
     connect(m_loc, &Locator::FixChanged, this, &Tray::rebuild);
     connect(m_loc, &Locator::peersChanged, this, &Tray::rebuild);
+    connect(m_loc, &Locator::meshNodesChanged, this, &Tray::rebuild);
     connect(m_loc, &Locator::elevationUpdated, this, &Tray::rebuild);
     connect(m_loc, &Locator::probeStarted, this, &Tray::rebuild);
     connect(m_loc, &Locator::notificationFallback, this, [this](const QString &s, const QString &b) { m_icon.showMessage(s, b, QSystemTrayIcon::Information, 6000); });
@@ -207,6 +211,34 @@ void Tray::rebuild()
         const int n = m_loc->apiServer()->mdns()->peers(false).size();
         if (n > 0) peers = QStringLiteral("\n📡 %1 other BeaconFix device%2 on this network").arg(n).arg(n == 1 ? QString() : QStringLiteral("s"));
     }
+    
+    const QList<MeshNodeInfo> meshNodes = m_loc->meshNodes();
+    m_meshMenu->clear();
+    if (meshNodes.isEmpty()) {
+        m_meshMenu->menuAction()->setVisible(false);
+    } else {
+        m_meshMenu->menuAction()->setVisible(true);
+        for (const MeshNodeInfo &n : meshNodes) {
+            QString status = n.online ? QStringLiteral("Online") : QStringLiteral("Offline");
+            if (n.online) {
+                if (n.hasBattery() && n.battPct >= 0) {
+                    status += QStringLiteral(" · %1%").arg(n.battPct);
+                    if (n.battMv > 0) status += QStringLiteral(" (%1 V)").arg(n.battMv / 1000.0, 0, 'f', 2);
+                    if (n.estRuntimeMins > 0) status += QStringLiteral(" (~%1 left)").arg(Locator::durationText(n.estRuntimeMins * 60));
+                } else if (!n.hasBattery()) {
+                    status += QStringLiteral(" · USB power");
+                }
+                status += QStringLiteral(" · ") + n.linkText();
+            } else if (n.lastSeen.isValid()) {
+                status += QStringLiteral(" · Last seen %1").arg(n.lastSeen.toString(QStringLiteral("ddd HH:mm")));
+            } else {
+                status += QStringLiteral(" · never seen");
+            }
+            QAction *na = m_meshMenu->addAction(QStringLiteral("%1: %2").arg(n.name, status));
+            na->setEnabled(false);
+        }
+    }
+
     m_icon.setToolTip(f.valid ? QStringLiteral("%1\n±%2 m · %3 · %4\n%5%6%7").arg(f.place).arg(qRound(f.accuracy)).arg(src, ageText(), trip, sunText.isEmpty() ? QString() : QStringLiteral("\n") + sunText, peers)
                               : QStringLiteral("BeaconFix — no location") + peers);
 }

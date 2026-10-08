@@ -87,6 +87,12 @@ class EspNodeManager @Inject constructor(
     private var udpSocket: DatagramSocket? = null
     private var udpJob: Job? = null
 
+    // BLE NUS framing: current firmware newline-terminates lines and splits them at the MTU; older firmware sends one
+    // notify per line, cut at MTU-3 (which truncated every status heartbeat)
+    private val bleRxBuf = StringBuilder()
+    private var bleFramed = false
+    private var bleLinkNode = ""
+
     private var autoConnectEnabled = true
     private var autoScanJob: Job? = null
 
@@ -102,12 +108,14 @@ class EspNodeManager @Inject constructor(
             try {
                 val socket = DatagramSocket(UDP_PORT)
                 udpSocket = socket
+                socket.broadcast = true   // relayBleLine sends from this socket
                 val buf = ByteArray(1024)
                 while (true) {
                     val packet = DatagramPacket(buf, buf.size)
                     socket.receive(packet)
                     val str = String(packet.data, 0, packet.length, Charsets.UTF_8).trim()
-                    if (str.startsWith("{")) {
+                    // Our own relay of a BLE line (relayBleLine) comes back to this socket; it was parsed already
+                    if (str.startsWith("{") && !str.contains("\"relay\":\"phone\"")) {
                         if (_connectionState.value == EspConnectionState.DISCONNECTED) {
                             _connectionState.value = EspConnectionState.CONNECTED_UDP
                         }
@@ -235,6 +243,8 @@ class EspNodeManager @Inject constructor(
             override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
                 if (newState == BluetoothProfile.STATE_CONNECTED && status == BluetoothGatt.GATT_SUCCESS) {
                     _connectionState.value = EspConnectionState.CONNECTED_BLE
+                    synchronized(bleRxBuf) { bleRxBuf.setLength(0); bleFramed = false }
+                    bleLinkNode = device.name ?: ""
                     gatt.discoverServices()
                 } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                     _connectionState.value = EspConnectionState.DISCONNECTED
@@ -271,12 +281,60 @@ class EspNodeManager @Inject constructor(
             @Deprecated("Deprecated in Java")
             override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
                 val bytes = characteristic.value ?: return
-                val line = String(bytes, Charsets.UTF_8).trim()
-                if (line.startsWith("{")) {
-                    parseTelemetryLine(line)
-                }
+                feedBle(String(bytes, Charsets.UTF_8))
             }
         })
+    }
+
+    private fun feedBle(chunk: String) {
+        val lines = mutableListOf<String>()
+        synchronized(bleRxBuf) {
+            if (chunk.endsWith("\n")) bleFramed = true
+            if (!bleFramed && chunk.startsWith("{")) bleRxBuf.setLength(0)
+            bleRxBuf.append(chunk)
+            var nl = bleRxBuf.indexOf("\n")
+            while (nl >= 0) {
+                lines += bleRxBuf.substring(0, nl)
+                bleRxBuf.delete(0, nl + 1)
+                nl = bleRxBuf.indexOf("\n")
+            }
+            if (!bleFramed && bleRxBuf.isNotEmpty()) {
+                val rest = bleRxBuf.toString()
+                if (runCatching { JSONObject(rest) }.isSuccess) { lines += rest; bleRxBuf.setLength(0) }
+            }
+            if (bleRxBuf.length > 8192) bleRxBuf.setLength(0)
+        }
+        for (raw in lines) {
+            val line = raw.trim()
+            if (!line.startsWith("{")) continue
+            parseTelemetryLine(line)
+            relayBleLine(line)
+        }
+    }
+
+    // Put what the BLE-linked node says on the LAN (UDP 47824), the way the desktop's USB/BLE bridge does, so the
+    // desktop sees this node — and every node it gateways for over the mesh — while the phone holds the link
+    private fun relayBleLine(line: String) {
+        val sock = udpSocket ?: return
+        scope.launch {
+            try {
+                val o = JSONObject(line)
+                when (o.optString("type")) {
+                    "status" -> {
+                        bleLinkNode = o.optString("node", bleLinkNode)
+                        o.put("is_usb", false)
+                        o.put("transport", "ble")
+                    }
+                    "mesh_telemetry" -> {
+                        o.put("via_link", "ble")
+                        o.put("gateway", bleLinkNode)
+                    }
+                }
+                o.put("relay", "phone")
+                val data = (o.toString() + "\n").toByteArray(Charsets.UTF_8)
+                sock.send(DatagramPacket(data, data.size, java.net.InetAddress.getByName("255.255.255.255"), UDP_PORT))
+            } catch (_: Exception) {}
+        }
     }
 
     @SuppressLint("MissingPermission")
@@ -518,7 +576,7 @@ class EspNodeManager @Inject constructor(
                 "status" -> {
                     val nName = o.optString("node")
                     val st = EspNodeStatus(
-                        version = o.optString("version", "3.10.2"),
+                        version = o.optString("version", ""),
                         node = nName,
                         uptime = o.optLong("uptime"),
                         heap = o.optLong("heap"),
@@ -531,7 +589,7 @@ class EspNodeManager @Inject constructor(
                         deauths = o.optLong("deauths"),
                         ble = o.optInt("ble", 0),
                         batt_mv = o.optInt("batt_mv", 0),
-                        batt_pct = o.optInt("batt_pct", 0),
+                        batt_pct = o.optInt("batt_pct", -1),
                         batt_state = o.optString("batt_state", "unknown"),
                         charging = o.optBoolean("charging", false),
                         batt_trained = o.optBoolean("batt_trained", false),
@@ -548,8 +606,8 @@ class EspNodeManager @Inject constructor(
                         val existing = _meshPeers.value[nName]
                         val peer = (existing ?: MeshPeerNode(name = nName)).copy(
                             name = nName,
-                            role = o.optString("mode", if (nName.contains("Master", true)) "base_station" else "mobile"),
-                            version = o.optString("version", "3.10.2"),
+                            role = o.optString("mode", existing?.role ?: "mobile"),
+                            version = o.optString("version", existing?.version ?: ""),
                             battMv = o.optInt("batt_mv", existing?.battMv ?: 0),
                             battPct = o.optInt("batt_pct", existing?.battPct ?: -1),
                             battState = o.optString("batt_state", existing?.battState ?: "unknown"),
@@ -560,7 +618,6 @@ class EspNodeManager @Inject constructor(
                             hops = 0,
                             pps = o.optLong("pps", existing?.pps ?: 0),
                             lastSeen = System.currentTimeMillis(),
-                            isOnline = true,
                             following = o.optBoolean("following", existing?.following ?: false),
                             attachedDevice = o.optString("attached_dev", existing?.attachedDevice ?: ""),
                             hasLocation = o.optBoolean("has_gps", existing?.hasLocation ?: false),
@@ -588,9 +645,10 @@ class EspNodeManager @Inject constructor(
                             name = origin,
                             mac = mac,
                             role = inner.optString("mode", existing?.role ?: "mobile"),
-                            version = inner.optString("version", existing?.version ?: "3.10.2"),
+                            version = inner.optString("version", existing?.version ?: ""),
                             battMv = inner.optInt("batt_mv", existing?.battMv ?: 0),
                             battPct = inner.optInt("batt_pct", existing?.battPct ?: -1),
+                            battState = inner.optString("batt_state", existing?.battState ?: ""),
                             battTrained = inner.optBoolean("batt_trained", existing?.battTrained ?: false),
                             battTrainPct = inner.optInt("batt_train_pct", existing?.battTrainPct ?: 0),
                             battCycles = inner.optDouble("batt_cycles", (existing?.battCycles ?: 0.0f).toDouble()).toFloat(),
@@ -598,8 +656,7 @@ class EspNodeManager @Inject constructor(
                             via = via,
                             prevMac = prevMac,
                             route = route,
-                            lastSeen = System.currentTimeMillis(),
-                            isOnline = true
+                            lastSeen = System.currentTimeMillis()
                         )
                         _meshPeers.value = _meshPeers.value + (origin to peer)
                     }
@@ -620,7 +677,7 @@ class EspNodeManager @Inject constructor(
                     val cycles = o.optDouble("batt_cycles", cur.batt_cycles.toDouble()).toFloat()
                     _nodeStatus.value = cur.copy(
                         batt_mv = o.optInt("mv", 0),
-                        batt_pct = o.optInt("pct", 0),
+                        batt_pct = o.optInt("pct", -1),
                         batt_state = o.optString("state", "unknown"),
                         charging = o.optBoolean("charging", false),
                         batt_trained = trained,

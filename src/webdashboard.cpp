@@ -1472,28 +1472,38 @@ ESP32 GND    ─────────────────────> Gr
         const data = await res.json();
         const nodes = data.nodes || [];
         if (nodes.length === 0) {
-          el.innerHTML = '<div style="color:var(--text-muted); font-size:0.85rem;">No active mesh nodes discovered yet.</div>';
+          el.innerHTML = '<div style="color:var(--text-muted); font-size:0.85rem;">No mesh nodes discovered yet.</div>';
           return;
         }
-        el.innerHTML = nodes.map(n => {
+        // Names go through esc() and data- attributes: USB/bridge names aren't limited to letters and digits
+        el.innerHTML = nodes.map((n, i) => {
           const mah = n.battMah || 240;
-          const pct = n.battPct >= 0 ? n.battPct : '—';
-          const mv = n.battMv > 0 ? n.battMv + ' mV' : 'USB 5V';
-          const est = n.estRuntimeMins > 0 ? `~${(n.estRuntimeMins/60).toFixed(1)}h remaining` : (n.charging ? 'Charging' : 'USB Powered');
+          const seen = n.ageS >= 0;
+          const state = n.online ? '<span style="color:var(--success);">● online</span>'
+                      : seen ? `<span style="color:#ff5555;">● offline · ${Math.round(n.ageS / 60)} min ago</span>`
+                      : '<span style="color:var(--text-muted);">● never seen</span>';
+          // A node without a battery still reports 0 % and a floating ~0.3 V
+          let power;
+          if (!seen) power = '—';
+          else if (!n.hasBattery) power = 'No battery (USB 5V)';
+          else {
+            power = n.battPct >= 0 ? `<span style="color:#fff; font-weight:600;">${n.battPct}%</span>` : '';
+            if (n.battMv > 0) power += ` (${n.battMv} mV)`;
+            power += ' · ' + (n.estRuntimeMins > 0 ? `<span style="color:var(--success);">~${(n.estRuntimeMins/60).toFixed(1)}h remaining</span>` : (n.charging ? 'Charging' : ''));
+          }
           return `
             <div style="background:#090d16; border:1px solid var(--card-border); border-radius:8px; padding:12px;">
               <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
-                <b style="color:var(--accent); font-family:monospace; font-size:0.85rem;">${n.name}</b>
-                <span style="font-size:0.75rem; background:rgba(255,255,255,0.06); padding:2px 6px; border-radius:4px;">${n.role || 'node'}</span>
+                <b style="color:var(--accent); font-family:monospace; font-size:0.85rem;">${esc(n.name)}</b>
+                <span style="font-size:0.75rem; background:rgba(255,255,255,0.06); padding:2px 6px; border-radius:4px;">${n.role === 'base_station' ? 'base' : esc(n.role || 'node')}</span>
               </div>
-              <div style="font-size:0.8rem; color:var(--text-muted); margin-bottom:8px;">
-                Power: <span style="color:#fff; font-weight:600;">${pct}%</span> (${mv}) · <span style="color:var(--success);">${est}</span>
-              </div>
+              <div style="font-size:0.8rem; color:var(--text-muted); margin-bottom:4px;">${state}${n.link && seen ? ' · ' + esc(n.link) : ''}${n.fwVersion ? ' · v' + esc(n.fwVersion) : ''}</div>
+              <div style="font-size:0.8rem; color:var(--text-muted); margin-bottom:8px;">Power: ${power}</div>
               <div style="display:flex; gap:6px; align-items:center;">
-                <input type="number" id="battInput_${n.name}" value="${mah}" min="50" max="50000" step="10" style="width:90px; padding:4px 8px; background:var(--surface); border:1px solid var(--card-border); border-radius:4px; color:#fff; font-size:0.8rem;">
+                <input type="number" id="battInput_${i}" value="${mah}" min="50" max="50000" step="10" style="width:90px; padding:4px 8px; background:var(--surface); border:1px solid var(--card-border); border-radius:4px; color:#fff; font-size:0.8rem;">
                 <span style="font-size:0.75rem; color:var(--text-muted);">mAh</span>
-                <button class="btn" style="padding:4px 8px; font-size:0.75rem;" onclick="saveNodeBattery('${n.name}', document.getElementById('battInput_${n.name}').value)">Save</button>
-                <button class="btn" style="padding:4px 8px; font-size:0.75rem;" onclick="saveNodeBattery('${n.name}', 240)" title="Set Heltec V3 stock LiPo capacity">240mAh</button>
+                <button class="btn" style="padding:4px 8px; font-size:0.75rem;" data-name="${esc(n.name)}" onclick="saveNodeBattery(this.dataset.name, document.getElementById('battInput_${i}').value)">Save</button>
+                <button class="btn" style="padding:4px 8px; font-size:0.75rem;" data-name="${esc(n.name)}" onclick="saveNodeBattery(this.dataset.name, 240)" title="Set Heltec V3 stock LiPo capacity">240mAh</button>
               </div>
             </div>
           `;

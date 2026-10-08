@@ -29,6 +29,12 @@ public:
     void onWrite(NimBLECharacteristic* pCharacteristic, NimBLEConnInfo& connInfo) override;
 };
 
+// TX subscribe = the client is ready for notifications (dump the store-and-forward queue then, not on connect)
+class BleTxCallbacksImpl : public NimBLECharacteristicCallbacks {
+public:
+    void onSubscribe(NimBLECharacteristic* pCharacteristic, NimBLEConnInfo& connInfo, uint16_t subValue) override;
+};
+
 class BleAdvertisedCallbacksImpl : public NimBLEScanCallbacks {
 public:
     void onResult(const NimBLEAdvertisedDevice* advertisedDevice) override;
@@ -43,7 +49,8 @@ public:
 
     bool begin(const char* nodeName) {
         m_tagQueue = xQueueCreate(32, sizeof(DetectedBleTag));
-        if (!m_tagQueue) {
+        m_txMutex = xSemaphoreCreateMutex();
+        if (!m_tagQueue || !m_txMutex) {
             return false;
         }
 
@@ -59,6 +66,7 @@ public:
             CHARACTERISTIC_UUID_TX,
             NIMBLE_PROPERTY::NOTIFY
         );
+        m_pTxChar->setCallbacks(new BleTxCallbacksImpl());
 
         m_pRxChar = pService->createCharacteristic(
             CHARACTERISTIC_UUID_RX,
@@ -90,6 +98,8 @@ public:
     void clientConnected() {
         m_connectedCount++;
         LedPatterns::instance().setBasePattern(PATTERN_LINK_ACTIVE);
+        // NimBLE stops advertising on connect; keep advertising so a phone and a desktop can both link
+        if (m_connectedCount < CONFIG_BT_NIMBLE_MAX_CONNECTIONS) NimBLEDevice::startAdvertising();
     }
     void clientDisconnected() {
         if (m_connectedCount > 0) m_connectedCount--;
@@ -98,10 +108,59 @@ public:
         }
     }
 
+    // One JSON line, newline-terminated so the client can reassemble it
     void sendTelemetry(const char* line) {
-        if (!m_pTxChar || m_connectedCount == 0) return;
-        m_pTxChar->setValue((const uint8_t*)line, strlen(line));
-        m_pTxChar->notify();
+        if (!line || !m_pTxChar || m_connectedCount == 0) return;
+        size_t len = strlen(line);
+        if (len == 0) return;
+        if (line[len - 1] == '\n') { sendRaw(line, len); return; }
+        if (!m_txMutex || xSemaphoreTake(m_txMutex, pdMS_TO_TICKS(100)) != pdTRUE) return;
+        sendChunksLocked((const uint8_t*)line, len);
+        sendChunksLocked((const uint8_t*)"\n", 1);
+        xSemaphoreGive(m_txMutex);
+    }
+
+    // Bytes as-is (caller frames them). Split to the smallest peer ATT MTU: a notify longer than
+    // MTU-3 is silently truncated, which cut every status heartbeat off at 253 bytes.
+    void sendRaw(const char* data, size_t len) {
+        if (!data || len == 0 || !m_pTxChar || m_connectedCount == 0) return;
+        if (!m_txMutex || xSemaphoreTake(m_txMutex, pdMS_TO_TICKS(100)) != pdTRUE) return;
+        sendChunksLocked((const uint8_t*)data, len);
+        xSemaphoreGive(m_txMutex);
+    }
+
+    // BLE RX arrives on the NimBLE host task; commands run on loop() instead (popRxLine)
+    void queueRx(const std::string& data) {
+        portENTER_CRITICAL(&m_rxMux);
+        if (m_rxBuf.size() + data.size() <= 1024) m_rxBuf += data;
+        m_rxLastMs = millis();
+        portEXIT_CRITICAL(&m_rxMux);
+    }
+
+    // Next newline-terminated command; an unterminated write counts as a command once 300 ms idle
+    bool popRxLine(String& out) {
+        bool got = false;
+        portENTER_CRITICAL(&m_rxMux);
+        size_t nl = m_rxBuf.find_first_of("\r\n");
+        if (nl != std::string::npos) {
+            out = String(m_rxBuf.substr(0, nl).c_str());
+            m_rxBuf.erase(0, nl + 1);
+            got = true;
+        } else if (!m_rxBuf.empty() && millis() - m_rxLastMs > 300) {
+            out = String(m_rxBuf.c_str());
+            m_rxBuf.clear();
+            got = true;
+        }
+        portEXIT_CRITICAL(&m_rxMux);
+        if (got) out.trim();
+        return got;
+    }
+
+    void requestQueueDump() { m_queueDumpPending = true; }
+    bool takeQueueDumpRequest() {
+        if (!m_queueDumpPending) return false;
+        m_queueDumpPending = false;
+        return true;
     }
 
     bool getNextTag(DetectedBleTag* outTag) {
@@ -120,7 +179,21 @@ public:
 private:
     BleScanner() : m_pServer(nullptr), m_pTxChar(nullptr), m_pRxChar(nullptr),
                    m_pScan(nullptr), m_tagQueue(nullptr), m_connectedCount(0),
-                   m_initialized(false) {}
+                   m_initialized(false), m_txMutex(nullptr), m_rxLastMs(0), m_queueDumpPending(false) {}
+
+    void sendChunksLocked(const uint8_t* data, size_t len) {
+        uint16_t mtu = 0;
+        for (uint16_t h : m_pServer->getPeerDevices()) {
+            uint16_t m = m_pServer->getPeerMTU(h);
+            if (m && (mtu == 0 || m < mtu)) mtu = m;
+        }
+        size_t chunk = (mtu > 23) ? (size_t)(mtu - 3) : 20;
+        for (size_t off = 0; off < len; off += chunk) {
+            size_t n = (len - off < chunk) ? (len - off) : chunk;
+            // notify fails when the controller's buffers are full; give it a moment rather than drop mid-line
+            for (int tries = 0; tries < 4 && !m_pTxChar->notify(data + off, n); tries++) delay(3);
+        }
+    }
 
     NimBLEServer* m_pServer;
     NimBLECharacteristic* m_pTxChar;
@@ -129,4 +202,13 @@ private:
     QueueHandle_t m_tagQueue;
     volatile int m_connectedCount;
     bool m_initialized;
+    SemaphoreHandle_t m_txMutex;
+    portMUX_TYPE m_rxMux = portMUX_INITIALIZER_UNLOCKED;
+    std::string m_rxBuf;
+    volatile unsigned long m_rxLastMs;
+    volatile bool m_queueDumpPending;
 };
+
+inline void BleTxCallbacksImpl::onSubscribe(NimBLECharacteristic* pCharacteristic, NimBLEConnInfo& connInfo, uint16_t subValue) {
+    if (subValue) BleScanner::instance().requestQueueDump();
+}

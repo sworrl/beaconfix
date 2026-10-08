@@ -118,6 +118,17 @@ static bool parseMacStr(const char* str, uint8_t* macOut) {
 }
 
 // ── Command Processing ───────────────────────────────────────────────────────
+
+void dumpMeshQueueToBle() {
+    MeshEngine::instance().dumpQueueToBle();
+}
+void sendBleTelemetry(const char* msg) {
+    if (BleScanner::instance().isConnected()) BleScanner::instance().sendTelemetry(msg);
+}
+// Command replies go to USB and BLE. SPRINTF output may be a fragment of one line (mesh peers), so it is sent raw.
+#define SPRINTF(...) do { char __b[512]; snprintf(__b, sizeof(__b), __VA_ARGS__); Serial.print(__b); if(BleScanner::instance().isConnected()) BleScanner::instance().sendRaw(__b, strlen(__b)); } while(0)
+#define SPRINTLN(msg) do { Serial.println(msg); if(BleScanner::instance().isConnected()){ String __s = String(msg) + "\n"; BleScanner::instance().sendRaw(__s.c_str(), __s.length()); } } while(0)
+
 void handleCommand(const String& cmdLine) {
     String cmd = cmdLine;
     cmd.trim();
@@ -133,14 +144,14 @@ void handleCommand(const String& cmdLine) {
             uint64_t epochUs = strtoull(cmd.substring(cmd.indexOf(':', timeIdx) + 1).c_str(), NULL, 10);
             if (epochUs > 1000000000000ULL) {
                 TimeSync::instance().setMasterTimeUs(epochUs);
-                Serial.printf("{\"type\":\"ack\",\"time_synced\":true,\"stratum\":1,\"epoch_us\":%llu}\n", (unsigned long long)epochUs);
+                SPRINTF("{\"type\":\"ack\",\"time_synced\":true,\"stratum\":1,\"epoch_us\":%llu}\n", (unsigned long long)epochUs);
                 return;
             }
         }
     }
 
     if (cmd.equalsIgnoreCase("help")) {
-        Serial.println("{\"type\":\"help\",\"commands\":["
+        SPRINTLN("{\"type\":\"help\",\"commands\":["
                        "\"status\",\"name [new_name|reset]\",\"mode <base|mobile|toggle|status>\","
                        "\"channel <0-14>\",\"hop <ms>\",\"time <epoch_us>\","
                        "\"mesh status\",\"mesh peers\",\"mesh send <text>\","
@@ -148,32 +159,32 @@ void handleCommand(const String& cmdLine) {
                        "\"led config <slot> rgb <r> <g> <b> <role> [inv]\",\"led clear <slot>\","
                        "\"led <pattern>\",\"batt [stats|reset|pin|divider]\",\"ota\",\"reboot\"]}");
     } else if (cmd.equalsIgnoreCase("mode") || cmd.equalsIgnoreCase("mode status")) {
-        Serial.printf("{\"type\":\"op_mode\",\"mode\":\"%s\",\"is_base_station\":%s,\"hops\":%u}\n",
+        SPRINTF("{\"type\":\"op_mode\",\"mode\":\"%s\",\"is_base_station\":%s,\"hops\":%u}\n",
             NodeConfig::instance().getOpModeStr(),
             NodeConfig::instance().isBaseStation() ? "true" : "false",
             MeshEngine::instance().getHopsToGateway());
     } else if (cmd.equalsIgnoreCase("mode base") || cmd.equalsIgnoreCase("mode base_station") || cmd.equalsIgnoreCase("mode station")) {
         NodeConfig::instance().setOpMode(OP_MODE_BASE_STATION);
-        Serial.println("{\"type\":\"ack\",\"action\":\"mode_changed\",\"mode\":\"base_station\",\"is_base_station\":true}");
+        SPRINTLN("{\"type\":\"ack\",\"action\":\"mode_changed\",\"mode\":\"base_station\",\"is_base_station\":true}");
     } else if (cmd.equalsIgnoreCase("mode mobile")) {
         NodeConfig::instance().setOpMode(OP_MODE_MOBILE);
-        Serial.println("{\"type\":\"ack\",\"action\":\"mode_changed\",\"mode\":\"mobile\",\"is_base_station\":false}");
+        SPRINTLN("{\"type\":\"ack\",\"action\":\"mode_changed\",\"mode\":\"mobile\",\"is_base_station\":false}");
     } else if (cmd.equalsIgnoreCase("mode toggle")) {
         NodeOpMode newMode = NodeConfig::instance().isBaseStation() ? OP_MODE_MOBILE : OP_MODE_BASE_STATION;
         NodeConfig::instance().setOpMode(newMode);
-        Serial.printf("{\"type\":\"ack\",\"action\":\"mode_changed\",\"mode\":\"%s\",\"is_base_station\":%s}\n",
+        SPRINTF("{\"type\":\"ack\",\"action\":\"mode_changed\",\"mode\":\"%s\",\"is_base_station\":%s}\n",
             NodeConfig::instance().getOpModeStr(),
             NodeConfig::instance().isBaseStation() ? "true" : "false");
     } else if (cmd.startsWith("time ")) {
         uint64_t epochUs = strtoull(cmd.substring(5).c_str(), NULL, 10);
         if (epochUs > 1000000000000ULL) {
             TimeSync::instance().setMasterTimeUs(epochUs);
-            Serial.printf("{\"type\":\"ack\",\"time_synced\":true,\"stratum\":1,\"epoch_us\":%llu}\n", (unsigned long long)epochUs);
+            SPRINTF("{\"type\":\"ack\",\"time_synced\":true,\"stratum\":1,\"epoch_us\":%llu}\n", (unsigned long long)epochUs);
         } else {
-            Serial.println("{\"type\":\"error\",\"message\":\"invalid_timestamp\"}");
+            SPRINTLN("{\"type\":\"error\",\"message\":\"invalid_timestamp\"}");
         }
     } else if (cmd.equalsIgnoreCase("mesh status") || cmd.equalsIgnoreCase("mesh")) {
-        Serial.printf("{\"type\":\"mesh_status\",\"is_gateway\":%s,\"hops\":%u,\"neighbors\":%u,\"queue\":%u,\"stratum\":%u,\"now_us\":%llu}\n",
+        SPRINTF("{\"type\":\"mesh_status\",\"is_gateway\":%s,\"hops\":%u,\"neighbors\":%u,\"queue\":%u,\"stratum\":%u,\"now_us\":%llu}\n",
             MeshEngine::instance().isGateway() ? "true" : "false",
             MeshEngine::instance().getHopsToGateway(),
             MeshEngine::instance().getNeighborCount(),
@@ -183,32 +194,32 @@ void handleCommand(const String& cmdLine) {
     } else if (cmd.equalsIgnoreCase("mesh peers")) {
         const MeshNeighbor* n = MeshEngine::instance().getNeighbors();
         uint8_t count = MeshEngine::instance().getNeighborCount();
-        Serial.printf("{\"type\":\"mesh_peers\",\"count\":%u,\"peers\":[", count);
+        SPRINTF("{\"type\":\"mesh_peers\",\"count\":%u,\"peers\":[", count);
         for (int i = 0; i < count; i++) {
             char macStr[18];
             WifiMonitor::formatMac(n[i].mac, macStr);
-            Serial.printf("{\"name\":\"%s\",\"mac\":\"%s\",\"rssi\":%d,\"hops\":%u,\"gateway\":%s,\"stratum\":%u}%s",
+            SPRINTF("{\"name\":\"%s\",\"mac\":\"%s\",\"rssi\":%d,\"hops\":%u,\"gateway\":%s,\"stratum\":%u}%s",
                 n[i].name, macStr, n[i].rssi, n[i].hopsToGateway,
                 n[i].isGateway ? "true" : "false", n[i].stratum,
                 (i < count - 1) ? "," : "");
         }
-        Serial.println("]}");
+        SPRINTLN("]}");
     } else if (cmd.startsWith("mesh send ")) {
         String msg = cmd.substring(10);
         MeshEngine::instance().sendTelemetry(msg.c_str());
-        Serial.printf("{\"type\":\"ack\",\"mesh_sent\":true,\"text\":\"%s\"}\n", msg.c_str());
+        SPRINTF("{\"type\":\"ack\",\"mesh_sent\":true,\"text\":\"%s\"}\n", msg.c_str());
     } else if (cmd.equalsIgnoreCase("name")) {
-        Serial.printf("{\"type\":\"node_name\",\"name\":\"%s\"}\n", NodeConfig::instance().getName());
+        SPRINTF("{\"type\":\"node_name\",\"name\":\"%s\"}\n", NodeConfig::instance().getName());
     } else if (cmd.equalsIgnoreCase("name reset")) {
         NodeConfig::instance().resetToDefaultName();
-        Serial.printf("{\"type\":\"ack\",\"name\":\"%s\",\"action\":\"name_reset\"}\n", NodeConfig::instance().getName());
+        SPRINTF("{\"type\":\"ack\",\"name\":\"%s\",\"action\":\"name_reset\"}\n", NodeConfig::instance().getName());
     } else if (cmd.startsWith("name ")) {
         String newName = cmd.substring(5);
         newName.trim();
         if (NodeConfig::instance().setName(newName.c_str())) {
-            Serial.printf("{\"type\":\"ack\",\"name\":\"%s\",\"action\":\"name_updated\"}\n", NodeConfig::instance().getName());
+            SPRINTF("{\"type\":\"ack\",\"name\":\"%s\",\"action\":\"name_updated\"}\n", NodeConfig::instance().getName());
         } else {
-            Serial.println("{\"type\":\"error\",\"message\":\"invalid_name\"}");
+            SPRINTLN("{\"type\":\"error\",\"message\":\"invalid_name\"}");
         }
     } else if (cmd.equalsIgnoreCase("status")) {
         Telemetry::instance().emitStatus(
@@ -234,11 +245,11 @@ void handleCommand(const String& cmdLine) {
     } else if (cmd.equalsIgnoreCase("batt reset") || cmd.equalsIgnoreCase("battery reset") || cmd.equalsIgnoreCase("batt stats reset") || cmd.equalsIgnoreCase("batt train reset")) {
         BatteryMonitor::instance().resetBatteryStats();
         const auto& s = BatteryMonitor::instance().getTrainingStats();
-        Serial.printf("{\"type\":\"ack\",\"action\":\"battery_stats_reset\",\"trained\":false,\"v_min\":%u,\"v_max\":%u,\"cycles\":%.1f,\"runtime_sec\":0}\n",
+        SPRINTF("{\"type\":\"ack\",\"action\":\"battery_stats_reset\",\"trained\":false,\"v_min\":%u,\"v_max\":%u,\"cycles\":%.1f,\"runtime_sec\":0}\n",
                       s.vMin, s.vMax, s.cycles);
     } else if (cmd.equalsIgnoreCase("batt diag") || cmd.equalsIgnoreCase("battery diag") || cmd.equalsIgnoreCase("batt stats") || cmd.equalsIgnoreCase("battery stats") || cmd.equalsIgnoreCase("batt info")) {
         const auto& s = BatteryMonitor::instance().getTrainingStats();
-        Serial.printf("{\"type\":\"battery_stats\",\"pin\":%d,\"raw_mv\":%lu,\"calc_mv\":%lu,\"pct\":%u,\"has_battery\":%s,\"state\":\"%s\",\"charging\":%s,\"trained\":%s,\"train_pct\":%u,\"v_min\":%u,\"v_max\":%u,\"v_nom\":%u,\"cycles\":%.2f,\"runtime_sec\":%lu,\"samples\":%lu,\"verdict\":\"%s\",\"advice\":\"%s\"}\n",
+        SPRINTF("{\"type\":\"battery_stats\",\"pin\":%d,\"raw_mv\":%lu,\"calc_mv\":%lu,\"pct\":%u,\"has_battery\":%s,\"state\":\"%s\",\"charging\":%s,\"trained\":%s,\"train_pct\":%u,\"v_min\":%u,\"v_max\":%u,\"v_nom\":%u,\"cycles\":%.2f,\"runtime_sec\":%lu,\"samples\":%lu,\"verdict\":\"%s\",\"advice\":\"%s\"}\n",
                       BatteryMonitor::instance().getPin(),
                       (unsigned long)BatteryMonitor::instance().getRawMilliVolts(),
                       (unsigned long)BatteryMonitor::instance().getMilliVolts(),
@@ -264,7 +275,7 @@ void handleCommand(const String& cmdLine) {
             BatteryMonitor::instance().getStateStr(),
             BatteryMonitor::instance().isCharging()
         );
-        Serial.printf("{\"type\":\"battery_status\",\"pin\":%d,\"calc_mv\":%lu,\"pct\":%u,\"has_battery\":%s,\"state\":\"%s\",\"charging\":%s,\"trained\":%s,\"train_pct\":%u,\"cycles\":%.1f}\n",
+        SPRINTF("{\"type\":\"battery_status\",\"pin\":%d,\"calc_mv\":%lu,\"pct\":%u,\"has_battery\":%s,\"state\":\"%s\",\"charging\":%s,\"trained\":%s,\"train_pct\":%u,\"cycles\":%.1f}\n",
                       BatteryMonitor::instance().getPin(),
                       (unsigned long)BatteryMonitor::instance().getMilliVolts(),
                       BatteryMonitor::instance().getPercentage(),
@@ -277,13 +288,13 @@ void handleCommand(const String& cmdLine) {
     } else if (cmd.startsWith("batt pin ")) {
         int p = cmd.substring(9).toInt();
         BatteryMonitor::instance().setPin(p);
-        Serial.printf("{\"type\":\"ack\",\"battPin\":%d}\n", p);
+        SPRINTF("{\"type\":\"ack\",\"battPin\":%d}\n", p);
     } else if (cmd.startsWith("batt divider ")) {
         float r = cmd.substring(13).toFloat();
         BatteryMonitor::instance().setDivider(r);
-        Serial.printf("{\"type\":\"ack\",\"battDivider\":%.2f}\n", r);
+        SPRINTF("{\"type\":\"ack\",\"battDivider\":%.2f}\n", r);
     } else if (cmd.equalsIgnoreCase("gps") || cmd.equalsIgnoreCase("gps status")) {
-        Serial.printf("{\"type\":\"gps_status\",\"hardware_detected\":%s,\"has_fix\":%s,\"lat\":%.6f,\"lon\":%.6f,\"acc\":%.1f,\"speed_kmh\":%.1f,\"alt\":%.1f,\"sats\":%u,\"hdop\":%.1f}\n",
+        SPRINTF("{\"type\":\"gps_status\",\"hardware_detected\":%s,\"has_fix\":%s,\"lat\":%.6f,\"lon\":%.6f,\"acc\":%.1f,\"speed_kmh\":%.1f,\"alt\":%.1f,\"sats\":%u,\"hdop\":%.1f}\n",
                       GpsReceiver::instance().hasHardwareDetected() ? "true" : "false",
                       NodeConfig::instance().hasGpsFix() ? "true" : "false",
                       NodeConfig::instance().getLat(), NodeConfig::instance().getLon(),
@@ -294,11 +305,11 @@ void handleCommand(const String& cmdLine) {
         String dev = cmd.substring(cmd.indexOf(' ') + 1);
         dev.trim();
         NodeConfig::instance().setAttachedDevice(dev.c_str());
-        Serial.printf("{\"type\":\"ack\",\"action\":\"attached\",\"device\":\"%s\",\"following\":true}\n", dev.c_str());
+        SPRINTF("{\"type\":\"ack\",\"action\":\"attached\",\"device\":\"%s\",\"following\":true}\n", dev.c_str());
     } else if (cmd.equalsIgnoreCase("detach") || cmd.equalsIgnoreCase("unfollow")) {
         NodeConfig::instance().clearAttachedDevice();
         NodeConfig::instance().clearGpsFix();
-        Serial.println("{\"type\":\"ack\",\"action\":\"detached\",\"following\":false}");
+        SPRINTLN("{\"type\":\"ack\",\"action\":\"detached\",\"following\":false}");
     } else if (cmd.startsWith("gps ")) {
         String args = cmd.substring(4);
         args.trim();
@@ -329,7 +340,7 @@ void handleCommand(const String& cmdLine) {
 
         if (lat != 0.0 && lon != 0.0) {
             NodeConfig::instance().setGpsFix(lat, lon, acc, speed, heading, alt, sats, tripKm);
-            Serial.printf("{\"type\":\"ack\",\"action\":\"gps_updated\",\"lat\":%.6f,\"lon\":%.6f,\"acc\":%.1f,\"speed_mps\":%.2f,\"trip_km\":%.2f,\"traveling\":%s}\n",
+            SPRINTF("{\"type\":\"ack\",\"action\":\"gps_updated\",\"lat\":%.6f,\"lon\":%.6f,\"acc\":%.1f,\"speed_mps\":%.2f,\"trip_km\":%.2f,\"traveling\":%s}\n",
                           lat, lon, acc, NodeConfig::instance().getSpeedMps(),
                           NodeConfig::instance().getTripDistKm(),
                           NodeConfig::instance().isTraveling() ? "true" : "false");
@@ -338,7 +349,7 @@ void handleCommand(const String& cmdLine) {
         String args = cmd.length() > 6 ? cmd.substring(cmd.indexOf(' ') + 1) : "";
         args.trim();
         if (args.isEmpty() || args.equalsIgnoreCase("status")) {
-            Serial.printf("{\"type\":\"travel_status\",\"traveling\":%s,\"state\":\"%s\",\"speed_kmh\":%.1f,\"speed_mph\":%.1f,\"heading\":%.1f,\"card\":\"%s\",\"alt_m\":%.1f,\"trip_km\":%.2f}\n",
+            SPRINTF("{\"type\":\"travel_status\",\"traveling\":%s,\"state\":\"%s\",\"speed_kmh\":%.1f,\"speed_mph\":%.1f,\"heading\":%.1f,\"card\":\"%s\",\"alt_m\":%.1f,\"trip_km\":%.2f}\n",
                           NodeConfig::instance().isTraveling() ? "true" : "false",
                           NodeConfig::instance().getTravelStateStr(),
                           NodeConfig::instance().getSpeedKmh(),
@@ -370,7 +381,7 @@ void handleCommand(const String& cmdLine) {
                 }
             }
             NodeConfig::instance().setTravelState(moving, spdKmh, hdg, alt, tripKm);
-            Serial.printf("{\"type\":\"ack\",\"action\":\"travel_updated\",\"traveling\":%s,\"speed_kmh\":%.1f,\"trip_km\":%.2f}\n",
+            SPRINTF("{\"type\":\"ack\",\"action\":\"travel_updated\",\"traveling\":%s,\"speed_kmh\":%.1f,\"trip_km\":%.2f}\n",
                           moving ? "true" : "false", NodeConfig::instance().getSpeedKmh(),
                           NodeConfig::instance().getTripDistKm());
         }
@@ -379,7 +390,7 @@ void handleCommand(const String& cmdLine) {
         args.trim();
         if (args.equalsIgnoreCase("reset")) {
             NodeConfig::instance().resetTrip();
-            Serial.println("{\"type\":\"ack\",\"action\":\"trip_reset\"}");
+            SPRINTLN("{\"type\":\"ack\",\"action\":\"trip_reset\"}");
         } else if (!args.isEmpty() && !args.equalsIgnoreCase("status")) {
             float distKm = args.toFloat();
             NodeConfig::instance().setTripDistKm(distKm);
@@ -390,24 +401,24 @@ void handleCommand(const String& cmdLine) {
                     NodeConfig::instance().setMaxSpeedKmh(maxSpdKmh);
                 }
             }
-            Serial.printf("{\"type\":\"ack\",\"action\":\"trip_updated\",\"trip_km\":%.2f,\"max_speed_kmh\":%.1f}\n",
+            SPRINTF("{\"type\":\"ack\",\"action\":\"trip_updated\",\"trip_km\":%.2f,\"max_speed_kmh\":%.1f}\n",
                           NodeConfig::instance().getTripDistKm(), NodeConfig::instance().getMaxSpeedKmh());
         } else {
-            Serial.printf("{\"type\":\"trip_status\",\"trip_km\":%.2f,\"max_speed_kmh\":%.1f}\n",
+            SPRINTF("{\"type\":\"trip_status\",\"trip_km\":%.2f,\"max_speed_kmh\":%.1f}\n",
                           NodeConfig::instance().getTripDistKm(),
                           NodeConfig::instance().getMaxSpeedKmh());
         }
     } else if (cmd.startsWith("channel ") || cmd.startsWith("ch ")) {
         int ch = cmd.substring(cmd.indexOf(' ') + 1).toInt();
         WifiMonitor::instance().setChannel(ch);
-        Serial.printf("{\"type\":\"ack\",\"channel\":%u,\"hop\":%s}\n",
+        SPRINTF("{\"type\":\"ack\",\"channel\":%u,\"hop\":%s}\n",
                       WifiMonitor::instance().getChannel(),
                       WifiMonitor::instance().isAutoHop() ? "true" : "false");
     } else if (cmd.startsWith("hop ")) {
         int ms = cmd.substring(4).toInt();
         if (ms >= 20 && ms <= 5000) {
             WifiMonitor::instance().setHopInterval(ms);
-            Serial.printf("{\"type\":\"ack\",\"hopInterval\":%u}\n", ms);
+            SPRINTF("{\"type\":\"ack\",\"hopInterval\":%u}\n", ms);
         }
     } else if (cmd.equalsIgnoreCase("led list")) {
         String json = "{\"type\":\"led_list\",\"slots\":[";
@@ -425,11 +436,11 @@ void handleCommand(const String& cmdLine) {
                     ",\"label\":\"" + String(s.label) + "\"}";
         }
         json += "],\"safePins\":[2,4,16,17,18,19,21,22,23,25,26,27,32,33]}";
-        Serial.println(json);
+        SPRINTLN(json);
     } else if (cmd.startsWith("led clear ")) {
         int slot = cmd.substring(10).toInt();
         LedPatterns::instance().clearSlot(slot);
-        Serial.printf("{\"type\":\"ack\",\"action\":\"led_cleared\",\"slot\":%d}\n", slot);
+        SPRINTF("{\"type\":\"ack\",\"action\":\"led_cleared\",\"slot\":%d}\n", slot);
     } else if (cmd.startsWith("led config ")) {
         // Syntax:
         // led config <slot> single <pin> <role> [inverted]
@@ -439,26 +450,26 @@ void handleCommand(const String& cmdLine) {
         buf[sizeof(buf) - 1] = '\0';
 
         char* p = strtok(buf, " ");
-        if (!p) { Serial.println("{\"type\":\"error\",\"message\":\"syntax_error\"}"); return; }
+        if (!p) { SPRINTLN("{\"type\":\"error\",\"message\":\"syntax_error\"}"); return; }
         int slot = atoi(p);
 
         p = strtok(NULL, " ");
-        if (!p) { Serial.println("{\"type\":\"error\",\"message\":\"missing_type\"}"); return; }
+        if (!p) { SPRINTLN("{\"type\":\"error\",\"message\":\"missing_type\"}"); return; }
         String typeStr = p;
 
         if (typeStr.equalsIgnoreCase("single")) {
             char* pinTok = strtok(NULL, " ");
             char* roleTok = strtok(NULL, " ");
             char* invTok = strtok(NULL, " ");
-            if (!pinTok) { Serial.println("{\"type\":\"error\",\"message\":\"missing_pin\"}"); return; }
+            if (!pinTok) { SPRINTLN("{\"type\":\"error\",\"message\":\"missing_pin\"}"); return; }
             int pin = atoi(pinTok);
             LedRole role = roleTok ? parseRole(roleTok) : ROLE_MIRROR;
             bool inv = invTok ? (atoi(invTok) != 0 || String(invTok).equalsIgnoreCase("true")) : false;
 
             if (LedPatterns::instance().configureSingle(slot, pin, role, inv)) {
-                Serial.printf("{\"type\":\"ack\",\"action\":\"led_configured\",\"slot\":%d,\"type\":\"single\",\"pin\":%d,\"role\":%d}\n", slot, pin, (int)role);
+                SPRINTF("{\"type\":\"ack\",\"action\":\"led_configured\",\"slot\":%d,\"type\":\"single\",\"pin\":%d,\"role\":%d}\n", slot, pin, (int)role);
             } else {
-                Serial.printf("{\"type\":\"error\",\"message\":\"invalid_pin_or_slot\",\"pin\":%d}\n", pin);
+                SPRINTF("{\"type\":\"error\",\"message\":\"invalid_pin_or_slot\",\"pin\":%d}\n", pin);
             }
         } else if (typeStr.equalsIgnoreCase("rgb")) {
             char* rTok = strtok(NULL, " ");
@@ -466,7 +477,7 @@ void handleCommand(const String& cmdLine) {
             char* bTok = strtok(NULL, " ");
             char* roleTok = strtok(NULL, " ");
             char* invTok = strtok(NULL, " ");
-            if (!rTok || !gTok || !bTok) { Serial.println("{\"type\":\"error\",\"message\":\"missing_rgb_pins\"}"); return; }
+            if (!rTok || !gTok || !bTok) { SPRINTLN("{\"type\":\"error\",\"message\":\"missing_rgb_pins\"}"); return; }
             int pinR = atoi(rTok);
             int pinG = atoi(gTok);
             int pinB = atoi(bTok);
@@ -474,9 +485,9 @@ void handleCommand(const String& cmdLine) {
             bool ca = invTok ? (atoi(invTok) != 0 || String(invTok).equalsIgnoreCase("true") || String(invTok).equalsIgnoreCase("anode")) : false;
 
             if (LedPatterns::instance().configureRgb(slot, pinR, pinG, pinB, role, ca)) {
-                Serial.printf("{\"type\":\"ack\",\"action\":\"led_configured\",\"slot\":%d,\"type\":\"rgb\",\"pins\":[%d,%d,%d],\"role\":%d}\n", slot, pinR, pinG, pinB, (int)role);
+                SPRINTF("{\"type\":\"ack\",\"action\":\"led_configured\",\"slot\":%d,\"type\":\"rgb\",\"pins\":[%d,%d,%d],\"role\":%d}\n", slot, pinR, pinG, pinB, (int)role);
             } else {
-                Serial.println("{\"type\":\"error\",\"message\":\"invalid_pins_or_slot\"}");
+                SPRINTLN("{\"type\":\"error\",\"message\":\"invalid_pins_or_slot\"}");
             }
         }
     } else if (cmd.startsWith("led ")) {
@@ -502,16 +513,16 @@ void handleCommand(const String& cmdLine) {
         } else if (arg.startsWith("pin ")) {
             int p = arg.substring(4).toInt();
             LedPatterns::instance().setPin(p);
-            Serial.printf("{\"type\":\"ack\",\"ledPin\":%d}\n", p);
+            SPRINTF("{\"type\":\"ack\",\"ledPin\":%d}\n", p);
         }
-        Serial.println("{\"type\":\"ack\",\"led\":\"pattern_applied\"}");
+        SPRINTLN("{\"type\":\"ack\",\"led\":\"pattern_applied\"}");
     } else if (cmd.equalsIgnoreCase("ota")) {
         WifiMonitor::instance().setChannel(1);
-        Serial.printf("{\"type\":\"ack\",\"mode\":\"ota_ready\",\"url\":\"http://%s/\",\"ssid\":\"%s\"}\n",
+        SPRINTF("{\"type\":\"ack\",\"mode\":\"ota_ready\",\"url\":\"http://%s/\",\"ssid\":\"%s\"}\n",
                       WiFi.softAPIP().toString().c_str(), NodeConfig::instance().getName());
     } else if (cmd.equalsIgnoreCase("wifi status") || cmd.equalsIgnoreCase("wifi")) {
         bool connected = (WiFi.status() == WL_CONNECTED);
-        Serial.printf("{\"type\":\"wifi_status\",\"configured\":%s,\"ssid\":\"%s\",\"connected\":%s,\"ip\":\"%s\",\"rssi\":%d}\n",
+        SPRINTF("{\"type\":\"wifi_status\",\"configured\":%s,\"ssid\":\"%s\",\"connected\":%s,\"ip\":\"%s\",\"rssi\":%d}\n",
             NodeConfig::instance().hasWifiCreds() ? "true" : "false",
             NodeConfig::instance().getWifiSsid().c_str(),
             connected ? "true" : "false",
@@ -527,14 +538,14 @@ void handleCommand(const String& cmdLine) {
         NodeConfig::instance().setWifiCreds(ssid.c_str(), pass.c_str());
         WiFi.mode(WIFI_AP_STA);
         WiFi.begin(ssid.c_str(), pass.c_str());
-        Serial.printf("{\"type\":\"ack\",\"action\":\"wifi_connecting\",\"ssid\":\"%s\"}\n", ssid.c_str());
+        SPRINTF("{\"type\":\"ack\",\"action\":\"wifi_connecting\",\"ssid\":\"%s\"}\n", ssid.c_str());
     } else if (cmd.equalsIgnoreCase("wifi clear")) {
         NodeConfig::instance().clearWifiCreds();
         WiFi.disconnect(true);
     } else if (cmd.startsWith("baud ")) {
         long newBaud = cmd.substring(5).toInt();
         if (newBaud >= 9600 && newBaud <= 2000000) {
-            Serial.printf("{\"type\":\"ack\",\"action\":\"baud_change\",\"baud\":%ld}\n", newBaud);
+            SPRINTF("{\"type\":\"ack\",\"action\":\"baud_change\",\"baud\":%ld}\n", newBaud);
             Serial.flush();
             delay(50);
             Serial.begin(newBaud);
@@ -589,10 +600,10 @@ void handleCommand(const String& cmdLine) {
                 targetMac, totalBytes, chunkSize, sha256, sig, (uint8_t)sigLen, verStr.c_str(), channel, hwType
             );
 
-            Serial.printf("{\"type\":\"ack\",\"action\":\"mesh_ota_start_sent\",\"ok\":%s,\"total\":%u,\"chunks\":%u,\"ch\":%u,\"hw\":%u}\n",
+            SPRINTF("{\"type\":\"ack\",\"action\":\"mesh_ota_start_sent\",\"ok\":%s,\"total\":%u,\"chunks\":%u,\"ch\":%u,\"hw\":%u}\n",
                           ok ? "true" : "false", totalBytes, (totalBytes + chunkSize - 1) / chunkSize, channel, hwType);
         } else {
-            Serial.println("{\"type\":\"error\",\"action\":\"invalid_mesh_ota_start_args\"}");
+            SPRINTLN("{\"type\":\"error\",\"action\":\"invalid_mesh_ota_start_args\"}");
         }
     } else if (cmd.startsWith("mesh ota chunk ")) {
         // Syntax: mesh ota chunk <target_mac|all> <chunk_idx> <hex_data>
@@ -614,10 +625,10 @@ void handleCommand(const String& cmdLine) {
             parseHexBytes(hexData.c_str(), rawChunk, sizeof(rawChunk), &chunkLen);
 
             bool ok = MeshOtaEngine::instance().transmitOtaChunk(targetMac, chunkIdx, rawChunk, (uint16_t)chunkLen);
-            Serial.printf("{\"type\":\"ack\",\"action\":\"mesh_ota_chunk_sent\",\"chunk\":%u,\"len\":%u,\"ok\":%s}\n",
+            SPRINTF("{\"type\":\"ack\",\"action\":\"mesh_ota_chunk_sent\",\"chunk\":%u,\"len\":%u,\"ok\":%s}\n",
                           chunkIdx, (unsigned int)chunkLen, ok ? "true" : "false");
         } else {
-            Serial.println("{\"type\":\"error\",\"action\":\"invalid_mesh_ota_chunk_args\"}");
+            SPRINTLN("{\"type\":\"error\",\"action\":\"invalid_mesh_ota_chunk_args\"}");
         }
     } else if (cmd.startsWith("mesh ota query ")) {
         String targetStr = cmd.substring(15);
@@ -625,14 +636,14 @@ void handleCommand(const String& cmdLine) {
         uint8_t targetMac[6];
         parseMacStr(targetStr.c_str(), targetMac);
         bool ok = MeshOtaEngine::instance().transmitOtaQuery(targetMac);
-        Serial.printf("{\"type\":\"ack\",\"action\":\"mesh_ota_query_sent\",\"ok\":%s}\n", ok ? "true" : "false");
+        SPRINTF("{\"type\":\"ack\",\"action\":\"mesh_ota_query_sent\",\"ok\":%s}\n", ok ? "true" : "false");
     } else if (cmd.startsWith("mesh ota abort")) {
         String targetStr = cmd.length() > 15 ? cmd.substring(15) : "all";
         targetStr.trim();
         uint8_t targetMac[6];
         parseMacStr(targetStr.c_str(), targetMac);
         bool ok = MeshOtaEngine::instance().transmitOtaAbort(targetMac, "Host command aborted");
-        Serial.printf("{\"type\":\"ack\",\"action\":\"mesh_ota_abort_sent\",\"ok\":%s}\n", ok ? "true" : "false");
+        SPRINTF("{\"type\":\"ack\",\"action\":\"mesh_ota_abort_sent\",\"ok\":%s}\n", ok ? "true" : "false");
     } else if (cmd.startsWith("mesh ota manifest ")) {
         // Syntax: mesh ota manifest <bytes> <chunk_sz> <sha256_hex> <sig_hex> [version] [hw_type]
         String args = cmd.substring(18);
@@ -671,10 +682,10 @@ void handleCommand(const String& cmdLine) {
             parseHexBytes(sigHex.c_str(), sig, sizeof(sig), &sigLen);
 
             MeshOtaEngine::instance().saveManifest(totalBytes, chunkSz, sha256, sig, (uint8_t)sigLen, verStr.c_str(), hwType);
-            Serial.printf("{\"type\":\"ack\",\"action\":\"manifest_set\",\"bytes\":%u,\"ver\":\"%s\",\"hw\":%u}\n",
+            SPRINTF("{\"type\":\"ack\",\"action\":\"manifest_set\",\"bytes\":%u,\"ver\":\"%s\",\"hw\":%u}\n",
                           totalBytes, verStr.c_str(), hwType);
         } else {
-            Serial.println("{\"type\":\"error\",\"action\":\"invalid_manifest_args\"}");
+            SPRINTLN("{\"type\":\"error\",\"action\":\"invalid_manifest_args\"}");
         }
     } else if (cmd.startsWith("mesh ota seed") || cmd.startsWith("mesh seed")) {
         String targetStr = "";
@@ -691,12 +702,12 @@ void handleCommand(const String& cmdLine) {
             hasTarget = true;
         }
         bool ok = MeshOtaEngine::instance().triggerSeeding(hasTarget ? targetMac : nullptr);
-        Serial.printf("{\"type\":\"ack\",\"action\":\"seeder_triggered\",\"ok\":%s,\"has_manifest\":%s,\"ver\":\"%s\"}\n",
+        SPRINTF("{\"type\":\"ack\",\"action\":\"seeder_triggered\",\"ok\":%s,\"has_manifest\":%s,\"ver\":\"%s\"}\n",
                       ok ? "true" : "false",
                       MeshOtaEngine::instance().hasManifest() ? "true" : "false",
                       MeshOtaEngine::instance().getManifestVersion());
     } else if (cmd.equalsIgnoreCase("mesh ota status")) {
-        Serial.printf("{\"type\":\"mesh_ota_local_status\",\"state\":%u,\"chunk\":%u,\"total\":%u,\"bytes\":%u,\"err\":%u,\"version\":\"%s\",\"has_manifest\":%s,\"is_seeding\":%s,\"manifest_ver\":\"%s\"}\n",
+        SPRINTF("{\"type\":\"mesh_ota_local_status\",\"state\":%u,\"chunk\":%u,\"total\":%u,\"bytes\":%u,\"err\":%u,\"version\":\"%s\",\"has_manifest\":%s,\"is_seeding\":%s,\"manifest_ver\":\"%s\"}\n",
                       MeshOtaEngine::instance().getState(),
                       MeshOtaEngine::instance().getNextExpectedChunk(),
                       MeshOtaEngine::instance().getTotalChunks(),
@@ -707,17 +718,16 @@ void handleCommand(const String& cmdLine) {
                       MeshOtaEngine::instance().isSeeding() ? "true" : "false",
                       MeshOtaEngine::instance().getManifestVersion());
     } else if (cmd.equalsIgnoreCase("reboot")) {
-        Serial.println("{\"type\":\"ack\",\"action\":\"rebooting\"}");
+        SPRINTLN("{\"type\":\"ack\",\"action\":\"rebooting\"}");
         delay(100);
         ESP.restart();
     } else {
-        Serial.printf("{\"type\":\"error\",\"message\":\"unknown command '%s'\"}\n", cmd.c_str());
+        SPRINTF("{\"type\":\"error\",\"message\":\"unknown command '%s'\"}\n", cmd.c_str());
     }
 }
 
 void BleScanner::processIncomingRx(const std::string& rxStr) {
-    String cmd(rxStr.c_str());
-    handleCommand(cmd);
+    queueRx(rxStr);
 }
 
 // ── Setup & Loop ─────────────────────────────────────────────────────────────
@@ -883,6 +893,13 @@ void loop() {
             g_serialBuffer += c;
         }
     }
+
+    // BLE NUS commands (queued by the NimBLE task) and the queue dump a new subscriber asked for
+    String bleCmd;
+    while (BleScanner::instance().popRxLine(bleCmd)) {
+        if (bleCmd.length() > 0) handleCommand(bleCmd);
+    }
+    if (BleScanner::instance().takeQueueDumpRequest()) dumpMeshQueueToBle();
 
     // 8. Periodic Status Telemetry Heartbeat (every 5 seconds)
     if (now - g_lastStatusTime >= 5000) {

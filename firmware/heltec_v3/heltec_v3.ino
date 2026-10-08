@@ -162,6 +162,17 @@ static bool parseMacStr(const char* str, uint8_t* macOut) {
 }
 
 // ── Command Processing ───────────────────────────────────────────────────────
+
+void dumpMeshQueueToBle() {
+    MeshEngine::instance().dumpQueueToBle();
+}
+void sendBleTelemetry(const char* msg) {
+    if (BleScanner::instance().isConnected()) BleScanner::instance().sendTelemetry(msg);
+}
+// Command replies go to USB and BLE. SPRINTF output may be a fragment of one line (mesh peers), so it is sent raw.
+#define SPRINTF(...) do { char __b[512]; snprintf(__b, sizeof(__b), __VA_ARGS__); Serial.print(__b); if(BleScanner::instance().isConnected()) BleScanner::instance().sendRaw(__b, strlen(__b)); } while(0)
+#define SPRINTLN(msg) do { Serial.println(msg); if(BleScanner::instance().isConnected()){ String __s = String(msg) + "\n"; BleScanner::instance().sendRaw(__s.c_str(), __s.length()); } } while(0)
+
 void handleCommand(const String& cmdLine) {
     String cmd = cmdLine;
     cmd.trim();
@@ -177,7 +188,7 @@ void handleCommand(const String& cmdLine) {
             uint64_t epochUs = strtoull(cmd.substring(cmd.indexOf(':', timeIdx) + 1).c_str(), NULL, 10);
             if (epochUs > 1000000000000ULL) {
                 TimeSync::instance().setMasterTimeUs(epochUs);
-                Serial.printf("{\"type\":\"ack\",\"time_synced\":true,\"stratum\":1,\"epoch_us\":%llu}\n", (unsigned long long)epochUs);
+                SPRINTF("{\"type\":\"ack\",\"time_synced\":true,\"stratum\":1,\"epoch_us\":%llu}\n", (unsigned long long)epochUs);
                 return;
             }
         }
@@ -231,13 +242,13 @@ void handleCommand(const String& cmdLine) {
 
             DisplayOled::instance().triggerAlprAlert(op, mdl, dist, conf, (int8_t)facing, spd, lat, lon);
             LedPatterns::instance().triggerDeauthAlert();
-            Serial.printf("{\"type\":\"ack\",\"action\":\"alpr_json_triggered\",\"operator\":\"%s\",\"distance\":%.1f}\n", op, dist);
+            SPRINTF("{\"type\":\"ack\",\"action\":\"alpr_json_triggered\",\"operator\":\"%s\",\"distance\":%.1f}\n", op, dist);
             return;
         }
     }
 
     if (cmd.equalsIgnoreCase("help")) {
-        Serial.println("{\"type\":\"help\",\"commands\":["
+        SPRINTLN("{\"type\":\"help\",\"commands\":["
                        "\"status\",\"name [new_name|reset]\",\"mode <base|mobile|toggle|status>\","
                        "\"channel <0-14>\",\"hop <ms>\",\"time <epoch_us>\","
                        "\"mesh status\",\"mesh peers\",\"mesh send <text>\","
@@ -247,7 +258,7 @@ void handleCommand(const String& cmdLine) {
                        "\"wifi status\",\"wifi connect <ssid> <pass>\",\"wifi clear\","
                        "\"gps [lat,lon,acc,...]\",\"led <pattern>\",\"batt [status|stats|reset|on|off|<mah>]\",\"ota\",\"reboot\"]}");
     } else if (cmd.equalsIgnoreCase("gps") || cmd.equalsIgnoreCase("gps status")) {
-        Serial.printf("{\"type\":\"gps_status\",\"hardware_detected\":%s,\"has_fix\":%s,\"lat\":%.6f,\"lon\":%.6f,\"acc\":%.1f,\"speed_kmh\":%.1f,\"alt\":%.1f,\"sats\":%u,\"hdop\":%.1f}\n",
+        SPRINTF("{\"type\":\"gps_status\",\"hardware_detected\":%s,\"has_fix\":%s,\"lat\":%.6f,\"lon\":%.6f,\"acc\":%.1f,\"speed_kmh\":%.1f,\"alt\":%.1f,\"sats\":%u,\"hdop\":%.1f}\n",
                       GpsReceiver::instance().hasHardwareDetected() ? "true" : "false",
                       NodeConfig::instance().hasGpsFix() ? "true" : "false",
                       NodeConfig::instance().getLat(), NodeConfig::instance().getLon(),
@@ -255,7 +266,7 @@ void handleCommand(const String& cmdLine) {
                       NodeConfig::instance().getAltM(), GpsReceiver::instance().getSatellites(),
                       GpsReceiver::instance().getHdop());
     } else if (cmd.equalsIgnoreCase("mode") || cmd.equalsIgnoreCase("mode status")) {
-        Serial.printf("{\"type\":\"op_mode\",\"mode\":\"%s\",\"is_base_station\":%s,\"hops\":%u,\"power_dbm\":%d}\n",
+        SPRINTF("{\"type\":\"op_mode\",\"mode\":\"%s\",\"is_base_station\":%s,\"hops\":%u,\"power_dbm\":%d}\n",
             NodeConfig::instance().getOpModeStr(),
             NodeConfig::instance().isBaseStation() ? "true" : "false",
             MeshEngine::instance().getHopsToGateway(),
@@ -264,18 +275,18 @@ void handleCommand(const String& cmdLine) {
         NodeConfig::instance().setOpMode(OP_MODE_BASE_STATION);
         LoraRadio::instance().setBaseStationMode(true);
         DisplayOled::instance().showModeToast(OP_MODE_BASE_STATION);
-        Serial.println("{\"type\":\"ack\",\"action\":\"mode_changed\",\"mode\":\"base_station\",\"is_base_station\":true,\"power_dbm\":22}");
+        SPRINTLN("{\"type\":\"ack\",\"action\":\"mode_changed\",\"mode\":\"base_station\",\"is_base_station\":true,\"power_dbm\":22}");
     } else if (cmd.equalsIgnoreCase("mode mobile")) {
         NodeConfig::instance().setOpMode(OP_MODE_MOBILE);
         LoraRadio::instance().setBaseStationMode(false);
         DisplayOled::instance().showModeToast(OP_MODE_MOBILE);
-        Serial.println("{\"type\":\"ack\",\"action\":\"mode_changed\",\"mode\":\"mobile\",\"is_base_station\":false,\"power_dbm\":14}");
+        SPRINTLN("{\"type\":\"ack\",\"action\":\"mode_changed\",\"mode\":\"mobile\",\"is_base_station\":false,\"power_dbm\":14}");
     } else if (cmd.equalsIgnoreCase("mode toggle")) {
         NodeOpMode newMode = NodeConfig::instance().isBaseStation() ? OP_MODE_MOBILE : OP_MODE_BASE_STATION;
         NodeConfig::instance().setOpMode(newMode);
         LoraRadio::instance().setBaseStationMode(newMode == OP_MODE_BASE_STATION);
         DisplayOled::instance().showModeToast(newMode);
-        Serial.printf("{\"type\":\"ack\",\"action\":\"mode_changed\",\"mode\":\"%s\",\"is_base_station\":%s,\"power_dbm\":%d}\n",
+        SPRINTF("{\"type\":\"ack\",\"action\":\"mode_changed\",\"mode\":\"%s\",\"is_base_station\":%s,\"power_dbm\":%d}\n",
             NodeConfig::instance().getOpModeStr(),
             NodeConfig::instance().isBaseStation() ? "true" : "false",
             LoraRadio::instance().getPowerDbm());
@@ -283,25 +294,25 @@ void handleCommand(const String& cmdLine) {
         uint64_t epochUs = strtoull(cmd.substring(5).c_str(), NULL, 10);
         if (epochUs > 1000000000000ULL) {
             TimeSync::instance().setMasterTimeUs(epochUs);
-            Serial.printf("{\"type\":\"ack\",\"time_synced\":true,\"stratum\":1,\"epoch_us\":%llu}\n", (unsigned long long)epochUs);
+            SPRINTF("{\"type\":\"ack\",\"time_synced\":true,\"stratum\":1,\"epoch_us\":%llu}\n", (unsigned long long)epochUs);
         } else {
-            Serial.println("{\"type\":\"error\",\"message\":\"invalid_timestamp\"}");
+            SPRINTLN("{\"type\":\"error\",\"message\":\"invalid_timestamp\"}");
         }
     } else if (cmd.startsWith("channel ") || cmd.startsWith("ch ")) {
         uint8_t ch = cmd.substring(cmd.indexOf(' ') + 1).toInt();
         WifiMonitor::instance().setChannel(ch);
-        Serial.printf("{\"type\":\"ack\",\"channel\":%u,\"hop\":%s}\n",
+        SPRINTF("{\"type\":\"ack\",\"channel\":%u,\"hop\":%s}\n",
                       WifiMonitor::instance().getChannel(),
                       WifiMonitor::instance().isAutoHop() ? "true" : "false");
     } else if (cmd.startsWith("attach ") || cmd.startsWith("follow ")) {
         String dev = cmd.substring(cmd.indexOf(' ') + 1);
         dev.trim();
         NodeConfig::instance().setAttachedDevice(dev.c_str());
-        Serial.printf("{\"type\":\"ack\",\"action\":\"attached\",\"device\":\"%s\",\"following\":true}\n", dev.c_str());
+        SPRINTF("{\"type\":\"ack\",\"action\":\"attached\",\"device\":\"%s\",\"following\":true}\n", dev.c_str());
     } else if (cmd.equalsIgnoreCase("detach") || cmd.equalsIgnoreCase("unfollow")) {
         NodeConfig::instance().clearAttachedDevice();
         NodeConfig::instance().clearGpsFix();
-        Serial.println("{\"type\":\"ack\",\"action\":\"detached\",\"following\":false}");
+        SPRINTLN("{\"type\":\"ack\",\"action\":\"detached\",\"following\":false}");
     } else if (cmd.startsWith("gps ")) {
         String args = cmd.substring(4);
         args.trim();
@@ -332,7 +343,7 @@ void handleCommand(const String& cmdLine) {
 
         if (lat != 0.0 && lon != 0.0) {
             NodeConfig::instance().setGpsFix(lat, lon, acc, speed, heading, alt, sats, tripKm);
-            Serial.printf("{\"type\":\"ack\",\"action\":\"gps_updated\",\"lat\":%.6f,\"lon\":%.6f,\"acc\":%.1f,\"speed_mps\":%.2f,\"trip_km\":%.2f,\"traveling\":%s}\n",
+            SPRINTF("{\"type\":\"ack\",\"action\":\"gps_updated\",\"lat\":%.6f,\"lon\":%.6f,\"acc\":%.1f,\"speed_mps\":%.2f,\"trip_km\":%.2f,\"traveling\":%s}\n",
                           lat, lon, acc, NodeConfig::instance().getSpeedMps(),
                           NodeConfig::instance().getTripDistKm(),
                           NodeConfig::instance().isTraveling() ? "true" : "false");
@@ -341,7 +352,7 @@ void handleCommand(const String& cmdLine) {
         String args = cmd.length() > 6 ? cmd.substring(cmd.indexOf(' ') + 1) : "";
         args.trim();
         if (args.isEmpty() || args.equalsIgnoreCase("status")) {
-            Serial.printf("{\"type\":\"travel_status\",\"traveling\":%s,\"state\":\"%s\",\"speed_kmh\":%.1f,\"speed_mph\":%.1f,\"heading\":%.1f,\"card\":\"%s\",\"alt_m\":%.1f,\"trip_km\":%.2f}\n",
+            SPRINTF("{\"type\":\"travel_status\",\"traveling\":%s,\"state\":\"%s\",\"speed_kmh\":%.1f,\"speed_mph\":%.1f,\"heading\":%.1f,\"card\":\"%s\",\"alt_m\":%.1f,\"trip_km\":%.2f}\n",
                           NodeConfig::instance().isTraveling() ? "true" : "false",
                           NodeConfig::instance().getTravelStateStr(),
                           NodeConfig::instance().getSpeedKmh(),
@@ -373,7 +384,7 @@ void handleCommand(const String& cmdLine) {
                 }
             }
             NodeConfig::instance().setTravelState(moving, spdKmh, hdg, alt, tripKm);
-            Serial.printf("{\"type\":\"ack\",\"action\":\"travel_updated\",\"traveling\":%s,\"speed_kmh\":%.1f,\"trip_km\":%.2f}\n",
+            SPRINTF("{\"type\":\"ack\",\"action\":\"travel_updated\",\"traveling\":%s,\"speed_kmh\":%.1f,\"trip_km\":%.2f}\n",
                           moving ? "true" : "false", NodeConfig::instance().getSpeedKmh(),
                           NodeConfig::instance().getTripDistKm());
         }
@@ -382,7 +393,7 @@ void handleCommand(const String& cmdLine) {
         args.trim();
         if (args.equalsIgnoreCase("reset")) {
             NodeConfig::instance().resetTrip();
-            Serial.println("{\"type\":\"ack\",\"action\":\"trip_reset\"}");
+            SPRINTLN("{\"type\":\"ack\",\"action\":\"trip_reset\"}");
         } else if (!args.isEmpty() && !args.equalsIgnoreCase("status")) {
             float distKm = args.toFloat();
             NodeConfig::instance().setTripDistKm(distKm);
@@ -393,10 +404,10 @@ void handleCommand(const String& cmdLine) {
                     NodeConfig::instance().setMaxSpeedKmh(maxSpdKmh);
                 }
             }
-            Serial.printf("{\"type\":\"ack\",\"action\":\"trip_updated\",\"trip_km\":%.2f,\"max_speed_kmh\":%.1f}\n",
+            SPRINTF("{\"type\":\"ack\",\"action\":\"trip_updated\",\"trip_km\":%.2f,\"max_speed_kmh\":%.1f}\n",
                           NodeConfig::instance().getTripDistKm(), NodeConfig::instance().getMaxSpeedKmh());
         } else {
-            Serial.printf("{\"type\":\"trip_status\",\"trip_km\":%.2f,\"max_speed_kmh\":%.1f}\n",
+            SPRINTF("{\"type\":\"trip_status\",\"trip_km\":%.2f,\"max_speed_kmh\":%.1f}\n",
                           NodeConfig::instance().getTripDistKm(),
                           NodeConfig::instance().getMaxSpeedKmh());
         }
@@ -408,12 +419,12 @@ void handleCommand(const String& cmdLine) {
             DisplayOled::instance().triggerAlprAlert("Flock Safety", "Falcon Flex", 38.0f, 96, 1, 58.0f,
                                                    NodeConfig::instance().getLat(), NodeConfig::instance().getLon(), 9000);
             LedPatterns::instance().triggerDeauthAlert();
-            Serial.println("{\"type\":\"ack\",\"action\":\"alpr_splash_triggered\",\"operator\":\"Flock Safety\",\"model\":\"Falcon Flex\",\"distance_m\":38,\"conf\":96}");
+            SPRINTLN("{\"type\":\"ack\",\"action\":\"alpr_splash_triggered\",\"operator\":\"Flock Safety\",\"model\":\"Falcon Flex\",\"distance_m\":38,\"conf\":96}");
         } else if (args.equalsIgnoreCase("dismiss")) {
             DisplayOled::instance().dismissAlprAlert();
-            Serial.println("{\"type\":\"ack\",\"action\":\"alpr_dismissed\"}");
+            SPRINTLN("{\"type\":\"ack\",\"action\":\"alpr_dismissed\"}");
         } else if (args.equalsIgnoreCase("status") || args.isEmpty()) {
-            Serial.printf("{\"type\":\"alpr_status\",\"passes\":%u,\"active\":%s}\n",
+            SPRINTF("{\"type\":\"alpr_status\",\"passes\":%u,\"active\":%s}\n",
                           DisplayOled::instance().getAlprPassCount(),
                           DisplayOled::instance().isAlprAlertActive() ? "true" : "false");
         } else {
@@ -430,7 +441,7 @@ void handleCommand(const String& cmdLine) {
                    op, mdl, &dist, &conf, &facing, &speed, &lat, &lon, &dur);
             DisplayOled::instance().triggerAlprAlert(op, mdl, dist, conf, (int8_t)facing, speed, lat, lon, dur);
             LedPatterns::instance().triggerDeauthAlert();
-            Serial.printf("{\"type\":\"ack\",\"action\":\"alpr_alert_set\",\"operator\":\"%s\",\"distance\":%.1f}\n", op, dist);
+            SPRINTF("{\"type\":\"ack\",\"action\":\"alpr_alert_set\",\"operator\":\"%s\",\"distance\":%.1f}\n", op, dist);
         }
     } else if (cmd.startsWith("antenna") || cmd.equalsIgnoreCase("ant")) {
         String args = cmd.length() > 7 ? cmd.substring(8) : "";
@@ -438,21 +449,21 @@ void handleCommand(const String& cmdLine) {
         if (args.equalsIgnoreCase("on") || args.equalsIgnoreCase("enable") || args.equalsIgnoreCase("1")) {
             LoraRadio::instance().setAntennaDetected(true);
             LoraRadio::instance().setTxInhibited(false);
-            Serial.println("{\"type\":\"ack\",\"action\":\"antenna_forced\",\"detected\":true,\"tx_inhibited\":false}");
+            SPRINTLN("{\"type\":\"ack\",\"action\":\"antenna_forced\",\"detected\":true,\"tx_inhibited\":false}");
         } else if (args.equalsIgnoreCase("off") || args.equalsIgnoreCase("disable") || args.equalsIgnoreCase("0")) {
             LoraRadio::instance().setAntennaDetected(false);
             LoraRadio::instance().setTxInhibited(true);
-            Serial.println("{\"type\":\"ack\",\"action\":\"antenna_forced\",\"detected\":false,\"tx_inhibited\":true}");
+            SPRINTLN("{\"type\":\"ack\",\"action\":\"antenna_forced\",\"detected\":false,\"tx_inhibited\":true}");
         } else if (args.equalsIgnoreCase("auto") || args.equalsIgnoreCase("detect")) {
             LoraRadio::instance().clearManualOverride();
             bool det = LoraRadio::instance().checkAntennaPresence();
-            Serial.printf("{\"type\":\"ack\",\"action\":\"antenna_auto\",\"detected\":%s,\"tx_inhibited\":%s,\"ambient_rssi\":%d}\n",
+            SPRINTF("{\"type\":\"ack\",\"action\":\"antenna_auto\",\"detected\":%s,\"tx_inhibited\":%s,\"ambient_rssi\":%d}\n",
                           det ? "true" : "false",
                           LoraRadio::instance().isTxInhibited() ? "true" : "false",
                           LoraRadio::instance().getAmbientRssi());
         } else {
             bool det = LoraRadio::instance().hasAntenna();
-            Serial.printf("{\"type\":\"antenna_status\",\"detected\":%s,\"tx_inhibited\":%s,\"ambient_rssi\":%d}\n",
+            SPRINTF("{\"type\":\"antenna_status\",\"detected\":%s,\"tx_inhibited\":%s,\"ambient_rssi\":%d}\n",
                           det ? "true" : "false",
                           LoraRadio::instance().isTxInhibited() ? "true" : "false",
                           LoraRadio::instance().getAmbientRssi());
@@ -463,11 +474,11 @@ void handleCommand(const String& cmdLine) {
         if (args.equalsIgnoreCase("reset") || args.equalsIgnoreCase("stats reset") || args.equalsIgnoreCase("reset stats") || args.equalsIgnoreCase("train reset")) {
             BatteryMonitor::instance().resetBatteryStats();
             const auto& s = BatteryMonitor::instance().getTrainingStats();
-            Serial.printf("{\"type\":\"ack\",\"action\":\"battery_stats_reset\",\"trained\":false,\"v_min\":%u,\"v_max\":%u,\"cycles\":%.1f,\"runtime_sec\":0}\n",
+            SPRINTF("{\"type\":\"ack\",\"action\":\"battery_stats_reset\",\"trained\":false,\"v_min\":%u,\"v_max\":%u,\"cycles\":%.1f,\"runtime_sec\":0}\n",
                           s.vMin, s.vMax, s.cycles);
         } else if (args.equalsIgnoreCase("stats") || args.equalsIgnoreCase("diag") || args.equalsIgnoreCase("info")) {
             const auto& s = BatteryMonitor::instance().getTrainingStats();
-            Serial.printf("{\"type\":\"battery_stats\",\"has_battery\":%s,\"mah\":%u,\"mv\":%lu,\"pct\":%u,\"state\":\"%s\",\"charging\":%s,\"trained\":%s,\"train_pct\":%u,\"v_min\":%u,\"v_max\":%u,\"v_nom\":%u,\"cycles\":%.2f,\"runtime_sec\":%lu,\"samples\":%lu}\n",
+            SPRINTF("{\"type\":\"battery_stats\",\"has_battery\":%s,\"mah\":%u,\"mv\":%lu,\"pct\":%u,\"state\":\"%s\",\"charging\":%s,\"trained\":%s,\"train_pct\":%u,\"v_min\":%u,\"v_max\":%u,\"v_nom\":%u,\"cycles\":%.2f,\"runtime_sec\":%lu,\"samples\":%lu}\n",
                           BatteryMonitor::instance().hasBattery() ? "true" : "false",
                           NodeConfig::instance().getBattMah(),
                           (unsigned long)BatteryMonitor::instance().getMilliVolts(),
@@ -485,19 +496,19 @@ void handleCommand(const String& cmdLine) {
         } else if (args.equalsIgnoreCase("none") || args.equalsIgnoreCase("off") || args.equalsIgnoreCase("0") || args.equalsIgnoreCase("usb")) {
             NodeConfig::instance().setBatteryEquipped(false);
             BatteryMonitor::instance().update();
-            Serial.println("{\"type\":\"ack\",\"action\":\"battery_disabled\",\"has_battery\":false,\"power\":\"usb_5v\"}");
+            SPRINTLN("{\"type\":\"ack\",\"action\":\"battery_disabled\",\"has_battery\":false,\"power\":\"usb_5v\"}");
         } else if (args.equalsIgnoreCase("on") || args.equalsIgnoreCase("enable")) {
             NodeConfig::instance().setBatteryEquipped(true);
             BatteryMonitor::instance().update();
-            Serial.printf("{\"type\":\"ack\",\"action\":\"battery_enabled\",\"has_battery\":true,\"mah\":%u}\n", NodeConfig::instance().getBattMah());
+            SPRINTF("{\"type\":\"ack\",\"action\":\"battery_enabled\",\"has_battery\":true,\"mah\":%u}\n", NodeConfig::instance().getBattMah());
         } else if (args.toInt() > 0) {
             uint32_t mah = args.toInt();
             NodeConfig::instance().setBattMah(mah);
             BatteryMonitor::instance().update();
-            Serial.printf("{\"type\":\"ack\",\"action\":\"battery_capacity_set\",\"mah\":%u,\"has_battery\":true}\n", mah);
+            SPRINTF("{\"type\":\"ack\",\"action\":\"battery_capacity_set\",\"mah\":%u,\"has_battery\":true}\n", mah);
         } else {
             const auto& s = BatteryMonitor::instance().getTrainingStats();
-            Serial.printf("{\"type\":\"battery_status\",\"has_battery\":%s,\"mah\":%u,\"mv\":%lu,\"pct\":%u,\"state\":\"%s\",\"charging\":%s,\"trained\":%s,\"train_pct\":%u,\"cycles\":%.1f}\n",
+            SPRINTF("{\"type\":\"battery_status\",\"has_battery\":%s,\"mah\":%u,\"mv\":%lu,\"pct\":%u,\"state\":\"%s\",\"charging\":%s,\"trained\":%s,\"train_pct\":%u,\"cycles\":%.1f}\n",
                           BatteryMonitor::instance().hasBattery() ? "true" : "false",
                           NodeConfig::instance().getBattMah(),
                           (unsigned long)BatteryMonitor::instance().getMilliVolts(),
@@ -511,13 +522,13 @@ void handleCommand(const String& cmdLine) {
     } else if (cmd.equalsIgnoreCase("base") || cmd.equalsIgnoreCase("mode base")) {
         NodeConfig::instance().setOpMode(OP_MODE_BASE_STATION);
         LoraRadio::instance().setBaseStationMode(true);
-        Serial.println("{\"type\":\"ack\",\"action\":\"mode_set\",\"mode\":\"base_station\"}");
+        SPRINTLN("{\"type\":\"ack\",\"action\":\"mode_set\",\"mode\":\"base_station\"}");
     } else if (cmd.equalsIgnoreCase("mobile") || cmd.equalsIgnoreCase("mode mobile")) {
         NodeConfig::instance().setOpMode(OP_MODE_MOBILE);
         LoraRadio::instance().setBaseStationMode(false);
-        Serial.println("{\"type\":\"ack\",\"action\":\"mode_set\",\"mode\":\"mobile\"}");
+        SPRINTLN("{\"type\":\"ack\",\"action\":\"mode_set\",\"mode\":\"mobile\"}");
     } else if (cmd.equalsIgnoreCase("mesh status") || cmd.equalsIgnoreCase("mesh")) {
-        Serial.printf("{\"type\":\"mesh_status\",\"is_gateway\":%s,\"mode\":\"%s\",\"hops\":%u,\"neighbors\":%u,\"queue\":%u,\"stratum\":%u,\"now_us\":%llu,\"lora\":%s,\"lora_tx\":%u,\"lora_rx\":%u,\"power_dbm\":%d}\n",
+        SPRINTF("{\"type\":\"mesh_status\",\"is_gateway\":%s,\"mode\":\"%s\",\"hops\":%u,\"neighbors\":%u,\"queue\":%u,\"stratum\":%u,\"now_us\":%llu,\"lora\":%s,\"lora_tx\":%u,\"lora_rx\":%u,\"power_dbm\":%d}\n",
             MeshEngine::instance().isGateway() ? "true" : "false",
             NodeConfig::instance().getOpModeStr(),
             MeshEngine::instance().getHopsToGateway(),
@@ -532,24 +543,24 @@ void handleCommand(const String& cmdLine) {
     } else if (cmd.equalsIgnoreCase("mesh peers")) {
         const MeshNeighbor* n = MeshEngine::instance().getNeighbors();
         uint8_t count = MeshEngine::instance().getNeighborCount();
-        Serial.printf("{\"type\":\"mesh_peers\",\"count\":%u,\"peers\":[", count);
+        SPRINTF("{\"type\":\"mesh_peers\",\"count\":%u,\"peers\":[", count);
         for (int i = 0; i < count; i++) {
             char macStr[18];
             WifiMonitor::formatMac(n[i].mac, macStr);
-            Serial.printf("{\"name\":\"%s\",\"mac\":\"%s\",\"rssi\":%d,\"ch\":%u,\"hops\":%u,\"gateway\":%s,\"stratum\":%u}%s",
+            SPRINTF("{\"name\":\"%s\",\"mac\":\"%s\",\"rssi\":%d,\"ch\":%u,\"hops\":%u,\"gateway\":%s,\"stratum\":%u}%s",
                 n[i].name, macStr, n[i].rssi, n[i].channel, n[i].hopsToGateway,
                 n[i].isGateway ? "true" : "false", n[i].stratum,
                 (i < count - 1) ? "," : "");
         }
-        Serial.println("]}");
+        SPRINTLN("]}");
     } else if (cmd.startsWith("mesh send ")) {
         String msg = cmd.substring(10);
         MeshEngine::instance().sendTelemetry(msg.c_str());
-        Serial.printf("{\"type\":\"ack\",\"mesh_sent\":true,\"text\":\"%s\"}\n", msg.c_str());
+        SPRINTF("{\"type\":\"ack\",\"mesh_sent\":true,\"text\":\"%s\"}\n", msg.c_str());
     } else if (cmd.startsWith("baud ")) {
         long newBaud = cmd.substring(5).toInt();
         if (newBaud >= 9600 && newBaud <= 2000000) {
-            Serial.printf("{\"type\":\"ack\",\"action\":\"baud_change\",\"baud\":%ld}\n", newBaud);
+            SPRINTF("{\"type\":\"ack\",\"action\":\"baud_change\",\"baud\":%ld}\n", newBaud);
             Serial.flush();
             delay(50);
             Serial.begin(newBaud);
@@ -605,10 +616,10 @@ void handleCommand(const String& cmdLine) {
                 targetMac, totalBytes, chunkSize, sha256, sig, (uint8_t)sigLen, verStr.c_str(), channel, hwType
             );
 
-            Serial.printf("{\"type\":\"ack\",\"action\":\"mesh_ota_start_sent\",\"ok\":%s,\"total\":%u,\"chunks\":%u,\"ch\":%u,\"hw\":%u}\n",
+            SPRINTF("{\"type\":\"ack\",\"action\":\"mesh_ota_start_sent\",\"ok\":%s,\"total\":%u,\"chunks\":%u,\"ch\":%u,\"hw\":%u}\n",
                           ok ? "true" : "false", totalBytes, (totalBytes + chunkSize - 1) / chunkSize, channel, hwType);
         } else {
-            Serial.println("{\"type\":\"error\",\"action\":\"invalid_mesh_ota_start_args\"}");
+            SPRINTLN("{\"type\":\"error\",\"action\":\"invalid_mesh_ota_start_args\"}");
         }
     } else if (cmd.startsWith("mesh ota chunk ")) {
         // Syntax: mesh ota chunk <target_mac|all> <chunk_idx> <hex_data>
@@ -630,10 +641,10 @@ void handleCommand(const String& cmdLine) {
             parseHexBytes(hexData.c_str(), rawChunk, sizeof(rawChunk), &chunkLen);
 
             bool ok = MeshOtaEngine::instance().transmitOtaChunk(targetMac, chunkIdx, rawChunk, (uint16_t)chunkLen);
-            Serial.printf("{\"type\":\"ack\",\"action\":\"mesh_ota_chunk_sent\",\"chunk\":%u,\"len\":%u,\"ok\":%s}\n",
+            SPRINTF("{\"type\":\"ack\",\"action\":\"mesh_ota_chunk_sent\",\"chunk\":%u,\"len\":%u,\"ok\":%s}\n",
                           chunkIdx, (unsigned int)chunkLen, ok ? "true" : "false");
         } else {
-            Serial.println("{\"type\":\"error\",\"action\":\"invalid_mesh_ota_chunk_args\"}");
+            SPRINTLN("{\"type\":\"error\",\"action\":\"invalid_mesh_ota_chunk_args\"}");
         }
     } else if (cmd.startsWith("mesh ota query ")) {
         String targetStr = cmd.substring(15);
@@ -641,14 +652,14 @@ void handleCommand(const String& cmdLine) {
         uint8_t targetMac[6];
         parseMacStr(targetStr.c_str(), targetMac);
         bool ok = MeshOtaEngine::instance().transmitOtaQuery(targetMac);
-        Serial.printf("{\"type\":\"ack\",\"action\":\"mesh_ota_query_sent\",\"ok\":%s}\n", ok ? "true" : "false");
+        SPRINTF("{\"type\":\"ack\",\"action\":\"mesh_ota_query_sent\",\"ok\":%s}\n", ok ? "true" : "false");
     } else if (cmd.startsWith("mesh ota abort")) {
         String targetStr = cmd.length() > 15 ? cmd.substring(15) : "all";
         targetStr.trim();
         uint8_t targetMac[6];
         parseMacStr(targetStr.c_str(), targetMac);
         bool ok = MeshOtaEngine::instance().transmitOtaAbort(targetMac, "Host command aborted");
-        Serial.printf("{\"type\":\"ack\",\"action\":\"mesh_ota_abort_sent\",\"ok\":%s}\n", ok ? "true" : "false");
+        SPRINTF("{\"type\":\"ack\",\"action\":\"mesh_ota_abort_sent\",\"ok\":%s}\n", ok ? "true" : "false");
     } else if (cmd.startsWith("mesh ota manifest ")) {
         // Syntax: mesh ota manifest <bytes> <chunk_sz> <sha256_hex> <sig_hex> [version] [hw_type]
         String args = cmd.substring(18);
@@ -687,10 +698,10 @@ void handleCommand(const String& cmdLine) {
             parseHexBytes(sigHex.c_str(), sig, sizeof(sig), &sigLen);
 
             MeshOtaEngine::instance().saveManifest(totalBytes, chunkSz, sha256, sig, (uint8_t)sigLen, verStr.c_str(), hwType);
-            Serial.printf("{\"type\":\"ack\",\"action\":\"manifest_set\",\"bytes\":%u,\"ver\":\"%s\",\"hw\":%u}\n",
+            SPRINTF("{\"type\":\"ack\",\"action\":\"manifest_set\",\"bytes\":%u,\"ver\":\"%s\",\"hw\":%u}\n",
                           totalBytes, verStr.c_str(), hwType);
         } else {
-            Serial.println("{\"type\":\"error\",\"action\":\"invalid_manifest_args\"}");
+            SPRINTLN("{\"type\":\"error\",\"action\":\"invalid_manifest_args\"}");
         }
     } else if (cmd.startsWith("mesh ota seed") || cmd.startsWith("mesh seed")) {
         String targetStr = "";
@@ -707,12 +718,12 @@ void handleCommand(const String& cmdLine) {
             hasTarget = true;
         }
         bool ok = MeshOtaEngine::instance().triggerSeeding(hasTarget ? targetMac : nullptr);
-        Serial.printf("{\"type\":\"ack\",\"action\":\"seeder_triggered\",\"ok\":%s,\"has_manifest\":%s,\"ver\":\"%s\"}\n",
+        SPRINTF("{\"type\":\"ack\",\"action\":\"seeder_triggered\",\"ok\":%s,\"has_manifest\":%s,\"ver\":\"%s\"}\n",
                       ok ? "true" : "false",
                       MeshOtaEngine::instance().hasManifest() ? "true" : "false",
                       MeshOtaEngine::instance().getManifestVersion());
     } else if (cmd.equalsIgnoreCase("mesh ota status")) {
-        Serial.printf("{\"type\":\"mesh_ota_local_status\",\"state\":%u,\"chunk\":%u,\"total\":%u,\"bytes\":%u,\"err\":%u,\"version\":\"%s\",\"has_manifest\":%s,\"is_seeding\":%s,\"manifest_ver\":\"%s\"}\n",
+        SPRINTF("{\"type\":\"mesh_ota_local_status\",\"state\":%u,\"chunk\":%u,\"total\":%u,\"bytes\":%u,\"err\":%u,\"version\":\"%s\",\"has_manifest\":%s,\"is_seeding\":%s,\"manifest_ver\":\"%s\"}\n",
                       MeshOtaEngine::instance().getState(),
                       MeshOtaEngine::instance().getNextExpectedChunk(),
                       MeshOtaEngine::instance().getTotalChunks(),
@@ -726,10 +737,10 @@ void handleCommand(const String& cmdLine) {
         String msg = cmd.substring(10);
         bool ok = LoraRadio::instance().transmitPacket((const uint8_t*)msg.c_str(), msg.length());
     } else if (cmd.equalsIgnoreCase("version") || cmd.equalsIgnoreCase("ver")) {
-        Serial.printf("{\"type\":\"version\",\"version\":\"%s\",\"build\":\"%s\",\"hardware\":\"Heltec_LoRa_V3_ESP32S3\",\"chip\":\"ESP32-S3\"}\n",
+        SPRINTF("{\"type\":\"version\",\"version\":\"%s\",\"build\":\"%s\",\"hardware\":\"Heltec_LoRa_V3_ESP32S3\",\"chip\":\"ESP32-S3\"}\n",
                       BEACONFIX_FW_VERSION, BEACONFIX_BUILD_DATE);
     } else if (cmd.equalsIgnoreCase("status")) {
-        Serial.printf("{\"type\":\"status\",\"version\":\"%s\",\"node\":\"%s\",\"mac\":\"%s\",\"mode\":\"%s\",\"is_base_station\":%s,\"hardware\":\"Heltec_LoRa_V3_ESP32S3\","
+        SPRINTF("{\"type\":\"status\",\"version\":\"%s\",\"node\":\"%s\",\"mac\":\"%s\",\"mode\":\"%s\",\"is_base_station\":%s,\"hardware\":\"Heltec_LoRa_V3_ESP32S3\","
                       "\"batt_mv\":%lu,\"batt_pct\":%u,\"batt_state\":\"%s\",\"batt_trained\":%s,\"batt_train_pct\":%u,\"batt_cycles\":%.2f,"
                       "\"wifi_ch\":%u,\"wifi_pps\":%u,\"total_frames\":%lu,"
                       "\"lora_freq\":%.2f,\"lora_tx\":%u,\"lora_rx\":%u,\"lora_rssi\":%d,\"power_dbm\":%d,"
@@ -771,7 +782,7 @@ void handleCommand(const String& cmdLine) {
                       NodeConfig::instance().isAttached() ? "true" : "false");
     } else if (cmd.equalsIgnoreCase("wifi status") || cmd.equalsIgnoreCase("wifi")) {
         bool connected = (WiFi.status() == WL_CONNECTED);
-        Serial.printf("{\"type\":\"wifi_status\",\"configured\":%s,\"ssid\":\"%s\",\"connected\":%s,\"ip\":\"%s\",\"rssi\":%d}\n",
+        SPRINTF("{\"type\":\"wifi_status\",\"configured\":%s,\"ssid\":\"%s\",\"connected\":%s,\"ip\":\"%s\",\"rssi\":%d}\n",
             NodeConfig::instance().hasWifiCreds() ? "true" : "false",
             NodeConfig::instance().getWifiSsid().c_str(),
             connected ? "true" : "false",
@@ -787,23 +798,23 @@ void handleCommand(const String& cmdLine) {
         NodeConfig::instance().setWifiCreds(ssid.c_str(), pass.c_str());
         WiFi.mode(WIFI_AP_STA);
         WiFi.begin(ssid.c_str(), pass.c_str());
-        Serial.printf("{\"type\":\"ack\",\"action\":\"wifi_connecting\",\"ssid\":\"%s\"}\n", ssid.c_str());
+        SPRINTF("{\"type\":\"ack\",\"action\":\"wifi_connecting\",\"ssid\":\"%s\"}\n", ssid.c_str());
     } else if (cmd.equalsIgnoreCase("wifi clear")) {
         NodeConfig::instance().clearWifiCreds();
         WiFi.disconnect(true);
-        Serial.println("{\"type\":\"ack\",\"action\":\"wifi_cleared\"}");
+        SPRINTLN("{\"type\":\"ack\",\"action\":\"wifi_cleared\"}");
     } else if (cmd.equalsIgnoreCase("screen off") || cmd.equalsIgnoreCase("display off") || cmd.equalsIgnoreCase("oled off")) {
         DisplayOled::instance().setScreenEnabled(false);
-        Serial.println("{\"type\":\"ack\",\"screen\":\"off\",\"power\":false}");
+        SPRINTLN("{\"type\":\"ack\",\"screen\":\"off\",\"power\":false}");
     } else if (cmd.equalsIgnoreCase("screen on") || cmd.equalsIgnoreCase("display on") || cmd.equalsIgnoreCase("oled on")) {
         DisplayOled::instance().setScreenEnabled(true);
-        Serial.println("{\"type\":\"ack\",\"screen\":\"on\",\"power\":true}");
+        SPRINTLN("{\"type\":\"ack\",\"screen\":\"on\",\"power\":true}");
     } else if (cmd.equalsIgnoreCase("screen toggle") || cmd.equalsIgnoreCase("display toggle") || cmd.equalsIgnoreCase("oled toggle")) {
         DisplayOled::instance().toggleScreen();
         bool en = DisplayOled::instance().isScreenEnabled();
-        Serial.printf("{\"type\":\"ack\",\"screen\":\"%s\",\"power\":%s}\n", en ? "on" : "off", en ? "true" : "false");
+        SPRINTF("{\"type\":\"ack\",\"screen\":\"%s\",\"power\":%s}\n", en ? "on" : "off", en ? "true" : "false");
     } else if (cmd.equalsIgnoreCase("screen") || cmd.equalsIgnoreCase("screen status") || cmd.equalsIgnoreCase("display status") || cmd.equalsIgnoreCase("oled status")) {
-        Serial.printf("{\"type\":\"screen_status\",\"enabled\":%s,\"page\":%u,\"auto_cycle\":%s}\n",
+        SPRINTF("{\"type\":\"screen_status\",\"enabled\":%s,\"page\":%u,\"auto_cycle\":%s}\n",
             DisplayOled::instance().isScreenEnabled() ? "true" : "false",
             DisplayOled::instance().getCurrentPage(),
             DisplayOled::instance().isAutoCycle() ? "true" : "false");
@@ -812,7 +823,7 @@ void handleCommand(const String& cmdLine) {
         if (val < 0) val = 0;
         if (val > 255) val = 255;
         DisplayOled::instance().setContrast((uint8_t)val);
-        Serial.printf("{\"type\":\"ack\",\"action\":\"contrast_set\",\"value\":%d}\n", val);
+        SPRINTF("{\"type\":\"ack\",\"action\":\"contrast_set\",\"value\":%d}\n", val);
     } else if (cmd.startsWith("page ")) {
         String pStr = cmd.substring(5);
         pStr.trim();
@@ -829,24 +840,23 @@ void handleCommand(const String& cmdLine) {
             DisplayOled::instance().setPage(p);
             DisplayOled::instance().setAutoCycle(false); // stay on user-selected page
         }
-        Serial.printf("{\"type\":\"ack\",\"page\":%u,\"auto_cycle\":%s}\n",
+        SPRINTF("{\"type\":\"ack\",\"page\":%u,\"auto_cycle\":%s}\n",
             DisplayOled::instance().getCurrentPage(),
             DisplayOled::instance().isAutoCycle() ? "true" : "false");
     } else if (cmd.equalsIgnoreCase("page") || cmd.equalsIgnoreCase("page next")) {
         DisplayOled::instance().nextPage();
-        Serial.printf("{\"type\":\"ack\",\"page\":%u}\n", DisplayOled::instance().getCurrentPage());
+        SPRINTF("{\"type\":\"ack\",\"page\":%u}\n", DisplayOled::instance().getCurrentPage());
     } else if (cmd.equalsIgnoreCase("reboot")) {
-        Serial.println("{\"type\":\"ack\",\"action\":\"rebooting\"}");
+        SPRINTLN("{\"type\":\"ack\",\"action\":\"rebooting\"}");
         delay(100);
         ESP.restart();
     } else {
-        Serial.printf("{\"type\":\"error\",\"message\":\"unknown command '%s'\"}\n", cmd.c_str());
+        SPRINTF("{\"type\":\"error\",\"message\":\"unknown command '%s'\"}\n", cmd.c_str());
     }
 }
 
 void BleScanner::processIncomingRx(const std::string& rxStr) {
-    String cmd(rxStr.c_str());
-    handleCommand(cmd);
+    queueRx(rxStr);
 }
 
 // ── Setup & Loop ─────────────────────────────────────────────────────────────
@@ -1107,6 +1117,13 @@ void loop() {
             g_serialBuffer += c;
         }
     }
+
+    // BLE NUS commands (queued by the NimBLE task) and the queue dump a new subscriber asked for
+    String bleCmd;
+    while (BleScanner::instance().popRxLine(bleCmd)) {
+        if (bleCmd.length() > 0) handleCommand(bleCmd);
+    }
+    if (BleScanner::instance().takeQueueDumpRequest()) dumpMeshQueueToBle();
 
     // 12. Periodic Status Telemetry Heartbeat (every 5 seconds)
     if (now - g_lastStatusTime >= 5000) {

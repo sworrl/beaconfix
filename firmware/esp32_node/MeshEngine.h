@@ -340,7 +340,32 @@ public:
 
     uint8_t getHopsToGateway() const { return m_hopsToGateway; }
     bool isGateway() const { return m_isGateway; }
-    uint8_t getQueueCount() const { return m_queueCount; }
+    void dumpQueueToBle() {
+        if (m_queueCount == 0) return;
+        uint8_t curr = m_queueTail;
+        uint8_t count = m_queueCount;
+        while (count > 0) {
+            StoredMessage* item = &m_queue[curr];
+            if (item->payloadLen > 0) {
+                char buf[260];
+                uint8_t copyLen = item->payloadLen;
+                if (copyLen > 254) copyLen = 254;
+                memcpy(buf, item->payload, copyLen);
+                buf[copyLen] = '\n';
+                buf[copyLen+1] = '\0';
+                extern void sendBleTelemetry(const char* msg);
+                sendBleTelemetry(buf);
+            }
+            curr = (curr + 1) % MESH_MAX_QUEUE;
+            count--;
+            delay(15);
+        }
+        m_queueCount = 0;
+        m_queueHead = 0;
+        m_queueTail = 0;
+    }
+
+uint8_t getQueueCount() const { return m_queueCount; }
     uint8_t getNeighborCount() const { return m_neighborCount; }
     bool isUsbActive() const { return m_usbActive; }
 
@@ -847,6 +872,7 @@ private:
         m_queueCount++;
     }
 
+    
     void drainQueueBatch(uint8_t maxBatch) {
         uint8_t sent = 0;
         while (m_queueCount > 0 && sent < maxBatch) {

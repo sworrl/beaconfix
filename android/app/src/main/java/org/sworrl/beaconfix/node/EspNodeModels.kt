@@ -12,7 +12,7 @@ enum class EspConnectionState {
 
 @Serializable
 data class EspNodeStatus(
-    val version: String = "3.10.0",
+    val version: String = "",
     val node: String = "",
     val uptime: Long = 0,
     val heap: Long = 0,
@@ -25,7 +25,7 @@ data class EspNodeStatus(
     val deauths: Long = 0,
     val ble: Int = 0,
     val batt_mv: Int = 0,
-    val batt_pct: Int = 0,
+    val batt_pct: Int = -1,
     val batt_state: String = "unknown",
     val charging: Boolean = false,
     val batt_trained: Boolean = false,
@@ -99,7 +99,7 @@ data class MeshPeerNode(
     val name: String,
     val mac: String = "",
     val role: String = "mobile",
-    val version: String = "3.10.2",
+    val version: String = "",
     val battMv: Int = 0,
     val battPct: Int = -1,
     val battState: String = "unknown",
@@ -111,8 +111,7 @@ data class MeshPeerNode(
     val hops: Int = 0,
     val rssi: Int = 0,
     val pps: Long = 0,
-    val lastSeen: Long = System.currentTimeMillis(),
-    val isOnline: Boolean = true,
+    val lastSeen: Long = 0L,
     val following: Boolean = false,
     val attachedDevice: String = "",
     val hasLocation: Boolean = false,
@@ -127,5 +126,12 @@ data class MeshPeerNode(
     val isUsb: Boolean = false,
     val usbPort: String = "",
     val transport: String = "mesh"
-)
+) {
+    // Derived, so a node never heard from can't read as online.
+    val isOnline: Boolean get() = lastSeen > 0 && System.currentTimeMillis() - lastSeen < 15_000L
+}
+
+// No-battery nodes report pct 0 and a floating ~284 mV; mesh-only nodes may lack battState.
+fun hasBattery(battState: String, battMv: Int, battPct: Int): Boolean =
+    battState != "no_battery" && battState != "absent" && (if (battMv == 0) battPct >= 0 else battMv >= 2500)
 

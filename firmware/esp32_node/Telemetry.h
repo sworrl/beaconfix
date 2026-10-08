@@ -141,7 +141,7 @@ public:
                     uint32_t probes, uint32_t beacons, uint32_t deauths, int bleClients,
                     uint32_t battMv = 3800, uint8_t battPct = 50, const char* battState = "halfway", bool charging = false,
                     bool battTrained = false, uint8_t battTrainPct = 0, float battCycles = 0.0f) {
-        char buf[576];
+        char buf[768];   // GPS fix + a long attached-device name runs past 600
         bool hasAnt = false;
         bool txInhib = true;
         int ambRssi = 0;
@@ -150,7 +150,7 @@ public:
 
         if (NodeConfig::instance().hasGpsFix()) {
             snprintf(buf, sizeof(buf),
-                "{\"type\":\"status\",\"version\":\"%s\",\"node\":\"%s\",\"mac\":\"%s\",\"uptime\":%lu,\"heap\":%lu,\"ch\":%u,\"hop\":%s,\"pps\":%lu,\"total\":%lu,\"probes\":%lu,\"beacons\":%lu,\"deauths\":%lu,\"ble\":%d,\"batt_mv\":%lu,\"batt_pct\":%u,\"batt_state\":\"%s\",\"charging\":%s,\"batt_trained\":%s,\"batt_train_pct\":%u,\"batt_cycles\":%.2f,\"antenna_detected\":%s,\"tx_inhibited\":%s,\"ambient_rssi\":%d,\"traveling\":%s,\"speed_kmh\":%.1f,\"attached_dev\":\"%s\",\"following\":%s,\"has_gps\":true,\"lat\":%.6f,\"lon\":%.6f,\"acc\":%.1f}",
+                "{\"type\":\"status\",\"version\":\"%s\",\"hardware\":\"ESP32\",\"node\":\"%s\",\"mac\":\"%s\",\"uptime\":%lu,\"heap\":%lu,\"ch\":%u,\"hop\":%s,\"pps\":%lu,\"total\":%lu,\"probes\":%lu,\"beacons\":%lu,\"deauths\":%lu,\"ble\":%d,\"batt_mv\":%lu,\"batt_pct\":%u,\"batt_state\":\"%s\",\"charging\":%s,\"batt_trained\":%s,\"batt_train_pct\":%u,\"batt_cycles\":%.2f,\"antenna_detected\":%s,\"tx_inhibited\":%s,\"ambient_rssi\":%d,\"traveling\":%s,\"speed_kmh\":%.1f,\"attached_dev\":\"%s\",\"following\":%s,\"has_gps\":true,\"lat\":%.6f,\"lon\":%.6f,\"acc\":%.1f}",
                 BEACONFIX_FW_VERSION, nodeName, WiFi.macAddress().c_str(), uptimeS, freeHeap, ch, hopping ? "true" : "false", pps, total, probes, beacons, deauths, bleClients,
                 battMv, battPct, battState, charging ? "true" : "false",
                 battTrained ? "true" : "false", battTrainPct, battCycles,
@@ -161,7 +161,7 @@ public:
                 NodeConfig::instance().getLat(), NodeConfig::instance().getLon(), NodeConfig::instance().getAccM());
         } else {
             snprintf(buf, sizeof(buf),
-                "{\"type\":\"status\",\"version\":\"%s\",\"node\":\"%s\",\"mac\":\"%s\",\"uptime\":%lu,\"heap\":%lu,\"ch\":%u,\"hop\":%s,\"pps\":%lu,\"total\":%lu,\"probes\":%lu,\"beacons\":%lu,\"deauths\":%lu,\"ble\":%d,\"batt_mv\":%lu,\"batt_pct\":%u,\"batt_state\":\"%s\",\"charging\":%s,\"batt_trained\":%s,\"batt_train_pct\":%u,\"batt_cycles\":%.2f,\"antenna_detected\":%s,\"tx_inhibited\":%s,\"ambient_rssi\":%d,\"traveling\":%s,\"speed_kmh\":%.1f,\"attached_dev\":\"%s\",\"following\":%s,\"has_gps\":false}",
+                "{\"type\":\"status\",\"version\":\"%s\",\"hardware\":\"ESP32\",\"node\":\"%s\",\"mac\":\"%s\",\"uptime\":%lu,\"heap\":%lu,\"ch\":%u,\"hop\":%s,\"pps\":%lu,\"total\":%lu,\"probes\":%lu,\"beacons\":%lu,\"deauths\":%lu,\"ble\":%d,\"batt_mv\":%lu,\"batt_pct\":%u,\"batt_state\":\"%s\",\"charging\":%s,\"batt_trained\":%s,\"batt_train_pct\":%u,\"batt_cycles\":%.2f,\"antenna_detected\":%s,\"tx_inhibited\":%s,\"ambient_rssi\":%d,\"traveling\":%s,\"speed_kmh\":%.1f,\"attached_dev\":\"%s\",\"following\":%s,\"has_gps\":false}",
                 BEACONFIX_FW_VERSION, nodeName, WiFi.macAddress().c_str(), uptimeS, freeHeap, ch, hopping ? "true" : "false", pps, total, probes, beacons, deauths, bleClients,
                 battMv, battPct, battState, charging ? "true" : "false",
                 battTrained ? "true" : "false", battTrainPct, battCycles,

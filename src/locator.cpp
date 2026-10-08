@@ -102,6 +102,17 @@ QJsonObject DevicePos::toJson() const
             {"lastSeen", lastSeen.toString(Qt::ISODate)}};
 }
 
+QString MeshNodeInfo::linkText() const
+{
+    if (!lastSeen.isValid()) return QStringLiteral("never seen");
+    if (isUsb) return usbPort.isEmpty() ? QStringLiteral("USB") : QStringLiteral("USB (%1)").arg(usbPort);
+    if (transport == QLatin1String("ble")) return QStringLiteral("BLE");
+    if (hops <= 1) return QStringLiteral("Direct");
+    QString s = QStringLiteral("%1 hops").arg(hops);
+    if (!routePath.isEmpty() && routePath != QLatin1String("Direct")) s += QStringLiteral(" · ") + routePath;
+    return s;
+}
+
 QJsonObject MeshNodeInfo::toJson() const
 {
     const qint64 age = lastSeen.isValid() ? lastSeen.secsTo(QDateTime::currentDateTime()) : -1;
@@ -110,6 +121,9 @@ QJsonObject MeshNodeInfo::toJson() const
     o[QStringLiteral("mac")] = mac;
     o[QStringLiteral("role")] = role;
     o[QStringLiteral("fwVersion")] = fwVersion;
+    o[QStringLiteral("hardware")] = hardware;
+    o[QStringLiteral("hasBattery")] = hasBattery();
+    o[QStringLiteral("link")] = linkText();
     o[QStringLiteral("battMv")] = battMv;
     o[QStringLiteral("battPct")] = battPct;
     o[QStringLiteral("battMah")] = battMah;
@@ -1445,6 +1459,7 @@ void Locator::onScanFinished(const QList<AccessPoint> &aps)
 {
     diffScan(aps);
     noteAnchorCalibration(aps);
+    noteMeshNodeAps(aps);
     const bool wasOnSite = m_onSite;
     updateSite(aps);
     if (m_liveScan) {
@@ -2849,6 +2864,68 @@ void Locator::loadState()
         for (const QJsonValue &v : o["travelling"].toArray()) m_travelling.insert(v.toString());
         for (const QJsonValue &v : o["notTravelling"].toArray()) m_notTravelling.insert(v.toString());
     }
+    
+    QFile mf(stateDir() + "/mesh.json");
+    if (mf.open(QIODevice::ReadOnly)) {
+        const QJsonArray arr = QJsonDocument::fromJson(mf.readAll()).array();
+        for (const QJsonValue &v : arr) {
+            QJsonObject o = v.toObject();
+            const QString name = o["name"].toString();
+            if (name.isEmpty() || name == QLatin1String("Node")) continue;
+            MeshNodeInfo &n = m_meshNodes[name];
+            n.name = name;
+            n.mac = o["mac"].toString();
+            n.role = o["role"].toString();
+            n.hardware = o["hardware"].toString();
+            n.battMv = o["battMv"].toInt();
+            n.battPct = o["battPct"].toInt(-1);
+            n.battMah = o["battMah"].toInt(240);
+            n.estRuntimeMins = o["estRuntimeMins"].toInt();
+            n.battState = o["battState"].toString();
+            n.charging = o["charging"].toBool();
+            n.hops = o["hops"].toInt();
+            n.viaNode = o["viaNode"].toString();
+            n.prevHopMac = o["prevHopMac"].toString();
+            n.routePath = o["routePath"].toString();
+            n.rssi = o["rssi"].toInt();
+            n.pps = o["pps"].toInt();
+            n.online = false; // Force offline at startup
+            n.lastSeen = QDateTime::fromString(o["lastSeen"].toString(), Qt::ISODate);
+            // Older builds saved a made-up "3.10.0" for nodes that never reported; keep a version only if we heard one
+            if (n.lastSeen.isValid()) n.fwVersion = o["fwVersion"].toString();
+            n.hasLocation = o["hasLocation"].toBool();
+            n.lat = o["lat"].toDouble();
+            n.lon = o["lon"].toDouble();
+            n.accM = o["accM"].toDouble(1.0);
+            n.anchorId = o["anchorId"].toString();
+            n.attachedDevice = o["attachedDevice"].toString();
+            n.following = o["following"].toBool();
+            n.lastGpsSync = QDateTime::fromString(o["lastGpsSync"].toString(), Qt::ISODate);
+            n.antennaDetected = o["antennaDetected"].toBool(true);
+            n.txInhibited = o["txInhibited"].toBool();
+            n.ambientRssi = o["ambientRssi"].toInt(-110);
+            n.traveling = o["traveling"].toBool();
+            n.speedKmh = o["speedKmh"].toDouble(-1.0);
+            n.headingDeg = o["headingDeg"].toDouble(-1.0);
+            n.isUsb = o["isUsb"].toBool();
+            n.usbPort = o["usbPort"].toString();
+            n.transport = o["transport"].toString(QStringLiteral("mesh"));
+        }
+    }
+    
+    QSettings qs;
+    for (const QString &k : qs.allKeys()) {
+        if (k.startsWith(QLatin1String("node_attached_dev/"))) {
+            const QString name = k.mid(18);
+            MeshNodeInfo &n = m_meshNodes[name];
+            n.name = name;
+            n.attachedDevice = qs.value(k).toString();
+        } else if (k.startsWith(QLatin1String("node_batt_mah/"))) {
+            // A capacity setting alone isn't a node (the bridge once registered the "Node" placeholder)
+            auto it = m_meshNodes.find(k.mid(14));
+            if (it != m_meshNodes.end()) it->battMah = qs.value(k, 240).toInt();
+        }
+    }
 }
 
 void Locator::saveState() const
@@ -2860,6 +2937,15 @@ void Locator::saveState() const
     QFile f(stateDir() + "/state.json");
     if (f.open(QIODevice::WriteOnly | QIODevice::Truncate))
         f.write(QJsonDocument(o).toJson(QJsonDocument::Compact) + "\n");
+        
+    QJsonArray meshArr;
+    for (auto it = m_meshNodes.begin(); it != m_meshNodes.end(); ++it) {
+        meshArr.append(it.value().toJson());
+    }
+    QFile mf(stateDir() + "/mesh.json");
+    if (mf.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        mf.write(QJsonDocument(meshArr).toJson(QJsonDocument::Compact) + "\n");
+    }
 }
 
 void Locator::rewriteHistory() const
@@ -3474,7 +3560,7 @@ QJsonArray Locator::linkedDevices() const
     }
     const QDateTime now = QDateTime::currentDateTime();
     for (const MeshNodeInfo &mn : m_meshNodes) {
-        if (mn.lastSeen.isValid() && mn.lastSeen.secsTo(now) > 300) continue;
+        if (!mn.lastSeen.isValid() || mn.lastSeen.secsTo(now) > 300) continue;
         QJsonObject o = mn.toJson();
         o[QStringLiteral("device")] = mn.name;
         o[QStringLiteral("kind")] = QStringLiteral("esp32-node");
@@ -5630,6 +5716,11 @@ void Locator::initMeshUdp()
     connect(&m_meshUpdateTimer, &QTimer::timeout, this, [this] {
         emit meshNodesChanged();
     });
+    // Nothing else ever clears online: a node that went quiet stayed "online" until restart
+    auto *stale = new QTimer(this);
+    stale->setInterval(15000);
+    connect(stale, &QTimer::timeout, this, &Locator::expireMeshNodes);
+    stale->start();
 
     m_nodeUdp = new QUdpSocket(this);
     bool bound = m_nodeUdp->bind(QHostAddress::AnyIPv4, 47824, QUdpSocket::ShareAddress | QUdpSocket::ReuseAddressHint);
@@ -5669,20 +5760,22 @@ void Locator::processMeshPacket(const QByteArray &data, const QHostAddress &send
         if (o.contains(QStringLiteral("mac")) && !o.value(QStringLiteral("mac")).toString().isEmpty()) {
             n.mac = o.value(QStringLiteral("mac")).toString();
         }
+        const QString transport = o.value(QStringLiteral("transport")).toString();
         if (o.contains(QStringLiteral("is_usb")) && o.value(QStringLiteral("is_usb")).toBool()) {
             n.isUsb = true;
             n.usbPort = o.value(QStringLiteral("usb_port")).toString();
             n.transport = QStringLiteral("usb_mesh_dual");
+        } else if (!transport.isEmpty()) {          // the BLE bridge (tools/esp32_autolink.py) says "ble"
+            n.isUsb = false;
+            n.usbPort.clear();
+            n.transport = transport;
         } else if (sender.isLoopback()) {
             n.isUsb = true;
             n.transport = QStringLiteral("usb_mesh_dual");
         }
-        if (o.contains(QStringLiteral("mode"))) {
-            n.role = o.value(QStringLiteral("mode")).toString();
-        } else if (nodeName.contains(QLatin1String("Master"), Qt::CaseInsensitive)) {
-            n.role = QStringLiteral("base_station");
-        }
+        if (o.contains(QStringLiteral("mode"))) n.role = o.value(QStringLiteral("mode")).toString();   // never from the name: names are random words
         if (o.contains(QStringLiteral("version"))) n.fwVersion = o.value(QStringLiteral("version")).toString();
+        if (o.contains(QStringLiteral("hardware"))) n.hardware = o.value(QStringLiteral("hardware")).toString();
         if (o.contains(QStringLiteral("batt_mv"))) n.battMv = o.value(QStringLiteral("batt_mv")).toInt();
         if (o.contains(QStringLiteral("batt_pct"))) n.battPct = o.value(QStringLiteral("batt_pct")).toInt();
         if (o.contains(QStringLiteral("batt_state"))) n.battState = o.value(QStringLiteral("batt_state")).toString();
@@ -5710,7 +5803,8 @@ void Locator::processMeshPacket(const QByteArray &data, const QHostAddress &send
         }
     } else if (type == QLatin1String("mesh_telemetry")) {
         nodeName = o.value(QStringLiteral("origin")).toString();
-        if (nodeName.isEmpty() || nodeName == QLatin1String("Unknown")) return;
+        // "Node" is the firmware's placeholder for a sender not yet in its neighbour table (MeshEngine.h)
+        if (nodeName.isEmpty() || nodeName == QLatin1String("Unknown") || nodeName == QLatin1String("Node")) return;
         MeshNodeInfo &n = m_meshNodes[nodeName];
         n.name = nodeName;
         n.lastSeen = now;
@@ -5719,6 +5813,12 @@ void Locator::processMeshPacket(const QByteArray &data, const QHostAddress &send
         if (o.contains(QStringLiteral("hops"))) n.hops = o.value(QStringLiteral("hops")).toInt();
         if (o.contains(QStringLiteral("via"))) n.viaNode = o.value(QStringLiteral("via")).toString();
         if (o.contains(QStringLiteral("prev_mac"))) n.prevHopMac = o.value(QStringLiteral("prev_mac")).toString();
+        // Relayed by a bridge: the gateway node itself is on that link, everyone else reached it over the mesh
+        if (o.contains(QStringLiteral("via_link"))) {
+            const bool isGateway = o.value(QStringLiteral("gateway")).toString() == nodeName;
+            n.transport = isGateway ? o.value(QStringLiteral("via_link")).toString() : QStringLiteral("mesh");
+            if (isGateway) { n.isUsb = false; n.usbPort.clear(); }
+        }
         if (o.contains(QStringLiteral("route"))) {
             n.routePath = o.value(QStringLiteral("route")).toString();
         } else {
@@ -5762,7 +5862,15 @@ void Locator::processMeshPacket(const QByteArray &data, const QHostAddress &send
     if (!nodeName.isEmpty()) {
         MeshNodeInfo &n = m_meshNodes[nodeName];
         n.battMah = nodeBatteryCapacity(nodeName);
-        if (n.battPct > 0 && n.battMah > 0) {
+        
+        // Estimate battery percentage if the node didn't provide one (e.g. newer uncalibrated boards)
+        if (n.battPct < 0 && n.battMv > 0 && n.hasBattery()) {
+            if (n.battMv >= 4150) n.battPct = 100;
+            else if (n.battMv <= 3300) n.battPct = 0;
+            else n.battPct = (n.battMv - 3300) * 100 / (4150 - 3300);
+        }
+        
+        if (n.hasBattery() && n.battPct > 0 && n.battMah > 0) {
             n.estRuntimeMins = (n.battMah * n.battPct * 60) / (100 * 75);
         } else if (n.charging || n.battState == QLatin1String("charging")) {
             n.estRuntimeMins = -1;
@@ -5812,8 +5920,42 @@ static bool isBeaconFixNodeName(const QString &name, bool isUsb)
 {
     if (isUsb) return true;
     if (name.startsWith(QLatin1String("BeaconFix-")) || name.startsWith(QLatin1String("BF-")) || name.startsWith(QLatin1String("BF_"))) return true;
+    if (name.startsWith(QLatin1String("ESP32-")) || name.startsWith(QLatin1String("ESP-"))) return true;   // the USB bridge's port names
     static const QRegularExpression rx(QStringLiteral("^[A-Z][a-z]+[A-Z][a-z]+[A-Z][a-z]+[0-9]{4}$"));
     return rx.match(name).hasMatch();
+}
+
+// A node's own soft-AP (SSID = its name) in our WiFi scan: it's powered and in range even with no telemetry link
+void Locator::noteMeshNodeAps(const QList<AccessPoint> &aps)
+{
+    const QDateTime now = QDateTime::currentDateTime();
+    bool changed = false;
+    for (const AccessPoint &ap : aps) {
+        // Not the bare ESP-/ESP32- prefixes: every ESP-based plug and bulb advertises those
+        if (ap.ssid.startsWith(QLatin1String("ESP")) || ap.ssid == QLatin1String("Node") || !isBeaconFixNodeName(ap.ssid, false)) continue;
+        MeshNodeInfo &n = m_meshNodes[ap.ssid];
+        n.name = ap.ssid;
+        if (n.mac.isEmpty()) n.mac = ap.bssid.toLower();
+        n.rssi = ap.dbm;
+        n.lastSeen = now;
+        n.online = true;
+        changed = true;
+    }
+    if (changed && !m_meshUpdateTimer.isActive()) m_meshUpdateTimer.start();
+}
+
+void Locator::expireMeshNodes()
+{
+    static constexpr int kStaleSecs = 120;   // status heartbeats are every 5 s; WiFi presence rides the scan cadence
+    const QDateTime now = QDateTime::currentDateTime();
+    bool changed = false;
+    for (MeshNodeInfo &n : m_meshNodes) {
+        if (n.online && (!n.lastSeen.isValid() || n.lastSeen.secsTo(now) > kStaleSecs)) {
+            n.online = false;
+            changed = true;
+        }
+    }
+    if (changed) emit meshNodesChanged();
 }
 
 QList<MeshNodeInfo> Locator::meshNodes() const

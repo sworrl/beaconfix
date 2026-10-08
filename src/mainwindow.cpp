@@ -1467,7 +1467,7 @@ QWidget *MainWindow::buildNodes()
     tb->addWidget(syncClockBtn);
 
     auto *otaBtn = new QPushButton(QIcon::fromTheme(QStringLiteral("system-software-update")), QStringLiteral("Mesh OTA Update…"));
-    otaBtn->setToolTip(QStringLiteral("Initiate autonomous cryptographic Mesh OTA broadcast to update remote nodes to latest signed v3.10.2 firmware"));
+    otaBtn->setToolTip(QStringLiteral("Initiate autonomous cryptographic Mesh OTA broadcast to update remote nodes to latest signed v3.10.3 firmware"));
     connect(otaBtn, &QPushButton::clicked, this, [this] {
         const QString binPath = QStringLiteral("/home/user/Documents/GitHub/beaconfix/firmware/heltec_v3/build/heltec_v3.ino.bin");
         const QString sigPath = binPath + QStringLiteral(".sig");
@@ -1485,19 +1485,19 @@ QWidget *MainWindow::buildNodes()
         const int size = binData.size();
 
         if (QMessageBox::question(this, QStringLiteral("Trigger Mesh OTA"),
-            QStringLiteral("Broadcast signed firmware v3.10.2 manifest to mesh?\n\nSize: %1 bytes (%2 chunks)\nSHA256: %3...\nSignature: %4 bytes\n\nThis will trigger autonomous round-robin mesh propagation.")
+            QStringLiteral("Broadcast signed firmware v3.10.3 manifest to mesh?\n\nSize: %1 bytes (%2 chunks)\nSHA256: %3...\nSignature: %4 bytes\n\nThis will trigger autonomous round-robin mesh propagation.")
             .arg(size).arg(192).arg(shaHex.left(16)).arg(sigHex.size() / 2)) != QMessageBox::Yes) {
             return;
         }
 
-        const QString cmd = QStringLiteral("mesh ota manifest %1 192 %2 %3 3.10.2 1\n").arg(size).arg(shaHex).arg(sigHex);
+        const QString cmd = QStringLiteral("mesh ota manifest %1 192 %2 %3 3.10.3 1\n").arg(size).arg(shaHex).arg(sigHex);
         QUdpSocket sock;
         sock.writeDatagram(cmd.toUtf8(), QHostAddress::LocalHost, 47825);
         sock.writeDatagram(cmd.toUtf8(), QHostAddress::Broadcast, 47824);
         if (m_nodesEventLog) {
-            m_nodesEventLog->appendPlainText(QStringLiteral("[%1] 🚀 Primed mesh with signed v3.10.2 manifest (%2 bytes, 192 chunks)").arg(QDateTime::currentDateTime().toString(QStringLiteral("HH:mm:ss"))).arg(size));
+            m_nodesEventLog->appendPlainText(QStringLiteral("[%1] 🚀 Primed mesh with signed v3.10.3 manifest (%2 bytes, 192 chunks)").arg(QDateTime::currentDateTime().toString(QStringLiteral("HH:mm:ss"))).arg(size));
         }
-        statusBar()->showMessage(QStringLiteral("Primed mesh with v3.10.2 OTA manifest"), 4000);
+        statusBar()->showMessage(QStringLiteral("Primed mesh with v3.10.3 OTA manifest"), 4000);
     });
     tb->addWidget(otaBtn);
 
@@ -1601,6 +1601,9 @@ void MainWindow::refreshNodes()
         if (isOnline) {
             stItem->setText(QStringLiteral("🟢 Online"));
             stItem->setForeground(QColor(0x6c, 0xff, 0x8a));
+        } else if (!n.lastSeen.isValid()) {
+            stItem->setText(QStringLiteral("⚫ Never seen"));
+            stItem->setForeground(QColor(0x9f, 0xb0, 0xc8));
         } else if (ageSecs < 600) {
             stItem->setText(QStringLiteral("🟡 Stale (%1m)").arg(ageSecs / 60));
             stItem->setForeground(QColor(0xff, 0xd7, 0x00));
@@ -1618,7 +1621,7 @@ void MainWindow::refreshNodes()
 
         // 2. Role & Mode
         QString roleStr;
-        if (n.role == QLatin1String("base_station") || n.name.contains(QLatin1String("Master"), Qt::CaseInsensitive)) {
+        if (n.role == QLatin1String("base_station")) {   // not from the name: names are random words
             roleStr = QStringLiteral("Base Station 🏠");
         } else if (n.following && !n.attachedDevice.isEmpty()) {
             roleStr = QStringLiteral("Follows %1 📱").arg(n.attachedDevice);
@@ -1634,14 +1637,13 @@ void MainWindow::refreshNodes()
         m_nodesTable->setItem(i, 2, roleItem);
 
         // 3. Hardware
-        QString hwStr = n.name.contains(QLatin1String("Falcon"), Qt::CaseInsensitive) || n.name.contains(QLatin1String("Cheetah"), Qt::CaseInsensitive)
-            ? QStringLiteral("Heltec V3 (ESP32-S3 + SX1262)")
-            : QStringLiteral("ESP32-WROOM-32");
+        // Only what the firmware reports; the old guess keyed on words in the (random) name
+        QString hwStr = n.hardware.isEmpty() ? QStringLiteral("—") : n.hardware;
         auto *hwItem = new QTableWidgetItem(hwStr);
         m_nodesTable->setItem(i, 3, hwItem);
 
         // 4. Firmware
-        QString ver = n.fwVersion.startsWith(QLatin1Char('v')) ? n.fwVersion : QStringLiteral("v%1").arg(n.fwVersion.isEmpty() ? QStringLiteral("3.10.0") : n.fwVersion);
+        QString ver = n.fwVersion.isEmpty() ? QStringLiteral("—") : n.fwVersion.startsWith(QLatin1Char('v')) ? n.fwVersion : QStringLiteral("v%1").arg(n.fwVersion);
         auto *verItem = new QTableWidgetItem(ver);
         verItem->setTextAlignment(Qt::AlignCenter);
         verItem->setForeground(QColor(0x35, 0xd6, 0xff));
@@ -1650,25 +1652,32 @@ void MainWindow::refreshNodes()
         // 5. Power / Battery
         const int capMah = m_loc->nodeBatteryCapacity(n.name);
         QString powerStr;
-        if (capMah > 0 && n.battPct >= 0 && n.battState != QLatin1String("no_battery") && n.battState != QLatin1String("absent")) {
+        if (!n.lastSeen.isValid()) {
+            powerStr = QStringLiteral("—");
+        } else if (capMah > 0 && n.battPct >= 0 && n.hasBattery()) {
             powerStr = QStringLiteral("%1% 🔋 (%2 mV · %3 mAh)").arg(n.battPct).arg(n.battMv).arg(capMah);
             if (n.estRuntimeMins > 0) powerStr += QStringLiteral(" ~%1h").arg(double(n.estRuntimeMins) / 60.0, 0, 'f', 1);
-        } else if (n.battMv > 0 && n.battState != QLatin1String("no_battery") && n.battState != QLatin1String("absent")) {
+        } else if (n.hasBattery() && n.battMv > 0) {
             powerStr = QStringLiteral("%1 mV 🔋 (%2 mAh)").arg(n.battMv).arg(capMah);
         } else {
             powerStr = QStringLiteral("USB / 5V (No Battery)");
         }
         auto *pwrItem = new QTableWidgetItem(powerStr);
-        if (n.battPct > 20) pwrItem->setForeground(QColor(0x6c, 0xff, 0x8a));
-        else if (n.battPct >= 0) pwrItem->setForeground(QColor(0xff, 0x55, 0x55));
+        if (n.hasBattery() && n.battPct > 20) pwrItem->setForeground(QColor(0x6c, 0xff, 0x8a));
+        else if (n.hasBattery() && n.battPct >= 0) pwrItem->setForeground(QColor(0xff, 0x55, 0x55));
         m_nodesTable->setItem(i, 5, pwrItem);
 
         // 6. RF & Mesh
         QString rfStr;
-        if (n.isUsb) {
-            rfStr = QStringLiteral("🔌 USB (%1) · 📡 LoRa Gateway").arg(n.usbPort.isEmpty() ? QStringLiteral("Local") : n.usbPort);
+        if (!n.lastSeen.isValid()) {
+            rfStr = QStringLiteral("—");
+        } else if (n.isUsb) {
+            rfStr = QStringLiteral("🔌 USB (%1) · 📡 Gateway").arg(n.usbPort.isEmpty() ? QStringLiteral("Local") : n.usbPort);
+        } else if (n.transport == QLatin1String("ble")) {
+            rfStr = QStringLiteral("📶 BLE · Gateway");
+            if (n.rssi != 0) rfStr += QStringLiteral(" · %1 dBm").arg(n.rssi);
         } else if (n.hops == 0) {
-            rfStr = QStringLiteral("0 hops (Direct Gateway)");
+            rfStr = QStringLiteral("Direct");
         } else if (n.hops == 1) {
             rfStr = QStringLiteral("1 hop (Direct Link)");
             if (n.rssi != 0) rfStr += QStringLiteral(" · %1 dBm").arg(n.rssi);

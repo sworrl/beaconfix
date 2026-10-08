@@ -1239,11 +1239,11 @@ Item {
                         var dv = ld[di]; if (!dv || dv.lat === undefined) continue
                         if (Math.abs(dv.lat) < 0.0001 && Math.abs(dv.lon) < 0.0001) continue
                         var dm = map.merc(dv.lat, dv.lon), dx = map.sx(dm.x), dy = map.sy(dm.y)
-                        var dAcc = Math.max(6, (dv.acc || 30) / mpp), stale = (dv.ageS || 0) > 3600
+                        var dAcc = Math.max(6, (dv.acc || 30) / mpp), stale = (dv.ageS !== undefined && dv.ageS < 0) || (dv.ageS || 0) > 3600
                         var dAlpha = stale ? 0.35 : dv.online ? 1 : 0.7
                         var isNode = (dv.kind === "esp32-node" || dv.kind === "node" || dv.kind === "mesh")
                         var isBase = (dv.role === "base_station" || dv.role === "base")
-                        var nodeCol = isBase ? "#ffd166" : (isNode ? "#35d6ff" : "#7cf2c4")
+                        var nodeCol = (isNode && !dv.online) ? "#9fb0c8" : isBase ? "#ffd166" : (isNode ? "#35d6ff" : "#7cf2c4")
                         ctx.globalAlpha = dAlpha
                         var dist = map.haversine(src.lat, src.lon, dv.lat, dv.lon)
                         if (dist < 2000) { ctx.setLineDash([4, 4]); ctx.strokeStyle = isNode ? "rgba(53,214,255,0.4)" : "rgba(124,242,196,0.5)"; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(mx, my); ctx.lineTo(dx, dy); ctx.stroke(); ctx.setLineDash([]) }
@@ -1251,9 +1251,18 @@ Item {
                         ctx.beginPath(); ctx.arc(dx, dy, 7, 0, Math.PI * 2); ctx.fillStyle = "#0b101a"; ctx.fill(); ctx.strokeStyle = nodeCol; ctx.lineWidth = 1.5; ctx.stroke()
                         ctx.globalAlpha = 1
                         marks.push({x: dx, y: dy + 0.5, t: map.deviceGlyph(dv.kind, dv.role), c: "#e6edf7", px: 10, h: 1, a: dAlpha})
-                        // name, role, battery %, and how old
+                        // name, role, battery %, voltage, runtime, and how old
                         if (!stale || (dv.ageS || 0) < 21600) {
-                            var bInfo = (dv.battPct !== undefined && dv.battPct >= 0) ? (" · 🔋" + dv.battPct + "%" + (dv.battMah ? (" · " + dv.battMah + "mAh") : "")) : ""
+                            // A node without a battery still reports 0 % and a floating ~0.3 V: say nothing about battery
+                            var hasBatt = !isNode || dv.hasBattery === true
+                            var bInfo = (hasBatt && dv.battPct !== undefined && dv.battPct >= 0) ? (" · 🔋" + dv.battPct + "%") : ""
+                            if (hasBatt && dv.battMv) bInfo += " · " + dv.battMv + "mV"
+                            if (hasBatt && isNode && dv.battMah) bInfo += " · " + dv.battMah + "mAh"
+                            if (hasBatt && dv.estRuntimeMins !== undefined && dv.estRuntimeMins > 0) {
+                                var rtH = Math.floor(dv.estRuntimeMins / 60)
+                                var rtM = dv.estRuntimeMins % 60
+                                bInfo += " · " + rtH + "h " + rtM + "m left"
+                            }
                             var rInfo = isBase ? " · Base" : ""
                             var dl = (dv.device || dv.identityName || "device") + rInfo + bInfo + (dv.ageS !== undefined && dv.ageS >= 600 ? " · " + map.ageText(dv.ageS) : "")
                             umarks.push({x: dx + 10, y: dy - 9, t: dl, c: nodeCol, px: 10, b: 1, o: 1, a: dAlpha})

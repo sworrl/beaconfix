@@ -48,6 +48,7 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.RadioButtonDefaults
 import org.sworrl.beaconfix.node.MeshPeerNode
+import org.sworrl.beaconfix.node.hasBattery
 import androidx.compose.material3.ScrollableTabRow
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
@@ -230,7 +231,7 @@ fun EspNodesScreen(
                         verticalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
                         items(meshPeers) { peer ->
-                            val isOnline = (System.currentTimeMillis() - peer.lastSeen) < 15000L
+                            val isOnline = peer.isOnline
                             Card(
                                 Modifier.fillMaxWidth(),
                                 colors = CardDefaults.cardColors(
@@ -258,12 +259,12 @@ fun EspNodesScreen(
                                                 style = MaterialTheme.typography.titleSmall
                                             )
                                             Surface(
-                                                color = if (peer.role == "master") Gold.copy(alpha = 0.2f) else Cyan.copy(alpha = 0.2f),
+                                                color = if (peer.role == "base_station") Gold.copy(alpha = 0.2f) else Cyan.copy(alpha = 0.2f),
                                                 shape = RoundedCornerShape(4.dp)
                                             ) {
                                                 Text(
-                                                    peer.role.uppercase(),
-                                                    color = if (peer.role == "master") Gold else Cyan,
+                                                    if (peer.role == "base_station") "BASE" else peer.role.uppercase(),
+                                                    color = if (peer.role == "base_station") Gold else Cyan,
                                                     fontWeight = FontWeight.Bold,
                                                     fontSize = 10.sp,
                                                     modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
@@ -274,7 +275,7 @@ fun EspNodesScreen(
                                                 shape = RoundedCornerShape(4.dp)
                                             ) {
                                                 Text(
-                                                    "v${peer.version}",
+                                                    "v${peer.version.ifBlank { "?" }}",
                                                     color = Slate,
                                                     fontSize = 10.sp,
                                                     modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
@@ -283,14 +284,16 @@ fun EspNodesScreen(
                                         }
                                         Chip(
                                             when {
-                                                peer.isUsb -> "🔌 USB + 📡 Gateway"
+                                                // transport wins over a stale isUsb from an earlier USB status
+                                                peer.transport == "ble" -> "BLE"
+                                                peer.isUsb || peer.transport == "usb_mesh_dual" -> "🔌 USB + 📡 Gateway"
                                                 peer.hops <= 0 -> "Direct (Local)"
                                                 peer.hops == 1 -> "1 Hop (Direct RF)"
                                                 peer.via.isNotBlank() && peer.via != "Direct" -> "${peer.hops} Hops (via ${peer.via})"
                                                 peer.prevMac.isNotBlank() -> "${peer.hops} Hops (via ${peer.prevMac.takeLast(8)})"
                                                 else -> "${peer.hops} Hops"
                                             },
-                                            if (peer.isUsb) Cyan else if (peer.hops <= 0) Green else if (peer.hops == 1) Cyan else Gold
+                                            if (peer.isUsb || peer.transport == "usb_mesh_dual" || peer.transport == "ble") Cyan else if (peer.hops <= 0) Green else if (peer.hops == 1) Cyan else Gold
                                         )
                                     }
 
@@ -306,10 +309,12 @@ fun EspNodesScreen(
                                             horizontalArrangement = Arrangement.spacedBy(6.dp)
                                         ) {
                                             Text("🛤 Route:", color = Slate, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
-                                            if (peer.isUsb) {
+                                            if (peer.transport == "ble") {
+                                                Text("${peer.name} ──(BLE)──➔ This Device", color = Cyan, fontSize = 11.sp, fontWeight = FontWeight.Medium)
+                                            } else if (peer.isUsb || peer.transport == "usb_mesh_dual") {
                                                 Text("Local Host USB (${peer.usbPort.ifEmpty { "/dev/ttyUSB0" }}) ➔ Mesh Gateway", color = Cyan, fontSize = 11.sp, fontWeight = FontWeight.Medium)
                                             } else if (peer.hops <= 0) {
-                                                Text("Local USB / BLE Connection ➔ This Device", color = Green, fontSize = 11.sp, fontWeight = FontWeight.Medium)
+                                                Text("Local Connection ➔ This Device", color = Green, fontSize = 11.sp, fontWeight = FontWeight.Medium)
                                             } else if (peer.hops == 1) {
                                                 Text("${peer.name} ──(Direct RF Link)──➔ This Device", color = Green, fontSize = 11.sp, fontWeight = FontWeight.Medium)
                                             } else {
@@ -336,18 +341,20 @@ fun EspNodesScreen(
                                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                                         Column {
                                             Text("Power / Battery:", color = Slate, style = MaterialTheme.typography.labelSmall)
-                                            if (peer.battState == "no_battery" || peer.battMv < 1200) {
-                                                Text("USB 5V (No Batt)", color = Cyan, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.bodySmall)
+                                            if (!hasBattery(peer.battState, peer.battMv, peer.battPct)) {
+                                                Text("No battery (USB 5V)", color = Cyan, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.bodySmall)
                                             } else {
                                                 val trainTag = if (peer.battTrained) " [Trained]" else if (peer.battTrainPct > 0) " [${peer.battTrainPct}% trn]" else ""
+                                                // pct -1 = not yet computed; show the raw voltage, not a red "-1%".
+                                                val level = if (peer.battPct < 0) "${peer.battMv} mV" else "${peer.battPct}%${if (peer.battMv > 0) " (${peer.battMv}mV)" else ""}"
                                                 Text(
-                                                    "${peer.battPct}% (${peer.battMv}mV${if (peer.charging) ", ⚡" else ""})$trainTag",
-                                                    color = if (peer.battPct > 20) Green else Red,
+                                                    "$level${if (peer.charging) " ⚡" else ""}$trainTag",
+                                                    color = if (peer.battPct < 0) Slate else if (peer.battPct > 20) Green else Red,
                                                     fontWeight = FontWeight.Bold,
                                                     style = MaterialTheme.typography.bodySmall
                                                 )
+                                                Text("${peer.battMah} mAh cell${if (peer.battCycles > 0.05f) String.format(java.util.Locale.US, " · %.1f cyc", peer.battCycles) else ""}", color = Slate, style = MaterialTheme.typography.labelSmall)
                                             }
-                                            Text("${peer.battMah} mAh cell${if (peer.battCycles > 0.05f) String.format(java.util.Locale.US, " · %.1f cyc", peer.battCycles) else ""}", color = Slate, style = MaterialTheme.typography.labelSmall)
                                         }
                                         Column {
                                             Text("RF & Mesh:", color = Slate, style = MaterialTheme.typography.labelSmall)
@@ -474,19 +481,20 @@ fun EspNodesScreen(
                                         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                                             Text("Node: ${st.node}", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.bodySmall)
                                             Surface(color = Cyan.copy(alpha = 0.2f), shape = RoundedCornerShape(4.dp)) {
-                                                Text("v${st.version}", color = Cyan, style = MaterialTheme.typography.labelSmall, modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp))
+                                                Text("v${st.version.ifBlank { "?" }}", color = Cyan, style = MaterialTheme.typography.labelSmall, modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp))
                                             }
                                         }
                                         Text("Uptime: ${st.uptime}s", color = Slate, style = MaterialTheme.typography.bodySmall)
                                     }
                                     Column { Text("Rate: ${st.pps} pps", color = Cyan, style = MaterialTheme.typography.bodySmall); Text("Heap: ${st.heap / 1024} KB free", color = Slate, style = MaterialTheme.typography.bodySmall) }
                                     Column {
-                                        if (st.batt_state == "no_battery" || st.batt_mv < 1200) {
+                                        if (!hasBattery(st.batt_state, st.batt_mv, st.batt_pct)) {
                                             Text("Power: USB (No Batt)", color = Cyan, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.bodySmall)
                                             Text("State: External 5V", color = Slate, style = MaterialTheme.typography.bodySmall)
                                         } else {
                                             val trainTag = if (st.batt_trained) " [Trained]" else if (st.batt_train_pct > 0) " [${st.batt_train_pct}% trn]" else ""
-                                            Text("Battery: ${st.batt_pct}% (${st.batt_mv}mV)$trainTag", color = if (st.batt_pct > 20) Green else Red, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.bodySmall)
+                                            val level = if (st.batt_pct < 0) "${st.batt_mv} mV" else "${st.batt_pct}% (${st.batt_mv}mV)"
+                                            Text("Battery: $level$trainTag", color = if (st.batt_pct < 0) Slate else if (st.batt_pct > 20) Green else Red, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.bodySmall)
                                             Text("State: ${st.batt_state}${if (st.charging) " ⚡" else ""}${if (st.batt_cycles > 0.05f) String.format(java.util.Locale.US, " · %.1f cyc", st.batt_cycles) else ""}", color = Slate, style = MaterialTheme.typography.bodySmall)
                                         }
                                     }
