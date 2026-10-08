@@ -120,10 +120,18 @@ OTA without USB: join the node's open access point (its name) and send the signe
 
 ### Battery
 
-Battery nodes (a Heltec V3 with its LiPo, or an ESP32 wired to a cell) learn their own empty and full voltages
-over a few charge cycles instead of using a stock table, and filter out the dips from radio transmits. Boards
-with no battery say so, and the apps show "USB power" for them. Serial or BLE commands: `batt stats` shows what
-it has learned so far, `batt reset` starts over (also a button in the Android app).
+An ESP32 can't see its cell unless the cell's voltage reaches an ADC pin, so a battery node needs two resistors
+besides the TP4056: 100 kΩ from the TP4056's B+ to GPIO 35 (34, 36 or 39 work too) and 100 kΩ from that pin to GND,
+with the TP4056 and ESP32 grounds tied together. The node finds whichever of those pins has the cell on it within a
+minute and remembers it. Without the divider every pin floats around 0.3 V and the node reports no battery.
+
+Battery nodes learn their own empty and full voltages over a few charge cycles instead of using a stock table, and
+filter out the dips from radio transmits. Runtime left comes from how fast that node's % has actually been falling,
+or from capacity and a typical draw (about 150 mA for an ESP32 with Wi-Fi and BLE on) until there's enough history.
+
+Serial or BLE commands: `batt stats`, `batt scan` (what each pin reads), `batt pin <n>` / `batt pin auto`,
+`batt divider <r>`, `batt reset` (also a button in the Android app). To send one to a node over the bridge:
+`echo '@NodeName batt scan' | nc -u -w1 127.0.0.1 47825` (leave off `@NodeName` to send to every linked node).
 
 ## How it gets a fix
 

@@ -185,7 +185,10 @@ struct MeshNodeInfo {
     QString   battState;                      // "full", "discharging", "charging", "absent"
     bool      charging = false;
     int       battMah = 240;                  // battery volume / capacity in mAh (default 240 for Heltec V3)
-    int       estRuntimeMins = 0;             // estimated battery runtime in minutes
+    int       estRuntimeMins = 0;             // estimated battery runtime in minutes (-1 charging)
+    double    drainPctPerMin = 0;             // learned discharge rate, smoothed; 0 until there's enough history
+    int       drainRefPct = -1;               // start of the current drain window
+    QDateTime drainRefTime;
     int       hops = 0;
     QString   viaNode;                        // Intermediate relay node name (e.g. "ObsidianCheetahNavi2717")
     QString   prevHopMac;                     // Last hop transmitter MAC
@@ -214,7 +217,8 @@ struct MeshNodeInfo {
         if (battState == QLatin1String("no_battery") || battState == QLatin1String("absent")) return false;
         return battMv > 0 ? battMv >= 2500 : battPct >= 0;
     }
-    QString linkText() const;                 // "USB (/dev/ttyUSB0)", "BLE", "Direct", "3 hops · via X", "never seen"
+    QString linkText() const;
+    void updateRuntimeEstimate(const QDateTime &now);                 // "USB (/dev/ttyUSB0)", "BLE", "Direct", "3 hops · via X", "never seen"
     QJsonObject toJson() const;
 };
 

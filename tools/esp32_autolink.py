@@ -501,6 +501,7 @@ NUS_RX = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"   # we write commands here
 NUS_TX = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"   # node notifies telemetry here
 NODE_NAME_RX = re.compile(r"^(BeaconFix-|BF-|BF_)|^[A-Z][a-z]+[A-Z][a-z]+[A-Z][a-z]+[0-9]{4}$")
 BLE_MAX_LINKS = 4
+BLE_LINKS: Dict[str, "BleNodeLink"] = {}   # node name -> live link, for commands from UDP 47825
 
 
 class BleNodeLink:
@@ -516,6 +517,13 @@ class BleNodeLink:
         self.framed = False          # firmware that newline-terminates and chunks lines to the MTU
         self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        self.loop = None
+        self.cmds = None
+
+    def send_cmd(self, cmd: str):
+        """Thread-safe: queue a command line for this node (written to NUS RX on the BLE loop)."""
+        if self.loop and self.cmds is not None:
+            self.loop.call_soon_threadsafe(self.cmds.put_nowait, cmd)
 
     def feed(self, data: bytes):
         if data.endswith(b"\n"):
@@ -548,7 +556,10 @@ class BleNodeLink:
             return
         t = data.get("type")
         if t == "status":
-            self.node_name = data.get("node", self.node_name)
+            if data.get("node") and data["node"] != self.node_name:
+                BLE_LINKS.pop(self.node_name, None)
+                self.node_name = data["node"]
+                BLE_LINKS[self.node_name] = self
             data["is_usb"] = False
             data["transport"] = "ble"
         elif t == "alert":
@@ -573,22 +584,31 @@ class BleNodeLink:
         from bleak import BleakClient
         done = asyncio.Event()
         client = BleakClient(self.address, disconnected_callback=lambda _c: done.set(), timeout=15.0)
+        self.loop = asyncio.get_running_loop()
+        self.cmds = asyncio.Queue()
         try:
             await client.connect()
             await client.start_notify(NUS_TX, lambda _ch, d: self.feed(bytes(d)))
+            BLE_LINKS[self.node_name] = self
             print(f"[+] BLE link up: {self.node_name} ({self.address})", file=sys.stderr)
             # Only "status" until framing is known: older firmware's newline-terminated command
             # replies would otherwise make its unterminated telemetry look framed
             await client.write_gatt_char(NUS_RX, b"status\n", response=False)
             synced = False
+            next_sync = 0.0
             while not done.is_set():
-                if self.framed and not synced:
+                if self.framed and (not synced or time.time() >= next_sync):
                     await client.write_gatt_char(NUS_RX, f"time {int(time.time() * 1000000)}\n".encode(), response=False)
-                    synced = True
-                try:
-                    await asyncio.wait_for(done.wait(), timeout=25.0)
-                except asyncio.TimeoutError:
-                    synced = False   # periodic re-sync, like the USB path
+                    synced, next_sync = True, time.time() + 25.0   # periodic re-sync, like the USB path
+                get = asyncio.ensure_future(self.cmds.get())
+                gone = asyncio.ensure_future(done.wait())
+                finished, _ = await asyncio.wait({get, gone}, timeout=25.0, return_when=asyncio.FIRST_COMPLETED)
+                if get in finished:
+                    await client.write_gatt_char(NUS_RX, (get.result().strip() + "\n").encode(), response=False)
+                else:
+                    get.cancel()
+                if gone not in finished:
+                    gone.cancel()
         except Exception as e:
             print(f"[!] BLE link {self.node_name} ({self.address}): {e}", file=sys.stderr)
         finally:
@@ -596,6 +616,8 @@ class BleNodeLink:
                 await client.disconnect()
             except Exception:
                 pass
+            if BLE_LINKS.get(self.node_name) is self:
+                del BLE_LINKS[self.node_name]
             self.udp_sock.close()
             print(f"[*] BLE link down: {self.node_name}", file=sys.stderr)
 
@@ -655,9 +677,18 @@ def autolink_loop(auto_flash=False, ble=True):
             while True:
                 data, _ = cmd_sock.recvfrom(1024)
                 cmd = data.decode("utf-8", errors="replace").strip()
-                if cmd:
-                    for w in list(active_workers.values()):
+                if not cmd:
+                    continue
+                # "@NodeName cmd" goes to that node only; anything else to every USB and BLE link
+                target = None
+                if cmd.startswith("@") and " " in cmd:
+                    target, cmd = cmd[1:].split(" ", 1)
+                for w in list(active_workers.values()):
+                    if target is None or w.node_name == target:
                         w.send_cmd(cmd)
+                for name, link in list(BLE_LINKS.items()):
+                    if target is None or name == target:
+                        link.send_cmd(cmd)
         except Exception as e:
             print(f"[!] Command listener error: {e}", file=sys.stderr)
 

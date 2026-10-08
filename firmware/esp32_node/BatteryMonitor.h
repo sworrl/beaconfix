@@ -2,6 +2,7 @@
 #include <Arduino.h>
 #include "LedPatterns.h"
 #include "BatteryTrainer.h"
+#include <Preferences.h>
 
 enum BatteryState {
     BATT_UNKNOWN = 0,
@@ -20,8 +21,13 @@ public:
     }
 
     void begin(int pin = 35, float dividerRatio = 2.0f) {
-        m_pin = pin;
-        m_dividerRatio = dividerRatio;
+        // A pin/divider set with `batt pin` / `batt divider` or found by the scan survives reboots
+        Preferences prefs;
+        prefs.begin("battmon", true);
+        m_pin = prefs.getInt("pin", pin);
+        m_dividerRatio = prefs.getFloat("divider", dividerRatio);
+        m_pinFixed = prefs.getBool("fixed", false);
+        prefs.end();
         pinMode(m_pin, INPUT);
         m_lastReadTime = 0;
         m_sampleCount = 0;
@@ -30,18 +36,62 @@ public:
         m_percentage = 0;
         m_state = BATT_NO_BATTERY;
         m_trainer.begin();
+        if (!m_pinFixed && readPinMv(m_pin) * m_dividerRatio < 1200) autoDetectPin();
         readSensor();
     }
 
+    // Set by the user: kept across reboots and never overridden by the scan
     void setPin(int pin) {
         m_pin = pin;
         pinMode(m_pin, INPUT);
+        resetSamples();
+        m_pinFixed = true;
+        save();
     }
 
     void setDivider(float ratio) {
         if (ratio > 0.1f && ratio < 20.0f) {
             m_dividerRatio = ratio;
+            resetSamples();
+            save();
         }
+    }
+
+    // Back to automatic: forget a user-set pin and scan again
+    void setPinAuto() {
+        m_pinFixed = false;
+        save();
+        autoDetectPin();
+    }
+    bool isPinFixed() const { return m_pinFixed; }
+
+    // Input-only ADC1 pins: safe to read with Wi-Fi up, and never an LED output (32/33 can be)
+    static constexpr int kScanPins[4] = {35, 34, 36, 39};
+
+    uint32_t readPinMv(int pin) {
+        pinMode(pin, INPUT);
+        uint32_t sum = 0;
+        for (int i = 0; i < 4; i++) sum += analogReadMilliVolts(pin);
+        return sum / 4;
+    }
+
+    // A divided Li-ion cell (2.8-4.4 V through the divider) on one of the scan pins; a floating pin reads under ~0.6 V
+    bool autoDetectPin() {
+        for (int pin : kScanPins) {
+            uint32_t mv = (uint32_t)(readPinMv(pin) * m_dividerRatio);
+            if (mv >= 2800 && mv <= 4400) {
+                if (pin != m_pin) {
+                    m_pin = pin;
+                    resetSamples();
+                    save();
+                    Serial.printf("{\"type\":\"battery_pin_detected\",\"pin\":%d,\"mv\":%lu}\n", pin, (unsigned long)mv);
+                }
+                pinMode(m_pin, INPUT);
+                return true;
+            }
+        }
+        pinMode(m_pin, INPUT);
+        return false;
     }
 
     int getPin() const { return m_pin; }
@@ -76,7 +126,7 @@ public:
 
     const char* getDiagnosticAdvice() const {
         if (m_rawMv < 50) return "No voltage on ADC pin. Check 100k resistor to Battery (+), and check common GND.";
-        if (m_batteryMv < 1200) return "Node is running on USB 5V. If a battery is attached, it is deeply drained (<1.2V) or TP4056 is off.";
+        if (m_batteryMv < 1200) return "No cell voltage seen. The ESP32 can only measure the cell through a divider: 100k from TP4056 B+ to GPIO 34/35/36/39 and 100k from that pin to GND (common GND). The node finds the pin by itself within a minute.";
         if (m_batteryMv < 3300) return "Battery is depleted (<3.3V). Charge via TP4056 USB-C port.";
         if (m_batteryMv > 4350) return "Voltage exceeds 4.35V! Verify 100k/100k resistor divider ratio.";
         return "3.7V Li-ion battery is connected and reading correctly.";
@@ -98,6 +148,11 @@ public:
         if (now - m_lastReadTime >= 1000) { // update once per second
             m_lastReadTime = now;
             readSensor();
+        }
+        // Nothing on the pin yet: a cell wired up later (or to another pin) gets found within a minute
+        if (!m_pinFixed && m_state == BATT_NO_BATTERY && now - m_lastScanTime >= 60000) {
+            m_lastScanTime = now;
+            autoDetectPin();
         }
     }
 
@@ -127,6 +182,21 @@ private:
     BatteryMonitor() : m_pin(35), m_dividerRatio(2.0f), m_lastReadTime(0),
                        m_batteryMv(0), m_percentage(0), m_state(BATT_NO_BATTERY),
                        m_sampleCount(0), m_readingsTotal(0) {}
+
+    void save() {
+        Preferences prefs;
+        prefs.begin("battmon", false);
+        prefs.putInt("pin", m_pin);
+        prefs.putFloat("divider", m_dividerRatio);
+        prefs.putBool("fixed", m_pinFixed);
+        prefs.end();
+    }
+
+    void resetSamples() {
+        m_sampleCount = 0;
+        m_sampleIndex = 0;
+        m_readingsTotal = 0;
+    }
 
     void readSensor() {
         // Read ADC with ESP32 calibration
@@ -190,4 +260,6 @@ private:
     uint8_t m_sampleCount;
     uint8_t m_sampleIndex = 0;
     uint32_t m_readingsTotal;
+    bool m_pinFixed = false;
+    unsigned long m_lastScanTime = 0;
 };

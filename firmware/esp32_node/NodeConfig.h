@@ -19,7 +19,7 @@ enum NodeOpMode : uint8_t {
 };
 
 #define BEACONFIX_HW_TYPE 2 // Heltec V3 ESP32-S3
-#define BEACONFIX_FW_VERSION "3.10.3"
+#define BEACONFIX_FW_VERSION "3.10.4"
 #define BEACONFIX_BUILD_DATE __DATE__
 
 class NodeConfig {

@@ -113,6 +113,36 @@ QString MeshNodeInfo::linkText() const
     return s;
 }
 
+// Runtime left: from how fast this node's % has actually been falling, else capacity / typical draw for the board
+void MeshNodeInfo::updateRuntimeEstimate(const QDateTime &now)
+{
+    if (!hasBattery() || battPct < 0) { estRuntimeMins = 0; drainRefPct = -1; return; }
+    if (charging || battState == QLatin1String("charging")) { estRuntimeMins = -1; drainRefPct = -1; return; }
+
+    if (drainRefPct < 0 || !drainRefTime.isValid() || battPct > drainRefPct) {
+        drainRefPct = battPct;                  // new window: first sample, or it was charged in between
+        drainRefTime = now;
+    } else {
+        const double mins = drainRefTime.secsTo(now) / 60.0;
+        if (mins >= 10 && battPct < drainRefPct) {
+            const double rate = (drainRefPct - battPct) / mins;
+            drainPctPerMin = drainPctPerMin > 0 ? 0.7 * drainPctPerMin + 0.3 * rate : rate;
+            drainRefPct = battPct;
+            drainRefTime = now;
+        }
+    }
+
+    if (drainPctPerMin > 0) {
+        estRuntimeMins = int(battPct / drainPctPerMin);
+    } else if (battMah > 0) {
+        // Until there's history: an ESP32 with Wi-Fi, BLE and sniffing on pulls ~150 mA, the Heltec ~75 mA
+        const int drawMa = hardware.contains(QLatin1String("Heltec"), Qt::CaseInsensitive) ? 75 : 150;
+        estRuntimeMins = (battMah * battPct * 60) / (100 * drawMa);
+    } else {
+        estRuntimeMins = 0;
+    }
+}
+
 QJsonObject MeshNodeInfo::toJson() const
 {
     const qint64 age = lastSeen.isValid() ? lastSeen.secsTo(QDateTime::currentDateTime()) : -1;
@@ -5830,6 +5860,9 @@ void Locator::processMeshPacket(const QByteArray &data, const QHostAddress &send
         if (inner.contains(QStringLiteral("version"))) n.fwVersion = inner.value(QStringLiteral("version")).toString();
         if (inner.contains(QStringLiteral("batt_mv"))) n.battMv = inner.value(QStringLiteral("batt_mv")).toInt();
         if (inner.contains(QStringLiteral("batt_pct"))) n.battPct = inner.value(QStringLiteral("batt_pct")).toInt();
+        if (inner.contains(QStringLiteral("batt_state"))) n.battState = inner.value(QStringLiteral("batt_state")).toString();
+        if (inner.contains(QStringLiteral("charging"))) n.charging = inner.value(QStringLiteral("charging")).toBool();
+        if (inner.contains(QStringLiteral("hardware"))) n.hardware = inner.value(QStringLiteral("hardware")).toString();
         if (inner.contains(QStringLiteral("mode"))) n.role = inner.value(QStringLiteral("mode")).toString();
         if (inner.contains(QStringLiteral("antenna_detected"))) n.antennaDetected = inner.value(QStringLiteral("antenna_detected")).toBool(true);
         if (inner.contains(QStringLiteral("tx_inhibited"))) n.txInhibited = inner.value(QStringLiteral("tx_inhibited")).toBool(false);
@@ -5870,13 +5903,7 @@ void Locator::processMeshPacket(const QByteArray &data, const QHostAddress &send
             else n.battPct = (n.battMv - 3300) * 100 / (4150 - 3300);
         }
         
-        if (n.hasBattery() && n.battPct > 0 && n.battMah > 0) {
-            n.estRuntimeMins = (n.battMah * n.battPct * 60) / (100 * 75);
-        } else if (n.charging || n.battState == QLatin1String("charging")) {
-            n.estRuntimeMins = -1;
-        } else {
-            n.estRuntimeMins = 0;
-        }
+        n.updateRuntimeEstimate(now);
         if (n.attachedDevice.isEmpty()) {
             n.attachedDevice = nodeAttachedDevice(nodeName);
             n.following = !n.attachedDevice.isEmpty();
@@ -6041,9 +6068,7 @@ bool Locator::setNodeBatteryCapacity(const QString &name, int mah)
     if (m_meshNodes.contains(name)) {
         MeshNodeInfo &n = m_meshNodes[name];
         n.battMah = mah;
-        if (n.battPct > 0) {
-            n.estRuntimeMins = (n.battMah * n.battPct * 60) / (100 * 75);
-        }
+        n.updateRuntimeEstimate(QDateTime::currentDateTime());
     }
     emit meshNodesChanged();
     return true;

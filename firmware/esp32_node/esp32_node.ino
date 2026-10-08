@@ -157,7 +157,7 @@ void handleCommand(const String& cmdLine) {
                        "\"mesh status\",\"mesh peers\",\"mesh send <text>\","
                        "\"led list\",\"led config <slot> single <pin> <role> [inv]\","
                        "\"led config <slot> rgb <r> <g> <b> <role> [inv]\",\"led clear <slot>\","
-                       "\"led <pattern>\",\"batt [stats|reset|pin|divider]\",\"ota\",\"reboot\"]}");
+                       "\"led <pattern>\",\"batt [stats|scan|reset|pin <n>|pin auto|divider <r>]\",\"ota\",\"reboot\"]}");
     } else if (cmd.equalsIgnoreCase("mode") || cmd.equalsIgnoreCase("mode status")) {
         SPRINTF("{\"type\":\"op_mode\",\"mode\":\"%s\",\"is_base_station\":%s,\"hops\":%u}\n",
             NodeConfig::instance().getOpModeStr(),
@@ -285,6 +285,23 @@ void handleCommand(const String& cmdLine) {
                       s.isTrained ? "true" : "false",
                       s.trainPct,
                       s.cycles);
+    } else if (cmd.equalsIgnoreCase("batt scan")) {
+        // What each input-only ADC pin reads, through the current divider ratio
+        const float div = BatteryMonitor::instance().getDivider();
+        String json = "{\"type\":\"battery_scan\",\"divider\":" + String(div, 2) + ",\"current_pin\":" +
+                      String(BatteryMonitor::instance().getPin()) + ",\"fixed\":" +
+                      (BatteryMonitor::instance().isPinFixed() ? "true" : "false") + ",\"pins\":{";
+        bool first = true;
+        for (int pin : BatteryMonitor::kScanPins) {
+            json += String(first ? "" : ",") + "\"" + String(pin) + "\":" + String((uint32_t)(BatteryMonitor::instance().readPinMv(pin) * div));
+            first = false;
+        }
+        pinMode(BatteryMonitor::instance().getPin(), INPUT);
+        json += "}}";
+        SPRINTLN(json);
+    } else if (cmd.equalsIgnoreCase("batt pin auto")) {
+        BatteryMonitor::instance().setPinAuto();
+        SPRINTF("{\"type\":\"ack\",\"battPin\":%d,\"auto\":true}\n", BatteryMonitor::instance().getPin());
     } else if (cmd.startsWith("batt pin ")) {
         int p = cmd.substring(9).toInt();
         BatteryMonitor::instance().setPin(p);
