@@ -26,6 +26,7 @@ systemctl --user stop beaconfix-esp32-bridge.service 2>/dev/null || true
 
 if [ "${2:-}" != "--no-compile" ]; then
     echo "==> Compiling Heltec V3 firmware..."
+    python3 "$DIR/tools/sign_firmware.py" --init   # your own keypair on first run; embeds its public half
     "$ARDUINO_CLI" compile --fqbn esp32:esp32:heltec_wifi_lora_32_V3 --build-path "$DIR/firmware/heltec_v3/build" "$DIR/firmware/heltec_v3"
     echo "==> Signing Heltec V3 firmware cryptographically..."
     python3 "$DIR/tools/sign_firmware.py" "$DIR/firmware/heltec_v3/build/heltec_v3.ino.bin"

@@ -9,13 +9,13 @@
 #include "BatteryMonitor.h"
 #include "WifiMonitor.h"
 
-// Public verification key (secp256r1 / NIST P-256).
-// The private signing key stays strictly protected on the desktop host and is NEVER in firmware.
-static const char* const FW_PUBLIC_KEY_PEM =
-"-----BEGIN PUBLIC KEY-----\n"
-"MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAERCAFKKvKLjU48k464ydKVoEEeIYz\n"
-"gBLywQ30K5QUQQR8Y1ZHBxeyHbVQGH0MndvfENckwSDqWhqX1jGpcHWRRA==\n"
-"-----END PUBLIC KEY-----\n";
+// Public verification key (secp256r1 / NIST P-256), generated per install by tools/sign_firmware.py --init
+// (the flash scripts run it). The private signing key stays on the desktop host and is never in firmware or git.
+#if __has_include("FwPublicKey.h")
+#include "FwPublicKey.h"
+#else
+#error "No firmware signing key yet: run tools/sign_firmware.py --init (makes your keypair and FwPublicKey.h), then build again"
+#endif
 
 class OtaUpdater {
 public:

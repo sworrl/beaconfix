@@ -9,6 +9,7 @@ install_manifest.txt
 __pycache__/
 *.pyc
 *.key
-tools/keys/*.key
+tools/keys/
+firmware/*/FwPublicKey.h
 android/.gradle/
 android/app/build/

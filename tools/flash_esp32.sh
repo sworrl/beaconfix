@@ -28,6 +28,7 @@ systemctl --user stop beaconfix-esp32-bridge.service 2>/dev/null || true
 
 if [ "${2:-}" != "--no-compile" ]; then
     echo "==> Compiling ESP32 firmware with min_spiffs (OTA enabled)..."
+    python3 "$DIR/tools/sign_firmware.py" --init   # your own keypair on first run; embeds its public half
     arduino-cli compile --fqbn esp32:esp32:esp32:PartitionScheme=min_spiffs --build-path "$DIR/firmware/esp32_node/build" "$DIR/firmware/esp32_node"
     echo "==> Signing firmware binary cryptographically..."
     python3 "$DIR/tools/sign_firmware.py" "$DIR/firmware/esp32_node/build/esp32_node.ino.bin"
