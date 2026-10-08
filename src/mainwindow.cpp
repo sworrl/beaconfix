@@ -1630,9 +1630,11 @@ void MainWindow::refreshNodes()
         } else {
             roleStr = QStringLiteral("Mobile Node 📡");
         }
-        if (!n.antennaDetected || n.txInhibited) roleStr += QStringLiteral(" ⚠️ No Ant");
+        // Only the Heltec has a LoRa radio to miss an antenna on; a plain ESP32 reports antenna_detected false
+        const bool loraWarn = n.hardware.contains(QLatin1String("Heltec"), Qt::CaseInsensitive) && (!n.antennaDetected || n.txInhibited);
+        if (loraWarn) roleStr += QStringLiteral(" ⚠️ No Ant");
         auto *roleItem = new QTableWidgetItem(roleStr);
-        if (!n.antennaDetected || n.txInhibited) roleItem->setForeground(QColor(0xff, 0xa7, 0x26));
+        if (loraWarn) roleItem->setForeground(QColor(0xff, 0xa7, 0x26));
         else if (n.following) roleItem->setForeground(QColor(0x35, 0xd6, 0xff));
         m_nodesTable->setItem(i, 2, roleItem);
 
@@ -2129,6 +2131,12 @@ void MainWindow::showLink()
     if (!m_linkDialog) m_linkDialog = new LinkDialog(m_loc->apiServer(), this);
     m_linkDialog->show(); m_linkDialog->raise(); m_linkDialog->activateWindow();
 }
+void MainWindow::selectTab(const QString &label)
+{
+    for (int i = 0; i < m_tabs->count(); ++i)
+        if (m_tabs->tabText(i).compare(label, Qt::CaseInsensitive) == 0) { m_tabs->setCurrentIndex(i); return; }
+}
+
 void MainWindow::showPlateEvent(const QString &uid)
 {
     if (!m_sightings) return;

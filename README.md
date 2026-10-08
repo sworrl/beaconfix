@@ -105,6 +105,29 @@ How the desktop hears them:
 
 A node goes offline after 2 minutes of silence.
 
+### The node list
+
+<p align="center">
+  <img src="docs/screenshots/nodes-desktop.png" width="72%" alt="Desktop Nodes tab: every node with status, role, board, firmware, power, link and nameplate">
+  <img src="docs/screenshots/nodes-android.png" width="24%" alt="Android Nodes and Mesh screen: each node's route, power and location mode">
+</p>
+
+The Nodes tab on the desktop, the Nodes screen in the Android app, the tray's Mesh Network menu, the widget's Trip
+tab and the web dashboard all show the same list. For each node:
+
+- **Status**: online, offline, or never seen (the desktop table also shows stale for a node heard in the last 10
+  minutes). A node you minted a nameplate for but never powered up shows as never seen until it checks in.
+- **Role**: mobile or base station, from what the node reports. A node can follow a device (your desktop or phone)
+  and take its position from it.
+- **Hardware and firmware**: the board and version the node reports, or a dash if it hasn't said yet.
+- **Power**: battery % and voltage with an estimate of runtime left, or "USB / 5V (No Battery)" when there's no
+  cell on the ADC. See [Battery](#battery) for the two resistors that make a battery readable.
+- **Link**: USB with its port, BLE, or how many mesh hops away it is and through which node.
+- **Location**: unset until you place it on the map, fixed once placed, or streaming from the device it follows.
+
+Both screenshots are from my own nodes. The desktop one was taken with location turned off (no scan, no fix), and
+the phone shot is cropped to the list. Nothing in either one shows where they are.
+
 ### Firmware signing keys
 
 Each install signs its own firmware. The first time you run a flash script (or `tools/sign_firmware.py --init`)

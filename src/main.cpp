@@ -400,13 +400,15 @@ int main(int argc, char **argv)
         Locator loc(true);
         TileSource tiles;
         MainWindow win(&loc, &tiles);
-        win.resize(1100, 720);
+        const QStringList size = qEnvironmentVariable("BEACONFIX_SNAPSHOT_SIZE").split(QLatin1Char('x'));   // e.g. 1500x800
+        win.resize(size.size() == 2 ? size[0].toInt() : 1100, size.size() == 2 ? size[1].toInt() : 720);
         win.show();
         const QString file = p.value(snapshot);
         // Docs hooks: BEACONFIX_SNAPSHOT_NOPROBE=1 renders the database as it is (no Wi-Fi scan, no fix: screenshots that
         // must not show where the machine really is); BEACONFIX_SNAPSHOT_CENTER="lat,lon,zoom"; BEACONFIX_SNAPSHOT_TAB=sightings
-        // (+ BEACONFIX_SNAPSHOT_EVENT=<uid> opens its dialog); BEACONFIX_SNAPSHOT_HOLD=<s> keeps running after the grab
-        // (for capturing dialogs from the X server); BEACONFIX_SNAPSHOT_ZOOM=17, BEACONFIX_SNAPSHOT_LAYER=0..3 as before.
+        // (+ BEACONFIX_SNAPSHOT_EVENT=<uid> opens its dialog) or any tab by name ("Nodes"); BEACONFIX_SNAPSHOT_HOLD=<s> keeps running after the grab
+        // (for capturing dialogs from the X server); BEACONFIX_SNAPSHOT_ZOOM=17, BEACONFIX_SNAPSHOT_LAYER=0..3 as before;
+        // BEACONFIX_SNAPSHOT_SIZE=WxH for the window.
         auto shoot = [&, file] {
             // Let tiles, the place name and nearby places arrive (places can take a while)
             auto *poll = new QTimer(&app);
@@ -422,7 +424,9 @@ int main(int argc, char **argv)
                 if (c.size() == 3) win.map()->focusOn(c[0].toDouble(), c[1].toDouble(), c[2].toDouble());
                 const int layer = qEnvironmentVariable("BEACONFIX_SNAPSHOT_LAYER").toInt(&ok);
                 if (ok) win.map()->setLayer(BeaconView::Layer(layer));
-                if (qEnvironmentVariable("BEACONFIX_SNAPSHOT_TAB") == QLatin1String("sightings")) win.showPlateEvent(qEnvironmentVariable("BEACONFIX_SNAPSHOT_EVENT"));
+                const QString tab = qEnvironmentVariable("BEACONFIX_SNAPSHOT_TAB");
+                if (tab == QLatin1String("sightings")) win.showPlateEvent(qEnvironmentVariable("BEACONFIX_SNAPSHOT_EVENT"));
+                else if (!tab.isEmpty()) win.selectTab(tab);   // any other tab by name, e.g. "Nodes"
                 const bool moved = ok || qEnvironmentVariableIsSet("BEACONFIX_SNAPSHOT_ZOOM") || c.size() == 3;
                 QTimer::singleShot(moved ? 9000 : 4000, &app, [&, file] {  // tiles for the final view
                     win.grab().save(file);

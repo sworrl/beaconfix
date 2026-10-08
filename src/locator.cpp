@@ -1222,9 +1222,17 @@ QString Locator::apStatus(const AccessPoint &ap) const
 }
 
 // ── Probe chain ───────────────────────────────────────────────────────────────
+// Docs snapshots (BEACONFIX_SNAPSHOT_NOPROBE): never scan or geolocate, so a screenshot can't show where this machine is.
+// main.cpp only skipped its own refresh; start() and the live timer still scanned and fixed through Apple.
+static bool noProbe()
+{
+    static const bool on = qEnvironmentVariableIsSet("BEACONFIX_SNAPSHOT_NOPROBE");
+    return on;
+}
+
 void Locator::Refresh()
 {
-    if (m_busy) return;
+    if (m_busy || noProbe()) return;
     m_busy = true;
     m_lastError.clear();
     m_starlinkError.clear();
@@ -1474,12 +1482,14 @@ void Locator::tryStarlink()
 // that arrives while a live scan is in flight simply takes that scan's result.
 void Locator::startProbeScan()
 {
+    if (noProbe()) return;
     if (m_liveScan) { m_probeWantsScan = true; return; }
     m_scanner.scan();
 }
 
 void Locator::liveScan()
 {
+    if (noProbe()) return;
     if (m_busy || m_liveScan || m_standalone || m_scanner.busy()) return;
     m_liveScan = true;
     m_scanner.scan();

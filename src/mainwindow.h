@@ -42,6 +42,7 @@ public:
     void showIdentity();
     void showEmergency();
     void showPlateEvent(const QString &uid);   // a notification's Details ("" = the Sightings tab)
+    void selectTab(const QString &label);   // by its visible name, case-insensitive (docs snapshots)
     void showLink();                          // the "Link a device" dialog (QR + mDNS requests), raised if open
     void importHistoryDialog();               // Settings → Map database → Import…
 private:
