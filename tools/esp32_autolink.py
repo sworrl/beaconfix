@@ -37,10 +37,11 @@ except ImportError:
     sys.exit(1)
 
 DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-ARDUINO_CLI = shutil.which("arduino-cli") or "/home/user/.local/bin/arduino-cli"
+ARDUINO_CLI = shutil.which("arduino-cli") or os.path.expanduser("~/.local/bin/arduino-cli")
 UDP_PORT = 47824
 BEACONFIX_API = "http://127.0.0.1:47822"
-WIREGUARD_HUB_URL = "https://hub.example.com"
+# Your BeaconFix hub (docs/HUB.md), if you run one; queued alerts are pushed there when it answers
+WIREGUARD_HUB_URL = os.environ.get("BEACONFIX_HUB_URL", "")
 QUEUE_FILE = os.path.expanduser("~/.config/beaconfix/autolink_queue.jsonl")
 QUEUE_LOCK = threading.Lock()
 
@@ -57,7 +58,7 @@ def store_and_forward_enqueue(item: dict):
 
 
 def trigger_hub_sync():
-    """Trigger immediate sync with the master database on the hub (192.0.2.1) over WireGuard."""
+    """Trigger an immediate `beaconfix --hub-sync` with the hub."""
     def _sync():
         try:
             res = subprocess.run(["beaconfix", "--hub-sync"], capture_output=True, text=True, timeout=12)
@@ -69,10 +70,10 @@ def trigger_hub_sync():
 
 
 def queue_worker():
-    """Background thread to drain and forward offline queued records to WireGuard hub."""
+    """Background thread: once the hub answers, sync and clear the store-and-forward queue."""
     while True:
         time.sleep(25)
-        if not os.path.exists(QUEUE_FILE):
+        if not WIREGUARD_HUB_URL or not os.path.exists(QUEUE_FILE):
             continue
         try:
             req = urllib.request.Request(f"{WIREGUARD_HUB_URL}/healthz")
@@ -662,7 +663,8 @@ def ble_loop(usb_workers: Dict[str, "EspDeviceWorker"], verbose: bool = True):
 def autolink_loop(auto_flash=False, ble=True):
     print(f"[*] BeaconFix ESP32 Auto-Link Daemon running...", file=sys.stderr)
     print(f"[*] Relaying UDP broadcasts on port {UDP_PORT}", file=sys.stderr)
-    print(f"[*] WireGuard Uplink active: {WIREGUARD_HUB_URL} via wg0", file=sys.stderr)
+    if WIREGUARD_HUB_URL:
+        print(f"[*] Hub uplink: {WIREGUARD_HUB_URL}", file=sys.stderr)
     active_workers: Dict[str, EspDeviceWorker] = {}
 
     # Background store-and-forward queue flusher to WireGuard hub

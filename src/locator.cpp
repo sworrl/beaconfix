@@ -6166,7 +6166,7 @@ QJsonObject Locator::generateNameplate(const QString &name, int units, bool shor
     QProcess proc;
     QString script = QCoreApplication::applicationDirPath() + QStringLiteral("/../tools/nameplate_generator.py");
     if (!QFile::exists(script)) {
-        script = QStringLiteral("/home/user/Documents/GitHub/beaconfix/tools/nameplate_generator.py");
+        script = QStringLiteral(BEACONFIX_SOURCE_DIR "/tools/nameplate_generator.py");
     }
     QStringList args;
     args << QStringLiteral("--json");
@@ -6219,7 +6219,7 @@ QJsonArray Locator::listNameplates() const
     QProcess proc;
     QString script = QCoreApplication::applicationDirPath() + QStringLiteral("/../tools/nameplate_generator.py");
     if (!QFile::exists(script)) {
-        script = QStringLiteral("/home/user/Documents/GitHub/beaconfix/tools/nameplate_generator.py");
+        script = QStringLiteral(BEACONFIX_SOURCE_DIR "/tools/nameplate_generator.py");
     }
     proc.start(QStringLiteral("python3"), QStringList{script, QStringLiteral("--list"), QStringLiteral("--json")});
     if (proc.waitForFinished(5000)) {

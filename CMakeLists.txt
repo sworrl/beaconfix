@@ -56,7 +56,8 @@ add_executable(beaconfix
     src/avoidroute.cpp
     src/routeplanner.cpp
 )
-target_compile_definitions(beaconfix PRIVATE BEACONFIX_VERSION="${PROJECT_VERSION}")
+# The checkout it was built from: where tools/ and firmware/ live when running from the build tree
+target_compile_definitions(beaconfix PRIVATE BEACONFIX_VERSION="${PROJECT_VERSION}" BEACONFIX_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 target_link_libraries(beaconfix PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Network Qt6::DBus Qt6::Sql OpenSSL::Crypto)
 # The app icon (data/icons/hicolor, rendered from the low/medium/high masters) compiled in for the window, tray and web dashboard
 qt_add_resources(beaconfix "icons" PREFIX "/" BASE data FILES

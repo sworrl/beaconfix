@@ -1,9 +1,9 @@
 # Slide-and-Clip Nameplate Specification & Generator Guide
 
 This document specifies the mechanical dimensions, retention geometry, and automated generator implementation for slide-and-clip nameplates used on the outdoor watertight enclosures:
-- [`models/heltec_v3_housing`](file:///home/user/Documents/GitHub/3d_printing/models/heltec_v3_housing)
-- [`models/esp32_housing`](file:///home/user/Documents/GitHub/3d_printing/models/esp32_housing)
-- [`models/nameplates`](file:///home/user/Documents/GitHub/3d_printing/models/nameplates)
+- [`models/heltec_v3_housing`](../3d_printing/models/heltec_v3_housing)
+- [`models/esp32_housing`](../3d_printing/models/esp32_housing)
+- [`models/nameplates`](../3d_printing/models/nameplates)
 
 The nameplates slide and clip into a standardized side-wall retention rail on the enclosure lids. They allow automatic generation and printing of custom callsigns, Meshtastic 4-character node short names (e.g. `!a1b2`, `NODE`), beacon identifiers, or deployment numbers during firmware flashing and node provisioning.
 
@@ -211,7 +211,7 @@ if __name__ == '__main__':
 ## 5. Pre-Generated Tile Assets
 
 For instant manual printing, ready-to-slice STLs and plates for blank plates, digits 0–9, and letters A–Z / a–z are available in:
-- Blank Plates: [`models/nameplates/stl/nameplate_4u_blank.stl`](file:///home/user/Documents/GitHub/3d_printing/models/nameplates/stl/nameplate_4u_blank.stl)
-- Digit Set (0–9): [`models/nameplates/stl/nameplate_1u_0.stl`](file:///home/user/Documents/GitHub/3d_printing/models/nameplates/stl/nameplate_1u_0.stl) through [`nameplate_1u_9.stl`](file:///home/user/Documents/GitHub/3d_printing/models/nameplates/stl/nameplate_1u_9.stl)
-- Uppercase Set (A–Z): [`models/nameplates/stl/nameplate_1u_A.stl`](file:///home/user/Documents/GitHub/3d_printing/models/nameplates/stl/nameplate_1u_A.stl) through [`nameplate_1u_Z.stl`](file:///home/user/Documents/GitHub/3d_printing/models/nameplates/stl/nameplate_1u_Z.stl)
-- Pre-sliced 3MF plates with Creality Print settings: [`models/nameplates/print/PLA/`](file:///home/user/Documents/GitHub/3d_printing/models/nameplates/print/PLA)
+- Blank Plates: [`models/nameplates/stl/nameplate_4u_blank.stl`](../3d_printing/models/nameplates/stl/nameplate_4u_blank.stl)
+- Digit Set (0–9): [`models/nameplates/stl/nameplate_1u_0.stl`](../3d_printing/models/nameplates/stl/nameplate_1u_0.stl) through [`nameplate_1u_9.stl`](../3d_printing/models/nameplates/stl/nameplate_1u_9.stl)
+- Uppercase Set (A–Z): [`models/nameplates/stl/nameplate_1u_A.stl`](../3d_printing/models/nameplates/stl/nameplate_1u_A.stl) through [`nameplate_1u_Z.stl`](../3d_printing/models/nameplates/stl/nameplate_1u_Z.stl)
+- Pre-sliced 3MF plates with Creality Print settings: [`models/nameplates/print/PLA/`](../3d_printing/models/nameplates/print/PLA)

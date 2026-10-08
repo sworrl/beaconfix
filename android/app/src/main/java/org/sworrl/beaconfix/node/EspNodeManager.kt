@@ -861,11 +861,7 @@ class EspNodeManager @Inject constructor(
      * Trigger desktop API to flash connected ESP32 over local network.
      */
     suspend fun triggerHostFlash(hostUrl: String = "http://10.0.2.2:8080"): Boolean = kotlinx.coroutines.withContext(Dispatchers.IO) {
-        val targets = listOf(
-            "http://192.0.2.10:8080/api/v1/esp/flash",
-            "http://192.168.1.100:8080/api/v1/esp/flash",
-            "$hostUrl/api/v1/esp/flash"
-        )
+        val targets = listOf("$hostUrl/api/v1/esp/flash")
         for (u in targets) {
             try {
                 val conn = java.net.URL(u).openConnection() as java.net.HttpURLConnection

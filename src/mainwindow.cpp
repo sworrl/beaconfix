@@ -1469,7 +1469,7 @@ QWidget *MainWindow::buildNodes()
     auto *otaBtn = new QPushButton(QIcon::fromTheme(QStringLiteral("system-software-update")), QStringLiteral("Mesh OTA Update…"));
     otaBtn->setToolTip(QStringLiteral("Initiate autonomous cryptographic Mesh OTA broadcast to update remote nodes to latest signed v3.10.4 firmware"));
     connect(otaBtn, &QPushButton::clicked, this, [this] {
-        const QString binPath = QStringLiteral("/home/user/Documents/GitHub/beaconfix/firmware/heltec_v3/build/heltec_v3.ino.bin");
+        const QString binPath = QStringLiteral(BEACONFIX_SOURCE_DIR "/firmware/heltec_v3/build/heltec_v3.ino.bin");
         const QString sigPath = binPath + QStringLiteral(".sig");
         if (!QFile::exists(binPath) || !QFile::exists(sigPath)) {
             QMessageBox::warning(this, QStringLiteral("Mesh OTA"), QStringLiteral("Compiled firmware binary or signature missing.\nPlease build firmware/heltec_v3 first."));

@@ -2114,7 +2114,7 @@ void ApiServer::serve(QTcpSocket *s, const Request &r, Device *dev, const QStrin
         QProcess proc;
         QString script = QCoreApplication::applicationDirPath() + QStringLiteral("/../tools/flash_esp32.sh");
         if (!QFile::exists(script)) {
-            script = QStringLiteral("/home/user/Documents/GitHub/beaconfix/tools/flash_esp32.sh");
+            script = QStringLiteral(BEACONFIX_SOURCE_DIR "/tools/flash_esp32.sh");
         }
         QStringList args;
         if (!reqPort.isEmpty()) args << reqPort;

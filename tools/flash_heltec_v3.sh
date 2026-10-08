@@ -4,7 +4,7 @@
 set -e
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-ARDUINO_CLI="${ARDUINO_CLI:-/home/user/.local/bin/arduino-cli}"
+ARDUINO_CLI="${ARDUINO_CLI:-$(command -v arduino-cli || echo "$HOME/.local/bin/arduino-cli")}"
 PORT="${1:-}"
 
 if [ -z "$PORT" ]; then
