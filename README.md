@@ -42,6 +42,14 @@ your devices unless you point it at your own hub.
   ChaCha20-Poly1305).
 - **Nearest help** — police, fire, the nearest ER and pediatric ER with phone numbers and drive times.
 
+### BeaconFix Lite
+
+[`lite/`](lite/README.md) is the locator on its own, as a small library for devices that only need to know where
+they are: a music player, a picture frame, a sensor box. Wi-Fi scan in, position out, with BeaconFix's robust
+estimator and integrity check, no GPS, no Google Play services and as little battery, network and flash as the
+answer allows (a repeat look costs about a millisecond; most looks need no network). Plain Kotlin, Android 5.0+,
+no dependencies. Releases tagged `lite-vX.Y.Z` carry the `.aar`, a JVM core jar and the sources.
+
 ## Install
 
 Requirements: KDE Plasma 6 for the widget (the app and tray run on any Qt 6 desktop), Qt 6.5+ (Core,
@@ -77,6 +85,11 @@ Then add **BeaconFix** through *Add Widgets*. The tray starts at login.
 **Android app** (Android 8+): install the APK from the [releases](https://github.com/sworrl/beaconfix/releases)
 page, open *Link a PC* and scan the QR the desktop shows (*Link a device…* in the tray menu). Building
 it yourself: [android/README.md](android/README.md).
+
+**BeaconFix Lite** (a library for your own app or device): the `lite-vX.Y.Z` releases on the same
+[releases](https://github.com/sworrl/beaconfix/releases) page carry `beaconfix-lite-X.Y.Z.aar`, the JVM core jar
+and a source zip. Desktop and app releases are tagged `vX.Y.Z`; the two series are versioned separately. Building
+it yourself: `tools/release_lite.sh --build-only`, or see [lite/README.md](lite/README.md).
 
 **Hub** (optional, self-hosted): a headless BeaconFix (`beaconfix --server`) in a container reachable
 over your VPN only. See [deploy/README.md](deploy/README.md) and [docs/HUB.md](docs/HUB.md).
@@ -291,6 +304,7 @@ KWin Night Light follows your position, and locale hints are exposed to other wi
 | `tools/sign_firmware.py` | makes your firmware signing key (`--init`), signs and verifies images |
 | `tools/mesh_flash.py` | sends a signed image over the mesh through a USB-connected node |
 | Pi agent | [docs/AGENT.md](docs/AGENT.md) |
+| `lite/` | BeaconFix Lite: the Wi-Fi locator as a small library for other devices — [lite/README.md](lite/README.md) |
 | `tools/train-plate-detector/` | a clean (MIT code + CC BY data) retraining pipeline for the plate detector |
 
 ## Privacy
@@ -333,6 +347,7 @@ run one, is yours, behind your VPN, with an end-to-end encrypted API.
 | [docs/SECURITY.md](docs/SECURITY.md), [docs/IDENTITY.md](docs/IDENTITY.md) | threat model, Wi-Fi grading, identity |
 | [docs/WIDGET.md](docs/WIDGET.md), [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) | the Plasma widget, building and testing |
 | [docs/LICENSING.md](docs/LICENSING.md) | the license policy and every third-party component |
+| [lite/README.md](lite/README.md) | BeaconFix Lite: the locator library, its accuracy and costs, releases |
 | [CHANGELOG.md](CHANGELOG.md) | release notes |
 
 ## License

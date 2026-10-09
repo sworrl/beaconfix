@@ -4,6 +4,32 @@ All notable changes to BeaconFix are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [lite 1.0.0] — 2026-10-09
+
+The first release of **BeaconFix Lite** ([lite/README.md](lite/README.md)): BeaconFix's Wi-Fi locator as a small
+library for devices that only need to know where they are. Lite releases are tagged `lite-vX.Y.Z` and versioned
+apart from the desktop and app.
+
+- **Estimator:** BeaconFix's `selfLocate` (robust range trilateration, Levenberg–Marquardt, Huber weights, a
+  chi-squared integrity check that drops disagreeing APs), with a 1-sigma and a 95 % radius on every fix. New
+  over the desktop's: a median start and a screen for APs mapped far beyond the rest. A loud AP mapped 2 km away
+  (your own router after a move) used to outvote ten honest ones; now it's dropped and the fix stays put.
+- **Reuse:** the same APs as the last fix (a weighted overlap of the strong ones) under 6 hours old returns that
+  fix with no solve, network or disk: about 1 ms on the MikuOS M500.
+- **Offline first:** a binary AP cache (20 bytes an AP, an append-only journal compacted when it reaches a
+  quarter of the main file). Apple's neighbours (~100 per request) are all kept, so most looks need no network.
+  APs nobody knows are remembered for 30 days instead of being asked about each time.
+- **Moved and travelling APs:** opt-out SSIDs, travelling names (hotspots, cars, trains, Starlink) and the
+  caller's own SSIDs are never sent or used. An AP the integrity check drops twice is treated as moved for 30 days.
+- **Learning:** `teach()` a trusted fix (GPS, a BeaconFix desktop) or `import()` a desktop's placements; the APs
+  around a good fix are learned at low weight, so a place visited before is solved offline.
+- **Android:** `BeaconFixLite` uses the system's scan when it is under 5 minutes old instead of asking for one,
+  and `Pacer` spaces looks out to 2 hours while nothing changes.
+- **Targets:** Android 5.0+ (API 21), Kotlin 1.9+, Java 8 bytecode, no dependencies; replaces the locator
+  copies in the MikuOS M500 launcher and the Frameo weather app.
+- Artifacts: `beaconfix-lite-1.0.0.aar`, `beaconfix-lite-core-1.0.0.jar` (JVM, with a CLI that reads
+  `cmd wifi list-scan-results`), `beaconfix-lite-src-1.0.0.zip`.
+
 ## [3.10.0] — 2026-10-03
 
 Desktop 3.10.0, Plasma widget 3.10.0, Android 1.6.0 and the hub. BeaconFix is now **Apache-2.0**

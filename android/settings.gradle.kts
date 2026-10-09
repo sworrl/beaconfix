@@ -20,3 +20,6 @@ dependencyResolutionManagement {
 }
 rootProject.name = "BeaconFix"
 include(":app")
+// BeaconFix Lite (../lite): the small locator library for other devices, built with the same toolchain
+include(":lite")
+project(":lite").projectDir = file("../lite")
