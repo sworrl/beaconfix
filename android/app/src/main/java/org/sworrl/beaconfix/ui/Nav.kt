@@ -127,7 +127,7 @@ fun BeaconFixRoot(launch: LaunchArgs = LaunchArgs()) {
         if (launch.file != null) nav.navigate("import")
         if (launch.importDryRun) nav.navigate("identity")
         when (launch.action) {
-            "sync" -> rootVm.syncNow(); "scan" -> rootVm.scanOnce(); "collector_on" -> rootVm.collector(true); "collector_off" -> rootVm.collector(false)
+            "sync" -> rootVm.syncNow(); "scan" -> rootVm.scanOnce(); "hub_enrol" -> { if (BuildConfig.DEBUG || prefs.devAutomation.first()) rootVm.hubEnrolThroughPc(); nav.navigate("link") }; "collector_on" -> rootVm.collector(true); "collector_off" -> rootVm.collector(false)
             "help" -> nav.navigate("help?focus="); "help_peds" -> nav.navigate("help?focus=peds"); "find_rv" -> nav.navigate("home") { popUpTo("home"); launchSingleTop = true }
             "share_location" -> shareVm.shareLocation(ctx)
             "sighting" -> launch.sightingUid?.let { nav.navigate("sighting/" + android.net.Uri.encode(it)) } ?: nav.navigate("sightings")

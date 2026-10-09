@@ -166,6 +166,28 @@ class LinkRepository @Inject constructor(
     /** A hub invite scanned directly (headless hubs): enrol, showing the fingerprint as information only. */
     fun enrolScannedInvite(text: String) { scope.launch { enrolHub(text, fromDesktop = "", pcName = "", fetchedFresh = false) } }
 
+    /**
+     * Enrol with the hub through a PC this phone is already linked to, without a new QR: the PC asks its hub for an
+     * invite (`POST /api/v1/link/hub-invite`). For a phone that kept its PC link but lost its hub one (an app-data
+     * reset, a forgotten hub). An unreachable hub keeps the invite and finishes when WireGuard is up.
+     */
+    fun enrolThroughLinkedPc() {
+        scope.launch {
+            if (hubStore.config() != null) { refreshHubState(); return@launch }
+            val pcs = desktops.paired()
+            if (pcs.isEmpty()) { _hub.value = HubLinkState(HubLinkState.Phase.FAILED, "No linked PC can invite this phone to a hub. Link a PC first."); return@launch }
+            _hub.value = HubLinkState(HubLinkState.Phase.ENROLLING, "Asking ${pcs.first().name.ifEmpty { "the PC" }} for a hub invite…")
+            var noHub = 0
+            for (d in pcs) {
+                val f = freshInvite(d.id)
+                f.invite?.let { enrolHub(it, d.id, d.name, fetchedFresh = true); return@launch }
+                if (f.noHub) noHub++
+            }
+            _hub.value = HubLinkState(HubLinkState.Phase.FAILED,
+                if (noHub == pcs.size) "None of the linked PCs is enrolled with a hub." else "The linked PCs didn't answer, or couldn't reach their hub. Try again on their network.")
+        }
+    }
+
     private fun launchLink(pc: String, block: suspend () -> Unit) {
         job?.cancel()
         _phase.value = LinkPhase.Contacting(pc, "Looking for $pc on this network…")

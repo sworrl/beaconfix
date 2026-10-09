@@ -170,9 +170,10 @@ class PairViewModel @Inject constructor(private val discovery: Discovery, privat
 
 /** App-level state: is there an identity yet, plus the automation hooks (sync now, one scan). */
 @HiltViewModel
-class RootViewModel @Inject constructor(identity: org.sworrl.beaconfix.identity.IdentityStore, private val sync: SyncRepository, private val recorder: org.sworrl.beaconfix.collector.ObservationRecorder, private val prefs: Prefs, @ApplicationContext private val ctx: Context) : ViewModel() {
+class RootViewModel @Inject constructor(identity: org.sworrl.beaconfix.identity.IdentityStore, private val sync: SyncRepository, private val link: org.sworrl.beaconfix.link.LinkRepository, private val recorder: org.sworrl.beaconfix.collector.ObservationRecorder, private val prefs: Prefs, @ApplicationContext private val ctx: Context) : ViewModel() {
     val hasIdentity: StateFlow<Boolean?> = kotlinx.coroutines.flow.combine(identity.current, kotlinx.coroutines.flow.flowOf(Unit)) { r, _ -> r != null && identity.seed() != null }.stateIn(viewModelScope, SharingStarted.Eagerly, null)
     fun syncNow() = viewModelScope.launch { runCatching { sync.syncAll() } }
     fun scanOnce() = viewModelScope.launch { runCatching { recorder.scanAndRecord(fresh = true) } }
     fun collector(on: Boolean) = viewModelScope.launch { prefs.setCollectorOn(on); org.sworrl.beaconfix.collector.CollectorService.ensure(ctx, prefs) }
+    fun hubEnrolThroughPc() = link.enrolThroughLinkedPc()
 }

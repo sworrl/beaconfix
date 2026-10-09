@@ -127,6 +127,7 @@ class LinkViewModel @Inject constructor(
     fun cancel() = repo.cancel()
     fun dismiss() = repo.reset()
     fun retryHub() = repo.retryHubNow()
+    fun enrolThroughLinkedPc() = repo.enrolThroughLinkedPc()
     fun unlink(id: String) = viewModelScope.launch { repo.unlink(id); message.value = "Unlinked on this phone — remove it on the PC under Devices too." }
     override fun onCleared() { browseJob?.cancel(); probeJob?.cancel() }
 }

@@ -67,6 +67,7 @@ import org.sworrl.beaconfix.ui.vm.PcRow
 fun LinkScreen(onBack: () -> Unit, hintHost: String? = null, hintPort: Int = 47822, autoLink: Boolean = false, vm: LinkViewModel = hiltViewModel()) {
     val phase by vm.phase.collectAsState(); val hub by vm.hub.collectAsState(); val msg by vm.message.collectAsState()
     val pcs by vm.pcs.collectAsState(); val linked by vm.linked.collectAsState(); val mdnsErr by vm.mdnsError.collectAsState()
+    val hubStatus by vm.hubStatus.collectAsState()
     var scanning by remember { mutableStateOf(false) }
     DisposableEffect(Unit) { vm.browse(true); onDispose { vm.browse(false) } }
     LaunchedEffect(hintHost, hintPort, autoLink) { if (!hintHost.isNullOrBlank()) vm.hint(hintHost, hintPort, autoLink) }
@@ -85,6 +86,9 @@ fun LinkScreen(onBack: () -> Unit, hintHost: String? = null, hintPort: Int = 478
         }
         PhaseCard(phase, onCancel = { vm.cancel() }, onDone = { vm.dismiss() })
         HubCard(hub, onRetry = { vm.retryHub() })
+        // Linked to a PC but not to its hub (an app-data reset keeps neither, a forgotten hub keeps the PC): no new QR needed
+        if (hubStatus.loaded && hubStatus.config == null && linked.isNotEmpty() && hub.phase != HubLinkState.Phase.ENROLLING && hub.phase != HubLinkState.Phase.WAITING)
+            OutlinedButton(onClick = { vm.enrolThroughLinkedPc() }, modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp)) { Text("Join the hub through a linked PC") }
         if (msg.isNotEmpty()) Text(msg, Modifier.padding(horizontal = 20.dp, vertical = 4.dp), color = MaterialTheme.colorScheme.tertiary, style = MaterialTheme.typography.bodyMedium)
 
         val busy = phase is LinkPhase.Contacting || phase is LinkPhase.Confirm
