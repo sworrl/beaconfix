@@ -323,3 +323,35 @@ data class PlateEventMediaEntity(
     /** the desktop holds it (uploaded from here, or listed in its feed) */
     @ColumnInfo(defaultValue = "0") val remote: Boolean = false,
 )
+
+/**
+ * Something an ESP32 node picked up and handed to this phone over BLE (schema v9): a probe request, a beacon, a deauth
+ * `alert` or a `ble_tracker`. Lines the node kept on flash while the phone was away arrive later with [stored] set;
+ * [uid] (`node:sf:<seq>` for those, `node:kind:mac:time` for live ones) keeps a resend from doubling up. [lat]/[lon]
+ * come from the node when it had a fix; otherwise a live line gets where this phone was at [timeMs], and a stored one
+ * where the node last had a fix, since it was out of the phone's reach ([locSource] says which).
+ */
+@Entity(tableName = "node_detections", indices = [Index(value = ["uid"], unique = true), Index("time_ms"), Index("hub_dirty")])
+data class NodeDetectionEntity(
+    @PrimaryKey(autoGenerate = true) val id: Long = 0,
+    val uid: String,
+    val node: String,
+    /** probe | beacon | alert | ble_tracker */
+    val kind: String,
+    /** client MAC (probe), BSSID (beacon), attacker (alert), tag (ble_tracker) */
+    val mac: String,
+    val ssid: String = "",
+    val rssi: Int = 0,
+    val ch: Int = 0,
+    /** the deauth target, or the tracker kind (airtag, smarttag, tile) */
+    val detail: String = "",
+    @ColumnInfo(name = "time_ms") val timeMs: Long,
+    val lat: Double? = null,
+    val lon: Double? = null,
+    val acc: Double? = null,
+    /** node | phone (live, so near the phone) | node_last (stored while apart: where the node last had a fix) | "" */
+    @ColumnInfo(name = "loc_source") val locSource: String = "",
+    val stored: Boolean = false,
+    @ColumnInfo(name = "hub_dirty") val hubDirty: Boolean = true,
+)
+

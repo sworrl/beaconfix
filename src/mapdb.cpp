@@ -410,6 +410,13 @@ bool MapDb::schema()
     q.exec(QStringLiteral("CREATE INDEX IF NOT EXISTS plate_event_media_camera ON plate_event_media(camera_id)"));
     // a uid merged into another pass (§1.1): the phone may still name it (media uploads)
     q.exec(QStringLiteral("CREATE TABLE IF NOT EXISTS plate_event_alias (uid TEXT PRIMARY KEY, target TEXT NOT NULL)"));
+    // What ESP32 nodes picked up and handed a phone over BLE (probes, beacons, deauth alerts, BLE trackers), pushed by the
+    // phone with /db/sync `nodeDetections`. uid is the phone's merge key (node:sf:<seq> or node:kind:mac:time)
+    q.exec(QStringLiteral("CREATE TABLE IF NOT EXISTS node_detections (id INTEGER PRIMARY KEY, uid TEXT NOT NULL UNIQUE, node TEXT NOT NULL, kind TEXT NOT NULL,"
+                          " mac TEXT NOT NULL, ssid TEXT, rssi INTEGER, ch INTEGER, detail TEXT, time TEXT, time_ms INTEGER NOT NULL, lat REAL, lon REAL, acc REAL,"
+                          " loc_source TEXT, stored INTEGER DEFAULT 0, device TEXT, received_at TEXT)"));
+    q.exec(QStringLiteral("CREATE INDEX IF NOT EXISTS node_detections_time ON node_detections(time_ms)"));
+    q.exec(QStringLiteral("CREATE INDEX IF NOT EXISTS node_detections_mac ON node_detections(mac, time_ms)"));
     // §2.0: what kind of camera (only an ALPR reads plates), and its OSM tags when known
     addCol("flock_cameras", "camera_type", "TEXT DEFAULT ''");
     addCol("flock_cameras", "tags", "TEXT DEFAULT ''");
@@ -3225,3 +3232,68 @@ QString MapDb::latestRegion() const
     q.exec(QStringLiteral("SELECT region FROM fixes WHERE COALESCE(region,'')<>'' ORDER BY time DESC LIMIT 1"));
     return q.next() ? q.value(0).toString() : QString();
 }
+
+int MapDb::ingestNodeDetections(const QJsonArray &rows, const QString &device)
+{
+    if (!m_db.isOpen() || m_readOnly) return -1;
+    static const QSet<QString> kinds{QStringLiteral("probe"), QStringLiteral("beacon"), QStringLiteral("alert"), QStringLiteral("ble_tracker")};
+    const QString now = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
+    int accepted = 0;
+    m_db.transaction();
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("INSERT OR IGNORE INTO node_detections (uid, node, kind, mac, ssid, rssi, ch, detail, time, time_ms, lat, lon, acc, loc_source, stored, device, received_at)"
+                             " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"));
+    for (const QJsonValue &v : rows) {
+        const QJsonObject o = v.toObject();
+        const QString uid = o["uid"].toString().left(160), kind = o["kind"].toString(), mac = o["mac"].toString().left(64);
+        const qint64 timeMs = qint64(o["timeMs"].toDouble());
+        if (uid.isEmpty() || mac.isEmpty() || !kinds.contains(kind) || timeMs <= 0) continue;
+        const auto real = [&](const char *k) { return o.contains(QLatin1String(k)) && o[QLatin1String(k)].isDouble() ? QVariant(o[QLatin1String(k)].toDouble()) : QVariant(QMetaType(QMetaType::Double)); };
+        q.addBindValue(uid);
+        q.addBindValue(o["node"].toString().left(64));
+        q.addBindValue(kind);
+        q.addBindValue(mac);
+        q.addBindValue(o["ssid"].toString().left(64));
+        q.addBindValue(o["rssi"].toInt());
+        q.addBindValue(o["ch"].toInt());
+        q.addBindValue(o["detail"].toString().left(200));
+        q.addBindValue(QDateTime::fromMSecsSinceEpoch(timeMs).toLocalTime().toString(Qt::ISODate));   // local ISO, like every other time column
+        q.addBindValue(timeMs);
+        q.addBindValue(real("lat"));
+        q.addBindValue(real("lon"));
+        q.addBindValue(real("acc"));
+        q.addBindValue(o["locSource"].toString().left(16));
+        q.addBindValue(o["stored"].toBool() ? 1 : 0);
+        q.addBindValue(device);
+        q.addBindValue(now);
+        if (q.exec()) ++accepted;      // a uid already here counts too: the phone can stop sending it
+    }
+    m_db.commit();
+    return accepted;
+}
+
+QJsonArray MapDb::nodeDetections(qint64 sinceMs, int limit, const QString &node, const QString &kind) const
+{
+    QJsonArray out;
+    if (!m_db.isOpen()) return out;
+    QString where = QStringLiteral(" WHERE time_ms > ?");
+    if (!node.isEmpty()) where += QStringLiteral(" AND node=?");
+    if (!kind.isEmpty()) where += QStringLiteral(" AND kind=?");
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("SELECT uid, node, kind, mac, ssid, rssi, ch, detail, time, time_ms, lat, lon, acc, loc_source, stored, device FROM node_detections%1"
+                             " ORDER BY time_ms DESC LIMIT ?").arg(where));
+    q.addBindValue(sinceMs);
+    if (!node.isEmpty()) q.addBindValue(node);
+    if (!kind.isEmpty()) q.addBindValue(kind);
+    q.addBindValue(qBound(1, limit, 50000));
+    if (q.exec()) while (q.next()) {
+        QJsonObject o{{"uid", q.value(0).toString()}, {"node", q.value(1).toString()}, {"kind", q.value(2).toString()}, {"mac", q.value(3).toString()},
+                      {"ssid", q.value(4).toString()}, {"rssi", q.value(5).toInt()}, {"ch", q.value(6).toInt()}, {"detail", q.value(7).toString()},
+                      {"time", q.value(8).toString()}, {"timeMs", double(q.value(9).toLongLong())}, {"locSource", q.value(13).toString()},
+                      {"stored", q.value(14).toInt() != 0}, {"device", q.value(15).toString()}};
+        if (!q.value(10).isNull()) { o["lat"] = q.value(10).toDouble(); o["lon"] = q.value(11).toDouble(); o["acc"] = q.value(12).toDouble(); }
+        out.append(o);
+    }
+    return out;
+}
+

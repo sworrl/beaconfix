@@ -38,6 +38,7 @@ class EspNodeManager @Inject constructor(
     private val cache: DesktopCache
 ) {
     companion object {
+        private const val TAG = "BeaconFixNode"
         val SERVICE_UUID_NUS: UUID = UUID.fromString("6E400001-B5A3-F393-E0A9-E50E24DCCA9E")
         val CHAR_UUID_RX: UUID = UUID.fromString("6E400002-B5A3-F393-E0A9-E50E24DCCA9E")
         val CHAR_UUID_TX: UUID = UUID.fromString("6E400003-B5A3-F393-E0A9-E50E24DCCA9E")
@@ -93,6 +94,17 @@ class EspNodeManager @Inject constructor(
     private val bleRxBuf = StringBuilder()
     private var bleFramed = false
     private var bleLinkNode = ""
+    private val bleQueue = ArrayDeque<ByteArray>()
+    @Volatile private var bleBusySince = 0L
+    @Volatile private var bleMtu = 23
+
+    /** What the linked node detects, kept in node_detections and sent to the hub; acks flash-stored lines back */
+    val recorder = NodeDetectionRecorder(db, scope) { cmd ->
+        // A GATT write fails while another is in flight (the GPS stream); try a few times
+        scope.launch { for (i in 0 until 5) { if (writeBle(cmd)) break; kotlinx.coroutines.delay(300) } }
+    }
+    val savedDetections = db.nodeDetections().count()
+    val detectionsWaitingForHub = db.nodeDetections().countHubDirty()
 
     private var autoConnectEnabled = true
     private var autoScanJob: Job? = null
@@ -245,7 +257,13 @@ class EspNodeManager @Inject constructor(
             val settings = android.bluetooth.le.ScanSettings.Builder()
                 .setScanMode(android.bluetooth.le.ScanSettings.SCAN_MODE_LOW_LATENCY)
                 .build()
-            scanner.startScan(null, settings, callback)
+            // Filtered: with the screen off Android hands an unfiltered scan nothing at all. Current firmware advertises
+            // the NUS UUID; older firmware only its name, so the names of nodes seen before are filters too.
+            val filters = buildList {
+                add(android.bluetooth.le.ScanFilter.Builder().setServiceUuid(android.os.ParcelUuid(SERVICE_UUID_NUS)).build())
+                for (name in knownNodeNames()) add(android.bluetooth.le.ScanFilter.Builder().setDeviceName(name).build())
+            }
+            scanner.startScan(filters, settings, callback)
             val dev = kotlinx.coroutines.withTimeoutOrNull(4000L) {
                 foundDevice.await()
             }
@@ -286,7 +304,13 @@ class EspNodeManager @Inject constructor(
                     _connectionState.value = EspConnectionState.CONNECTED_BLE
                     synchronized(bleRxBuf) { bleRxBuf.setLength(0); bleFramed = false }
                     bleLinkNode = device.name ?: ""
-                    gatt.discoverServices()
+                    rememberNodeName(bleLinkNode)
+                    synchronized(bleQueue) { bleQueue.clear(); bleBusySince = 0L; bleMtu = 23 }
+                    // Ask for a bigger ATT MTU first: at the default 23 every write over 20 bytes reached the node cut
+                    // short (the time sync lost its last digit, `gps …` lines their tail)
+                    val asked = gatt.requestMtu(247)
+                    android.util.Log.i(TAG, "linked ${device.name}, MTU request ${if (asked) "sent" else "refused"}")
+                    if (!asked) gatt.discoverServices()
                 } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                     _connectionState.value = EspConnectionState.DISCONNECTED
                     _isFollowingPhone.value = false
@@ -299,6 +323,7 @@ class EspNodeManager @Inject constructor(
             }
 
             override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
+                android.util.Log.i(TAG, "services discovered (status $status), NUS ${gatt.getService(SERVICE_UUID_NUS) != null}")
                 if (status != BluetoothGatt.GATT_SUCCESS) return
                 val service = gatt.getService(SERVICE_UUID_NUS) ?: return
                 rxChar = service.getCharacteristic(CHAR_UUID_RX)
@@ -308,7 +333,8 @@ class EspNodeManager @Inject constructor(
                     val desc = tx.getDescriptor(CLIENT_CONFIG_DESCRIPTOR)
                     if (desc != null) {
                         desc.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                        gatt.writeDescriptor(desc)
+                        bleBusySince = System.currentTimeMillis()      // one GATT operation at a time: writes wait
+                        if (!gatt.writeDescriptor(desc)) bleBusySince = 0L
                     }
                 }
                 // Request initial status
@@ -319,8 +345,32 @@ class EspNodeManager @Inject constructor(
                 }
             }
 
+            override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
+                if (status == BluetoothGatt.GATT_SUCCESS) bleMtu = mtu
+                android.util.Log.i(TAG, "MTU $mtu (status $status), discovering services")
+                gatt.discoverServices()
+            }
+
+            override fun onDescriptorWrite(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
+                android.util.Log.i(TAG, "notifications on (status $status), ${bleQueue.size} writes queued")
+                bleBusySince = 0L
+                pumpBle()
+            }
+
+            override fun onCharacteristicWrite(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
+                bleBusySince = 0L
+                pumpBle()
+            }
+
+            // Android 13+: the bytes come as a copy. The older callback reads characteristic.value, which the next
+            // notification can overwrite first, and back-to-back lines (a node handing over its stored ones) got lost.
+            override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, value: ByteArray) {
+                feedBle(String(value, Charsets.UTF_8))
+            }
+
             @Deprecated("Deprecated in Java")
             override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
+                if (android.os.Build.VERSION.SDK_INT >= 33) return
                 val bytes = characteristic.value ?: return
                 feedBle(String(bytes, Charsets.UTF_8))
             }
@@ -350,6 +400,7 @@ class EspNodeManager @Inject constructor(
             if (!line.startsWith("{")) continue
             parseTelemetryLine(line)
             relayBleLine(line)
+            recorder.offer(line, bleLinkNode)
         }
     }
 
@@ -384,18 +435,57 @@ class EspNodeManager @Inject constructor(
         activeGatt?.close()
         activeGatt = null
         rxChar = null
+        synchronized(bleQueue) { bleQueue.clear(); bleBusySince = 0L }
         if (_connectionState.value == EspConnectionState.CONNECTED_BLE) {
             _connectionState.value = EspConnectionState.DISCONNECTED
         }
     }
 
-    // Write one command line to the BLE-linked node; false when there is no link
-    @SuppressLint("MissingPermission")
+    // Write one command line to the BLE-linked node; false when there is no link. Lines are split to the MTU and
+    // queued: Android runs one GATT operation at a time and drops a write issued while another is in flight.
     private fun writeBle(cmd: String): Boolean {
-        val char = rxChar ?: return false
-        val gatt = activeGatt ?: return false
-        char.value = (cmd.trim() + "\n").toByteArray(Charsets.UTF_8)
-        return gatt.writeCharacteristic(char)
+        if (rxChar == null || activeGatt == null) return false
+        val bytes = (cmd.trim() + "\n").toByteArray(Charsets.UTF_8)
+        val size = (bleMtu - 3).coerceAtLeast(20)
+        synchronized(bleQueue) {
+            if (bleQueue.size > 400) return false
+            var i = 0
+            while (i < bytes.size) { bleQueue.add(bytes.copyOfRange(i, minOf(bytes.size, i + size))); i += size }
+        }
+        pumpBle()
+        return true
+    }
+
+    private val nodePrefs by lazy { context.getSharedPreferences("esp_nodes", Context.MODE_PRIVATE) }
+
+    private fun knownNodeNames(): Set<String> =
+        (nodePrefs.getStringSet("names", emptySet()).orEmpty() + _meshPeers.value.keys).filter { it.isNotBlank() }.take(20).toSet()
+
+    private fun rememberNodeName(name: String) {
+        if (name.isBlank()) return
+        val names = nodePrefs.getStringSet("names", emptySet()).orEmpty()
+        if (name !in names) nodePrefs.edit().putStringSet("names", names + name).apply()
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun pumpBle() {
+        synchronized(bleQueue) {
+            val now = System.currentTimeMillis()
+            if (bleBusySince != 0L && now - bleBusySince < 2000) return     // a write is in flight (2 s = lost callback)
+            val next = bleQueue.firstOrNull() ?: run { bleBusySince = 0L; return }
+            val char = rxChar
+            val gatt = activeGatt
+            if (char == null || gatt == null) { bleQueue.clear(); bleBusySince = 0L; return }
+            char.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+            char.value = next
+            if (gatt.writeCharacteristic(char)) {
+                bleQueue.removeFirst()
+                bleBusySince = now
+            } else {
+                bleBusySince = 0L
+                scope.launch { kotlinx.coroutines.delay(60); pumpBle() }
+            }
+        }
     }
 
     fun sendCommand(cmd: String) {

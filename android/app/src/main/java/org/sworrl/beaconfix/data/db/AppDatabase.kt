@@ -4,8 +4,8 @@ import androidx.room.Database
 import androidx.room.RoomDatabase
 
 @Database(
-    entities = [ApEntity::class, ObservationEntity::class, FixEntity::class, PoiEntity::class, DesktopEntity::class, IdentityEntity::class, PendingLinkEntity::class, AnchorEntity::class, SnapshotEntity::class, EstimateHistoryEntity::class, PlateEventEntity::class, PlateEventMediaEntity::class],
-    version = 8,
+    entities = [ApEntity::class, ObservationEntity::class, FixEntity::class, PoiEntity::class, DesktopEntity::class, IdentityEntity::class, PendingLinkEntity::class, AnchorEntity::class, SnapshotEntity::class, EstimateHistoryEntity::class, PlateEventEntity::class, PlateEventMediaEntity::class, NodeDetectionEntity::class],
+    version = 9,
     exportSchema = true,
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -19,4 +19,5 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun snapshots(): SnapshotDao
     abstract fun estimateHistory(): EstimateHistoryDao
     abstract fun plateEvents(): PlateEventDao
+    abstract fun nodeDetections(): NodeDetectionDao
 }

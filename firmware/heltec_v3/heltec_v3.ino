@@ -256,7 +256,7 @@ void handleCommand(const String& cmdLine) {
                        "\"screen <on|off|toggle|status>\",\"page <0-7|next|prev|cycle on|cycle off>\",\"contrast <0-255>\","
                        "\"travel <status|moving|stationary> [kmh] [hdg] [alt] [trip_km]\",\"trip <km|reset|status>\",\"alpr <test|dismiss|alert ...>\","
                        "\"wifi status\",\"wifi connect <ssid|\\\"ssid with spaces\\\"> <pass>\",\"wifi clear\","
-                       "\"gps [lat,lon,acc,...]\",\"led <pattern>\",\"batt [status|stats|reset|on|off|<mah>]\",\"ota\",\"reboot\"]}");
+                       "\"gps [lat,lon,acc,...]\",\"led <pattern>\",\"batt [status|stats|reset|on|off|<mah>]\",\"sf [status|dump|clear|ack <seq>]\",\"ota\",\"reboot\"]}");
     } else if (cmd.equalsIgnoreCase("gps") || cmd.equalsIgnoreCase("gps status")) {
         SPRINTF("{\"type\":\"gps_status\",\"hardware_detected\":%s,\"has_fix\":%s,\"lat\":%.6f,\"lon\":%.6f,\"acc\":%.1f,\"speed_kmh\":%.1f,\"alt\":%.1f,\"sats\":%u,\"hdop\":%.1f}\n",
                       GpsReceiver::instance().hasHardwareDetected() ? "true" : "false",
@@ -780,6 +780,18 @@ void handleCommand(const String& cmdLine) {
                       NodeConfig::instance().getTripDistKm(),
                       NodeConfig::instance().getAttachedDevice(),
                       NodeConfig::instance().isAttached() ? "true" : "false");
+    } else if (cmd.startsWith("sf ack ")) {
+        StoreForward::instance().ack((uint32_t)strtoul(cmd.c_str() + 7, nullptr, 10));
+    } else if (cmd.equalsIgnoreCase("sf") || cmd.equalsIgnoreCase("sf status")) {
+        SPRINTF("{\"type\":\"sf_status\",\"ok\":%s,\"pending\":%lu,\"used\":%u,\"total\":%u,\"storing\":%s,\"following\":\"%s\"}\n",
+                StoreForward::instance().ok() ? "true" : "false", (unsigned long)StoreForward::instance().pending(),
+                (unsigned)StoreForward::instance().usedBytes(), (unsigned)StoreForward::instance().totalBytes(),
+                Telemetry::instance().storingForPhone() ? "true" : "false", NodeConfig::instance().getAttachedDevice());
+    } else if (cmd.equalsIgnoreCase("sf clear")) {
+        StoreForward::instance().clear();
+        SPRINTLN("{\"type\":\"ack\",\"cmd\":\"sf clear\"}");
+    } else if (cmd.equalsIgnoreCase("sf dump")) {
+        StoreForward::instance().startDump();
     } else if (cmd.equalsIgnoreCase("wifi status") || cmd.equalsIgnoreCase("wifi")) {
         bool connected = (WiFi.status() == WL_CONNECTED);
         SPRINTF("{\"type\":\"wifi_status\",\"configured\":%s,\"ssid\":\"%s\",\"connected\":%s,\"ip\":\"%s\",\"rssi\":%d}\n",
@@ -925,6 +937,7 @@ void setup() {
     // 10. Initialize Telemetry & UDP Broadcast
     Telemetry::instance().begin(47824);
     Telemetry::instance().enableUdp(true);
+    StoreForward::instance().begin();
     MeshEngine::instance().registerHostDeliveryHook([](const char* json) {
         Telemetry::instance().broadcastUdp(json);
     });
@@ -1136,7 +1149,13 @@ void loop() {
     for (int i = 0; i < 4 && Telemetry::instance().popUdpCommand(udpCmd); ++i) {
         if (udpCmd.length() > 0) handleCommand(udpCmd);
     }
-    if (BleScanner::instance().takeQueueDumpRequest()) dumpMeshQueueToBle();
+    if (BleScanner::instance().takeQueueDumpRequest()) {
+        dumpMeshQueueToBle();
+        StoreForward::instance().startDump();
+    }
+    StoreForward::instance().pump(BleScanner::instance().isConnected(), [](const char* line) {
+        return BleScanner::instance().sendTelemetry(line);
+    });
 
     // 12. Periodic Status Telemetry Heartbeat (every 5 seconds)
     if (now - g_lastStatusTime >= 5000) {

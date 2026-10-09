@@ -18,6 +18,7 @@ import org.sworrl.beaconfix.data.db.MIGRATION_4_5
 import org.sworrl.beaconfix.data.db.MIGRATION_5_6
 import org.sworrl.beaconfix.data.db.MIGRATION_6_7
 import org.sworrl.beaconfix.data.db.MIGRATION_7_8
+import org.sworrl.beaconfix.data.db.MIGRATION_8_9
 import org.sworrl.beaconfix.data.db.MigrationSql
 import java.io.File
 import java.lang.reflect.Proxy
@@ -152,5 +153,17 @@ class MigrationSqlTest {
         assertTrue(versions.toString(), versions.containsAll(listOf(3, 4, 5, 6, 7, 8)))
         assertEquals((1 until versions.last()).toList(), ALL_MIGRATIONS.map { it.startVersion })
         ALL_MIGRATIONS.forEach { assertEquals(it.startVersion + 1, it.endVersion) }
+    }
+
+    @Test fun eightToNineOnlyCreatesNodeDetections() {
+        val sql = sqlOf(MIGRATION_8_9)
+        assertEquals(schema(9)["node_detections"]!!, sql)
+        assertTrue(sql.none { it.contains("DROP", ignoreCase = true) || it.contains("DELETE", ignoreCase = true) || it.contains("ALTER", ignoreCase = true) })
+    }
+
+    @Test fun protectedTablesAreUnchangedFromEightToNine() {
+        val a = schema(8); val b = schema(9)
+        for (t in a.keys) assertEquals(t, a[t], b[t])
+        assertEquals(a.keys + "node_detections", b.keys)
     }
 }

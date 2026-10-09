@@ -1763,6 +1763,22 @@ void ApiServer::serve(QTcpSocket *s, const Request &r, Device *dev, const QStrin
         finish(200, o);
         return;
     }
+    // ── What ESP32 nodes handed a phone (pushed with /db/sync nodeDetections) ──
+    if (ep == QLatin1String("node-detections")) {
+        if (!get) { finish(405, QJsonObject{{"error", "method not allowed"}}, {"Allow: GET"}); return; }
+        MapDb *db = m_loc->mapDb();
+        if (!db || !db->isOpen()) { finish(503, QJsonObject{{"error", "map database unavailable"}}); return; }
+        const QUrlQuery qq(r.query);
+        const QString kind = qq.queryItemValue(QStringLiteral("kind"));
+        if (!kind.isEmpty() && kind != QLatin1String("probe") && kind != QLatin1String("beacon") && kind != QLatin1String("alert") && kind != QLatin1String("ble_tracker")) {
+            finish(400, QJsonObject{{"error", "kind: probe | beacon | alert | ble_tracker"}}); return;
+        }
+        const qint64 since = qq.queryItemValue(QStringLiteral("since")).toLongLong();
+        const int limit = qq.hasQueryItem(QStringLiteral("limit")) ? qBound(1, qq.queryItemValue(QStringLiteral("limit")).toInt(), 5000) : 500;
+        const QJsonArray rows = db->nodeDetections(since, limit, qq.queryItemValue(QStringLiteral("node")), kind);
+        finish(200, QJsonObject{{"detections", rows}, {"count", rows.size()}});
+        return;
+    }
     // ── Plate events (docs/SIGHTINGS.md §5) ──
     if (ep == QLatin1String("plate-events") || ep.startsWith(QLatin1String("plate-events/"))) {
         PlateWatch *pw = m_loc->plateWatch();
@@ -2367,8 +2383,9 @@ void ApiServer::serve(QTcpSocket *s, const Request &r, Device *dev, const QStrin
             const QJsonObject res = m_loc->plateWatch()->ingest(b["plateEvents"].toArray(), from, false);
             plateEvents = res["accepted"].toInt(); plateEventUids = res["uids"].toArray();
         }
-        if (obs < 0 || aps < 0 || fixes < 0) { finish(500, QJsonObject{{"error", err.isEmpty() ? QStringLiteral("merge failed") : err}}); return; }
-        QJsonObject o{{"accepted", QJsonObject{{"observations", obs}, {"aps", aps}, {"fixes", fixes}, {"anchors", anchors}, {"plateEvents", plateEvents}}}, {"cursor", double(db->currentSeq())}, {"refitQueued", obs > 0 || aps > 0}, {"device", from}};
+        const int nodeDetections = b["nodeDetections"].isArray() ? db->ingestNodeDetections(b["nodeDetections"].toArray(), from) : 0;
+        if (obs < 0 || aps < 0 || fixes < 0 || nodeDetections < 0) { finish(500, QJsonObject{{"error", err.isEmpty() ? QStringLiteral("merge failed") : err}}); return; }
+        QJsonObject o{{"accepted", QJsonObject{{"observations", obs}, {"aps", aps}, {"fixes", fixes}, {"anchors", anchors}, {"plateEvents", plateEvents}, {"nodeDetections", nodeDetections}}}, {"cursor", double(db->currentSeq())}, {"refitQueued", obs > 0 || aps > 0}, {"device", from}};
         if (!plateEventUids.isEmpty()) o["plateEventUids"] = plateEventUids;
         if (idn && idn->exists()) o["identity"] = idn->id();
         if (b.contains("sinceCursor")) {                        // convenience: the peer's pull in the same round trip

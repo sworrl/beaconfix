@@ -610,6 +610,18 @@ fun EspNodesScreen(
                                     }
                                 }
                             }
+                            val saved by nodeManager.savedDetections.collectAsState(0)
+                            val waiting by nodeManager.detectionsWaitingForHub.collectAsState(0)
+                            val rec by nodeManager.recorder.stats.collectAsState()
+                            Text(
+                                "Saved on this phone: $saved detections · $waiting waiting for the hub" +
+                                    (if (rec.fromFlash > 0) " · ${rec.fromFlash} handed over from node storage" else ""),
+                                color = Slate, style = MaterialTheme.typography.bodySmall
+                            )
+                            Text(
+                                "While it follows this phone, the node keeps what it detects on its own flash when the phone is out of reach and hands it over when it's back.",
+                                color = Slate, style = MaterialTheme.typography.labelSmall
+                            )
                         }
                     }
 

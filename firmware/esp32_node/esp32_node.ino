@@ -157,7 +157,7 @@ void handleCommand(const String& cmdLine) {
                        "\"mesh status\",\"mesh peers\",\"mesh send <text>\","
                        "\"led list\",\"led config <slot> single <pin> <role> [inv]\","
                        "\"led config <slot> rgb <r> <g> <b> <role> [inv]\",\"led clear <slot>\","
-                       "\"led <pattern>\",\"batt [stats|scan|reset|pin <n>|pin auto|divider <r>]\",\"ota\",\"reboot\"]}");
+                       "\"led <pattern>\",\"batt [stats|scan|reset|pin <n>|pin auto|divider <r>]\",\"sf [status|dump|clear|ack <seq>]\",\"ota\",\"reboot\"]}");
     } else if (cmd.equalsIgnoreCase("mode") || cmd.equalsIgnoreCase("mode status")) {
         SPRINTF("{\"type\":\"op_mode\",\"mode\":\"%s\",\"is_base_station\":%s,\"hops\":%u}\n",
             NodeConfig::instance().getOpModeStr(),
@@ -537,6 +537,18 @@ void handleCommand(const String& cmdLine) {
         WifiMonitor::instance().setChannel(1);
         SPRINTF("{\"type\":\"ack\",\"mode\":\"ota_ready\",\"url\":\"http://%s/\",\"ssid\":\"%s\"}\n",
                       WiFi.softAPIP().toString().c_str(), NodeConfig::instance().getName());
+    } else if (cmd.startsWith("sf ack ")) {
+        StoreForward::instance().ack((uint32_t)strtoul(cmd.c_str() + 7, nullptr, 10));
+    } else if (cmd.equalsIgnoreCase("sf") || cmd.equalsIgnoreCase("sf status")) {
+        SPRINTF("{\"type\":\"sf_status\",\"ok\":%s,\"pending\":%lu,\"used\":%u,\"total\":%u,\"storing\":%s,\"following\":\"%s\"}\n",
+                StoreForward::instance().ok() ? "true" : "false", (unsigned long)StoreForward::instance().pending(),
+                (unsigned)StoreForward::instance().usedBytes(), (unsigned)StoreForward::instance().totalBytes(),
+                Telemetry::instance().storingForPhone() ? "true" : "false", NodeConfig::instance().getAttachedDevice());
+    } else if (cmd.equalsIgnoreCase("sf clear")) {
+        StoreForward::instance().clear();
+        SPRINTLN("{\"type\":\"ack\",\"cmd\":\"sf clear\"}");
+    } else if (cmd.equalsIgnoreCase("sf dump")) {
+        StoreForward::instance().startDump();
     } else if (cmd.equalsIgnoreCase("wifi status") || cmd.equalsIgnoreCase("wifi")) {
         bool connected = (WiFi.status() == WL_CONNECTED);
         SPRINTF("{\"type\":\"wifi_status\",\"configured\":%s,\"ssid\":\"%s\",\"connected\":%s,\"ip\":\"%s\",\"rssi\":%d}\n",
@@ -800,6 +812,7 @@ void setup() {
     // 7. Initialize Telemetry & UDP Broadcast
     Telemetry::instance().begin(47824);
     Telemetry::instance().enableUdp(true);
+    StoreForward::instance().begin();
     MeshEngine::instance().registerHostDeliveryHook([](const char* json) {
         Telemetry::instance().broadcastUdp(json);
     });
@@ -929,7 +942,13 @@ void loop() {
     for (int i = 0; i < 4 && Telemetry::instance().popUdpCommand(udpCmd); ++i) {
         if (udpCmd.length() > 0) handleCommand(udpCmd);
     }
-    if (BleScanner::instance().takeQueueDumpRequest()) dumpMeshQueueToBle();
+    if (BleScanner::instance().takeQueueDumpRequest()) {
+        dumpMeshQueueToBle();
+        StoreForward::instance().startDump();
+    }
+    StoreForward::instance().pump(BleScanner::instance().isConnected(), [](const char* line) {
+        return BleScanner::instance().sendTelemetry(line);
+    });
 
     // 8. Periodic Status Telemetry Heartbeat (every 5 seconds)
     if (now - g_lastStatusTime >= 5000) {

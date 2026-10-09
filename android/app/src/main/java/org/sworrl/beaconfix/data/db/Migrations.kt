@@ -51,6 +51,14 @@ object MigrationSql {
     const val CREATE_PLATE_EVENT_MEDIA_UID = "CREATE UNIQUE INDEX IF NOT EXISTS `index_plate_event_media_uid` ON `plate_event_media` (`uid`)"
     const val CREATE_PLATE_EVENT_MEDIA_EVENT = "CREATE INDEX IF NOT EXISTS `index_plate_event_media_event_uid` ON `plate_event_media` (`event_uid`)"
     const val CREATE_PLATE_EVENT_MEDIA_CAMERA = "CREATE INDEX IF NOT EXISTS `index_plate_event_media_camera_id` ON `plate_event_media` (`camera_id`)"
+    // v9: what ESP32 nodes hand the phone over BLE
+    val V9: List<String> = listOf(
+        "CREATE TABLE IF NOT EXISTS `node_detections` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `uid` TEXT NOT NULL, `node` TEXT NOT NULL, `kind` TEXT NOT NULL, `mac` TEXT NOT NULL, `ssid` TEXT NOT NULL, `rssi` INTEGER NOT NULL, `ch` INTEGER NOT NULL, `detail` TEXT NOT NULL, `time_ms` INTEGER NOT NULL, `lat` REAL, `lon` REAL, `acc` REAL, `loc_source` TEXT NOT NULL, `stored` INTEGER NOT NULL, `hub_dirty` INTEGER NOT NULL)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS `index_node_detections_uid` ON `node_detections` (`uid`)",
+        "CREATE INDEX IF NOT EXISTS `index_node_detections_time_ms` ON `node_detections` (`time_ms`)",
+        "CREATE INDEX IF NOT EXISTS `index_node_detections_hub_dirty` ON `node_detections` (`hub_dirty`)",
+    )
+
     val V7: List<String> = listOf(CREATE_PLATE_EVENTS, CREATE_PLATE_EVENTS_UID, CREATE_PLATE_EVENTS_TIME, CREATE_PLATE_EVENTS_CAMERA,
         CREATE_PLATE_EVENT_MEDIA, CREATE_PLATE_EVENT_MEDIA_UID, CREATE_PLATE_EVENT_MEDIA_EVENT, CREATE_PLATE_EVENT_MEDIA_CAMERA)
 
@@ -124,5 +132,12 @@ val MIGRATION_7_8 = object : Migration(7, 8) {
     }
 }
 
+/** ESP32 nodes: additive only. `node_detections` is new (what a node hands the phone over BLE, kept and sent to the hub). */
+val MIGRATION_8_9 = object : Migration(8, 9) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        for (sql in MigrationSql.V9) db.execSQL(sql)
+    }
+}
+
 /** In order; register all of them (AppModule, MigrationTest). */
-val ALL_MIGRATIONS: Array<Migration> = arrayOf(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8)
+val ALL_MIGRATIONS: Array<Migration> = arrayOf(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9)

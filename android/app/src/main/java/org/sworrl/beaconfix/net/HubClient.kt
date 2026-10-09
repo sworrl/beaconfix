@@ -49,7 +49,14 @@ class HubSecurityException(message: String, cause: Throwable? = null) : IOExcept
  * (docs/API.md, docs/SIGHTINGS.md §5). A null list is left out of the JSON.
  */
 @Serializable data class HubSyncBody(val device: String, val kind: String, val identity: String?, val observations: List<ObservationDto>, val fixes: List<FixDto>, val anchors: List<JsonObject>?,
-                                     val plateEvents: List<org.sworrl.beaconfix.data.api.PlateEventDto>? = null)
+                                     val plateEvents: List<org.sworrl.beaconfix.data.api.PlateEventDto>? = null,
+                                     val nodeDetections: List<NodeDetectionDto>? = null)
+
+/** One node_detections row for the hub (docs/API.md, /db/sync `nodeDetections`); [uid] is the merge key. */
+@Serializable data class NodeDetectionDto(val uid: String, val node: String, val kind: String, val mac: String, val ssid: String,
+                                          val rssi: Int, val ch: Int, val detail: String, val timeMs: Long,
+                                          val lat: Double? = null, val lon: Double? = null, val acc: Double? = null,
+                                          val locSource: String = "", val stored: Boolean = false)
 
 /** The hub routes whose shapes differ from the LAN client's ([BeaconFixApi] covers the rest, same DTOs). */
 interface HubApi {

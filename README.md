@@ -126,6 +126,22 @@ The Home Wi-Fi card on that page does the same thing. Over serial or BLE it's
 A node on WiFi only takes commands from that network. Its own access point stays open for setup and signed OTA,
 but UDP commands from it are ignored.
 
+#### A node that follows your phone
+
+Link a node to the Android app and it follows that phone: the app streams its GPS and the time to it, and saves
+everything the node detects (probe requests, beacons, deauths, BLE trackers) in its own database, with the
+position the node had from the phone (or where the phone was, for a line that came without one). The next hub sync sends them on (`/db/sync`, `nodeDetections`), and the hub has them at
+`GET /api/v1/node-detections`. The Nodes screen shows how many are saved and how many are still waiting for the hub.
+
+When the phone is out of BLE range, the node keeps what it detects on its own flash (128 KB on an ESP32 DevKit,
+1.5 MB on a Heltec V3, oldest dropped first when it fills, one beacon per AP a minute so it lasts) and hands it all
+over when the phone is back. It only deletes what the phone confirms it saved. Those get the last position the node
+had, since it wasn't with the phone when it made them. `sf status` shows what's stored,
+`sf clear` empties it. A node that's on WiFi sends straight to the desktop instead.
+
+The phone thins live detections the same way (one beacon per AP a minute, one probe per client and network every
+30 s), so a day of following stays a reasonable size.
+
 ### The node list
 
 <p align="center">

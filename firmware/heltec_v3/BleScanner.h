@@ -77,10 +77,17 @@ public:
         pService->start();
 
         // Advertising
+        // The service UUID in the advertisement and the name in the scan response: a 20-character name and a 128-bit
+        // UUID don't both fit in 31 bytes, and the UUID got dropped. Phones with the screen off only see nodes through
+        // a scan filter, and the filter matches on the UUID.
         NimBLEAdvertising* pAdv = NimBLEDevice::getAdvertising();
-        pAdv->setName(nodeName);
-        pAdv->addServiceUUID(SERVICE_UUID_NUS);
-        pAdv->enableScanResponse(true);
+        NimBLEAdvertisementData advData;
+        advData.setFlags(BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP);
+        advData.setCompleteServices(NimBLEUUID(SERVICE_UUID_NUS));
+        pAdv->setAdvertisementData(advData);
+        NimBLEAdvertisementData scanData;
+        scanData.setName(nodeName);
+        pAdv->setScanResponseData(scanData);
         pAdv->start();
 
         // Scanner setup
@@ -109,15 +116,16 @@ public:
     }
 
     // One JSON line, newline-terminated so the client can reassemble it
-    void sendTelemetry(const char* line) {
-        if (!line || !m_pTxChar || m_connectedCount == 0) return;
+    // False when it didn't all go out (no link, or the notify buffers stayed full)
+    bool sendTelemetry(const char* line) {
+        if (!line || !m_pTxChar || m_connectedCount == 0) return false;
         size_t len = strlen(line);
-        if (len == 0) return;
-        if (line[len - 1] == '\n') { sendRaw(line, len); return; }
-        if (!m_txMutex || xSemaphoreTake(m_txMutex, pdMS_TO_TICKS(100)) != pdTRUE) return;
-        sendChunksLocked((const uint8_t*)line, len);
-        sendChunksLocked((const uint8_t*)"\n", 1);
+        if (len == 0) return false;
+        if (line[len - 1] == '\n') { sendRaw(line, len); return true; }
+        if (!m_txMutex || xSemaphoreTake(m_txMutex, pdMS_TO_TICKS(100)) != pdTRUE) return false;
+        const bool ok = sendChunksLocked((const uint8_t*)line, len) && sendChunksLocked((const uint8_t*)"\n", 1);
         xSemaphoreGive(m_txMutex);
+        return ok;
     }
 
     // Bytes as-is (caller frames them). Split to the smallest peer ATT MTU: a notify longer than
@@ -184,7 +192,7 @@ private:
                    m_pScan(nullptr), m_tagQueue(nullptr), m_connectedCount(0),
                    m_totalTagsDetected(0), m_initialized(false), m_txMutex(nullptr), m_rxLastMs(0), m_queueDumpPending(false) {}
 
-    void sendChunksLocked(const uint8_t* data, size_t len) {
+    bool sendChunksLocked(const uint8_t* data, size_t len) {
         uint16_t mtu = 0;
         for (uint16_t h : m_pServer->getPeerDevices()) {
             uint16_t m = m_pServer->getPeerMTU(h);
@@ -194,8 +202,11 @@ private:
         for (size_t off = 0; off < len; off += chunk) {
             size_t n = (len - off < chunk) ? (len - off) : chunk;
             // notify fails when the controller's buffers are full; give it a moment rather than drop mid-line
-            for (int tries = 0; tries < 4 && !m_pTxChar->notify(data + off, n); tries++) delay(3);
+            bool ok = false;
+            for (int tries = 0; tries < 10 && !(ok = m_pTxChar->notify(data + off, n)); tries++) delay(4);
+            if (!ok) return false;
         }
+        return true;
     }
 
     NimBLEServer* m_pServer;

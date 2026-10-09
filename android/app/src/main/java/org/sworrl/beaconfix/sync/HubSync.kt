@@ -18,6 +18,7 @@ import org.sworrl.beaconfix.net.HubClient
 import org.sworrl.beaconfix.net.HubErrors
 import org.sworrl.beaconfix.net.HubStore
 import org.sworrl.beaconfix.net.HubSyncBody
+import org.sworrl.beaconfix.net.NodeDetectionDto
 import org.sworrl.beaconfix.sightings.PlateDest
 import org.sworrl.beaconfix.sightings.PlateEventRepository
 import org.sworrl.beaconfix.data.db.PlateEventEntity
@@ -100,6 +101,8 @@ class HubSync @Inject constructor(
             }
             // ── push: plate events (records only; their images wait for a LAN desktop) ──
             pushedPlates = pushPlates(api, name, myId)
+            // ── push: what the ESP32 nodes handed this phone ───────────────
+            val pushedNodes = pushNodeDetections(api, name, myId)
 
             // ── pull: everyone's changes after our cursor ──────────────────
             for (page in 0 until MAX_PAGES) {
@@ -128,7 +131,7 @@ class HubSync @Inject constructor(
             val refit = if (pulledObs > 0 || pushed > 0) estimates.refit(touched, force = true) else 0
             runCatching { anchors.applyToAps() }
             val platesText = if (pushedPlates + pulledPlates > 0) " · plate events: pushed $pushedPlates, pulled $pulledPlates" else ""
-            val text = "pushed $pushed observations, $pushedFixes fixes · pulled $pulledAps beacons, $pulledObs observations · refit $refit$platesText"
+            val text = "pushed $pushed observations, $pushedFixes fixes · pulled $pulledAps beacons, $pulledObs observations · refit $refit$platesText" + (if (pushedNodes > 0) " · node detections: pushed $pushedNodes" else "")
             store.noteSync(text)
             return SyncReport(label, true, pushed, pulledAps, pulledObs, pushedFixes, refit, text)
         } catch (e: CancellationException) {
@@ -158,6 +161,29 @@ class HubSync @Inject constructor(
      * the hub will not take for its size waits for the desktop); a short count is resolved one by one. Returns how
      * many the hub took. An older hub that does not report plate events takes none: they stay queued.
      */
+    /**
+     * Push node_detections rows the hub hasn't got, in batches halved on `413`. A hub that doesn't answer with an
+     * `accepted.nodeDetections` count is older than this: everything stays queued for when it's updated.
+     */
+    private suspend fun pushNodeDetections(api: HubApi, name: String, myId: String?): Int {
+        var batch = 500
+        var pushed = 0
+        for (round in 0 until 400) {
+            val rows = db.nodeDetections().hubDirty(batch)
+            if (rows.isEmpty()) break
+            val dtos = rows.map { NodeDetectionDto(it.uid, it.node, it.kind, it.mac, it.ssid, it.rssi, it.ch, it.detail, it.timeMs,
+                                                   it.lat, it.lon, it.acc, it.locSource, it.stored) }
+            val (code, answer) = post(api, HubSyncBody(name, HubClient.KIND, myId, emptyList(), emptyList(), null, nodeDetections = dtos))
+            if (code == 413) { if (batch <= MIN_BATCH) break; batch /= 2; continue }
+            val accepted = answer?.get("accepted")?.let { runCatching { it.jsonObject }.getOrNull() }
+            if (accepted?.containsKey("nodeDetections") != true) break
+            db.nodeDetections().hubClean(rows.map { it.id })
+            pushed += rows.size
+            if (rows.size < batch) break
+        }
+        return pushed
+    }
+
     private suspend fun pushPlates(api: HubApi, name: String, myId: String?): Int {
         var maxBytes = HubPlates.MAX_BYTES
         val skip = HashSet<String>()

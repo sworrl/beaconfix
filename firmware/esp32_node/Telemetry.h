@@ -7,6 +7,7 @@
 #include "TimeSync.h"
 #include "MeshEngine.h"
 #include "NodeConfig.h"
+#include "StoreForward.h"
 
 
 class Telemetry {
@@ -39,7 +40,19 @@ public:
         }
     }
 
-    void broadcastJson(const char* jsonStr, bool toMesh = true) {
+    // A node following a phone that's out of reach (no BLE link, no WiFi) keeps its detections on flash until the
+    // phone is back, instead of sending them nowhere
+    bool storingForPhone() const {
+        return StoreForward::instance().ok() && NodeConfig::instance().isAttached() &&
+               !BleScanner::instance().isConnected() && WiFi.status() != WL_CONNECTED;
+    }
+
+    void broadcastJson(const char* jsonStr, bool toMesh = true, bool detection = false) {
+        if (detection && storingForPhone()) {
+            StoreForward::instance().store(jsonStr);
+            toMesh = false;   // the mesh queue would hand the same line to the phone a second time, cut short
+        }
+
         // 1. USB Serial
         Serial.println(jsonStr);
 
@@ -70,7 +83,7 @@ public:
                 "{\"type\":\"probe\",\"mac\":\"%s\",\"ssid\":\"%s\",\"rssi\":%d,\"ch\":%u,\"seq\":%u,\"ts\":%lu,\"ts_us\":%llu}",
                 macStr, f.ssid, f.rssi, f.channel, f.seq, f.timestampMs, (unsigned long long)TimeSync::instance().getNowUs());
         }
-        broadcastJson(buf);
+        broadcastJson(buf, true, true);
     }
 
     void emitBeacon(const DetectedFrame& f) {
@@ -91,7 +104,7 @@ public:
                 "{\"type\":\"beacon\",\"bssid\":\"%s\",\"ssid\":\"%s\",\"rssi\":%d,\"ch\":%u,\"ts\":%lu,\"ts_us\":%llu}",
                 macStr, f.ssid, f.rssi, f.channel, f.timestampMs, (unsigned long long)TimeSync::instance().getNowUs());
         }
-        broadcastJson(buf, false);
+        broadcastJson(buf, false, true);
     }
 
     void emitDeauth(const DetectedFrame& f) {
@@ -112,7 +125,7 @@ public:
                 (f.category == CAT_DEAUTH) ? "deauth" : "disassoc",
                 srcMac, dstMac, f.reasonCode, f.rssi, f.channel, f.timestampMs, (unsigned long long)TimeSync::instance().getNowUs());
         }
-        broadcastJson(buf);
+        broadcastJson(buf, true, true);
     }
 
     void emitBleTag(const DetectedBleTag& t) {
@@ -127,7 +140,7 @@ public:
                 "{\"type\":\"ble_tracker\",\"kind\":\"%s\",\"mac\":\"%s\",\"name\":\"%s\",\"rssi\":%d,\"payload\":\"%s\",\"ts\":%lu,\"ts_us\":%llu}",
                 t.kind, t.mac, t.name, t.rssi, t.payloadHex, t.timestampMs, (unsigned long long)TimeSync::instance().getNowUs());
         }
-        broadcastJson(buf);
+        broadcastJson(buf, true, true);
     }
 
     void emitBattery(uint32_t mv, uint8_t pct, const char* state, bool charging,
@@ -236,7 +249,8 @@ private:
             if (b.used && memcmp(b.mac, f.mac, 6) == 0) { slot = &b; break; }
         }
         if (slot) {
-            if (now - slot->ms < 3000 && abs(f.rssi - slot->rssi) < 8) return false;
+            const uint32_t every = storingForPhone() ? 60000 : 3000;   // flash is small; once a minute per AP
+            if (now - slot->ms < every && abs(f.rssi - slot->rssi) < 8) return false;
         } else {
             slot = &m_beaconSeen[0];
             for (auto& b : m_beaconSeen) {

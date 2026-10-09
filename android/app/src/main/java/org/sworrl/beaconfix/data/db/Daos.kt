@@ -67,6 +67,9 @@ interface FixDao {
     @Query("SELECT * FROM fixes WHERE source = 'desktop' ORDER BY time DESC LIMIT 1") suspend fun lastDesktop(): FixEntity?
     @Query("SELECT EXISTS(SELECT 1 FROM fixes WHERE source = 'desktop' AND time = :time)") suspend fun existsDesktopAt(time: Long): Boolean
     @Query("SELECT * FROM fixes WHERE source NOT LIKE 'desktop%' AND time > :t ORDER BY time") suspend fun phoneSince(t: Long): List<FixEntity>
+    /** This phone's own fix closest to [t], within [windowMs] either side */
+    @Query("SELECT * FROM fixes WHERE source NOT LIKE 'desktop%' AND time BETWEEN :t - :windowMs AND :t + :windowMs ORDER BY ABS(time - :t) LIMIT 1")
+    suspend fun phoneNear(t: Long, windowMs: Long): FixEntity?
     @Query("SELECT * FROM fixes WHERE source NOT LIKE 'desktop%' AND time > :since ORDER BY time ASC LIMIT :limit") suspend fun phoneFixesSince(since: Long, limit: Int = 200): List<FixEntity>
     @Query("SELECT * FROM fixes WHERE source NOT LIKE 'desktop%' ORDER BY time ASC") suspend fun allPhoneFixes(): List<FixEntity>
     @Query("INSERT OR IGNORE INTO fixes (time, lat, lon, acc, source, provider) SELECT DISTINCT time, lat, lon, acc, 'phone-gps', 'fused' FROM observations WHERE lat != 0.0 AND lon != 0.0") suspend fun backfillFromObservations()
@@ -193,3 +196,18 @@ interface PlateEventDao {
     @Query("UPDATE plate_event_media SET event_uid = :to WHERE event_uid = :from") suspend fun moveMedia(from: String, to: String)
     @Query("DELETE FROM plate_event_media WHERE uid = :uid") suspend fun deleteMedia(uid: String)
 }
+
+@Dao
+interface NodeDetectionDao {
+    /** Row ids, -1 for a uid already here */
+    @Insert(onConflict = OnConflictStrategy.IGNORE) suspend fun insertAll(rows: List<NodeDetectionEntity>): List<Long>
+    @Query("SELECT * FROM node_detections WHERE hub_dirty = 1 ORDER BY time_ms LIMIT :limit") suspend fun hubDirty(limit: Int = 500): List<NodeDetectionEntity>
+    @Query("UPDATE node_detections SET hub_dirty = 0 WHERE id IN (:ids)") suspend fun hubClean(ids: List<Long>)
+    /** The node's last position at or before [t], within [windowMs] (where it was when the phone left it) */
+    @Query("SELECT * FROM node_detections WHERE node = :node AND lat IS NOT NULL AND loc_source != 'node_last' AND time_ms BETWEEN :t - :windowMs AND :t ORDER BY time_ms DESC LIMIT 1")
+    suspend fun lastPositioned(node: String, t: Long, windowMs: Long): NodeDetectionEntity?
+    @Query("SELECT COUNT(*) FROM node_detections") fun count(): Flow<Int>
+    @Query("SELECT COUNT(*) FROM node_detections WHERE hub_dirty = 1") fun countHubDirty(): Flow<Int>
+    @Query("SELECT * FROM node_detections ORDER BY time_ms DESC LIMIT :limit") fun recent(limit: Int = 200): Flow<List<NodeDetectionEntity>>
+}
+

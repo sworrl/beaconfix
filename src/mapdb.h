@@ -149,6 +149,9 @@ public:
     // The feed: seq > since, oldest first; kind "" = both
     QJsonArray plateEventsSince(qint64 since, int limit, const QString &kind, bool *more, qint64 *cursor) const;
     QJsonArray plateEventsLatest(int limit, const QString &kind = QString(), bool withMedia = false) const;   // newest first (time)
+    // ESP32 node detections a phone pushed (/db/sync nodeDetections); -1 when the db isn't writable. Rows already here count.
+    int ingestNodeDetections(const QJsonArray &rows, const QString &device);
+    QJsonArray nodeDetections(qint64 sinceMs, int limit, const QString &node = QString(), const QString &kind = QString()) const;   // newest first
     QJsonObject plateEventCounts() const;
     QJsonArray plateEventMedia(const QString &eventUid, const QString &cameraId, bool includeLocal = true) const;   // metadata; includeLocal = webcam stills too (never served onward)
     struct MediaRow {
