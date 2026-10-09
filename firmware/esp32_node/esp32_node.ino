@@ -603,7 +603,7 @@ void handleCommand(const String& cmdLine) {
             uint16_t chunkSize = (uint16_t)args.substring(s2 + 1, s3).toInt();
             String shaHex = args.substring(s3 + 1, s4);
             String sigHex = (s5 > 0) ? args.substring(s4 + 1, s5) : args.substring(s4 + 1);
-            String verStr = "3.10.0";
+            String verStr = BEACONFIX_FW_VERSION;
             uint8_t channel = 1;
             uint8_t hwType = BEACONFIX_HW_TYPE;
 

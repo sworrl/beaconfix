@@ -4,6 +4,51 @@ All notable changes to BeaconFix are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [3.12.0] — 2026-10-09
+
+Desktop 3.12.0, Plasma widget 3.12.0, Android 3.12.0 and node firmware 3.12.0: one version for all of them from
+here on. 3.9.0 and 3.10.0 never got a GitHub release, so this one carries them too. The headline: the nodes reach
+you over WiFi and through the phone, a battery node can follow your phone around, and the phone app knows when
+you're not going anywhere.
+
+### Nodes
+- **No desktop Bluetooth needed.** A node on your WiFi talks UDP (47824 out, 47825 in), and the phone app relays a
+  node it holds over BLE onto the LAN, both ways. The bridge sends a command for a node a phone holds through that
+  phone. *Put Nodes on WiFi…* sends the network to every node it can reach.
+- **A node that follows your phone.** While the phone is in range it saves what the node detects (probes, beacons,
+  deauths, BLE trackers) with the phone's position. Out of range the node keeps it on flash (128 KB on an ESP32,
+  1.5 MB on a Heltec) and hands it over when the phone is back, deleting only what the phone confirms. The phone
+  syncs it to the hub, or to the paired desktops (`GET /api/v1/node-detections`).
+- **Battery nodes**: the cell is found on whichever ADC pin has it, empty and full are learned over a few cycles,
+  and runtime comes from how fast that node really drains. The two-resistor wiring diagram is in every UI and on
+  the node's own page.
+- **Your own firmware key per install**, made by the first flash. Boards only take OTA signed with it. The hash a
+  signature covers was wrong before and is fixed.
+- One beacon report per AP every 3 s instead of every frame (it was flooding the WiFi it sat on), and over BLE only
+  what the phone keeps (one beacon per AP a minute, one probe or tracker per device every 30 s).
+- The status line says `on_wifi`, and the Heltec's splash screen shows the real version instead of 3.10.0.
+
+### Android
+- **It knows when you're sitting still**: the significant-motion sensor, steps, shaking, GPS speed or a fix 150 m
+  away mean moving, three quiet minutes mean idle. Idle: no GPS of its own (the node gets the newest cached fix
+  every 30 s), a low-power node link and scan, the collector passive with no wake lock, screens' database work off
+  with the screen. Parked with a node linked, BeaconFix went from about 17 % of a core to 3 %, and from holding the
+  GPS 5.6 hours in 11.5 to none.
+- Sync no longer reads every observation each run, refits only what came in, checks duplicates on the time index
+  (57 ms a row before) and writes AP merges in one transaction.
+- **Join the hub through a linked PC**: a phone that kept its PC link but lost the hub one (an app-data reset)
+  asks the PC for an invite. No new QR.
+- BLE fixes: the MTU is requested (writes were cut at 20 bytes), writes are queued, screen-off scans are filtered
+  so they find anything at all, and notifications use the API 33 overload so lines in a burst aren't lost.
+
+### BeaconFix Lite
+- New: the locator as a small library for other devices, released separately as `lite-v1.0.0` (below).
+
+### Docs
+- A new README with the one-line installers and updaters, the flasher, and charts drawn from measurements
+  (`tools/render_readme_charts.py`). Release assets now include `beaconfix_amd64.deb` and `beaconfix.apk` under
+  fixed names, so `releases/latest/download/…` always gets the newest.
+
 ## [lite 1.0.0] — 2026-10-09
 
 The first release of **BeaconFix Lite** ([lite/README.md](lite/README.md)): BeaconFix's Wi-Fi locator as a small

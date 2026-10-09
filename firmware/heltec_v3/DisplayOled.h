@@ -237,7 +237,7 @@ public:
         }
 
         m_u8g2->setFont(u8g2_font_5x7_tr);
-        m_u8g2->drawStr(36, 52, "v3.10.0 LoRa+Wi-Fi Mesh");
+        m_u8g2->drawStr(36, 52, "v" BEACONFIX_FW_VERSION " LoRa+Wi-Fi Mesh");
 
         m_u8g2->sendBuffer();
         delay(1200);

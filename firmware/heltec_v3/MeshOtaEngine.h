@@ -334,7 +334,7 @@ public:
         p.chunkSize = chunkSize > 0 ? chunkSize : OTA_CHUNK_PAYLOAD_MAX;
         p.totalChunks = (totalBytes + p.chunkSize - 1) / p.chunkSize;
         memcpy(p.sha256, sha256, 32);
-        strncpy(p.version, version ? version : "3.10.0", sizeof(p.version) - 1);
+        strncpy(p.version, version ? version : BEACONFIX_FW_VERSION, sizeof(p.version) - 1);
         p.hardwareType = hardwareType;
         p.channel = channel > 0 ? channel : 1;
         p.sigLen = sigLen > sizeof(p.sig) ? sizeof(p.sig) : sigLen;

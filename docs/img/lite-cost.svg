@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 244" width="760" height="244" role="img"><title>What a look costs BeaconFix Lite</title><desc>Same APs as last time (reuse): 1.5 ms; Reuse after a restart (cache load): 12.7 ms; Full offline solve: 17.6 ms; First fix here (one Apple lookup): 672.0 ms</desc><style>
+  .bg{fill:none}
+  .t{font:600 15px system-ui,-apple-system,'Segoe UI',sans-serif;fill:#0b0b0b}
+  .s{font:400 12px system-ui,-apple-system,'Segoe UI',sans-serif;fill:#52514e}
+  .l{font:400 12px system-ui,-apple-system,'Segoe UI',sans-serif;fill:#0b0b0b}
+  .v{font:600 12px system-ui,-apple-system,'Segoe UI',sans-serif;fill:#0b0b0b}
+  .g{stroke:#e4e3df;stroke-width:1}
+  .ax{stroke:#a8a7a1;stroke-width:1}
+  .c1{fill:#2a78d6}.c2{fill:#eb6834}.k1{stroke:#2a78d6}.k2{stroke:#eb6834}
+  .box{fill:#f4f3f0;stroke:#d6d5d0;stroke-width:1}
+  .hl{fill:#e8f0fb;stroke:#2a78d6;stroke-width:1.5}
+  .ln{stroke:#8a8983;stroke-width:1.5;fill:none}
+  .lnb{stroke:#2a78d6;stroke-width:2;fill:none}
+  .arr{fill:#8a8983}
+  @media (prefers-color-scheme: dark){
+    .t,.l,.v{fill:#f0efec}.s{fill:#c3c2b7}
+    .g{stroke:#34332f}.ax{stroke:#6c6b66}
+    .c1{fill:#3987e5}.c2{fill:#d95926}.k1{stroke:#3987e5}.k2{stroke:#d95926}
+    .box{fill:#22221f;stroke:#45443f}
+    .hl{fill:#1b2a3d;stroke:#3987e5}
+    .ln{stroke:#8f8e87}.lnb{stroke:#3987e5}.arr{fill:#8f8e87}
+  }
+</style><rect class="bg" width="760" height="244"/><text class="t" x="0" y="20">What a look costs BeaconFix Lite</text><text class="s" x="0" y="40">Measured on the MikuOS M500 (arm64, Android 14), 33 APs heard. Log scale: each line is 10×.</text><line class="g" x1="250.0" y1="60" x2="250.0" y2="206"/><text class="s" x="250.0" y="222" text-anchor="middle">1 ms</text><line class="g" x1="393.3" y1="60" x2="393.3" y2="206"/><text class="s" x="393.3" y="222" text-anchor="middle">10 ms</text><line class="g" x1="536.7" y1="60" x2="536.7" y2="206"/><text class="s" x="536.7" y="222" text-anchor="middle">100 ms</text><line class="g" x1="680.0" y1="60" x2="680.0" y2="206"/><text class="s" x="680.0" y="222" text-anchor="middle">1000 ms</text><text class="l" x="238" y="80" text-anchor="end">Same APs as last time (reuse)</text><path class="c1" d="M250.0,67.0 h21.2 a4,4 0 0 1 4,4 v10.0 a4,4 0 0 1 -4,4 h-21.2 z"/><text class="v" x="281.2" y="80">1.5 ms</text><text class="l" x="238" y="114" text-anchor="end">Reuse after a restart (cache load)</text><path class="c1" d="M250.0,101.0 h154.2 a4,4 0 0 1 4,4 v10.0 a4,4 0 0 1 -4,4 h-154.2 z"/><text class="v" x="414.2" y="114">12.7 ms</text><text class="l" x="238" y="148" text-anchor="end">Full offline solve</text><path class="c1" d="M250.0,135.0 h174.5 a4,4 0 0 1 4,4 v10.0 a4,4 0 0 1 -4,4 h-174.5 z"/><text class="v" x="434.5" y="148">17.6 ms</text><text class="l" x="238" y="182" text-anchor="end">First fix here (one Apple lookup)</text><path class="c1" d="M250.0,169.0 h401.3 a4,4 0 0 1 4,4 v10.0 a4,4 0 0 1 -4,4 h-401.3 z"/><text class="v" x="661.3" y="182">672 ms</text><line class="ax" x1="250" y1="60" x2="250" y2="206"/></svg>

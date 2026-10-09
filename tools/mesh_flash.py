@@ -92,7 +92,7 @@ def render_progress_bar(pct: float, current: int, total: int, speed_kbps: float,
 
 def flash_mesh(bin_path: Path, key_path: Path, target: str, port: str,
                baud: int = 921600, channel: int = 1, chunk_size: int = 192,
-               pacing: float = 0.0025, version: str = "3.10.0", hardware_type: int = 0):
+               pacing: float = 0.0025, version: str = "3.12.0", hardware_type: int = 0):
     sig_path = ensure_signed_firmware(bin_path, key_path)
 
     if hardware_type == 0:
@@ -321,7 +321,7 @@ def main():
     parser.add_argument("--channel", type=int, default=1, help="Wi-Fi channel (default: 1)")
     parser.add_argument("--chunk-size", type=int, default=192, help="Chunk size in bytes (default: 192)")
     parser.add_argument("--pacing", type=float, default=0.040, help="Inter-chunk delay in seconds (default: 0.040 = 40ms)")
-    parser.add_argument("--version", default="3.10.0", help="Firmware version tag (default: 3.10.0)")
+    parser.add_argument("--version", default="3.12.0", help="Firmware version tag (default: 3.12.0)")
     parser.add_argument("--hardware-type", type=int, default=0, help="Hardware architecture type (1=Heltec S3, 2=Generic ESP32, 0=auto-detect)")
     args = parser.parse_args()
 

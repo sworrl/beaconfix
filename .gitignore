@@ -13,3 +13,4 @@ tools/keys/
 firmware/*/FwPublicKey.h
 android/.gradle/
 android/app/build/
+dist/
