@@ -18,6 +18,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.flow.collectLatest
 import org.json.JSONObject
 import java.net.DatagramPacket
 import java.net.DatagramSocket
@@ -34,6 +35,7 @@ import javax.inject.Singleton
 class EspNodeManager @Inject constructor(
     @ApplicationContext private val context: Context,
     private val locationSource: LocationSource,
+    private val motion: org.sworrl.beaconfix.collector.MotionDetector,
     private val db: AppDatabase,
     private val cache: DesktopCache
 ) {
@@ -113,6 +115,7 @@ class EspNodeManager @Inject constructor(
         startUdpListener()
         startCommandListener()
         startAutoConnect()
+        scope.launch { motion.idle.collect { applyConnectionPriority() } }
     }
 
     // ── UDP Telemetry Listener ───────────────────────────────────────────────
@@ -128,6 +131,17 @@ class EspNodeManager @Inject constructor(
                     val packet = DatagramPacket(buf, buf.size)
                     socket.receive(packet)
                     val str = String(packet.data, 0, packet.length, Charsets.UTF_8).trim()
+                    // The node this phone holds over BLE, heard on the WiFi as well: the BLE copy is parsed already. Note
+                    // where it is (relayBleLine leaves its detections alone then) and skip the second parse.
+                    if (_connectionState.value == EspConnectionState.CONNECTED_BLE && bleLinkNode.isNotEmpty()) {
+                        if (packet.address == bleNodeLanIp) {
+                            if (str.contains("\"type\":\"status\"")) bleNodeLanAt = System.currentTimeMillis()
+                            continue
+                        }
+                        if (str.contains("\"type\":\"status\"") && !str.contains("\"relay\":\"phone\"") && str.contains("\"node\":\"$bleLinkNode\"")) {
+                            bleNodeLanIp = packet.address; bleNodeLanAt = System.currentTimeMillis(); continue
+                        }
+                    }
                     // Our own relay of a BLE line (relayBleLine) comes back to this socket; it was parsed already
                     if (str.startsWith("{") && !str.contains("\"relay\":\"phone\"")) {
                         if (_connectionState.value == EspConnectionState.DISCONNECTED) {
@@ -208,19 +222,24 @@ class EspNodeManager @Inject constructor(
     fun startAutoConnect() {
         if (autoScanJob?.isActive == true) return
         autoScanJob = scope.launch {
+            // Hunt hard (low-latency scan, every 5 s) for 2 min after the link drops or while we're on the move; sitting
+            // still with no node around, a low-power scan every 30 s. It was a low-latency scan 4 s in every 9, all day.
+            var linkedAt = System.currentTimeMillis()
             while (autoConnectEnabled) {
+                val hunt = !motion.idle.value || System.currentTimeMillis() - linkedAt < 120_000L
                 try {
-                    if (_connectionState.value == EspConnectionState.DISCONNECTED && hasBlePermissions()) {
+                    if (_connectionState.value != EspConnectionState.DISCONNECTED) linkedAt = System.currentTimeMillis()
+                    else if (hasBlePermissions()) {
                         val adapter = btAdapter
                         if (adapter != null && adapter.isEnabled) {
                             val scanner = adapter.bluetoothLeScanner
                             if (scanner != null) {
-                                runAutoScanCycle(scanner)
+                                runAutoScanCycle(scanner, hunt)
                             }
                         }
                     }
                 } catch (_: Exception) {}
-                kotlinx.coroutines.delay(5000L)
+                kotlinx.coroutines.delay(if (hunt) 5000L else 30_000L)
             }
         }
     }
@@ -231,7 +250,7 @@ class EspNodeManager @Inject constructor(
     }
 
     @SuppressLint("MissingPermission")
-    private suspend fun runAutoScanCycle(scanner: android.bluetooth.le.BluetoothLeScanner) {
+    private suspend fun runAutoScanCycle(scanner: android.bluetooth.le.BluetoothLeScanner, hunt: Boolean) {
         val foundDevice = kotlinx.coroutines.CompletableDeferred<BluetoothDevice?>()
         val callback = object : android.bluetooth.le.ScanCallback() {
             override fun onScanResult(callbackType: Int, result: android.bluetooth.le.ScanResult?) {
@@ -255,7 +274,7 @@ class EspNodeManager @Inject constructor(
 
         try {
             val settings = android.bluetooth.le.ScanSettings.Builder()
-                .setScanMode(android.bluetooth.le.ScanSettings.SCAN_MODE_LOW_LATENCY)
+                .setScanMode(if (hunt) android.bluetooth.le.ScanSettings.SCAN_MODE_LOW_LATENCY else android.bluetooth.le.ScanSettings.SCAN_MODE_LOW_POWER)
                 .build()
             // Filtered: with the screen off Android hands an unfiltered scan nothing at all. Current firmware advertises
             // the NUS UUID; older firmware only its name, so the names of nodes seen before are filters too.
@@ -264,7 +283,8 @@ class EspNodeManager @Inject constructor(
                 for (name in knownNodeNames()) add(android.bluetooth.le.ScanFilter.Builder().setDeviceName(name).build())
             }
             scanner.startScan(filters, settings, callback)
-            val dev = kotlinx.coroutines.withTimeoutOrNull(4000L) {
+            // a low-power scan listens ~0.5 s in every 5 s: give it two windows
+            val dev = kotlinx.coroutines.withTimeoutOrNull(if (hunt) 4000L else 11_000L) {
                 foundDevice.await()
             }
             runCatching { scanner.stopScan(callback) }
@@ -303,7 +323,7 @@ class EspNodeManager @Inject constructor(
                 if (newState == BluetoothProfile.STATE_CONNECTED && status == BluetoothGatt.GATT_SUCCESS) {
                     _connectionState.value = EspConnectionState.CONNECTED_BLE
                     synchronized(bleRxBuf) { bleRxBuf.setLength(0); bleFramed = false }
-                    bleLinkNode = device.name ?: ""
+                    bleLinkNode = device.name ?: ""; bleNodeOnWifi = false
                     rememberNodeName(bleLinkNode)
                     synchronized(bleQueue) { bleQueue.clear(); bleBusySince = 0L; bleMtu = 23 }
                     // Ask for a bigger ATT MTU first: at the default 23 every write over 20 bytes reached the node cut
@@ -347,6 +367,7 @@ class EspNodeManager @Inject constructor(
 
             override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
                 if (status == BluetoothGatt.GATT_SUCCESS) bleMtu = mtu
+                applyConnectionPriority(gatt)
                 android.util.Log.i(TAG, "MTU $mtu (status $status), discovering services")
                 gatt.discoverServices()
             }
@@ -398,6 +419,7 @@ class EspNodeManager @Inject constructor(
         for (raw in lines) {
             val line = raw.trim()
             if (!line.startsWith("{")) continue
+            if (line.contains("\"type\":\"status\"")) bleNodeOnWifi = line.contains("\"on_wifi\":true")   // 3.11.1+
             parseTelemetryLine(line)
             relayBleLine(line)
             recorder.offer(line, bleLinkNode)
@@ -406,8 +428,24 @@ class EspNodeManager @Inject constructor(
 
     // Put what the BLE-linked node says on the LAN (UDP 47824), the way the desktop's USB/BLE bridge does, so the
     // desktop sees this node — and every node it gateways for over the mesh — while the phone holds the link
+    // The BLE-linked node's own address on the WiFi, when it is on it (its status lines arrive by UDP too)
+    @Volatile private var bleNodeLanIp: java.net.InetAddress? = null
+    @Volatile private var bleNodeLanAt = 0L
+    @Volatile private var bleNodeOnWifi = false     // its own status says so (a screen-off phone may not hear its UDP)
+
+    // Sitting still the link can idle along (connection events ~100 ms apart instead of ~30–50): the node's lines
+    // still arrive, a few per event. Back to balanced as soon as we move.
+    @SuppressLint("MissingPermission")
+    private fun applyConnectionPriority(gatt: BluetoothGatt? = activeGatt) {
+        val g = gatt ?: return
+        runCatching { g.requestConnectionPriority(if (motion.idle.value) BluetoothGatt.CONNECTION_PRIORITY_LOW_POWER else BluetoothGatt.CONNECTION_PRIORITY_BALANCED) }
+    }
+
     private fun relayBleLine(line: String) {
         val sock = udpSocket ?: return
+        // A node on the WiFi itself already gives the desktop every line: only its status goes through the phone too
+        // (the desktop's bridge sends a node's commands through the phone that relays its status)
+        if ((bleNodeOnWifi || System.currentTimeMillis() - bleNodeLanAt < 60_000L) && !line.contains("\"type\":\"status\"")) return
         scope.launch {
             try {
                 val o = JSONObject(line)
@@ -503,7 +541,17 @@ class EspNodeManager @Inject constructor(
         }
     }
 
+    // Asked with every fix sent to the node; reading the trip snapshot or a day of fixes each time cost more CPU than
+    // the fix itself. A minute old is fresh enough for a trip odometer.
+    @Volatile private var tripKmCache = 0f
+    @Volatile private var tripKmAt = 0L
     private suspend fun getAccumulatedTripKm(): Float {
+        val now = System.currentTimeMillis()
+        if (now - tripKmAt < 60_000L) return tripKmCache
+        return computeTripKm().also { tripKmCache = it; tripKmAt = now }
+    }
+
+    private suspend fun computeTripKm(): Float {
         return try {
             val tripSnap = cache.decode<TripDto>(cache.snapshotNow("trip"))?.trip
             val snapKm = tripSnap?.distanceTripKm ?: tripSnap?.distanceTodayKm ?: 0.0
@@ -538,68 +586,53 @@ class EspNodeManager @Inject constructor(
 
         sendCommand("attach $phoneName")
 
-        // 1. Live GPS Stream (push GPS fixes every 2.5s / 1.5m movement)
+        // 1. GPS for the node. Moving: a fix every 2.5 s / 1.5 m. Sitting still (MotionDetector.idle): nothing switched on
+        // for us; other apps' fixes pass through as they happen, and the newest fix the phone has goes over every 30 s
+        // (the node trusts a fix for 45 s). That stream used to keep the GPS and Wi-Fi location scans on around the clock.
         gpsStreamJob = scope.launch {
             try {
-                // Send immediate current/last location fix upon attach!
-                val initialLoc = locationSource.current(2000L)
-                val initialTripKm = getAccumulatedTripKm()
-                if (initialLoc != null) {
-                    val lat = initialLoc.latitude
-                    val lon = initialLoc.longitude
-                    val acc = if (initialLoc.hasAccuracy()) initialLoc.accuracy else 5.0f
-                    val spd = if (initialLoc.hasSpeed()) initialLoc.speed else -1.0f
-                    val hdg = if (initialLoc.hasBearing()) initialLoc.bearing else -1.0f
-                    val alt = if (initialLoc.hasAltitude()) initialLoc.altitude.toFloat() else 0.0f
-                    val cmd = String.format(java.util.Locale.US, "gps %.6f,%.6f,%.1f,%.2f,%.1f,%.1f,0,%.2f", lat, lon, acc, spd, hdg, alt, initialTripKm)
-                    sendCommand(cmd)
-                    if (initialTripKm > 0.005f) {
-                        sendCommand(String.format(java.util.Locale.US, "trip %.2f", initialTripKm))
+                (if (motion.idle.value) locationSource.last() else locationSource.current(2000L) ?: locationSource.last())?.let { sendFix(it) }
+                motion.idle.collectLatest { idle ->
+                    kotlinx.coroutines.coroutineScope {
+                        launch {
+                            if (idle) locationSource.updates(30_000L, 5f, com.google.android.gms.location.Priority.PRIORITY_PASSIVE).collect { sendFix(it) }
+                            else locationSource.updates(2500L, 1.5f).collect { sendFix(it) }
+                        }
+                        // no new fix (the 1.5 m filter, or nobody asking): the newest one again before the node drops it
+                        while (true) {
+                            kotlinx.coroutines.delay(10_000L)
+                            if (System.currentTimeMillis() - lastFixSentWall >= 30_000L) locationSource.last()?.let { sendFix(it, again = true) }
+                        }
                     }
                 }
-
-                locationSource.updates(2500L, 1.5f).collect { loc ->
-                    val lat = loc.latitude
-                    val lon = loc.longitude
-                    val acc = if (loc.hasAccuracy()) loc.accuracy else 5.0f
-                    val spd = if (loc.hasSpeed()) loc.speed else -1.0f
-                    val hdg = if (loc.hasBearing()) loc.bearing else -1.0f
-                    val alt = if (loc.hasAltitude()) loc.altitude.toFloat() else 0.0f
-                    val tripKm = getAccumulatedTripKm()
-                    val cmd = String.format(java.util.Locale.US, "gps %.6f,%.6f,%.1f,%.2f,%.1f,%.1f,0,%.2f", lat, lon, acc, spd, hdg, alt, tripKm)
-                    sendCommand(cmd)
-                    if (tripKm > 0.005f) {
-                        sendCommand(String.format(java.util.Locale.US, "trip %.2f", tripKm))
-                    }
-                }
-            } catch (_: Exception) {}
+            } catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (_: Exception) {}
         }
 
-        // 2. Microsecond Stratum 1 Time Sync & Periodic GPS/Trip Keepalive (every 15s)
+        // 2. Clock: every 15 s while moving, every 5 min sitting still (the node's clock drifts far less than that matters)
         timeSyncJob = scope.launch {
             try {
                 while (_isFollowingPhone.value) {
-                    val epochUs = System.currentTimeMillis() * 1000L
-                    sendCommand("time $epochUs")
-                    val loc = locationSource.current(1000L)
-                    val tripKm = getAccumulatedTripKm()
-                    if (loc != null) {
-                        val lat = loc.latitude
-                        val lon = loc.longitude
-                        val acc = if (loc.hasAccuracy()) loc.accuracy else 5.0f
-                        val spd = if (loc.hasSpeed()) loc.speed else 0.0f
-                        val hdg = if (loc.hasBearing()) loc.bearing else -1.0f
-                        val alt = if (loc.hasAltitude()) loc.altitude.toFloat() else 0.0f
-                        val cmd = String.format(java.util.Locale.US, "gps %.6f,%.6f,%.1f,%.2f,%.1f,%.1f,0,%.2f", lat, lon, acc, spd, hdg, alt, tripKm)
-                        sendCommand(cmd)
-                    }
-                    if (tripKm > 0.005f) {
-                        sendCommand(String.format(java.util.Locale.US, "trip %.2f", tripKm))
-                    }
-                    kotlinx.coroutines.delay(15000L)
+                    sendCommand("time ${System.currentTimeMillis() * 1000L}")
+                    kotlinx.coroutines.delay(if (motion.idle.value) 300_000L else 15_000L)
                 }
-            } catch (_: Exception) {}
+            } catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (_: Exception) {}
         }
+    }
+
+    @Volatile private var lastFixSentAt = 0L
+    @Volatile private var lastFixSentWall = 0L
+    private suspend fun sendFix(loc: android.location.Location, again: Boolean = false) {
+        // a passive fix can be the one we just sent: once is enough (a deliberate resend keeps the node's fix alive)
+        if (!again && loc.time != 0L && loc.time == lastFixSentAt) return
+        lastFixSentAt = loc.time
+        lastFixSentWall = System.currentTimeMillis()
+        val acc = if (loc.hasAccuracy()) loc.accuracy else 5.0f
+        val spd = if (loc.hasSpeed()) loc.speed else -1.0f
+        val hdg = if (loc.hasBearing()) loc.bearing else -1.0f
+        val alt = if (loc.hasAltitude()) loc.altitude.toFloat() else 0.0f
+        val tripKm = getAccumulatedTripKm()
+        sendCommand(String.format(java.util.Locale.US, "gps %.6f,%.6f,%.1f,%.2f,%.1f,%.1f,0,%.2f", loc.latitude, loc.longitude, acc, spd, hdg, alt, tripKm))
+        if (tripKm > 0.005f) sendCommand(String.format(java.util.Locale.US, "trip %.2f", tripKm))
     }
 
     fun sendGpsFix(lat: Double, lon: Double, accM: Float = 5.0f, speedMps: Float = -1.0f, headingDeg: Float = -1.0f, altM: Float = 0.0f) {

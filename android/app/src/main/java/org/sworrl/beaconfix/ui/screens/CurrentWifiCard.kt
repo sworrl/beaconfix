@@ -1,5 +1,6 @@
 package org.sworrl.beaconfix.ui.screens
 
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -7,7 +8,6 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -55,7 +55,7 @@ class CurrentWifiViewModel @Inject constructor(private val monitor: CurrentNetwo
 /** Home's "Connected Wi-Fi" card: the network's name, how safe it is in plain words, and a banking hint when it is not. */
 @Composable
 fun CurrentWifiCard(vm: CurrentWifiViewModel = hiltViewModel()) {
-    val ui by vm.ui.collectAsState()
+    val ui by vm.ui.collectAsStateWithLifecycle()
     LaunchedEffect(Unit) { vm.refreshIfHidden() }
     InfoCard(stringResource(R.string.wifi_card_title)) {
         val w = ui.wifi

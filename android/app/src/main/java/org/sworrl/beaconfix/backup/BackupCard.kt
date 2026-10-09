@@ -1,5 +1,6 @@
 package org.sworrl.beaconfix.backup
 
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import android.content.Context
 import android.content.Intent
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -16,7 +17,6 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -47,10 +47,10 @@ private fun openAction(ctx: Context, action: String) {
 @Composable
 fun BackupCard(onRestore: (() -> Unit)? = null, onIdentity: (() -> Unit)? = null, vm: BackupViewModel = hiltViewModel()) {
     val ctx = LocalContext.current
-    val busy by vm.busy.collectAsState()
-    val message by vm.message.collectAsState()
-    val last by vm.lastBackupAt.collectAsState()
-    val targets by vm.targets.collectAsState()
+    val busy by vm.busy.collectAsStateWithLifecycle()
+    val message by vm.message.collectAsStateWithLifecycle()
+    val last by vm.lastBackupAt.collectAsStateWithLifecycle()
+    val targets by vm.targets.collectAsStateWithLifecycle()
     val save = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/json")) { uri -> uri?.let { vm.save(it) } }
     InfoCard(stringResource(R.string.backup_title)) {
         Text(stringResource(R.string.backup_body), color = Slate, style = MaterialTheme.typography.bodySmall)

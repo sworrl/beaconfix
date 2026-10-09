@@ -25,7 +25,8 @@ class MotionSensors @Inject constructor(@ApplicationContext private val ctx: Con
         if (on) return
         val m = sm ?: return
         m.getDefaultSensor(Sensor.TYPE_PRESSURE)?.let { m.registerListener(this, it, SensorManager.SENSOR_DELAY_NORMAL) }
-        m.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)?.let { m.registerListener(this, it, SensorManager.SENSOR_DELAY_UI) }
+        // 5 Hz: the 64-sample window spans ~13 s, plenty for walking vs still (16 Hz woke the CPU 3x as often)
+        m.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)?.let { m.registerListener(this, it, SensorManager.SENSOR_DELAY_NORMAL) }
         on = true
     }
     fun stop() { if (!on) return; sm?.unregisterListener(this); on = false }

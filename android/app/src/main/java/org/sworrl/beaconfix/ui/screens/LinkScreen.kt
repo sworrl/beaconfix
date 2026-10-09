@@ -1,5 +1,6 @@
 package org.sworrl.beaconfix.ui.screens
 
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -29,7 +30,6 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -65,9 +65,9 @@ import org.sworrl.beaconfix.ui.vm.PcRow
  */
 @Composable
 fun LinkScreen(onBack: () -> Unit, hintHost: String? = null, hintPort: Int = 47822, autoLink: Boolean = false, vm: LinkViewModel = hiltViewModel()) {
-    val phase by vm.phase.collectAsState(); val hub by vm.hub.collectAsState(); val msg by vm.message.collectAsState()
-    val pcs by vm.pcs.collectAsState(); val linked by vm.linked.collectAsState(); val mdnsErr by vm.mdnsError.collectAsState()
-    val hubStatus by vm.hubStatus.collectAsState()
+    val phase by vm.phase.collectAsStateWithLifecycle(); val hub by vm.hub.collectAsStateWithLifecycle(); val msg by vm.message.collectAsStateWithLifecycle()
+    val pcs by vm.pcs.collectAsStateWithLifecycle(); val linked by vm.linked.collectAsStateWithLifecycle(); val mdnsErr by vm.mdnsError.collectAsStateWithLifecycle()
+    val hubStatus by vm.hubStatus.collectAsStateWithLifecycle()
     var scanning by remember { mutableStateOf(false) }
     DisposableEffect(Unit) { vm.browse(true); onDispose { vm.browse(false) } }
     LaunchedEffect(hintHost, hintPort, autoLink) { if (!hintHost.isNullOrBlank()) vm.hint(hintHost, hintPort, autoLink) }

@@ -1,5 +1,6 @@
 package org.sworrl.beaconfix.ui.screens
 
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -15,7 +16,6 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -29,8 +29,8 @@ import org.sworrl.beaconfix.ui.vm.SyncViewModel
 
 @Composable
 fun SyncScreen(onPair: () -> Unit, onHub: () -> Unit = {}, vm: SyncViewModel = hiltViewModel(), hubVm: org.sworrl.beaconfix.ui.vm.HubViewModel = hiltViewModel()) {
-    val ui by vm.ui.collectAsState()
-    val hub by hubVm.status.collectAsState()
+    val ui by vm.ui.collectAsStateWithLifecycle()
+    val hub by hubVm.status.collectAsStateWithLifecycle()
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(vertical = 8.dp)) {
         HubSyncCard(onOpen = onHub, vm = hubVm)
         InfoCard("Sync") {

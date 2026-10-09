@@ -1,5 +1,6 @@
 package org.sworrl.beaconfix.ui.screens
 
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Paint
@@ -27,7 +28,6 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -100,18 +100,18 @@ fun MapScreen(
     inspectVm: org.sworrl.beaconfix.sightings.ui.InspectionViewModel = hiltViewModel(),
 ) {
     val ctx = LocalContext.current
-    val aps by live.mapAps.collectAsState(); val track by live.phoneTrack.collectAsState(); val desk by live.desktopTrack.collectAsState()
-    val views by live.views.collectAsState(); val me by live.phone.collectAsState()
-    val desktopHeatmap by live.desktopHeatmap.collectAsState()
-    val anchorsList by anchorsVm.anchors.collectAsState(); val editing by anchorsVm.editing.collectAsState()
-    val ranges by live.ranges.collectAsState()
-    val flockCameras by live.flockCameras.collectAsState()
-    val activePlan by inspectVm.activePlan.collectAsState()
-    val inspectedPlan by inspectVm.inspectedCameraPlan.collectAsState()
-    val isInspectLoading by inspectVm.loading.collectAsState()
-    val liveGuardAlert by inspectVm.liveGuardAlert.collectAsState()
+    val aps by live.mapAps.collectAsStateWithLifecycle(); val track by live.phoneTrack.collectAsStateWithLifecycle(); val desk by live.desktopTrack.collectAsStateWithLifecycle()
+    val views by live.views.collectAsStateWithLifecycle(); val me by live.phone.collectAsStateWithLifecycle()
+    val desktopHeatmap by live.desktopHeatmap.collectAsStateWithLifecycle()
+    val anchorsList by anchorsVm.anchors.collectAsStateWithLifecycle(); val editing by anchorsVm.editing.collectAsStateWithLifecycle()
+    val ranges by live.ranges.collectAsStateWithLifecycle()
+    val flockCameras by live.flockCameras.collectAsStateWithLifecycle()
+    val activePlan by inspectVm.activePlan.collectAsStateWithLifecycle()
+    val inspectedPlan by inspectVm.inspectedCameraPlan.collectAsStateWithLifecycle()
+    val isInspectLoading by inspectVm.loading.collectAsStateWithLifecycle()
+    val liveGuardAlert by inspectVm.liveGuardAlert.collectAsStateWithLifecycle()
     val inspectionSheetState = androidx.compose.material3.rememberModalBottomSheetState(skipPartiallyExpanded = true)
-    val doomBatteryMode by live.doomBatteryMode.collectAsState()
+    val doomBatteryMode by live.doomBatteryMode.collectAsStateWithLifecycle()
     var showDoomBatteryDialog by rememberSaveable { mutableStateOf(false) }
     var anchorsLayer by remember { mutableStateOf(true) }
     var heatmapLayer by remember { mutableStateOf(true) }
@@ -138,8 +138,8 @@ fun MapScreen(
     val latest = ranged?.let { org.sworrl.beaconfix.data.db.FixEntity(time = it.time, lat = it.lat, lon = it.lon, acc = it.acc, source = "phone-range", provider = if (it.bearingDeg != null) "ranged" else "ring") }
         ?: me.fix ?: views.firstOrNull()?.location?.takeIf { it.valid }?.let { org.sworrl.beaconfix.data.db.FixEntity(time = 0, lat = it.lat, lon = it.lon, acc = it.accuracy, source = "desktop") }
     // places: the offline cache, through the saved filter; the place whose sheet is open always draws
-    val cached by placesVm.places.collectAsState(); val style by placesVm.style.collectAsState(); val filter by placesVm.filter.collectAsState()
-    val prefetchTo by placesVm.prefetchTarget.collectAsState()
+    val cached by placesVm.places.collectAsStateWithLifecycle(); val style by placesVm.style.collectAsStateWithLifecycle(); val filter by placesVm.filter.collectAsStateWithLifecycle()
+    val prefetchTo by placesVm.prefetchTarget.collectAsStateWithLifecycle()
     var sheet by remember { mutableStateOf<org.sworrl.beaconfix.data.db.PoiEntity?>(null) }
     var sharedPin by remember { mutableStateOf<PlacesOverlay.Pin?>(null) }
     val pois = remember(filter, cached, sheet) { MapFilter.apply(filter, cached).let { l -> sheet?.takeIf { s -> s.source.isNotEmpty() && l.none { it.key == s.key } }?.let { l + it } ?: l } }
@@ -148,7 +148,7 @@ fun MapScreen(
     DisposableEffect(styler) { onDispose { styler.detach() } }
     var devicesLayer by remember { mutableStateOf(true) }
     // every node the hub knows (desktop, Steam Deck, …) while the map is up; merged with the LAN desktops' answers, freshest per device
-    val hubDevices by hubVm.devices.collectAsState()
+    val hubDevices by hubVm.devices.collectAsStateWithLifecycle()
     DisposableEffect(hubVm) { hubVm.live(true); onDispose { hubVm.live(false) } }
     val devices = remember(views, hubDevices, devicesLayer) { if (devicesLayer) org.sworrl.beaconfix.net.HubLive.merge(views.flatMap { v -> v.devices + (v.location?.takeIf { it.valid }?.let { l -> listOf(org.sworrl.beaconfix.data.api.LinkedDevice(v.desktop.name.ifEmpty { v.desktop.hostname }, "desktop", "", "", l.lat, l.lon, l.accuracy, l.time, l.ageS, l.source, true)) } ?: emptyList()) }.distinctBy { it.device }, hubDevices) else emptyList() }
     val unsetNodes = remember(devices) { devices.filter { (it.kind == "esp32-node" || it.kind == "node" || it.kind == "mesh") && (it.lat == 0.0 && it.lon == 0.0) } }
@@ -165,7 +165,7 @@ fun MapScreen(
     var ticker by remember { mutableStateOf("") }
     var menu by remember { mutableStateOf(false) }
     // "Show on map" from Help / Places / the trip journal / a shared link: re-centre, open the sheet (or drop a pin), then clear the target
-    val focus by MapFocus.target.collectAsState()
+    val focus by MapFocus.target.collectAsStateWithLifecycle()
     val sharedLabel = stringResource(R.string.map_shared_place); val placeLabel = stringResource(R.string.map_place)
     LaunchedEffect(focus, mapRef) {
         val t = focus ?: return@LaunchedEffect
@@ -366,7 +366,7 @@ fun MapScreen(
     // the cameras for the area on screen: asked for again once the view is CAMERA_REFETCH_M from where they were last
     // answered for, after it has stood still SETTLE_MS (a glide re-culls on every frame: each frame restarts this and
     // cancels the wait); a failed fetch leaves camerasFrom alone, so the next pan, or the desktop answering again, retries
-    val camerasFrom by live.camerasFrom.collectAsState()
+    val camerasFrom by live.camerasFrom.collectAsStateWithLifecycle()
     val desktopUp = views.any { it.error.isEmpty() && it.fetched > 0 }
     LaunchedEffect(cullBox, camerasLayer, camerasFrom, desktopUp) {
         val c = cullBox?.centerWithDateLine ?: return@LaunchedEffect

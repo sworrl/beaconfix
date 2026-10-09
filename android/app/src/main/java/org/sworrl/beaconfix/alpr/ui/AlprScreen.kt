@@ -1,5 +1,6 @@
 package org.sworrl.beaconfix.alpr.ui
 
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
@@ -50,7 +51,6 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableLongStateOf
@@ -108,10 +108,10 @@ fun bytesText(b: Long): String = when { b < 1024 -> "$b B"; b < 1024 * 1024 -> "
 @Composable
 fun AlprScreen(onBack: () -> Unit, vm: AlprViewModel = hiltViewModel()) {
     val ctx = LocalContext.current
-    val st by vm.status.state.collectAsState(); val recent by vm.status.recent.collectAsState()
-    val cfg by vm.settings.config.collectAsState(); val pairing by vm.link.pairing.collectAsState()
-    val busy by vm.busy.collectAsState(); val msg by vm.message.collectAsState(); val test by vm.selfTest.collectAsState()
-    val incoming by AlprIncoming.payload.collectAsState()
+    val st by vm.status.state.collectAsStateWithLifecycle(); val recent by vm.status.recent.collectAsStateWithLifecycle()
+    val cfg by vm.settings.config.collectAsStateWithLifecycle(); val pairing by vm.link.pairing.collectAsStateWithLifecycle()
+    val busy by vm.busy.collectAsStateWithLifecycle(); val msg by vm.message.collectAsStateWithLifecycle(); val test by vm.selfTest.collectAsStateWithLifecycle()
+    val incoming by AlprIncoming.payload.collectAsStateWithLifecycle()
     var scanning by remember { mutableStateOf(false) }
     var scanned by remember { mutableStateOf<PairingPayload?>(null) }
     var permNote by remember { mutableStateOf("") }
@@ -134,9 +134,9 @@ fun AlprScreen(onBack: () -> Unit, vm: AlprViewModel = hiltViewModel()) {
             ).espNodeManager()
         }.getOrNull()
     }
-    val espConn by (espManager?.connectionState ?: kotlinx.coroutines.flow.MutableStateFlow(org.sworrl.beaconfix.node.EspConnectionState.DISCONNECTED)).collectAsState()
-    val espStatus by (espManager?.nodeStatus ?: kotlinx.coroutines.flow.MutableStateFlow(null)).collectAsState()
-    val espProbes by (espManager?.recentProbes ?: kotlinx.coroutines.flow.MutableStateFlow(emptyList())).collectAsState()
+    val espConn by (espManager?.connectionState ?: kotlinx.coroutines.flow.MutableStateFlow(org.sworrl.beaconfix.node.EspConnectionState.DISCONNECTED)).collectAsStateWithLifecycle()
+    val espStatus by (espManager?.nodeStatus ?: kotlinx.coroutines.flow.MutableStateFlow(null)).collectAsStateWithLifecycle()
+    val espProbes by (espManager?.recentProbes ?: kotlinx.coroutines.flow.MutableStateFlow(emptyList())).collectAsStateWithLifecycle()
 
     if (scanning) {
         QrScanner("Point the camera at the pairing QR on FalconEyez (Settings → Phones → Pair a phone)", onResult = { text ->
@@ -343,7 +343,7 @@ private fun SettingsCard(cfg: AlprConfig, vm: AlprViewModel) {
 fun AlprDetectorCard(onOpen: () -> Unit, modifier: Modifier = Modifier) {
     val ctx = LocalContext.current
     val e = remember { ctx.alprEntry() }
-    val st by e.alprStatus().state.collectAsState()
+    val st by e.alprStatus().state.collectAsStateWithLifecycle()
     Card(modifier.fillMaxWidth().clickable { onOpen() }, shape = RoundedCornerShape(8.dp)) {
         Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {

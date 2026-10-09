@@ -1,11 +1,11 @@
 package org.sworrl.beaconfix.quick
 
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import android.content.Context
 import android.content.Intent
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
@@ -93,7 +93,7 @@ object Shortcuts {
     fun PinKidsErButton() {
         val ctx = LocalContext.current
         val help = remember { EntryPointAccessors.fromApplication(ctx.applicationContext, WidgetEntryPoint::class.java).help() }
-        val live by help.snapshot.collectAsState()
+        val live by help.snapshot.collectAsStateWithLifecycle()
         val stored by produceState(HelpSnapshot()) { value = runCatching { HelpStore.load(ctx) }.getOrDefault(HelpSnapshot()) }
         val kids = org.sworrl.beaconfix.tile.TileModel.newest(live, stored).first(HelpKind.PEDS_ER)
         val supported = remember { ShortcutManagerCompat.isRequestPinShortcutSupported(ctx) }

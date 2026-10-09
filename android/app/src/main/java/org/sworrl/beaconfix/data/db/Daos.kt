@@ -33,6 +33,11 @@ interface ApDao {
     @Query("UPDATE aps SET home=:home WHERE bssid IN (:bssids)") suspend fun setHome(bssids: List<String>, home: Boolean)
     @Query("UPDATE aps SET home=0") suspend fun clearHome()
     @Query("SELECT bssid FROM aps") suspend fun allBssids(): List<String>
+    @Query("SELECT * FROM aps WHERE bssid IN (:bssids)") suspend fun byBssids(bssids: List<String>): List<ApEntity>
+    @Query("SELECT * FROM aps WHERE lastSeen > :since") suspend fun seenSince(since: Long): List<ApEntity>
+    @Query("SELECT COUNT(*) FROM aps") suspend fun countNow(): Int
+    /** Whole rows the caller merged already (one statement each, no failed INSERT first as with @Upsert). */
+    @Insert(onConflict = OnConflictStrategy.REPLACE) suspend fun replaceAll(aps: List<ApEntity>)
 }
 
 @Dao
@@ -52,7 +57,10 @@ interface ObservationDao {
     suspend fun ownScanRows(sinceId: Long, limit: Int): List<ScanRow>
     /** Each AP's newest RTT range since [since] (ms; the time index keeps it cheap). SQLite takes the bare columns from the MAX(time) row. */
     @Query("SELECT bssid, rangeM, rangeSd, MAX(time) AS time FROM observations WHERE time > :since AND rangeM IS NOT NULL GROUP BY bssid") suspend fun latestRanges(since: Long): List<ApRangeRow>
-    @Query("SELECT COUNT(*) FROM observations WHERE bssid=:bssid AND ABS(time - :time) < 1500 AND ABS(lat - :lat) < 0.00001 AND ABS(lon - :lon) < 0.00001") suspend fun duplicates(bssid: String, time: Long, lat: Double, lon: Double): Int
+    // Ranges on the time index (a 3 s window holds a handful of rows); "+bssid" keeps SQLite off the bssid index, which
+    // walked every row of a busy AP (~57 ms each, for every imported row of a sync)
+    @Query("SELECT COUNT(*) FROM observations WHERE time BETWEEN :time - 1499 AND :time + 1499 AND +bssid = :bssid " +
+        "AND lat > :lat - 0.00001 AND lat < :lat + 0.00001 AND lon > :lon - 0.00001 AND lon < :lon + 0.00001") suspend fun duplicates(bssid: String, time: Long, lat: Double, lon: Double): Int
 }
 
 @Dao
@@ -72,7 +80,6 @@ interface FixDao {
     suspend fun phoneNear(t: Long, windowMs: Long): FixEntity?
     @Query("SELECT * FROM fixes WHERE source NOT LIKE 'desktop%' AND time > :since ORDER BY time ASC LIMIT :limit") suspend fun phoneFixesSince(since: Long, limit: Int = 200): List<FixEntity>
     @Query("SELECT * FROM fixes WHERE source NOT LIKE 'desktop%' ORDER BY time ASC") suspend fun allPhoneFixes(): List<FixEntity>
-    @Query("INSERT OR IGNORE INTO fixes (time, lat, lon, acc, source, provider) SELECT DISTINCT time, lat, lon, acc, 'phone-gps', 'fused' FROM observations WHERE lat != 0.0 AND lon != 0.0") suspend fun backfillFromObservations()
     /** Collapse desktop fixes pulled more than once (same timestamp) to the first copy; returns the rows removed. */
     @Query(DEDUPE_DESKTOP_FIXES) suspend fun dedupeDesktop(): Int
 }

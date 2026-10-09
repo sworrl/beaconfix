@@ -21,6 +21,7 @@ import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -101,7 +102,8 @@ class CollectorService : LifecycleService() {
         val pm = getSystemService(PowerManager::class.java)
         collectorWake = pm?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "beaconfix:doom_collector")?.apply { setReferenceCounted(false) }
         doomModeJob = lifecycleScope.launch {
-            combine(prefs.doomBatteryMode, prefs.collectorOn) { mode, on -> mode to on }
+            // sitting still (MotionDetector.idle) nothing needs the CPU held awake; only Nightmare keeps it regardless
+            combine(prefs.doomBatteryMode, prefs.collectorOn, motion.idle) { mode, on, idle -> mode to (on && (!idle || mode == DoomBatteryMode.NIGHTMARE)) }
                 .distinctUntilChanged()
                 .collect { (mode, on) ->
                     if (mode.holdWakeLock && on) {
@@ -149,9 +151,12 @@ class CollectorService : LifecycleService() {
         if (loop == null) loop = lifecycleScope.launch { run() }
         if (locationJob == null) {
             locationJob = lifecycleScope.launch {
-                prefs.doomBatteryMode.distinctUntilChanged().collectLatest { doomMode ->
+                // Sitting still: no GPS of our own, just the fixes other requests produce (Nightmare and a survey excepted)
+                combine(prefs.doomBatteryMode, motion.idle, status.state.map { it.survey }) { m, idle, survey -> m to (idle && !survey && m != DoomBatteryMode.NIGHTMARE) }
+                    .distinctUntilChanged().collectLatest { (doomMode, still) ->
                     runCatching {
-                        location.updates(intervalMs = doomMode.gpsIntervalMs, minDistanceM = doomMode.gpsMinDistanceM).collect { loc ->
+                        (if (still) location.updates(60_000L, 10f, com.google.android.gms.location.Priority.PRIORITY_PASSIVE)
+                         else location.updates(intervalMs = doomMode.gpsIntervalMs, minDistanceM = doomMode.gpsMinDistanceM)).collect { loc ->
                             motion.onLocationUpdate(loc)
                             hubPresence.offer(loc.latitude, loc.longitude, loc.accuracy.toDouble(), loc.time, "gps", if (loc.hasSpeed()) loc.speed else null)
                             livePasses.onLocation(loc)      // docs/SIGHTINGS.md §2: phone-live camera passes
@@ -225,15 +230,11 @@ class CollectorService : LifecycleService() {
             delay(1000)
             refreshNotification()
 
-            // Wait for interval, but awaken early if motion changes to a faster sampling rate
-            val remaining = (interval - 1000).coerceAtLeast(500)
-            kotlinx.coroutines.withTimeoutOrNull(remaining) {
-                motion.status.collect { s ->
-                    if (s.suggestedIntervalMs < interval) {
-                        return@collect
-                    }
-                }
-            }
+            // Sitting still the same APs answer every scan: once a minute is plenty (survey and Nightmare excepted).
+            // Wait the interval; a long still wait ends the moment we start moving.
+            val stillInterval = if (!survey && doomMode != DoomBatteryMode.NIGHTMARE && motion.idle.value) maxOf(interval, 60_000L) else interval
+            val remaining = (stillInterval - 1000).coerceAtLeast(500)
+            kotlinx.coroutines.withTimeoutOrNull(remaining) { motion.idle.first { !it && stillInterval > interval } }
         }
     }
 

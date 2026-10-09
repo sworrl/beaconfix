@@ -1,5 +1,6 @@
 package org.sworrl.beaconfix.ui.screens
 
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -20,7 +21,6 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -46,7 +46,7 @@ import org.sworrl.beaconfix.ui.vm.HubViewModel
  */
 @Composable
 fun HubScreen(onBack: () -> Unit, onLink: () -> Unit = {}, vm: HubViewModel = hiltViewModel()) {
-    val st by vm.status.collectAsState(); val busy by vm.busy.collectAsState(); val msg by vm.message.collectAsState()
+    val st by vm.status.collectAsStateWithLifecycle(); val busy by vm.busy.collectAsStateWithLifecycle(); val msg by vm.message.collectAsStateWithLifecycle()
     val cfg = st.config
     DisposableEffect(cfg != null) { vm.live(cfg != null); onDispose { vm.live(false) } }
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(vertical = 8.dp)) {
@@ -75,7 +75,7 @@ private fun NotEnrolled(onLink: () -> Unit) {
 @Composable
 private fun Enrolled(st: HubStatus, vm: HubViewModel, onLink: () -> Unit) {
     val cfg = st.config ?: return
-    val queued by vm.queued.collectAsState(); val devices by vm.devices.collectAsState(); val streaming by vm.streaming.collectAsState()
+    val queued by vm.queued.collectAsStateWithLifecycle(); val devices by vm.devices.collectAsStateWithLifecycle(); val streaming by vm.streaming.collectAsStateWithLifecycle()
     var editUrl by remember { mutableStateOf(false) }; var url by remember(cfg.url) { mutableStateOf(cfg.url) }
     var confirmForget by remember { mutableStateOf(false) }
     LaunchedEffect(cfg.deviceId) { if (st.reachable == null) vm.test() }
@@ -134,7 +134,7 @@ fun HubReachability(st: HubStatus) {
 /** The Sync screen's hub card: what the hub sync did, and the way to the Hub screen. */
 @Composable
 fun HubSyncCard(onOpen: () -> Unit, vm: HubViewModel = hiltViewModel()) {
-    val st by vm.status.collectAsState()
+    val st by vm.status.collectAsStateWithLifecycle()
     val cfg = st.config
     InfoCard(if (cfg != null) "Hub — the sync target" else "Hub") {
         if (cfg == null) Text("No hub enrolled: syncing with paired desktops on the LAN.", color = Slate, style = MaterialTheme.typography.bodySmall)

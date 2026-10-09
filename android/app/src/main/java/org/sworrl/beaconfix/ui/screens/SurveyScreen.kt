@@ -1,5 +1,6 @@
 package org.sworrl.beaconfix.ui.screens
 
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Canvas
@@ -20,7 +21,6 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -38,8 +38,8 @@ import org.sworrl.beaconfix.ui.vm.SurveyViewModel
 
 @Composable
 fun SurveyScreen(vm: SurveyViewModel = hiltViewModel()) {
-    val st by vm.status.state.collectAsState()
-    val hintSeen by vm.throttleHintSeen.collectAsState()
+    val st by vm.status.state.collectAsStateWithLifecycle()
+    val hintSeen by vm.throttleHintSeen.collectAsStateWithLifecycle()
     val ctx = LocalContext.current
     val ask = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { r -> if (r.values.all { it }) vm.surveyOn() }
     DisposableEffect(Unit) { onDispose { vm.surveyOff() } }

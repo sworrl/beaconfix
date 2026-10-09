@@ -157,10 +157,10 @@ class WidgetUpdater @Inject constructor(
         val place = if (usePhone && phoneFix!!.place.isNotEmpty()) phoneFix.place else deskPlace.ifEmpty { if (lat != 0.0 || lon != 0.0) String.format(java.util.Locale.US, "%.5f, %.5f", lat, lon) else "" }
         // beacons: the collector's last scan (in this process) or, failing that, the most recently seen rows
         val scan = status.state.value.scan
-        val apsAll = db.aps().all().first()
-        val byBssid = apsAll.associateBy { it.bssid }
+        // only the rows it shows: every AP with its fit metrics was read here on each refresh (several a minute)
+        val byBssid = (if (scan.isNotEmpty()) scan.map { it.bssid }.distinct().chunked(900).flatMap { db.aps().byBssids(it) } else emptyList()).associateBy { it.bssid }
         val heard = if (scan.isNotEmpty()) scan.map { s -> TopBeacon(s.ssid, s.bssid, s.dbm, byBssid[s.bssid]?.security?.ifEmpty { org.sworrl.beaconfix.collector.ObservationRecorder.securityOf(s.capabilities) } ?: org.sworrl.beaconfix.collector.ObservationRecorder.securityOf(s.capabilities), byBssid[s.bssid]?.home ?: false) }
-                    else apsAll.filter { System.currentTimeMillis() - it.lastSeen < 15 * 60_000L }.map { TopBeacon(it.ssid, it.bssid, -100, it.security, it.home) }
+                    else db.aps().seenSince(System.currentTimeMillis() - 15 * 60_000L).map { TopBeacon(it.ssid, it.bssid, -100, it.security, it.home) }
         var open = 0; var wep = 0; var wpa1 = 0; var tkip = 0; var wpa2 = 0; var wpa3 = 0; var other = 0
         for (b in heard) when (b.security) { "open" -> open++; "wep" -> wep++; "wpa1" -> wpa1++; "wpa2-tkip" -> tkip++; "wpa2" -> wpa2++; "wpa3", "wpa3-eap192" -> wpa3++; else -> other++ }
         val worst = when { open + wep + wpa1 + tkip > 0 -> "critical"; wpa2 > 0 -> "weak"; other > 0 -> "ok"; wpa3 > 0 -> "strong"; else -> "" }
@@ -174,7 +174,7 @@ class WidgetUpdater @Inject constructor(
             inRange = heard.size, scanTime = if (scan.isNotEmpty()) status.state.value.lastScanAt else 0,
             open = open, wep = wep, wpa1 = wpa1, tkip = tkip, wpa2 = wpa2, wpa3 = wpa3, other = other, worst = worst, top = top,
             desktopName = paired?.name ?: "", desktopPaired = paired != null, lastSync = paired?.lastSync ?: prefs.lastSyncAt.first(), unsynced = unsynced, collectorOn = collectorOn,
-            apsKnown = apsAll.size, apsPositioned = positioned, mapPath = old.mapPath, mapTime = old.mapTime, nearestDevice = nearestDevice,
+            apsKnown = db.aps().countNow(), apsPositioned = positioned, mapPath = old.mapPath, mapTime = old.mapTime, nearestDevice = nearestDevice,
             rangeLine = runCatching { ranging.get().line() }.getOrDefault(""),
         )
         // a measured range beats a difference of two fixes for the widget's nearest-device line

@@ -1,5 +1,6 @@
 package org.sworrl.beaconfix.ui.screens
 
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -13,7 +14,6 @@ import androidx.compose.material3.Slider
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.remember
@@ -81,7 +81,7 @@ class SettingsPlacesViewModel @Inject constructor(private val prefs: Prefs) : Vi
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SettingsPlacesSection(vm: SettingsPlacesViewModel = hiltViewModel()) {
-    val ui by vm.ui.collectAsState()
+    val ui by vm.ui.collectAsStateWithLifecycle()
     val imperialNow = when (ui.units) { "imperial" -> true; "metric" -> false; else -> Units.imperial }
     InfoCard(stringResource(R.string.a10_places_title)) {
         Text(stringResource(R.string.a10_units), style = MaterialTheme.typography.bodyMedium)
@@ -116,7 +116,7 @@ fun SettingsPlacesSection(vm: SettingsPlacesViewModel = hiltViewModel()) {
 /** Settings → Developer automation: lets adb test hooks act on a release build (off by default). */
 @Composable
 fun DeveloperAutomationCard(vm: SettingsPlacesViewModel = hiltViewModel()) {
-    val ui by vm.ui.collectAsState()
+    val ui by vm.ui.collectAsStateWithLifecycle()
     InfoCard(stringResource(R.string.a10_dev_title)) {
         SwitchRow(stringResource(R.string.a10_dev_automation), stringResource(R.string.a10_dev_automation_hint), ui.devAutomation) { vm.setDevAutomation(it) }
         if (ui.devAutomation || BuildConfig.DEBUG) {

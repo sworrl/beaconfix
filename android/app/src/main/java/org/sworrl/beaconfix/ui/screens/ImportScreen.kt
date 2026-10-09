@@ -1,5 +1,6 @@
 package org.sworrl.beaconfix.ui.screens
 
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -21,7 +22,6 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -56,8 +56,8 @@ class ImportViewModel @Inject constructor(val repo: ImportRepository) : ViewMode
 /** Settings → Import, and the target of "Share → BeaconFix" for JSON/CSV/GPX/KML files. */
 @Composable
 fun ImportScreen(onBack: () -> Unit, incoming: Uri? = null, vm: ImportViewModel = hiltViewModel()) {
-    val busy by vm.busy.collectAsState(); val err by vm.error.collectAsState(); val summary by vm.summary.collectAsState()
-    val parsed by vm.repo.parsed.collectAsState(); val progress by vm.repo.progress.collectAsState(); val name by vm.repo.fileName.collectAsState(); val fmt by vm.repo.format.collectAsState()
+    val busy by vm.busy.collectAsStateWithLifecycle(); val err by vm.error.collectAsStateWithLifecycle(); val summary by vm.summary.collectAsStateWithLifecycle()
+    val parsed by vm.repo.parsed.collectAsStateWithLifecycle(); val progress by vm.repo.progress.collectAsStateWithLifecycle(); val name by vm.repo.fileName.collectAsStateWithLifecycle(); val fmt by vm.repo.format.collectAsStateWithLifecycle()
     var positions by remember { mutableStateOf(true) }; var wifi by remember { mutableStateOf(true) }; var places by remember { mutableStateOf(true) }
     var from by remember { mutableStateOf("") }; var to by remember { mutableStateOf("") }
     val pick = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri -> uri?.let { vm.open(it) } }

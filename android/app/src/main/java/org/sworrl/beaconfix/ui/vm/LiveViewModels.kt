@@ -11,6 +11,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
@@ -52,6 +54,7 @@ class LiveViewModel @Inject constructor(
     @ApplicationContext private val ctx: Context,
     val refits: org.sworrl.beaconfix.estimate.RefitBus,
     val ranging: org.sworrl.beaconfix.ranging.RangingRepository,
+    private val motion: org.sworrl.beaconfix.collector.MotionDetector,
     val snapper: org.sworrl.beaconfix.route.RoadSnapper,
     val locationSource: org.sworrl.beaconfix.collector.LocationSource
 ) : ViewModel() {
@@ -83,8 +86,12 @@ class LiveViewModel @Inject constructor(
 
     init {
         viewModelScope.launch { phoneRaw.collect { f -> phoneEnriched.value = enrich(f) } }
+        // The live dot, only while BeaconFix is on screen (this model outlives the screen being off), and every 10 s
+        // instead of 1.5 s while the phone sits still
         viewModelScope.launch {
-            locationSource.updates(intervalMs = 1500L, minDistanceM = 1.0f).collect { loc ->
+            combine(ranging.visible, motion.idle) { v, i -> v to i }.distinctUntilChanged().collectLatest { (visible, idle) ->
+            if (!visible) return@collectLatest
+            locationSource.updates(intervalMs = if (idle) 10_000L else 1500L, minDistanceM = 1.0f).collect { loc ->
                 if (loc.latitude != 0.0 && loc.longitude != 0.0 && (!loc.hasAccuracy() || loc.accuracy <= 100f)) {
                     val f = org.sworrl.beaconfix.data.db.FixEntity(
                         time = loc.time.takeIf { it > 0 } ?: System.currentTimeMillis(),
@@ -96,6 +103,7 @@ class LiveViewModel @Inject constructor(
                     )
                     phoneEnriched.value = enrich(f)
                 }
+            }
             }
         }
         refresh()

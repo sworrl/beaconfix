@@ -1,5 +1,6 @@
 package org.sworrl.beaconfix.ui.screens
 
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import android.content.Intent
 import android.graphics.Bitmap
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -26,7 +27,6 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -50,7 +50,7 @@ import org.sworrl.beaconfix.ui.vm.IdentityViewModel
 /** First launch: no identity yet. Create one or bring one over from another BeaconFix. */
 @Composable
 fun OnboardingScreen(initialName: String? = null, onImportHistory: (() -> Unit)? = null, onLinkPc: (() -> Unit)? = null, vm: IdentityViewModel = hiltViewModel()) {
-    val busy by vm.busy.collectAsState(); val msg by vm.message.collectAsState(); val staged by vm.importBundle.collectAsState()
+    val busy by vm.busy.collectAsStateWithLifecycle(); val msg by vm.message.collectAsStateWithLifecycle(); val staged by vm.importBundle.collectAsStateWithLifecycle()
     var name by remember { mutableStateOf(initialName ?: "") }
     var mode by remember { mutableStateOf("choose") }     // choose | scan | paste (debug builds)
     var pass by remember { mutableStateOf("") }
@@ -94,11 +94,11 @@ fun OnboardingScreen(initialName: String? = null, onImportHistory: (() -> Unit)?
 /** Settings → Identity: show, export, link, forget. */
 @Composable
 fun IdentityScreen(onBack: () -> Unit, onLink: () -> Unit = {}, vm: IdentityViewModel = hiltViewModel()) {
-    val rec by vm.identity.collectAsState(); val pending by vm.pending.collectAsState()
-    val busy by vm.busy.collectAsState(); val msg by vm.message.collectAsState()
-    val exportText by vm.exportText.collectAsState(); val exportCode by vm.exportCode.collectAsState()
-    val offer by vm.offerText.collectAsState(); val statement by vm.statementText.collectAsState(); val staged by vm.importBundle.collectAsState()
-    val incoming by vm.incomingLink.collectAsState()
+    val rec by vm.identity.collectAsStateWithLifecycle(); val pending by vm.pending.collectAsStateWithLifecycle()
+    val busy by vm.busy.collectAsStateWithLifecycle(); val msg by vm.message.collectAsStateWithLifecycle()
+    val exportText by vm.exportText.collectAsStateWithLifecycle(); val exportCode by vm.exportCode.collectAsStateWithLifecycle()
+    val offer by vm.offerText.collectAsStateWithLifecycle(); val statement by vm.statementText.collectAsStateWithLifecycle(); val staged by vm.importBundle.collectAsStateWithLifecycle()
+    val incoming by vm.incomingLink.collectAsStateWithLifecycle()
     val ctx = LocalContext.current; val clip = LocalClipboardManager.current
     var mode by remember { mutableStateOf("view") }   // view | scan
     var pass by remember { mutableStateOf("") }; var newName by remember(rec?.name) { mutableStateOf(rec?.name ?: "") }

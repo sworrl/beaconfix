@@ -1530,7 +1530,7 @@ QWidget *MainWindow::buildNodes()
     tb->addWidget(syncClockBtn);
 
     auto *otaBtn = new QPushButton(QIcon::fromTheme(QStringLiteral("system-software-update")), QStringLiteral("Mesh OTA Update…"));
-    otaBtn->setToolTip(QStringLiteral("Initiate autonomous cryptographic Mesh OTA broadcast to update remote nodes to latest signed v3.11.0 firmware"));
+    otaBtn->setToolTip(QStringLiteral("Initiate autonomous cryptographic Mesh OTA broadcast to update remote nodes to latest signed v3.11.1 firmware"));
     connect(otaBtn, &QPushButton::clicked, this, [this] {
         const QString binPath = QStringLiteral(BEACONFIX_SOURCE_DIR "/firmware/heltec_v3/build/heltec_v3.ino.bin");
         const QString sigPath = binPath + QStringLiteral(".sig");
@@ -1548,19 +1548,19 @@ QWidget *MainWindow::buildNodes()
         const int size = binData.size();
 
         if (QMessageBox::question(this, QStringLiteral("Trigger Mesh OTA"),
-            QStringLiteral("Broadcast signed firmware v3.11.0 manifest to mesh?\n\nSize: %1 bytes (%2 chunks)\nSHA256: %3...\nSignature: %4 bytes\n\nThis will trigger autonomous round-robin mesh propagation.")
+            QStringLiteral("Broadcast signed firmware v3.11.1 manifest to mesh?\n\nSize: %1 bytes (%2 chunks)\nSHA256: %3...\nSignature: %4 bytes\n\nThis will trigger autonomous round-robin mesh propagation.")
             .arg(size).arg(192).arg(shaHex.left(16)).arg(sigHex.size() / 2)) != QMessageBox::Yes) {
             return;
         }
 
-        const QString cmd = QStringLiteral("mesh ota manifest %1 192 %2 %3 3.11.0 1\n").arg(size).arg(shaHex).arg(sigHex);
+        const QString cmd = QStringLiteral("mesh ota manifest %1 192 %2 %3 3.11.1 1\n").arg(size).arg(shaHex).arg(sigHex);
         QUdpSocket sock;
         sock.writeDatagram(cmd.toUtf8(), QHostAddress::LocalHost, 47825);
         sock.writeDatagram(cmd.toUtf8(), QHostAddress::Broadcast, 47824);
         if (m_nodesEventLog) {
-            m_nodesEventLog->appendPlainText(QStringLiteral("[%1] 🚀 Primed mesh with signed v3.11.0 manifest (%2 bytes, 192 chunks)").arg(QDateTime::currentDateTime().toString(QStringLiteral("HH:mm:ss"))).arg(size));
+            m_nodesEventLog->appendPlainText(QStringLiteral("[%1] 🚀 Primed mesh with signed v3.11.1 manifest (%2 bytes, 192 chunks)").arg(QDateTime::currentDateTime().toString(QStringLiteral("HH:mm:ss"))).arg(size));
         }
-        statusBar()->showMessage(QStringLiteral("Primed mesh with v3.11.0 OTA manifest"), 4000);
+        statusBar()->showMessage(QStringLiteral("Primed mesh with v3.11.1 OTA manifest"), 4000);
     });
     tb->addWidget(otaBtn);
 

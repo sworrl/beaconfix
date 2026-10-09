@@ -1,5 +1,6 @@
 package org.sworrl.beaconfix.ui.screens
 
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -28,7 +29,6 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -52,8 +52,8 @@ import org.sworrl.beaconfix.ui.vm.AnchorsViewModel
 /** The anchors list (More → Anchors): every surveyed antenna, with edit / delete, and "Place one at my position". */
 @Composable
 fun AnchorsScreen(onBack: () -> Unit, onMap: () -> Unit = {}, vm: AnchorsViewModel = hiltViewModel()) {
-    val anchors by vm.anchors.collectAsState(); val editing by vm.editing.collectAsState(); val message by vm.message.collectAsState()
-    val desktopAnchor by vm.desktopAnchor.collectAsState()
+    val anchors by vm.anchors.collectAsStateWithLifecycle(); val editing by vm.editing.collectAsStateWithLifecycle(); val message by vm.message.collectAsStateWithLifecycle()
+    val desktopAnchor by vm.desktopAnchor.collectAsStateWithLifecycle()
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(vertical = 8.dp)) {
         Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) {
             TextButton(onClick = onBack) { Text("‹ Back") }
@@ -93,7 +93,7 @@ private fun fmt(v: Double) = if (v >= 10) v.toInt().toString() else String.forma
 @Composable
 fun AnchorEditorSheet(a: AnchorDto, vm: AnchorsViewModel) {
     val sheet = rememberModalBottomSheetState(skipPartiallyExpanded = true)
-    val scan by vm.scan.collectAsState(); val scanning by vm.scanning.collectAsState(); val averaging by vm.averaging.collectAsState()
+    val scan by vm.scan.collectAsStateWithLifecycle(); val scanning by vm.scanning.collectAsStateWithLifecycle(); val averaging by vm.averaging.collectAsStateWithLifecycle()
     var name by remember(a.id) { mutableStateOf(a.name) }
     var height by remember(a.id) { mutableStateOf(a.heightM?.let { fmt(it) } ?: "") }
     var acc by remember(a.id) { mutableStateOf(fmt(a.accM)) }

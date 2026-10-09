@@ -1,5 +1,6 @@
 package org.sworrl.beaconfix.ui.screens
 
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -17,7 +18,6 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -50,14 +50,14 @@ import org.sworrl.beaconfix.ui.vm.PlacesViewModel
 @Composable
 fun NearbyScreen(onHelp: () -> Unit = {}, onMap: () -> Unit = {}) {
     val vm: PlacesViewModel = hiltViewModel()
-    val places by vm.places.collectAsState()
-    val filter by vm.filter.collectAsState()
-    val total by vm.total.collectAsState()
-    val status by vm.status.collectAsState()
-    val paired by vm.paired.collectAsState()
-    val reachable by vm.reachable.collectAsState()
-    val refreshing by vm.refreshing.collectAsState()
-    val searching by vm.phoneSearching.collectAsState()
+    val places by vm.places.collectAsStateWithLifecycle()
+    val filter by vm.filter.collectAsStateWithLifecycle()
+    val total by vm.total.collectAsStateWithLifecycle()
+    val status by vm.status.collectAsStateWithLifecycle()
+    val paired by vm.paired.collectAsStateWithLifecycle()
+    val reachable by vm.reachable.collectAsStateWithLifecycle()
+    val refreshing by vm.refreshing.collectAsStateWithLifecycle()
+    val searching by vm.phoneSearching.collectAsStateWithLifecycle()
     val empty = PlacesModel.empty(paired, reachable, total, places.size)
 
     Column(Modifier.fillMaxSize()) {

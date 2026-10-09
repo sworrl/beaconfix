@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 package org.sworrl.beaconfix.sightings.ui
 
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import android.content.Context
 import android.content.Intent
 import android.graphics.BitmapFactory
@@ -29,7 +30,6 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -149,9 +149,9 @@ private fun openUrl(ctx: Context, url: String) = runCatching { ctx.startActivity
 /** More → Sightings: every plate event, newest first, from Room (works offline). */
 @Composable
 fun SightingsScreen(onOpen: (String) -> Unit, onBack: () -> Unit, vm: SightingsViewModel = hiltViewModel()) {
-    val list by vm.events.collectAsState()
-    val watch by vm.watch.collectAsState()
-    val plates by vm.plates.collectAsState()
+    val list by vm.events.collectAsStateWithLifecycle()
+    val watch by vm.watch.collectAsStateWithLifecycle()
+    val plates by vm.plates.collectAsStateWithLifecycle()
     LazyColumn(Modifier.fillMaxSize(), contentPadding = androidx.compose.foundation.layout.PaddingValues(vertical = 8.dp)) {
         item {
             Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -173,7 +173,7 @@ fun SightingsScreen(onOpen: (String) -> Unit, onBack: () -> Unit, vm: SightingsV
                 Text("Plate check: ${if (watch.lastCheck > 0) ago(watch.lastCheck) else "not yet"} · ${watch.mode.ifEmpty { "idle" }}${watch.lastStatus.let { if (it.isNotEmpty()) " · $it" else "" }}$next",
                     color = Slate, style = MaterialTheme.typography.bodySmall)
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) { OutlinedButton(onClick = { vm.checkPlatesNow() }) { Text("Check my plates now") } }
-                val stills by vm.webcamStills.collectAsState()
+                val stills by vm.webcamStills.collectAsStateWithLifecycle()
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                     Column(Modifier.weight(1f)) {
                         Text("Keep public webcam stills", style = MaterialTheme.typography.bodyMedium)
@@ -224,7 +224,7 @@ private fun SightingRow(e: PlateEventEntity, vm: SightingsViewModel, onClick: ()
 @Composable
 fun SightingDetailScreen(uid: String, onBack: () -> Unit, onMap: () -> Unit, vm: SightingsViewModel = hiltViewModel()) {
     val ctx = LocalContext.current
-    val ev by remember(uid) { vm.event(uid) }.collectAsState(initial = null)
+    val ev by remember(uid) { vm.event(uid) }.collectAsStateWithLifecycle(initialValue = null)
     LaunchedEffect(uid) { vm.fetchFull(uid) }
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(vertical = 8.dp)) {
         Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -233,7 +233,7 @@ fun SightingDetailScreen(uid: String, onBack: () -> Unit, onMap: () -> Unit, vm:
         }
         val e = ev
         if (e == null) { Text("Not on this phone (yet). Sync with your PC to fetch it.", color = Slate, modifier = Modifier.padding(16.dp)); return@Column }
-        val media by remember(e.uid, e.cameraId) { vm.media(e) }.collectAsState(initial = emptyList())
+        val media by remember(e.uid, e.cameraId) { vm.media(e) }.collectAsStateWithLifecycle(initialValue = emptyList())
         InfoCard(kindLabel(e)) {
             Text(who(e), fontWeight = FontWeight.Bold)
             e.details?.let { Text(it) }

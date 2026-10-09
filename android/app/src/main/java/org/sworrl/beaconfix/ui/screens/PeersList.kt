@@ -1,5 +1,6 @@
 package org.sworrl.beaconfix.ui.screens
 
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -13,7 +14,6 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -36,9 +36,9 @@ import org.sworrl.beaconfix.ui.vm.PeersViewModel
  */
 @Composable
 fun PeersList(haveIdentity: Boolean, vm: PeersViewModel = hiltViewModel()) {
-    val rows by vm.rows.collectAsState(); val scanning by vm.scanning.collectAsState(); val note by vm.note.collectAsState()
-    val busy by vm.busy.collectAsState(); val msg by vm.message.collectAsState()
-    val importFrom by vm.importFrom.collectAsState(); val hint by vm.importHint.collectAsState()
+    val rows by vm.rows.collectAsStateWithLifecycle(); val scanning by vm.scanning.collectAsStateWithLifecycle(); val note by vm.note.collectAsStateWithLifecycle()
+    val busy by vm.busy.collectAsStateWithLifecycle(); val msg by vm.message.collectAsStateWithLifecycle()
+    val importFrom by vm.importFrom.collectAsStateWithLifecycle(); val hint by vm.importHint.collectAsStateWithLifecycle()
     var manual by remember { mutableStateOf("") }
     InfoCard("BeaconFix devices on this network") {
         Text("Devices on your own network are usually yours. Pick one to bring its identity here, or to link the two.", color = Slate, style = MaterialTheme.typography.bodySmall)

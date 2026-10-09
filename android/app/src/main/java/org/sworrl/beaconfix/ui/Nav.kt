@@ -1,5 +1,6 @@
 package org.sworrl.beaconfix.ui
 
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
@@ -24,7 +25,6 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.adaptive.currentWindowAdaptiveInfo
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -94,7 +94,7 @@ private fun DestIcon(t: Dest) {
 fun BeaconFixRoot(launch: LaunchArgs = LaunchArgs()) {
     val idVm: IdentityViewModel = hiltViewModel()
     val rootVm: RootViewModel = hiltViewModel()
-    val hasIdentity by rootVm.hasIdentity.collectAsState()
+    val hasIdentity by rootVm.hasIdentity.collectAsStateWithLifecycle()
     val ctx = LocalContext.current
     val prefs = remember { EntryPointAccessors.fromApplication(ctx.applicationContext, WidgetEntryPoint::class.java).prefs() }
     LaunchedEffect(launch.seq) {

@@ -1,5 +1,6 @@
 package org.sworrl.beaconfix.ui.help
 
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -13,7 +14,6 @@ import androidx.compose.material3.OutlinedCard
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -57,8 +57,8 @@ fun HomeHelpCard(onOpen: () -> Unit) {
 @Composable
 private fun HelpCardBody(vm: HelpViewModel, onOpen: () -> Unit, modifier: Modifier, withEr: Boolean) {
     val ctx = LocalContext.current
-    val ui by vm.ui.collectAsState()
-    val snap by vm.snapshot.collectAsState()
+    val ui by vm.ui.collectAsStateWithLifecycle()
+    val snap by vm.snapshot.collectAsStateWithLifecycle()
     val number = Emergency.accept(ui.number, snap.countryCode.ifBlank { null })
     val callLabel = stringResource(R.string.help_call_number, number)
     val first = ui.peds ?: ui.er

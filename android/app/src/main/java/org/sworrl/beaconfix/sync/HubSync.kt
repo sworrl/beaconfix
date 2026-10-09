@@ -81,7 +81,6 @@ class HubSync @Inject constructor(
                 }
             }
             // ── push: this phone's fixes (its track) ───────────────────────
-            runCatching { db.fixes().backfillFromObservations() }
             batch = BATCH
             for (round in 0 until 400) {
                 val rows = db.fixes().phoneFixesSince(store.fixCursor(), batch)
@@ -105,6 +104,7 @@ class HubSync @Inject constructor(
             val pushedNodes = pushNodeDetections(api, name, myId)
 
             // ── pull: everyone's changes after our cursor ──────────────────
+            val obsMark = db.observations().maxId() ?: 0L
             for (page in 0 until MAX_PAGES) {
                 val since = store.pullCursor()
                 val r = api.changes(since, PAGE)
@@ -127,8 +127,8 @@ class HubSync @Inject constructor(
             runCatching { plates.announce(freshPlates) }
             freshPlates.clear()                          // announced (or given up on): never twice
 
-            val touched = db.observations().touchedSince(0).take(400)
-            val refit = if (pulledObs > 0 || pushed > 0) estimates.refit(touched, force = true) else 0
+            // What came in now (ours were fitted as they were recorded); it used to read every observation's BSSID each sync
+            val refit = if (pulledObs > 0) estimates.refit(db.observations().touchedSince(obsMark).take(400), force = true) else 0
             runCatching { anchors.applyToAps() }
             val platesText = if (pushedPlates + pulledPlates > 0) " · plate events: pushed $pushedPlates, pulled $pulledPlates" else ""
             val text = "pushed $pushed observations, $pushedFixes fixes · pulled $pulledAps beacons, $pulledObs observations · refit $refit$platesText" + (if (pushedNodes > 0) " · node detections: pushed $pushedNodes" else "")

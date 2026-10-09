@@ -1,5 +1,6 @@
 package org.sworrl.beaconfix.ui.screens
 
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -23,7 +24,6 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -75,10 +75,10 @@ import java.util.Locale
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun HelpScreen(focus: String?, onBack: () -> Unit, onMap: () -> Unit, vm: HelpViewModel = hiltViewModel()) {
-    val snap by vm.snapshot.collectAsState()
-    val meta by vm.meta.collectAsState()
-    val ui by vm.ui.collectAsState()
-    val refreshing by vm.refreshing.collectAsState()
+    val snap by vm.snapshot.collectAsStateWithLifecycle()
+    val meta by vm.meta.collectAsStateWithLifecycle()
+    val ui by vm.ui.collectAsStateWithLifecycle()
+    val refreshing by vm.refreshing.collectAsStateWithLifecycle()
     val list = rememberLazyListState()
     var now by remember { mutableLongStateOf(System.currentTimeMillis()) }
     LaunchedEffect(Unit) { vm.open() }

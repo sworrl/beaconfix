@@ -28,9 +28,17 @@ class LocationSource @Inject constructor(@ApplicationContext private val ctx: Co
             ?: runCatching { fused.lastLocation.await() }.getOrNull()
     }
 
+    /** The newest fix the phone already has, from anyone: no GPS, no scan. */
     @SuppressLint("MissingPermission")
-    fun updates(intervalMs: Long, minDistanceM: Float = 2f): Flow<Location> = callbackFlow {
-        val req = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, intervalMs).setMinUpdateDistanceMeters(minDistanceM).build()
+    suspend fun last(): Location? = runCatching { fused.lastLocation.await() }.getOrNull()
+
+    /**
+     * [priority] PRIORITY_PASSIVE: only the fixes other requests produce (nothing switched on for us); what the
+     * collector and the node stream fall back to while the phone sits still.
+     */
+    @SuppressLint("MissingPermission")
+    fun updates(intervalMs: Long, minDistanceM: Float = 2f, priority: Int = Priority.PRIORITY_HIGH_ACCURACY): Flow<Location> = callbackFlow {
+        val req = LocationRequest.Builder(priority, intervalMs).setMinUpdateDistanceMeters(minDistanceM).build()
         val cb = object : LocationCallback() { override fun onLocationResult(r: LocationResult) { r.lastLocation?.let { trySend(it) } } }
         fused.requestLocationUpdates(req, cb, Looper.getMainLooper())
         awaitClose { fused.removeLocationUpdates(cb) }

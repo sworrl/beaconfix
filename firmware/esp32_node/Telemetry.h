@@ -47,7 +47,9 @@ public:
                !BleScanner::instance().isConnected() && WiFi.status() != WL_CONNECTED;
     }
 
-    void broadcastJson(const char* jsonStr, bool toMesh = true, bool detection = false) {
+    // bleKey/bleEveryMs: the phone keeps one beacon per AP a minute and one probe / tracker per device every 30 s, so
+    // over BLE no more than that goes out (USB, WiFi and the mesh still get every line). Each notify wakes the phone.
+    void broadcastJson(const char* jsonStr, bool toMesh = true, bool detection = false, uint32_t bleKey = 0, uint32_t bleEveryMs = 0) {
         if (detection && storingForPhone()) {
             StoreForward::instance().store(jsonStr);
             toMesh = false;   // the mesh queue would hand the same line to the phone a second time, cut short
@@ -57,7 +59,7 @@ public:
         Serial.println(jsonStr);
 
         // 2. BLE GATT notification
-        BleScanner::instance().sendTelemetry(jsonStr);
+        if (!bleKey || bleDue(bleKey, bleEveryMs)) BleScanner::instance().sendTelemetry(jsonStr);
 
         // 3. UDP Broadcast (if network is active)
         broadcastUdp(jsonStr);
@@ -83,7 +85,7 @@ public:
                 "{\"type\":\"probe\",\"mac\":\"%s\",\"ssid\":\"%s\",\"rssi\":%d,\"ch\":%u,\"seq\":%u,\"ts\":%lu,\"ts_us\":%llu}",
                 macStr, f.ssid, f.rssi, f.channel, f.seq, f.timestampMs, (unsigned long long)TimeSync::instance().getNowUs());
         }
-        broadcastJson(buf, true, true);
+        broadcastJson(buf, true, true, fnv(f.ssid, strlen(f.ssid), fnv(f.mac, 6)), 30000);
     }
 
     void emitBeacon(const DetectedFrame& f) {
@@ -104,7 +106,7 @@ public:
                 "{\"type\":\"beacon\",\"bssid\":\"%s\",\"ssid\":\"%s\",\"rssi\":%d,\"ch\":%u,\"ts\":%lu,\"ts_us\":%llu}",
                 macStr, f.ssid, f.rssi, f.channel, f.timestampMs, (unsigned long long)TimeSync::instance().getNowUs());
         }
-        broadcastJson(buf, false, true);
+        broadcastJson(buf, false, true, fnv(f.mac, 6), 60000);
     }
 
     void emitDeauth(const DetectedFrame& f) {
@@ -140,7 +142,7 @@ public:
                 "{\"type\":\"ble_tracker\",\"kind\":\"%s\",\"mac\":\"%s\",\"name\":\"%s\",\"rssi\":%d,\"payload\":\"%s\",\"ts\":%lu,\"ts_us\":%llu}",
                 t.kind, t.mac, t.name, t.rssi, t.payloadHex, t.timestampMs, (unsigned long long)TimeSync::instance().getNowUs());
         }
-        broadcastJson(buf, true, true);
+        broadcastJson(buf, true, true, fnv(t.mac, strlen(t.mac)), 30000);
     }
 
     void emitBattery(uint32_t mv, uint8_t pct, const char* state, bool charging,
@@ -167,25 +169,25 @@ public:
 
         if (NodeConfig::instance().hasGpsFix()) {
             snprintf(buf, sizeof(buf),
-                "{\"type\":\"status\",\"version\":\"%s\",\"hardware\":\"ESP32\",\"node\":\"%s\",\"mac\":\"%s\",\"uptime\":%lu,\"heap\":%lu,\"ch\":%u,\"hop\":%s,\"pps\":%lu,\"total\":%lu,\"probes\":%lu,\"beacons\":%lu,\"deauths\":%lu,\"ble\":%d,\"batt_mv\":%lu,\"batt_pct\":%u,\"batt_state\":\"%s\",\"charging\":%s,\"batt_trained\":%s,\"batt_train_pct\":%u,\"batt_cycles\":%.2f,\"antenna_detected\":%s,\"tx_inhibited\":%s,\"ambient_rssi\":%d,\"traveling\":%s,\"speed_kmh\":%.1f,\"attached_dev\":\"%s\",\"following\":%s,\"has_gps\":true,\"lat\":%.6f,\"lon\":%.6f,\"acc\":%.1f}",
+                "{\"type\":\"status\",\"version\":\"%s\",\"hardware\":\"ESP32\",\"node\":\"%s\",\"mac\":\"%s\",\"uptime\":%lu,\"heap\":%lu,\"ch\":%u,\"hop\":%s,\"pps\":%lu,\"total\":%lu,\"probes\":%lu,\"beacons\":%lu,\"deauths\":%lu,\"ble\":%d,\"batt_mv\":%lu,\"batt_pct\":%u,\"batt_state\":\"%s\",\"charging\":%s,\"batt_trained\":%s,\"batt_train_pct\":%u,\"batt_cycles\":%.2f,\"antenna_detected\":%s,\"tx_inhibited\":%s,\"ambient_rssi\":%d,\"traveling\":%s,\"speed_kmh\":%.1f,\"attached_dev\":\"%s\",\"following\":%s,\"on_wifi\":%s,\"has_gps\":true,\"lat\":%.6f,\"lon\":%.6f,\"acc\":%.1f}",
                 BEACONFIX_FW_VERSION, nodeName, WiFi.macAddress().c_str(), uptimeS, freeHeap, ch, hopping ? "true" : "false", pps, total, probes, beacons, deauths, bleClients,
                 battMv, battPct, battState, charging ? "true" : "false",
                 battTrained ? "true" : "false", battTrainPct, battCycles,
                 hasAnt ? "true" : "false", txInhib ? "true" : "false", ambRssi,
                 traveling ? "true" : "false", speedKmh,
                 NodeConfig::instance().getAttachedDevice(),
-                NodeConfig::instance().isAttached() ? "true" : "false",
+                NodeConfig::instance().isAttached() ? "true" : "false", WiFi.status() == WL_CONNECTED ? "true" : "false",
                 NodeConfig::instance().getLat(), NodeConfig::instance().getLon(), NodeConfig::instance().getAccM());
         } else {
             snprintf(buf, sizeof(buf),
-                "{\"type\":\"status\",\"version\":\"%s\",\"hardware\":\"ESP32\",\"node\":\"%s\",\"mac\":\"%s\",\"uptime\":%lu,\"heap\":%lu,\"ch\":%u,\"hop\":%s,\"pps\":%lu,\"total\":%lu,\"probes\":%lu,\"beacons\":%lu,\"deauths\":%lu,\"ble\":%d,\"batt_mv\":%lu,\"batt_pct\":%u,\"batt_state\":\"%s\",\"charging\":%s,\"batt_trained\":%s,\"batt_train_pct\":%u,\"batt_cycles\":%.2f,\"antenna_detected\":%s,\"tx_inhibited\":%s,\"ambient_rssi\":%d,\"traveling\":%s,\"speed_kmh\":%.1f,\"attached_dev\":\"%s\",\"following\":%s,\"has_gps\":false}",
+                "{\"type\":\"status\",\"version\":\"%s\",\"hardware\":\"ESP32\",\"node\":\"%s\",\"mac\":\"%s\",\"uptime\":%lu,\"heap\":%lu,\"ch\":%u,\"hop\":%s,\"pps\":%lu,\"total\":%lu,\"probes\":%lu,\"beacons\":%lu,\"deauths\":%lu,\"ble\":%d,\"batt_mv\":%lu,\"batt_pct\":%u,\"batt_state\":\"%s\",\"charging\":%s,\"batt_trained\":%s,\"batt_train_pct\":%u,\"batt_cycles\":%.2f,\"antenna_detected\":%s,\"tx_inhibited\":%s,\"ambient_rssi\":%d,\"traveling\":%s,\"speed_kmh\":%.1f,\"attached_dev\":\"%s\",\"following\":%s,\"on_wifi\":%s,\"has_gps\":false}",
                 BEACONFIX_FW_VERSION, nodeName, WiFi.macAddress().c_str(), uptimeS, freeHeap, ch, hopping ? "true" : "false", pps, total, probes, beacons, deauths, bleClients,
                 battMv, battPct, battState, charging ? "true" : "false",
                 battTrained ? "true" : "false", battTrainPct, battCycles,
                 hasAnt ? "true" : "false", txInhib ? "true" : "false", ambRssi,
                 traveling ? "true" : "false", speedKmh,
                 NodeConfig::instance().getAttachedDevice(),
-                NodeConfig::instance().isAttached() ? "true" : "false");
+                NodeConfig::instance().isAttached() ? "true" : "false", WiFi.status() == WL_CONNECTED ? "true" : "false");
         }
         broadcastJson(buf);
     }
@@ -238,6 +240,27 @@ private:
     WiFiUDP m_udp;
     WiFiUDP m_cmdUdp;
     bool m_cmdOpen = false;
+
+    static uint32_t fnv(const void* p, size_t n, uint32_t h = 2166136261u) {
+        const uint8_t* b = (const uint8_t*)p;
+        for (size_t i = 0; i < n; i++) { h ^= b[i]; h *= 16777619u; }
+        return h ? h : 1;
+    }
+
+    struct BleSent { uint32_t key; uint32_t ms; };
+    BleSent m_bleSent[128] = {};
+    bool bleDue(uint32_t key, uint32_t everyMs) {
+        if (!BleScanner::instance().isConnected()) return false;
+        const uint32_t now = millis();
+        BleSent* slot = &m_bleSent[0];
+        for (auto& e : m_bleSent) {
+            if (e.key == key) { if (now - e.ms < everyMs) return false; slot = &e; break; }
+            if (now - e.ms > now - slot->ms) slot = &e;   // else the oldest (an empty slot counts as oldest)
+        }
+        slot->key = key;
+        slot->ms = now;
+        return true;
+    }
 
     struct BeaconSeen { uint8_t mac[6]; uint32_t ms; int8_t rssi; bool used; };
     BeaconSeen m_beaconSeen[48] = {};

@@ -1,5 +1,6 @@
 package org.sworrl.beaconfix.ui.screens
 
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -15,7 +16,6 @@ import androidx.compose.material3.Slider
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -43,14 +43,14 @@ fun SettingsScreen(
     vm: SettingsViewModel = hiltViewModel()
 ) {
     val ctx = androidx.compose.ui.platform.LocalContext.current
-    val ui by vm.ui.collectAsState()
+    val ui by vm.ui.collectAsStateWithLifecycle()
     val placesVm: SettingsPlacesViewModel = hiltViewModel()
     var home by remember(ui.home) { mutableStateOf(ui.home.joinToString("\n")) }
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(vertical = 8.dp)) {
         SettingsPlacesSection(placesVm)
         SystemHealthCard(compact = false)
         org.sworrl.beaconfix.backup.BackupCard(onRestore = onImport, onIdentity = onIdentity)
-        val doomMode by vm.doomBatteryMode.collectAsState()
+        val doomMode by vm.doomBatteryMode.collectAsStateWithLifecycle()
         var showDoomDialog by remember { mutableStateOf(false) }
         InfoCard("Collector") {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) { Text("Collect in the background"); Switch(ui.collectorOn, { vm.setCollector(it) }) }
@@ -132,7 +132,7 @@ fun SettingsScreen(
             }
         }
         InfoCard("Status in the shade") {
-            val on by vm.statusNotification.collectAsState()
+            val on by vm.statusNotification.collectAsStateWithLifecycle()
             Text("BeaconFix keeps one silent, permanent card in the shade while it runs: your fix, beacons in range, sync state and the range to your desktop, with Help / Scan / Pause buttons. The lock screen only shows “BeaconFix · running”. Swiping it away only puts it back.", color = Slate, style = MaterialTheme.typography.bodySmall)
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) { Column(Modifier.weight(1f)) { Text("Hide the status notification"); Text("Not recommended: the card is the foreground service that keeps BeaconFix alive. Without it Android may stop background collection and device ranging.", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }; Switch(!on, { vm.setStatusNotification(!it) }) }
         }

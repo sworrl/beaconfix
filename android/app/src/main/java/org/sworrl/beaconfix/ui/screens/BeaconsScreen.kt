@@ -1,5 +1,6 @@
 package org.sworrl.beaconfix.ui.screens
 
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -17,7 +18,6 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -50,9 +50,9 @@ import org.sworrl.beaconfix.ui.vm.LiveViewModel
 /** The radio security audit: every beacon graded, worst first, with the reasoning spelled out (same text as the desktop). */
 @Composable
 fun BeaconsScreen(vm: BeaconsViewModel = hiltViewModel(), live: LiveViewModel = hiltViewModel()) {
-    val aps by vm.aps.collectAsState(); val q by vm.query.collectAsState()
-    val scan by live.status.state.collectAsState()
-    val ranges by vm.ranges.collectAsState()
+    val aps by vm.aps.collectAsStateWithLifecycle(); val q by vm.query.collectAsStateWithLifecycle()
+    val scan by live.status.state.collectAsStateWithLifecycle()
+    val ranges by vm.ranges.collectAsStateWithLifecycle()
     var filter by remember { mutableStateOf("all") }   // all | insecure | range | placed
     var open by remember { mutableStateOf<String?>(null) }
     val inRange = scan.scan.associateBy { it.bssid }

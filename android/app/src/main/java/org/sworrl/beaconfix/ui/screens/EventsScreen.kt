@@ -1,5 +1,6 @@
 package org.sworrl.beaconfix.ui.screens
 
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -13,7 +14,6 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -38,7 +38,7 @@ private fun colour(t: String): Color = when (t) { "ap_new" -> Cyan; "ap_lost" ->
 /** The desktop's live event ticker (what it hears, places, fixes, stops), streamed over SSE while this screen is open. */
 @Composable
 fun EventsScreen(live: LiveViewModel = hiltViewModel()) {
-    val views by live.views.collectAsState()
+    val views by live.views.collectAsStateWithLifecycle()
     DisposableEffect(Unit) { live.stream(true); onDispose { live.stream(false) } }
     val events = views.flatMap { v -> v.events.map { v.desktop.name to it } }.sortedByDescending { it.second.id }
     Column(Modifier.fillMaxSize()) {

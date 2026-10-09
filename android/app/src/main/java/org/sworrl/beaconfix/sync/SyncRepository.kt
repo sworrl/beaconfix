@@ -145,7 +145,6 @@ class SyncRepository @Inject constructor(
                 }
 
                 // ── push fixes ──────────────────────────────────────────────────
-                runCatching { db.fixes().backfillFromObservations() }
                 var fixCursor = 0L
                 while (true) {
                     val fixBatch = db.fixes().phoneFixesSince(fixCursor, 200)
@@ -225,6 +224,7 @@ class SyncRepository @Inject constructor(
             Mirror.bodyOf { api.devicesPositions(auth) }?.let { dv -> runCatching { cache.putSnapshot(src, Mirror.DEVICES, cache.encode(dv), at.first, at.second) } }
 
             // ── pull: the observations behind those positions (control scope) ──
+            val obsMark = db.observations().maxId() ?: 0L
             if (canControl) {
                 if ("sync" in features) {
                     val ch = api.changes(auth, d.cursor)
@@ -240,8 +240,8 @@ class SyncRepository @Inject constructor(
             }
             // ── plate events: push ours + upload frames (control), pull the feed, cache the plates and leaky list ──
             runCatching { plateEvents.sync(d) }
-            val touched = db.observations().touchedSince(0).take(400)   // refit what we have data for (bounded)
-            val refit = estimates.refit(touched, force = true)
+            // refit what this sync brought in (bounded); it refitted the first 400 APs on every sync, new data or not
+            val refit = if (pulledObs > 0) estimates.refit(db.observations().touchedSince(obsMark).take(400), force = true) else 0
             runCatching { anchors.applyToAps() }
             desktops.upsert(d.copy(lastSync = System.currentTimeMillis(), lastError = "", pushedObs = d.pushedObs + pushed, pulledAps = d.pulledAps + pulledAps, hostname = hello.body()?.hostname ?: d.hostname, version = hello.body()?.version ?: d.version))
             return SyncReport(d.name, true, pushed, pulledAps, pulledObs, pulledFixes, refit)
@@ -259,9 +259,13 @@ class SyncRepository @Inject constructor(
     suspend fun mergeAps(list: List<org.sworrl.beaconfix.data.api.ApDto>, heardNow: Boolean = true): Int {
         var n = 0
         val now = System.currentTimeMillis()
+        // one read and one write transaction per page: a get and an upsert (its own commit) per AP made a first hub
+        // pull of a few thousand APs minutes of disk work
+        val olds = list.map { it.bssid }.filter { it.length == 17 }.distinct().chunked(900).flatMap { db.aps().byBssids(it) }.associateBy { it.bssid }
+        val out = ArrayList<ApEntity>(list.size)
         for (a in list) {
             if (a.bssid.length != 17) continue
-            val old = db.aps().get(a.bssid)
+            val old = olds[a.bssid]
             val hasPos = a.lat != null && a.lon != null && a.kind != "ring" && a.kind != "none" && a.kind != "mobile"
             val theirAcc = a.r ?: 100.0
             val fit = Mirror.fitOfPosition(a)       // the desktop's fit, when it is what placed this position
@@ -277,9 +281,11 @@ class SyncRepository @Inject constructor(
                 home = a.home || (old?.home ?: false), travelling = a.status == "travelling" || (old?.travelling ?: false),
                 security = a.security.ifEmpty { old?.security ?: "" }, rsnFlags = if (heardNow || a.rsnFlags != 0) a.rsnFlags else old?.rsnFlags ?: 0, wpaFlags = if (heardNow || a.wpaFlags != 0) a.wpaFlags else old?.wpaFlags ?: 0)
             // the desktop's fit becomes the row's grade along with its position (none sent: the old grade no longer applies)
-            db.aps().upsert(if (takePos) Mirror.withDesktopFit(base, fit, now) else base)
+            out += if (takePos) Mirror.withDesktopFit(base, fit, now) else base
             n++
         }
+        // REPLACE, not @Upsert: upsert tries an INSERT first and catches the constraint exception for every existing row
+        if (out.isNotEmpty()) db.aps().replaceAll(out.associateBy { it.bssid }.values.toList())
         return n
     }
 
@@ -334,7 +340,9 @@ class SyncRepository @Inject constructor(
         fun iso(ms: Long): String = LocalDateTime.ofInstant(Instant.ofEpochMilli(ms), ZoneId.systemDefault()).withNano(0).format(fmt)
         fun parseIso(s: String): Long = runCatching { LocalDateTime.parse(s.take(19), fmt).atZone(ZoneId.systemDefault()).toInstant().toEpochMilli() }.getOrElse { System.currentTimeMillis() }
         fun JsonObject.str(k: String) = this[k]?.jsonPrimitive?.contentOrNull
-        fun JsonObject.num(k: String) = this[k]?.jsonPrimitive?.doubleOrNull
+        // toDouble() straight: doubleOrNull screens every number with a regex first (the top cost of a hub catch-up)
+        fun JsonObject.num(k: String): Double? = (this[k] as? kotlinx.serialization.json.JsonPrimitive)?.takeIf { it !is kotlinx.serialization.json.JsonNull }
+            ?.let { p -> try { p.content.toDouble() } catch (_: NumberFormatException) { null } }
         fun JsonObject.int(k: String) = this[k]?.jsonPrimitive?.intOrNull
         fun JsonObject.long(k: String) = this[k]?.jsonPrimitive?.contentOrNull?.toLongOrNull()
         @Suppress("unused") fun JsonObject.bool(k: String) = this[k]?.jsonPrimitive?.booleanOrNull

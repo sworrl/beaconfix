@@ -88,7 +88,8 @@ class ObservationRecorder @Inject constructor(
                 security = if (old?.security.isNullOrEmpty()) securityOf(s.capabilities) else old!!.security))
         }
         // position: GPS/fused first; filter low-power wandering and idle jumps
-        val rawLoc = location.current()
+        // sitting still a fix up to 10 min old is where we are: no GPS switched on for each scan
+        val rawLoc = (if (motion.idle.value) location.last()?.takeIf { System.currentTimeMillis() - it.time < 10 * 60_000L } else null) ?: location.current()
         val filtered = rawLoc?.let { motion.filterLocation(it) }
         if (filtered?.isRejectedJump == true) {
             status.update { it.copy(lastFixAt = now, lastFixAcc = rawLoc!!.accuracy.toDouble(), lastFixSource = "gps idle jump suppressed (${rawLoc.accuracy.toInt()} m)") }

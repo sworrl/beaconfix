@@ -1,5 +1,6 @@
 package org.sworrl.beaconfix.ui.screens
 
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
@@ -15,7 +16,6 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -46,9 +46,9 @@ import org.sworrl.beaconfix.ui.vm.TripViewModel
  */
 @Composable
 fun TripScreen(onMap: () -> Unit = {}, live: LiveViewModel = hiltViewModel(), vm: TripViewModel = hiltViewModel()) {
-    val views by live.views.collectAsState()
-    val ui by vm.ui.collectAsState()
-    val msg by vm.message.collectAsState()
+    val views by live.views.collectAsStateWithLifecycle()
+    val ui by vm.ui.collectAsStateWithLifecycle()
+    val msg by vm.message.collectAsStateWithLifecycle()
     val export = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/gpx+xml")) { uri -> if (uri != null) vm.exportGpx(uri) }
     // each desktop's trip (as of when it was saved, if it is not live), else the newest saved one
     val savedTitle = stringResource(R.string.a9_saved_trip)

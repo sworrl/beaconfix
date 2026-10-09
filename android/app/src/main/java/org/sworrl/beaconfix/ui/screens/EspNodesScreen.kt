@@ -1,5 +1,6 @@
 package org.sworrl.beaconfix.ui.screens
 
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import android.annotation.SuppressLint
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
@@ -64,7 +65,6 @@ import androidx.compose.material3.Tab
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -108,14 +108,14 @@ fun EspNodesScreen(
     }
 ) {
     val ctx = LocalContext.current
-    val connectionState by nodeManager.connectionState.collectAsState()
-    val status by nodeManager.nodeStatus.collectAsState()
-    val probes by nodeManager.recentProbes.collectAsState()
-    val alerts by nodeManager.recentAlerts.collectAsState()
-    val trackers by nodeManager.recentTrackers.collectAsState()
-    val isFollowing by nodeManager.isFollowingPhone.collectAsState()
-    val meshPeers by nodeManager.meshPeers.collectAsState()
-    val batteryTraining by nodeManager.batteryTraining.collectAsState()
+    val connectionState by nodeManager.connectionState.collectAsStateWithLifecycle()
+    val status by nodeManager.nodeStatus.collectAsStateWithLifecycle()
+    val probes by nodeManager.recentProbes.collectAsStateWithLifecycle()
+    val alerts by nodeManager.recentAlerts.collectAsStateWithLifecycle()
+    val trackers by nodeManager.recentTrackers.collectAsStateWithLifecycle()
+    val isFollowing by nodeManager.isFollowingPhone.collectAsStateWithLifecycle()
+    val meshPeers by nodeManager.meshPeers.collectAsStateWithLifecycle()
+    val batteryTraining by nodeManager.batteryTraining.collectAsStateWithLifecycle()
     var editingBatteryNode by remember { mutableStateOf<MeshPeerNode?>(null) }
 
     var selectedTab by remember { mutableIntStateOf(0) }
@@ -610,9 +610,9 @@ fun EspNodesScreen(
                                     }
                                 }
                             }
-                            val saved by nodeManager.savedDetections.collectAsState(0)
-                            val waiting by nodeManager.detectionsWaitingForHub.collectAsState(0)
-                            val rec by nodeManager.recorder.stats.collectAsState()
+                            val saved by nodeManager.savedDetections.collectAsStateWithLifecycle(0)
+                            val waiting by nodeManager.detectionsWaitingForHub.collectAsStateWithLifecycle(0)
+                            val rec by nodeManager.recorder.stats.collectAsStateWithLifecycle()
                             Text(
                                 "Saved on this phone: $saved detections · $waiting waiting for the hub" +
                                     (if (rec.fromFlash > 0) " · ${rec.fromFlash} handed over from node storage" else ""),

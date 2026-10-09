@@ -1,5 +1,6 @@
 package org.sworrl.beaconfix.ui.screens
 
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -12,7 +13,6 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -45,7 +45,7 @@ fun MoreScreen(
     onGo: (String) -> Unit,
     live: org.sworrl.beaconfix.ui.vm.LiveViewModel = androidx.hilt.navigation.compose.hiltViewModel()
 ) {
-    val doomMode by live.doomBatteryMode.collectAsState()
+    val doomMode by live.doomBatteryMode.collectAsStateWithLifecycle()
     var showDoomDialog by androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf(false) }
 
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(vertical = 8.dp)) {

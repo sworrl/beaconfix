@@ -1,5 +1,6 @@
 package org.sworrl.beaconfix.ui.screens
 
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
@@ -18,7 +19,6 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -50,12 +50,12 @@ import org.sworrl.beaconfix.widget.WidgetUpdater
 
 @Composable
 fun HomeScreen(onPair: () -> Unit, onIdentity: () -> Unit = {}, onHelp: () -> Unit = {}, onMap: () -> Unit = {}, vm: HomeViewModel = hiltViewModel(), live: LiveViewModel = hiltViewModel()) {
-    val ui by vm.ui.collectAsState(); val views by live.views.collectAsState(); val phone by live.phone.collectAsState()
-    val refreshing by live.refreshing.collectAsState()
+    val ui by vm.ui.collectAsStateWithLifecycle(); val views by live.views.collectAsStateWithLifecycle(); val phone by live.phone.collectAsStateWithLifecycle()
+    val refreshing by live.refreshing.collectAsStateWithLifecycle()
     val ctx = LocalContext.current
     val ask = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { r -> if (r.values.all { it }) vm.toggleCollector(true) }
     val askRanging = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { live.ranging.foreground(true) }
-    val ranges by live.ranges.collectAsState()
+    val ranges by live.ranges.collectAsStateWithLifecycle()
     DisposableEffect(Unit) { live.stream(true); onDispose { live.stream(false) } }
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(vertical = 8.dp)) {
         Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) {

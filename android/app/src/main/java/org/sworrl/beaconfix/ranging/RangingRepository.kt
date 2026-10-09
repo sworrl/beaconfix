@@ -85,7 +85,7 @@ data class RangeSession(
 class RangingRepository @Inject constructor(
     @ApplicationContext private val ctx: Context, private val desktops: DesktopStore, private val identity: IdentityStore, private val scanner: WifiScanner,
     private val status: CollectorStatus, private val db: AppDatabase, private val anchors: AnchorRepository, private val live: DesktopLive,
-    private val rtt: RttRanging, private val ble: BleRanging, private val motion: MotionSensors, private val widgets: dagger.Lazy<org.sworrl.beaconfix.widget.WidgetUpdater>,
+    private val rtt: RttRanging, private val ble: BleRanging, private val motion: MotionSensors, private val stillness: org.sworrl.beaconfix.collector.MotionDetector, private val widgets: dagger.Lazy<org.sworrl.beaconfix.widget.WidgetUpdater>,
     private val prefs: org.sworrl.beaconfix.data.Prefs,
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -122,7 +122,10 @@ class RangingRepository @Inject constructor(
     }
 
     fun presence(on: Boolean) { presence = on; kick() }
-    fun foreground(on: Boolean) { val was = foreground; foreground = on; if (on && !was) boost(); kick() }
+    fun foreground(on: Boolean) { val was = foreground; foreground = on; _visible.value = on; if (on && !was) boost(); kick() }
+    private val _visible = kotlinx.coroutines.flow.MutableStateFlow(false)
+    /** BeaconFix is on screen (MainActivity started): what live views tie their GPS to. */
+    val visible: kotlinx.coroutines.flow.StateFlow<Boolean> = _visible
     /** The user opened the app or a ranging view: RTT bursts go back to one per tick (see [RttPacer]). */
     fun boost() { val now = System.currentTimeMillis(); pacers.values.forEach { it.boost(now) }; wake.trySend(Unit) }
     fun anchorsChanged() { scope.launch { runCatching { refreshAnchors() } } }
@@ -154,7 +157,9 @@ class RangingRepository @Inject constructor(
                 for (d in paired) keep[d.id] = runCatching { tick(_sessions.value[d.id]?.copy(desktop = d) ?: RangeSession(d), mode, dozing) }.getOrElse { e -> (_sessions.value[d.id] ?: RangeSession(d)).copy(error = e.message ?: e.toString()) }
                 _sessions.value = keep
                 pushLine()
-                withTimeoutOrNull(if (dozing) DOZE_TICK_MS else if (mode) 2500L else 20_000L) { wake.receive() }
+                // nobody looking and the phone sitting still: a tick every 10 s (bursts are paced to 30 s by then anyway)
+                val tickMs = when { dozing -> DOZE_TICK_MS; mode && (foreground || !stillness.idle.value) -> 2500L; mode -> 10_000L; else -> 20_000L }
+                withTimeoutOrNull(tickMs) { wake.receive() }
             }
         } finally { ble.stop(); motion.stop(); job = null; _sessions.value = _sessions.value.mapValues { it.value.copy(active = false) }; if (active()) kick() }
     }
@@ -330,10 +335,12 @@ class RangingRepository @Inject constructor(
     @Volatile var rttOverride: org.sworrl.beaconfix.data.api.RttInfo? = null
     fun overrideRtt(info: org.sworrl.beaconfix.data.api.RttInfo?) { rttOverride = info; kick() }
 
-    /** Shared-AP differential fingerprint (§5.4a): the desktop's current levels come from its /aps (refreshed every 30 s). */
+    /** Shared-AP differential fingerprint (§5.4a): the desktop's current levels come from its /aps (refreshed every 30 s, 5 min while still). */
     private suspend fun fingerprint(d: DesktopEntity, auth: String, wifi: List<WifiRssi>, now: Long): Fingerprint? {
         val cached = deskAps[d.id]
-        val theirs = if (cached != null && now - cached.first < 30_000) cached.second else {
+        // the whole AP list is a big download to parse: every 30 s while something moves, every 5 min sitting still
+        val maxAge = if (stillness.idle.value && !foreground) 300_000L else 30_000L
+        val theirs = if (cached != null && now - cached.first < maxAge) cached.second else {
             val m = withTimeoutOrNull(5000) { runCatching { desktops.api(d).aps(auth) }.getOrNull()?.body()?.aps?.filter { it.dbm > -100 }?.associate { it.bssid.uppercase() to it.dbm } } ?: cached?.second ?: emptyMap()
             deskAps[d.id] = now to m; m
         }

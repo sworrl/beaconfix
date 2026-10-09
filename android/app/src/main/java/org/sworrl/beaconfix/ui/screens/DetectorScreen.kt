@@ -1,5 +1,6 @@
 package org.sworrl.beaconfix.ui.screens
 
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
@@ -50,7 +51,6 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableDoubleStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -93,11 +93,11 @@ fun DetectorScreen(
         }
     }
 ) {
-    val phoneFix by live.phone.collectAsState()
-    val flockCameras by live.flockCameras.collectAsState()
-    val desktopViews by live.views.collectAsState()
+    val phoneFix by live.phone.collectAsStateWithLifecycle()
+    val flockCameras by live.flockCameras.collectAsStateWithLifecycle()
+    val desktopViews by live.views.collectAsStateWithLifecycle()
     val activePlate = desktopViews.firstNotNullOfOrNull { it.alprSummary?.activePlate }   // the desktop's registered plate, never hard-coded
-    val settings by alertManager.settings.collectAsState()
+    val settings by alertManager.settings.collectAsStateWithLifecycle()
     var showSettingsSheet by remember { mutableStateOf(false) }
 
     val myLoc = phoneFix.fix
