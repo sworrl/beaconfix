@@ -507,6 +507,9 @@ BLE_LINKS: Dict[str, "BleNodeLink"] = {}   # node name -> live link, for command
 # phones relaying their BLE links ("phone@<ip>"). Many WiFi networks drop broadcasts from wired to wireless clients,
 # so commands go to these addresses directly.
 LAN_PEERS: Dict[str, tuple] = {}            # key -> (ip, last seen)
+# node -> (phone ip, last seen) for a node a phone holds the BLE link to. A command for it goes to that phone: its BLE
+# writes are acknowledged, while unicast to a node on the WiFi (radio shared with BLE and sniffing) loses a few in ten
+VIA_PHONE: Dict[str, tuple] = {}
 LAN_PEER_TTL = 60.0
 
 
@@ -730,8 +733,11 @@ def autolink_loop(auto_flash=False, ble=True):
                     now = time.time()
                     live = {k: ip for k, (ip, seen) in list(LAN_PEERS.items()) if now - seen < LAN_PEER_TTL}
                     phones = {ip for k, ip in live.items() if k.startswith("phone@")}
+                    via = VIA_PHONE.get(target) if target else None
                     if target is None:
                         dests = set(live.values())
+                    elif via and now - via[1] < 20:
+                        dests = {via[0]}
                     elif target in live:
                         dests = {live[target]}
                     else:
@@ -767,6 +773,8 @@ def autolink_loop(auto_flash=False, ble=True):
                         continue
                     if o.get("relay") == "phone":
                         LAN_PEERS[f"phone@{src}"] = (src, time.time())
+                        if o.get("type") == "status" and o.get("node"):
+                            VIA_PHONE[o["node"]] = (src, time.time())
                     elif o.get("type") == "status" and o.get("node"):
                         # The node itself on the WiFi, or another machine's bridge carrying it: either takes commands
                         LAN_PEERS[o["node"]] = (src, time.time())
