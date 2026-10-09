@@ -1,0 +1,89 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 640" width="960" height="640" font-family="DejaVu Sans, Arial, sans-serif">
+  <rect x="0" y="0" width="960" height="640" rx="14" fill="#ffffff"/>
+  <text x="32" y="44" font-size="22" font-weight="bold" fill="#1d2330">ESP32 battery node wiring</text>
+  <text x="32" y="70" font-size="14" fill="#5b6475">TP4056 charger, 3.7 V Li-ion cell, ESP32 DevKit, and the two resistors that let the node read its cell</text>
+
+  <g fill="none" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+    <!-- cell + to B+ / OUT+ to VIN (positive, red) -->
+    <path d="M100 190 V232 M100 190 H240" stroke="#d7263d"/>
+    <path d="M420 190 H760" stroke="#d7263d"/>
+    <!-- cell - to B- / OUT- to GND (ground, dark) -->
+    <path d="M100 288 V310 H240" stroke="#2b2f3a"/>
+    <path d="M420 310 H480 V410 H760" stroke="#2b2f3a"/>
+    <!-- divider -->
+    <path d="M600 190 V210 M600 270 V320 M600 390 V410" stroke="#2b2f3a"/>
+    <path d="M600 300 H760" stroke="#e07a10"/>
+    <!-- optional C1 -->
+    <path d="M680 300 V346 M680 364 V410" stroke="#2b2f3a" stroke-dasharray="6 6"/>
+  </g>
+
+  <!-- battery symbol -->
+  <g stroke="#2b2f3a" stroke-width="3" stroke-linecap="round">
+    <line x1="76" y1="232" x2="124" y2="232"/>
+    <line x1="88" y1="246" x2="112" y2="246" stroke-width="5"/>
+    <line x1="76" y1="270" x2="124" y2="270"/>
+    <line x1="88" y1="288" x2="112" y2="288" stroke-width="5"/>
+  </g>
+  <text x="132" y="232" font-size="16" fill="#d7263d" font-weight="bold">+</text>
+  <text x="30" y="350" font-size="14" fill="#1d2330" font-weight="bold">Li-ion cell</text>
+  <text x="30" y="368" font-size="13" fill="#5b6475">3.7 V, 4.2 V full</text>
+
+  <!-- TP4056 -->
+  <rect x="240" y="140" width="180" height="220" rx="8" fill="#eef3fb" stroke="#2b5ea7" stroke-width="2"/>
+  <rect x="312" y="112" width="36" height="28" rx="5" fill="#c9d6ea" stroke="#2b5ea7" stroke-width="2"/>
+  <text x="330" y="100" font-size="13" fill="#5b6475" text-anchor="middle">USB-C 5 V in</text>
+  <text x="330" y="244" font-size="18" font-weight="bold" fill="#1d2330" text-anchor="middle">TP4056</text>
+  <text x="330" y="264" font-size="12" fill="#5b6475" text-anchor="middle">charger + protection</text>
+  <text x="250" y="195" font-size="14" fill="#1d2330">B+</text>
+  <text x="250" y="315" font-size="14" fill="#1d2330">B−</text>
+  <text x="410" y="195" font-size="14" fill="#1d2330" text-anchor="end">OUT+</text>
+  <text x="410" y="315" font-size="14" fill="#1d2330" text-anchor="end">OUT−</text>
+
+  <!-- ESP32 -->
+  <rect x="760" y="140" width="170" height="320" rx="8" fill="#eef7f0" stroke="#2f8f4e" stroke-width="2"/>
+  <text x="845" y="452" font-size="16" font-weight="bold" fill="#1d2330" text-anchor="middle">ESP32 DevKit</text>
+  <text x="772" y="195" font-size="14" fill="#1d2330">VIN (5V pin)</text>
+  <text x="772" y="305" font-size="14" fill="#1d2330" font-weight="bold">GPIO 35</text>
+  <text x="772" y="415" font-size="14" fill="#1d2330">GND</text>
+
+  <!-- R1 / R2 zigzags -->
+  <g fill="none" stroke="#2b2f3a" stroke-width="3" stroke-linejoin="round" stroke-linecap="round">
+    <path d="M600 210 L612 216 L588 228 L612 240 L588 252 L612 264 L600 270"/>
+    <path d="M600 320 L612 326 L588 338 L612 350 L588 362 L612 374 L600 380 V390"/>
+  </g>
+  <text x="624" y="238" font-size="14" font-weight="bold" fill="#1d2330">R1</text>
+  <text x="624" y="256" font-size="14" fill="#1d2330">100 kΩ</text>
+  <text x="522" y="350" font-size="14" font-weight="bold" fill="#1d2330">R2</text>
+  <text x="508" y="368" font-size="14" fill="#1d2330">100 kΩ</text>
+
+  <!-- C1 -->
+  <g stroke="#2b2f3a" stroke-width="3" stroke-linecap="round">
+    <line x1="666" y1="346" x2="694" y2="346"/>
+    <line x1="666" y1="364" x2="694" y2="364"/>
+  </g>
+  <text x="702" y="350" font-size="12" fill="#5b6475">C1</text>
+  <text x="702" y="366" font-size="12" fill="#5b6475">100 nF</text>
+  <text x="702" y="382" font-size="11" fill="#5b6475">optional</text>
+
+  <!-- sense label -->
+  <text x="690" y="290" font-size="12" fill="#e07a10" text-anchor="middle">2.1 V at a full cell</text>
+
+  <!-- junction dots -->
+  <g fill="#2b2f3a">
+    <circle cx="600" cy="190" r="5" fill="#d7263d"/>
+    <circle cx="600" cy="300" r="5" fill="#e07a10"/>
+    <circle cx="680" cy="300" r="5" fill="#e07a10"/>
+    <circle cx="600" cy="410" r="5"/>
+    <circle cx="680" cy="410" r="5"/>
+  </g>
+
+  <!-- notes -->
+  <line x1="32" y1="490" x2="928" y2="490" stroke="#d9dee8" stroke-width="1"/>
+  <g font-size="13.5" fill="#1d2330">
+    <text x="32" y="516">R1 goes from the cell's + to GPIO 35, R2 from GPIO 35 to GND. B+ and OUT+ are the same pin on TP4056 boards with protection.</text>
+    <text x="32" y="540">100k / 100k halves the cell, so a full 4.2 V cell reads 2.1 V at the pin. That's the firmware's default divider of 2.0.</text>
+    <text x="32" y="564">GPIO 34, 36 or 39 work too (ADC1 inputs, which still read with WiFi on). The node finds the pin by itself within a minute.</text>
+    <text x="32" y="588">Other values: send <tspan font-family="DejaVu Sans Mono, monospace">batt divider &lt;(R1+R2)/R2&gt;</tspan> and keep the pin under 2.5 V. Use 1% resistors. The pair draws about 21 µA.</text>
+    <text x="32" y="612">All grounds common. C1 across R2 is optional and steadies the reading. Check it with <tspan font-family="DejaVu Sans Mono, monospace">batt scan</tspan> or <tspan font-family="DejaVu Sans Mono, monospace">batt stats</tspan>.</text>
+  </g>
+</svg>

@@ -67,6 +67,8 @@ qt_add_resources(beaconfix "icons" PREFIX "/" BASE data FILES
     data/icons/hicolor/128x128/apps/beaconfix.png data/icons/hicolor/256x256/apps/beaconfix.png)
 # The surveillance signatures (docs/DETECTION.md), shared with the Android app: compiled in, overridable from the data dir
 qt_add_resources(beaconfix "signatures" PREFIX "/" BASE data FILES data/signatures/surveillance.json)
+# The ESP32 battery wiring diagram for the Nodes tab (docs/battery-wiring.svg, rendered by tools/render_wiring.py)
+qt_add_resources(beaconfix "hardware" PREFIX "/" BASE data FILES data/hardware/battery-wiring.png)
 
 # ── Install ──────────────────────────────────────────────────────────────────
 include(GNUInstallDirs)

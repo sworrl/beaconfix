@@ -6,6 +6,14 @@ import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothManager
 import android.content.Context
 import androidx.compose.foundation.background
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.layout.width
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
+import org.sworrl.beaconfix.R
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.rememberScrollState
@@ -718,6 +726,12 @@ fun EspNodesScreen(
                                 }
                             }
 
+                            var showWiring by remember { mutableStateOf(false) }
+                            OutlinedButton(onClick = { showWiring = true }, modifier = Modifier.fillMaxWidth()) {
+                                Text("Wiring Diagram (cell, TP4056, 100k/100k divider)", fontSize = 12.sp)
+                            }
+                            if (showWiring) BatteryWiringDialog { showWiring = false }
+
                             if (isBattDiagExpanded) {
                                 Spacer(Modifier.height(4.dp))
                                 val trn = batteryTraining
@@ -880,5 +894,29 @@ fun EspNodesScreen(
                 }
             }
         )
+    }
+}
+
+// docs/battery-wiring.svg, rendered by tools/render_wiring.py. Tap to switch between fit-to-screen and full size.
+@Composable
+private fun BatteryWiringDialog(onDismiss: () -> Unit) {
+    var zoomed by remember { mutableStateOf(false) }
+    Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+        Surface(shape = RoundedCornerShape(12.dp), color = Color.White, modifier = Modifier.fillMaxWidth().padding(8.dp)) {
+            Column(Modifier.padding(8.dp)) {
+                val img = Modifier.clickable { zoomed = !zoomed }
+                if (zoomed) {
+                    Box(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState())) {
+                        Image(painterResource(R.drawable.battery_wiring), "ESP32 battery wiring", img.width(960.dp), contentScale = ContentScale.FillWidth)
+                    }
+                } else {
+                    Image(painterResource(R.drawable.battery_wiring), "ESP32 battery wiring", img.fillMaxWidth(), contentScale = ContentScale.FillWidth)
+                }
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                    Text(if (zoomed) "Tap to fit, swipe to pan" else "Tap the diagram to zoom", color = Color(0xFF5B6475), fontSize = 12.sp)
+                    androidx.compose.material3.TextButton(onClick = onDismiss) { Text("Close") }
+                }
+            }
+        }
     }
 }

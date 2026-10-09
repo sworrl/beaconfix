@@ -52,6 +52,7 @@
 #include <QTimer>
 #include <QDialog>
 #include <QDialogButtonBox>
+#include <QScrollArea>
 #include <QInputDialog>
 #include <QJsonArray>
 #include <QJsonObject>
@@ -1488,6 +1489,31 @@ QWidget *MainWindow::buildNodes()
     });
     tb->addWidget(wifiBtn);
 
+    // How to wire a cell to an ESP32 so the node can read it (docs/battery-wiring.svg, rendered by tools/render_wiring.py)
+    auto *wiringBtn = new QPushButton(QIcon::fromTheme(QStringLiteral("battery")), QStringLiteral("Battery Wiring…"));
+    wiringBtn->setToolTip(QStringLiteral("TP4056, cell and the 100k/100k divider an ESP32 needs to read its battery"));
+    connect(wiringBtn, &QPushButton::clicked, this, [this] {
+        QDialog dlg(this);
+        dlg.setWindowTitle(QStringLiteral("ESP32 Battery Wiring"));
+        auto *lay = new QVBoxLayout(&dlg);
+        QPixmap pm(QStringLiteral(":/hardware/battery-wiring.png"));
+        pm.setDevicePixelRatio(2.0);
+        auto *img = new QLabel(&dlg);
+        img->setPixmap(pm);
+        img->setAlignment(Qt::AlignCenter);
+        auto *scroll = new QScrollArea(&dlg);
+        scroll->setWidget(img);
+        scroll->setWidgetResizable(true);
+        scroll->setFrameShape(QFrame::NoFrame);
+        lay->addWidget(scroll);
+        auto *buttons = new QDialogButtonBox(QDialogButtonBox::Close, &dlg);
+        connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+        lay->addWidget(buttons);
+        dlg.resize(1000, 720);
+        dlg.exec();
+    });
+    tb->addWidget(wiringBtn);
+
     auto *syncClockBtn = new QPushButton(QIcon::fromTheme(QStringLiteral("chronometer")), QStringLiteral("Broadcast Clock Sync"));
     syncClockBtn->setToolTip(QStringLiteral("Broadcast microsecond epoch time to connected Base Station and mesh nodes for sub-ms cardiac sync"));
     connect(syncClockBtn, &QPushButton::clicked, this, [this] {
@@ -1504,7 +1530,7 @@ QWidget *MainWindow::buildNodes()
     tb->addWidget(syncClockBtn);
 
     auto *otaBtn = new QPushButton(QIcon::fromTheme(QStringLiteral("system-software-update")), QStringLiteral("Mesh OTA Update…"));
-    otaBtn->setToolTip(QStringLiteral("Initiate autonomous cryptographic Mesh OTA broadcast to update remote nodes to latest signed v3.10.5 firmware"));
+    otaBtn->setToolTip(QStringLiteral("Initiate autonomous cryptographic Mesh OTA broadcast to update remote nodes to latest signed v3.10.6 firmware"));
     connect(otaBtn, &QPushButton::clicked, this, [this] {
         const QString binPath = QStringLiteral(BEACONFIX_SOURCE_DIR "/firmware/heltec_v3/build/heltec_v3.ino.bin");
         const QString sigPath = binPath + QStringLiteral(".sig");
@@ -1522,19 +1548,19 @@ QWidget *MainWindow::buildNodes()
         const int size = binData.size();
 
         if (QMessageBox::question(this, QStringLiteral("Trigger Mesh OTA"),
-            QStringLiteral("Broadcast signed firmware v3.10.5 manifest to mesh?\n\nSize: %1 bytes (%2 chunks)\nSHA256: %3...\nSignature: %4 bytes\n\nThis will trigger autonomous round-robin mesh propagation.")
+            QStringLiteral("Broadcast signed firmware v3.10.6 manifest to mesh?\n\nSize: %1 bytes (%2 chunks)\nSHA256: %3...\nSignature: %4 bytes\n\nThis will trigger autonomous round-robin mesh propagation.")
             .arg(size).arg(192).arg(shaHex.left(16)).arg(sigHex.size() / 2)) != QMessageBox::Yes) {
             return;
         }
 
-        const QString cmd = QStringLiteral("mesh ota manifest %1 192 %2 %3 3.10.5 1\n").arg(size).arg(shaHex).arg(sigHex);
+        const QString cmd = QStringLiteral("mesh ota manifest %1 192 %2 %3 3.10.6 1\n").arg(size).arg(shaHex).arg(sigHex);
         QUdpSocket sock;
         sock.writeDatagram(cmd.toUtf8(), QHostAddress::LocalHost, 47825);
         sock.writeDatagram(cmd.toUtf8(), QHostAddress::Broadcast, 47824);
         if (m_nodesEventLog) {
-            m_nodesEventLog->appendPlainText(QStringLiteral("[%1] 🚀 Primed mesh with signed v3.10.5 manifest (%2 bytes, 192 chunks)").arg(QDateTime::currentDateTime().toString(QStringLiteral("HH:mm:ss"))).arg(size));
+            m_nodesEventLog->appendPlainText(QStringLiteral("[%1] 🚀 Primed mesh with signed v3.10.6 manifest (%2 bytes, 192 chunks)").arg(QDateTime::currentDateTime().toString(QStringLiteral("HH:mm:ss"))).arg(size));
         }
-        statusBar()->showMessage(QStringLiteral("Primed mesh with v3.10.5 OTA manifest"), 4000);
+        statusBar()->showMessage(QStringLiteral("Primed mesh with v3.10.6 OTA manifest"), 4000);
     });
     tb->addWidget(otaBtn);
 

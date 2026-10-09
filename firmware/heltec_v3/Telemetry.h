@@ -75,6 +75,9 @@ public:
     }
 
     void emitBeacon(const DetectedFrame& f) {
+        // An AP beacons ~10x a second; one report per AP every few seconds is
+        // plenty, and over WiFi every frame flooded the network the node is on.
+        if (!beaconDue(f)) return;
         char macStr[18];
         WifiMonitor::formatMac(f.mac, macStr);
 
@@ -223,6 +226,31 @@ private:
     WiFiUDP m_udp;
     WiFiUDP m_cmdUdp;
     bool m_cmdOpen = false;
+
+    struct BeaconSeen { uint8_t mac[6]; uint32_t ms; int8_t rssi; bool used; };
+    BeaconSeen m_beaconSeen[48] = {};
+
+    bool beaconDue(const DetectedFrame& f) {
+        const uint32_t now = millis();
+        BeaconSeen* slot = nullptr;
+        for (auto& b : m_beaconSeen) {
+            if (b.used && memcmp(b.mac, f.mac, 6) == 0) { slot = &b; break; }
+        }
+        if (slot) {
+            if (now - slot->ms < 3000 && abs(f.rssi - slot->rssi) < 8) return false;
+        } else {
+            slot = &m_beaconSeen[0];
+            for (auto& b : m_beaconSeen) {
+                if (!b.used) { slot = &b; break; }
+                if (b.ms - slot->ms > 0x80000000u) slot = &b;   // oldest, wrap-safe
+            }
+            memcpy(slot->mac, f.mac, 6);
+            slot->used = true;
+        }
+        slot->ms = now;
+        slot->rssi = f.rssi;
+        return true;
+    }
     char m_replyBuf[768];
     size_t m_replyLen = 0;
 };

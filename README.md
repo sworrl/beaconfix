@@ -165,9 +165,16 @@ OTA without USB: join the node's open access point (its name) and send the signe
 ### Battery
 
 An ESP32 can't see its cell unless the cell's voltage reaches an ADC pin, so a battery node needs two resistors
-besides the TP4056: 100 kΩ from the TP4056's B+ to GPIO 35 (34, 36 or 39 work too) and 100 kΩ from that pin to GND,
-with the TP4056 and ESP32 grounds tied together. The node finds whichever of those pins has the cell on it within a
-minute and remembers it. Without the divider every pin floats around 0.3 V and the node reports no battery.
+besides the TP4056: 100 kΩ from the TP4056's B+ (or OUT+, the same pin on boards with protection) to GPIO 35
+(34, 36 or 39 work too) and 100 kΩ from that pin to GND, with the TP4056 and ESP32 grounds tied together. The node
+finds whichever of those pins has the cell on it within a minute and remembers it. Without the divider every pin
+floats around 0.3 V and the node reports no battery.
+
+![ESP32 battery node wiring](docs/battery-wiring.svg)
+
+The same diagram is under Nodes > Battery Wiring… on the desktop, in the battery card of the Android app's Nodes
+screen, and on the node's own setup page. `docs/battery-wiring.svg` is the source; `tools/render_wiring.py` makes the
+copies the apps and firmware use.
 
 Battery nodes learn their own empty and full voltages over a few charge cycles instead of using a stock table, and
 filter out the dips from radio transmits. Runtime left comes from how fast that node's % has actually been falling,

@@ -1,4 +1,5 @@
 #include "OtaUpdater.h"
+#include "WiringSvg.h"
 
 void OtaUpdater::setupWebEndpoints() {
     // ── 1. Web Portal HTML Dashboard ──────────────────────────────────────────
@@ -80,7 +81,10 @@ void OtaUpdater::setupWebEndpoints() {
                 "<li><b>2. Resistor Divider on GPIO 35:</b> Verify resistor 1 (100kΩ) is between Battery (+) and GPIO 35, and resistor 2 (100kΩ) is between GPIO 35 and GND.</li>"
                 "<li><b>3. Recovered Vape Cell Deep Sleep:</b> If a recovered vape battery was left flat for days, its protection chip trips (<2.5V). Plug the TP4056 module into USB-C for 15 minutes to awaken the cell.</li>"
                 "<li><b>4. Running on USB Only:</b> If you are intentionally powering the node via USB 5V without a battery attached, this is completely normal! The LED will play a quiet dual-tick instead of alarming.</li>"
-                "</ul></details></div>";
+                "</ul></details>"
+                "<details " + String(hasBatt ? "" : "open ") + "style='background:#0b1120;padding:12px;border-radius:8px;margin-top:10px;font-size:0.85rem;color:var(--sub)'>"
+                "<summary style='cursor:pointer;font-weight:bold;color:var(--accent)'>Wiring diagram: cell, TP4056 and the 100k/100k divider</summary>"
+                "<div style='margin-top:10px;overflow-x:auto'><img src='/wiring.svg' alt='ESP32 battery wiring' loading='lazy' style='width:100%;min-width:640px;background:#fff;border-radius:8px'></div></details></div>";
 
         // Card 1.8: Home Wi-Fi Gateway Link
         bool staConn = (WiFi.status() == WL_CONNECTED);
@@ -253,6 +257,12 @@ void OtaUpdater::setupWebEndpoints() {
         json += "\"charging\":" + String(BatteryMonitor::instance().isCharging() ? "true" : "false");
         json += "}";
         m_webServer->send(200, "application/json", json);
+    });
+
+    // The battery wiring diagram, straight from flash (docs/battery-wiring.svg)
+    m_webServer->on("/wiring.svg", HTTP_GET, [this]() {
+        m_webServer->sendHeader("Cache-Control", "max-age=86400");
+        m_webServer->send_P(200, "image/svg+xml", WIRING_SVG);
     });
 
     // ── 3. Name Config Endpoint ───────────────────────────────────────────────
