@@ -1451,6 +1451,43 @@ QWidget *MainWindow::buildNodes()
     });
     tb->addWidget(openPlatesBtn);
 
+    // Nodes reached over USB, BLE (here or through the phone) or already on a network get these; a node on the WiFi
+    // reports straight to the desktop and takes commands without any Bluetooth
+    auto *wifiBtn = new QPushButton(QIcon::fromTheme(QStringLiteral("network-wireless")), QStringLiteral("Put Nodes on WiFi…"));
+    wifiBtn->setToolTip(QStringLiteral("Send a 2.4 GHz network name and password to every node the desktop can reach"));
+    connect(wifiBtn, &QPushButton::clicked, this, [this] {
+        QDialog dlg(this);
+        dlg.setWindowTitle(QStringLiteral("Put Nodes on WiFi"));
+        auto *form = new QFormLayout(&dlg);
+        auto *intro = new QLabel(QStringLiteral("Nodes join this network and report to the desktop over it. "
+                                                "It must be 2.4 GHz and on the same network as this computer."));
+        intro->setWordWrap(true);
+        form->addRow(intro);
+        auto *ssidEdit = new QLineEdit(&dlg);
+        auto *passEdit = new QLineEdit(&dlg);
+        passEdit->setEchoMode(QLineEdit::Password);
+        form->addRow(QStringLiteral("Network name"), ssidEdit);
+        form->addRow(QStringLiteral("Password"), passEdit);
+        auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+        connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+        connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+        form->addRow(buttons);
+        if (dlg.exec() != QDialog::Accepted) return;
+        const QString ssid = ssidEdit->text().trimmed();
+        if (ssid.isEmpty() || ssid.contains(QLatin1Char('"'))) {
+            statusBar()->showMessage(QStringLiteral("Network names with a \" can't be sent to the nodes"), 4000);
+            return;
+        }
+        const QByteArray cmd = QStringLiteral("wifi connect \"%1\" %2\n").arg(ssid, passEdit->text()).toUtf8();
+        QUdpSocket sock;
+        sock.writeDatagram(cmd, QHostAddress::LocalHost, 47825);
+        if (m_nodesEventLog) {
+            m_nodesEventLog->appendPlainText(QStringLiteral("[%1] 📶 Sent WiFi \"%2\" to the nodes").arg(QDateTime::currentDateTime().toString(QStringLiteral("HH:mm:ss")), ssid));
+        }
+        statusBar()->showMessage(QStringLiteral("Sent WiFi to the nodes; each shows WiFi in its link once it joins"), 5000);
+    });
+    tb->addWidget(wifiBtn);
+
     auto *syncClockBtn = new QPushButton(QIcon::fromTheme(QStringLiteral("chronometer")), QStringLiteral("Broadcast Clock Sync"));
     syncClockBtn->setToolTip(QStringLiteral("Broadcast microsecond epoch time to connected Base Station and mesh nodes for sub-ms cardiac sync"));
     connect(syncClockBtn, &QPushButton::clicked, this, [this] {
@@ -1467,7 +1504,7 @@ QWidget *MainWindow::buildNodes()
     tb->addWidget(syncClockBtn);
 
     auto *otaBtn = new QPushButton(QIcon::fromTheme(QStringLiteral("system-software-update")), QStringLiteral("Mesh OTA Update…"));
-    otaBtn->setToolTip(QStringLiteral("Initiate autonomous cryptographic Mesh OTA broadcast to update remote nodes to latest signed v3.10.4 firmware"));
+    otaBtn->setToolTip(QStringLiteral("Initiate autonomous cryptographic Mesh OTA broadcast to update remote nodes to latest signed v3.10.5 firmware"));
     connect(otaBtn, &QPushButton::clicked, this, [this] {
         const QString binPath = QStringLiteral(BEACONFIX_SOURCE_DIR "/firmware/heltec_v3/build/heltec_v3.ino.bin");
         const QString sigPath = binPath + QStringLiteral(".sig");
@@ -1485,19 +1522,19 @@ QWidget *MainWindow::buildNodes()
         const int size = binData.size();
 
         if (QMessageBox::question(this, QStringLiteral("Trigger Mesh OTA"),
-            QStringLiteral("Broadcast signed firmware v3.10.4 manifest to mesh?\n\nSize: %1 bytes (%2 chunks)\nSHA256: %3...\nSignature: %4 bytes\n\nThis will trigger autonomous round-robin mesh propagation.")
+            QStringLiteral("Broadcast signed firmware v3.10.5 manifest to mesh?\n\nSize: %1 bytes (%2 chunks)\nSHA256: %3...\nSignature: %4 bytes\n\nThis will trigger autonomous round-robin mesh propagation.")
             .arg(size).arg(192).arg(shaHex.left(16)).arg(sigHex.size() / 2)) != QMessageBox::Yes) {
             return;
         }
 
-        const QString cmd = QStringLiteral("mesh ota manifest %1 192 %2 %3 3.10.4 1\n").arg(size).arg(shaHex).arg(sigHex);
+        const QString cmd = QStringLiteral("mesh ota manifest %1 192 %2 %3 3.10.5 1\n").arg(size).arg(shaHex).arg(sigHex);
         QUdpSocket sock;
         sock.writeDatagram(cmd.toUtf8(), QHostAddress::LocalHost, 47825);
         sock.writeDatagram(cmd.toUtf8(), QHostAddress::Broadcast, 47824);
         if (m_nodesEventLog) {
-            m_nodesEventLog->appendPlainText(QStringLiteral("[%1] 🚀 Primed mesh with signed v3.10.4 manifest (%2 bytes, 192 chunks)").arg(QDateTime::currentDateTime().toString(QStringLiteral("HH:mm:ss"))).arg(size));
+            m_nodesEventLog->appendPlainText(QStringLiteral("[%1] 🚀 Primed mesh with signed v3.10.5 manifest (%2 bytes, 192 chunks)").arg(QDateTime::currentDateTime().toString(QStringLiteral("HH:mm:ss"))).arg(size));
         }
-        statusBar()->showMessage(QStringLiteral("Primed mesh with v3.10.4 OTA manifest"), 4000);
+        statusBar()->showMessage(QStringLiteral("Primed mesh with v3.10.5 OTA manifest"), 4000);
     });
     tb->addWidget(otaBtn);
 
@@ -1678,6 +1715,8 @@ void MainWindow::refreshNodes()
         } else if (n.transport == QLatin1String("ble")) {
             rfStr = QStringLiteral("📶 BLE · Gateway");
             if (n.rssi != 0) rfStr += QStringLiteral(" · %1 dBm").arg(n.rssi);
+        } else if (n.transport == QLatin1String("wifi")) {
+            rfStr = QStringLiteral("📶 WiFi · Gateway");
         } else if (n.hops == 0) {
             rfStr = QStringLiteral("Direct");
         } else if (n.hops == 1) {
@@ -1758,7 +1797,7 @@ void MainWindow::refreshNodes()
         auto *pingBtn = new QPushButton(QStringLiteral("💓 Blink"));
         pingBtn->setToolTip(QStringLiteral("Trigger heartbeat LED cadence to physically locate and verify this node"));
         connect(pingBtn, &QPushButton::clicked, this, [this, nodeName] {
-            const QByteArray cmd("led heartbeat\n");
+            const QByteArray cmd = QStringLiteral("@%1 led heartbeat\n").arg(nodeName).toUtf8();
             QUdpSocket sock;
             sock.writeDatagram(cmd, QHostAddress::LocalHost, 47825);
             sock.writeDatagram(cmd, QHostAddress::Broadcast, 47824);

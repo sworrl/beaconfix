@@ -503,6 +503,11 @@ NUS_TX = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"   # node notifies telemetry here
 NODE_NAME_RX = re.compile(r"^(BeaconFix-|BF-|BF_)|^[A-Z][a-z]+[A-Z][a-z]+[A-Z][a-z]+[0-9]{4}$")
 BLE_MAX_LINKS = 4
 BLE_LINKS: Dict[str, "BleNodeLink"] = {}   # node name -> live link, for commands from UDP 47825
+# Who takes commands on the LAN, learnt from their own packets on 47824: nodes joined to the WiFi (by node name) and
+# phones relaying their BLE links ("phone@<ip>"). Many WiFi networks drop broadcasts from wired to wireless clients,
+# so commands go to these addresses directly.
+LAN_PEERS: Dict[str, tuple] = {}            # key -> (ip, last seen)
+LAN_PEER_TTL = 60.0
 
 
 class BleNodeLink:
@@ -634,13 +639,20 @@ def ble_loop(usb_workers: Dict[str, "EspDeviceWorker"], verbose: bool = True):
     async def main():
         links: Dict[str, asyncio.Task] = {}
         retry_at: Dict[str, float] = {}
+        last_error = ""
         while True:
             try:
                 found = await BleakScanner.discover(timeout=6.0, return_adv=True)
             except Exception as e:
-                print(f"[!] BLE scan failed: {e}", file=sys.stderr)
+                # Say it once: with no adapter this fails every pass, and the phone or WiFi carries the nodes meanwhile
+                if str(e) != last_error:
+                    print(f"[!] BLE scan failed: {e} (retrying quietly every 30 s)", file=sys.stderr)
+                    last_error = str(e)
                 await asyncio.sleep(30)
                 continue
+            if last_error:
+                print("[*] BLE scanning again", file=sys.stderr)
+                last_error = ""
             for addr in [a for a, t in links.items() if t.done()]:
                 del links[addr]
                 retry_at[addr] = time.time() + 15
@@ -670,31 +682,98 @@ def autolink_loop(auto_flash=False, ble=True):
     # Background store-and-forward queue flusher to WireGuard hub
     threading.Thread(target=queue_worker, daemon=True).start()
 
-    # Local command dispatcher thread (UDP 47825)
+    # Command dispatcher (UDP 47825). The apps on this machine send to 127.0.0.1; what no USB/BLE link here can
+    # deliver also goes out as a LAN broadcast, where nodes joined to the WiFi and the phone (holding its own BLE
+    # links) pick it up. Commands from other LAN hosts reach the links here only and are never sent on again, and
+    # our own broadcast coming back is dropped, so nothing loops.
+    own_ips = {"0.0.0.0"}
+    own_ips_at = 0.0
+
+    def is_own_ip(ip: str) -> bool:
+        nonlocal own_ips, own_ips_at
+        if time.time() - own_ips_at > 60:
+            try:
+                out = subprocess.run(["ip", "-j", "-4", "addr"], capture_output=True, text=True, timeout=3).stdout
+                own_ips = {a["local"] for i in json.loads(out) for a in i.get("addr_info", [])} - {"127.0.0.1"}
+            except Exception:
+                pass
+            own_ips_at = time.time()
+        return ip in own_ips
+
     def cmd_listener():
         cmd_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         cmd_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        cmd_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         try:
             cmd_sock.bind(("0.0.0.0", 47825))
             while True:
-                data, _ = cmd_sock.recvfrom(1024)
-                cmd = data.decode("utf-8", errors="replace").strip()
-                if not cmd:
+                data, (src, _) = cmd_sock.recvfrom(1024)
+                if is_own_ip(src):
+                    continue
+                line = data.decode("utf-8", errors="replace").strip()
+                if not line:
                     continue
                 # "@NodeName cmd" goes to that node only; anything else to every USB and BLE link
-                target = None
+                target, cmd = None, line
                 if cmd.startswith("@") and " " in cmd:
                     target, cmd = cmd[1:].split(" ", 1)
+                delivered = False
                 for w in list(active_workers.values()):
                     if target is None or w.node_name == target:
                         w.send_cmd(cmd)
+                        delivered = True
                 for name, link in list(BLE_LINKS.items()):
                     if target is None or name == target:
                         link.send_cmd(cmd)
+                        delivered = True
+                if src.startswith("127.") and (target is None or not delivered):
+                    now = time.time()
+                    live = {k: ip for k, (ip, seen) in list(LAN_PEERS.items()) if now - seen < LAN_PEER_TTL}
+                    phones = {ip for k, ip in live.items() if k.startswith("phone@")}
+                    if target is None:
+                        dests = set(live.values())
+                    elif target in live:
+                        dests = {live[target]}
+                    else:
+                        dests = phones   # a phone delivers it if it holds that node's BLE link
+                    # Broadcast too when nobody known could take it: a node that just joined, or a wired network
+                    if not dests or (target is not None and target not in live):
+                        dests.add("255.255.255.255")
+                    for ip in dests:
+                        try:
+                            cmd_sock.sendto((line + "\n").encode(), (ip, 47825))
+                        except OSError as e:
+                            print(f"[!] LAN command relay to {ip} failed: {e}", file=sys.stderr)
         except Exception as e:
             print(f"[!] Command listener error: {e}", file=sys.stderr)
 
     threading.Thread(target=cmd_listener, daemon=True).start()
+
+    def lan_peer_listener():
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)   # the desktop app shares this port
+        try:
+            sock.bind(("0.0.0.0", UDP_PORT))
+            while True:
+                data, (src, _) = sock.recvfrom(4096)
+                if src.startswith("127.") or is_own_ip(src):
+                    continue
+                for raw in data.decode("utf-8", errors="replace").splitlines():
+                    if '"status"' not in raw and '"relay"' not in raw:
+                        continue
+                    try:
+                        o = json.loads(raw)
+                    except ValueError:
+                        continue
+                    if o.get("relay") == "phone":
+                        LAN_PEERS[f"phone@{src}"] = (src, time.time())
+                    elif o.get("type") == "status" and o.get("node"):
+                        # The node itself on the WiFi, or another machine's bridge carrying it: either takes commands
+                        LAN_PEERS[o["node"]] = (src, time.time())
+        except Exception as e:
+            print(f"[!] LAN peer listener error: {e}", file=sys.stderr)
+
+    threading.Thread(target=lan_peer_listener, daemon=True).start()
 
     if ble:
         threading.Thread(target=ble_loop, args=(active_workers,), daemon=True).start()

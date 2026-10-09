@@ -107,6 +107,7 @@ QString MeshNodeInfo::linkText() const
     if (!lastSeen.isValid()) return QStringLiteral("never seen");
     if (isUsb) return usbPort.isEmpty() ? QStringLiteral("USB") : QStringLiteral("USB (%1)").arg(usbPort);
     if (transport == QLatin1String("ble")) return QStringLiteral("BLE");
+    if (transport == QLatin1String("wifi")) return QStringLiteral("WiFi");
     if (hops <= 1) return QStringLiteral("Direct");
     QString s = QStringLiteral("%1 hops").arg(hops);
     if (!routePath.isEmpty() && routePath != QLatin1String("Direct")) s += QStringLiteral(" · ") + routePath;
@@ -5782,7 +5783,6 @@ void Locator::initMeshUdp()
 
 void Locator::processMeshPacket(const QByteArray &data, const QHostAddress &sender)
 {
-    Q_UNUSED(sender);
     QJsonDocument doc = QJsonDocument::fromJson(data.trimmed());
     if (!doc.isObject()) return;
     const QJsonObject o = doc.object();
@@ -5812,6 +5812,10 @@ void Locator::processMeshPacket(const QByteArray &data, const QHostAddress &send
         } else if (sender.isLoopback()) {
             n.isUsb = true;
             n.transport = QStringLiteral("usb_mesh_dual");
+        } else {                                    // untagged from the LAN: the node itself, joined to the WiFi
+            n.isUsb = false;
+            n.usbPort.clear();
+            n.transport = QStringLiteral("wifi");
         }
         if (o.contains(QStringLiteral("mode"))) n.role = o.value(QStringLiteral("mode")).toString();   // never from the name: names are random words
         if (o.contains(QStringLiteral("version"))) n.fwVersion = o.value(QStringLiteral("version")).toString();

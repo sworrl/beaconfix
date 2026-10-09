@@ -286,6 +286,7 @@ fun EspNodesScreen(
                                             when {
                                                 // transport wins over a stale isUsb from an earlier USB status
                                                 peer.transport == "ble" -> "BLE"
+                                                peer.transport == "wifi" -> "📶 WiFi"
                                                 peer.isUsb || peer.transport == "usb_mesh_dual" -> "🔌 USB + 📡 Gateway"
                                                 peer.hops <= 0 -> "Direct (Local)"
                                                 peer.hops == 1 -> "1 Hop (Direct RF)"
@@ -293,7 +294,7 @@ fun EspNodesScreen(
                                                 peer.prevMac.isNotBlank() -> "${peer.hops} Hops (via ${peer.prevMac.takeLast(8)})"
                                                 else -> "${peer.hops} Hops"
                                             },
-                                            if (peer.isUsb || peer.transport == "usb_mesh_dual" || peer.transport == "ble") Cyan else if (peer.hops <= 0) Green else if (peer.hops == 1) Cyan else Gold
+                                            if (peer.isUsb || peer.transport == "usb_mesh_dual" || peer.transport == "ble" || peer.transport == "wifi") Cyan else if (peer.hops <= 0) Green else if (peer.hops == 1) Cyan else Gold
                                         )
                                     }
 
@@ -311,6 +312,8 @@ fun EspNodesScreen(
                                             Text("🛤 Route:", color = Slate, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
                                             if (peer.transport == "ble") {
                                                 Text("${peer.name} ──(BLE)──➔ This Device", color = Cyan, fontSize = 11.sp, fontWeight = FontWeight.Medium)
+                                            } else if (peer.transport == "wifi") {
+                                                Text("${peer.name} ──(WiFi)──➔ This Device", color = Cyan, fontSize = 11.sp, fontWeight = FontWeight.Medium)
                                             } else if (peer.isUsb || peer.transport == "usb_mesh_dual") {
                                                 Text("Local Host USB (${peer.usbPort.ifEmpty { "/dev/ttyUSB0" }}) ➔ Mesh Gateway", color = Cyan, fontSize = 11.sp, fontWeight = FontWeight.Medium)
                                             } else if (peer.hops <= 0) {

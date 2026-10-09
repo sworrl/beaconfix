@@ -170,8 +170,8 @@ void sendBleTelemetry(const char* msg) {
     if (BleScanner::instance().isConnected()) BleScanner::instance().sendTelemetry(msg);
 }
 // Command replies go to USB and BLE. SPRINTF output may be a fragment of one line (mesh peers), so it is sent raw.
-#define SPRINTF(...) do { char __b[512]; snprintf(__b, sizeof(__b), __VA_ARGS__); Serial.print(__b); if(BleScanner::instance().isConnected()) BleScanner::instance().sendRaw(__b, strlen(__b)); } while(0)
-#define SPRINTLN(msg) do { Serial.println(msg); if(BleScanner::instance().isConnected()){ String __s = String(msg) + "\n"; BleScanner::instance().sendRaw(__s.c_str(), __s.length()); } } while(0)
+#define SPRINTF(...) do { char __b[512]; snprintf(__b, sizeof(__b), __VA_ARGS__); Serial.print(__b); if(BleScanner::instance().isConnected()) BleScanner::instance().sendRaw(__b, strlen(__b)); Telemetry::instance().udpReply(__b); } while(0)
+#define SPRINTLN(msg) do { Serial.println(msg); String __s = String(msg) + "\n"; if(BleScanner::instance().isConnected()) BleScanner::instance().sendRaw(__s.c_str(), __s.length()); Telemetry::instance().udpReply(__s.c_str()); } while(0)
 
 void handleCommand(const String& cmdLine) {
     String cmd = cmdLine;
@@ -255,7 +255,7 @@ void handleCommand(const String& cmdLine) {
                        "\"lora freq <mhz>\",\"lora send <text>\","
                        "\"screen <on|off|toggle|status>\",\"page <0-7|next|prev|cycle on|cycle off>\",\"contrast <0-255>\","
                        "\"travel <status|moving|stationary> [kmh] [hdg] [alt] [trip_km]\",\"trip <km|reset|status>\",\"alpr <test|dismiss|alert ...>\","
-                       "\"wifi status\",\"wifi connect <ssid> <pass>\",\"wifi clear\","
+                       "\"wifi status\",\"wifi connect <ssid|\\\"ssid with spaces\\\"> <pass>\",\"wifi clear\","
                        "\"gps [lat,lon,acc,...]\",\"led <pattern>\",\"batt [status|stats|reset|on|off|<mah>]\",\"ota\",\"reboot\"]}");
     } else if (cmd.equalsIgnoreCase("gps") || cmd.equalsIgnoreCase("gps status")) {
         SPRINTF("{\"type\":\"gps_status\",\"hardware_detected\":%s,\"has_fix\":%s,\"lat\":%.6f,\"lon\":%.6f,\"acc\":%.1f,\"speed_kmh\":%.1f,\"alt\":%.1f,\"sats\":%u,\"hdop\":%.1f}\n",
@@ -790,10 +790,18 @@ void handleCommand(const String& cmdLine) {
             connected ? WiFi.RSSI() : 0);
     } else if (cmd.startsWith("wifi connect ")) {
         String args = cmd.substring(13);
-        int spaceIdx = args.indexOf(' ');
-        String ssid = (spaceIdx > 0) ? args.substring(0, spaceIdx) : args;
-        String pass = (spaceIdx > 0) ? args.substring(spaceIdx + 1) : "";
-        ssid.trim();
+        args.trim();
+        String ssid, pass;
+        int q = args.startsWith("\"") ? args.indexOf('"', 1) : -1;
+        if (q > 0) {
+            // wifi connect "SSID with spaces" pass
+            ssid = args.substring(1, q);
+            pass = args.substring(q + 1);
+        } else {
+            int spaceIdx = args.indexOf(' ');
+            ssid = (spaceIdx > 0) ? args.substring(0, spaceIdx) : args;
+            pass = (spaceIdx > 0) ? args.substring(spaceIdx + 1) : "";
+        }
         pass.trim();
         NodeConfig::instance().setWifiCreds(ssid.c_str(), pass.c_str());
         WiFi.mode(WIFI_AP_STA);
@@ -1122,6 +1130,11 @@ void loop() {
     String bleCmd;
     while (BleScanner::instance().popRxLine(bleCmd)) {
         if (bleCmd.length() > 0) handleCommand(bleCmd);
+    }
+    // WiFi commands (UDP 47825); a few per pass so a flood can't starve the loop
+    String udpCmd;
+    for (int i = 0; i < 4 && Telemetry::instance().popUdpCommand(udpCmd); ++i) {
+        if (udpCmd.length() > 0) handleCommand(udpCmd);
     }
     if (BleScanner::instance().takeQueueDumpRequest()) dumpMeshQueueToBle();
 

@@ -86,6 +86,7 @@ class EspNodeManager @Inject constructor(
     private var rxChar: BluetoothGattCharacteristic? = null
     private var udpSocket: DatagramSocket? = null
     private var udpJob: Job? = null
+    private var cmdJob: Job? = null
 
     // BLE NUS framing: current firmware newline-terminates lines and splits them at the MTU; older firmware sends one
     // notify per line, cut at MTU-3 (which truncated every status heartbeat)
@@ -98,6 +99,7 @@ class EspNodeManager @Inject constructor(
 
     init {
         startUdpListener()
+        startCommandListener()
         startAutoConnect()
     }
 
@@ -119,7 +121,10 @@ class EspNodeManager @Inject constructor(
                         if (_connectionState.value == EspConnectionState.DISCONNECTED) {
                             _connectionState.value = EspConnectionState.CONNECTED_UDP
                         }
-                        parseTelemetryLine(str)
+                        // A bridge tags what it carries (is_usb / transport); an untagged status is the node itself on the WiFi
+                        val line = if (str.contains("\"type\":\"status\"") && !str.contains("\"transport\"") && !str.contains("\"is_usb\":true"))
+                            runCatching { JSONObject(str).put("transport", "wifi").toString() }.getOrDefault(str) else str
+                        parseTelemetryLine(line)
                     }
                 }
             } catch (e: Exception) {
@@ -127,6 +132,42 @@ class EspNodeManager @Inject constructor(
             }
         }
     }
+
+    // ── LAN commands (UDP 47825) ────────────────────────────────────────────
+    // The desktop bridge broadcasts the commands none of its own links can deliver. "@NodeName cmd" goes to the
+    // BLE-linked node when the name matches; a plain command goes to it as-is. Our own broadcasts (sendCommand with
+    // no link) come back here and are dropped.
+    fun startCommandListener() {
+        if (cmdJob?.isActive == true) return
+        cmdJob = scope.launch {
+            try {
+                val socket = DatagramSocket(null).apply {
+                    reuseAddress = true
+                    bind(java.net.InetSocketAddress(47825))
+                }
+                val buf = ByteArray(1024)
+                while (true) {
+                    val packet = DatagramPacket(buf, buf.size)
+                    socket.receive(packet)
+                    if (isOwnAddress(packet.address)) continue
+                    val line = String(packet.data, 0, packet.length, Charsets.UTF_8).lineSequence().firstOrNull()?.trim().orEmpty()
+                    if (line.isEmpty()) continue
+                    var cmd = line
+                    if (line.startsWith("@")) {
+                        val sp = line.indexOf(' ')
+                        if (sp < 0 || !line.substring(1, sp).equals(bleLinkNode, ignoreCase = true)) continue
+                        cmd = line.substring(sp + 1)
+                    }
+                    writeBle(cmd)
+                }
+            } catch (e: Exception) {
+                // Socket closed or port taken
+            }
+        }
+    }
+
+    private fun isOwnAddress(addr: java.net.InetAddress): Boolean =
+        addr.isLoopbackAddress || runCatching { java.net.NetworkInterface.getByInetAddress(addr) != null }.getOrDefault(false)
 
     fun isBeaconNodeName(name: String?): Boolean {
         if (name.isNullOrBlank()) return false
@@ -348,15 +389,18 @@ class EspNodeManager @Inject constructor(
         }
     }
 
+    // Write one command line to the BLE-linked node; false when there is no link
     @SuppressLint("MissingPermission")
+    private fun writeBle(cmd: String): Boolean {
+        val char = rxChar ?: return false
+        val gatt = activeGatt ?: return false
+        char.value = (cmd.trim() + "\n").toByteArray(Charsets.UTF_8)
+        return gatt.writeCharacteristic(char)
+    }
+
     fun sendCommand(cmd: String) {
         val bytes = (cmd.trim() + "\n").toByteArray(Charsets.UTF_8)
-        val char = rxChar
-        val gatt = activeGatt
-        if (char != null && gatt != null) {
-            char.value = bytes
-            gatt.writeCharacteristic(char)
-        } else {
+        if (!writeBle(cmd)) {
             scope.launch {
                 try {
                     val bcast = java.net.InetAddress.getByName("255.255.255.255")

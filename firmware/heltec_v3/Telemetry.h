@@ -1,5 +1,6 @@
 #pragma once
 #include <Arduino.h>
+#include <WiFi.h>
 #include <WiFiUdp.h>
 #include "WifiMonitor.h"
 #include "BleScanner.h"
@@ -174,9 +175,54 @@ public:
         broadcastJson(buf);
     }
 
+    // Command replies (SPRINTF) arrive in fragments; put each finished line on the LAN as one datagram
+    void udpReply(const char* s) {
+        if (!m_udpEnabled || WiFi.status() != WL_CONNECTED) return;
+        for (; *s; ++s) {
+            if (*s == '\n' || m_replyLen >= sizeof(m_replyBuf) - 1) {
+                m_replyBuf[m_replyLen] = 0;
+                if (m_replyLen) broadcastUdp(m_replyBuf);
+                m_replyLen = 0;
+                if (*s == '\n') continue;
+            }
+            m_replyBuf[m_replyLen++] = *s;
+        }
+    }
+
+    // Commands over WiFi on UDP 47825, as the desktop bridge sends them ("@NodeName cmd" or plain "cmd" for every
+    // node). Only from the network the node joined as a station: the soft-AP is open, so anyone in range could
+    // join it and reconfigure the node. Returns false when nothing is waiting; cmd is empty when a packet was dropped.
+    bool popUdpCommand(String& cmd) {
+        cmd = "";
+        if (!m_udpEnabled || WiFi.status() != WL_CONNECTED) return false;
+        if (!m_cmdOpen) m_cmdOpen = m_cmdUdp.begin(47825);
+        if (!m_cmdOpen || m_cmdUdp.parsePacket() <= 0) return false;
+        char buf[256];
+        int n = m_cmdUdp.read((uint8_t*)buf, sizeof(buf) - 1);
+        uint32_t from = m_cmdUdp.remoteIP(), ip = WiFi.localIP(), mask = WiFi.subnetMask();
+        if (n <= 0 || (from & mask) != (ip & mask)) return true;
+        buf[n] = 0;
+        String line(buf);
+        int nl = line.indexOf('\n');
+        if (nl >= 0) line = line.substring(0, nl);
+        line.trim();
+        if (line.startsWith("@")) {
+            int sp = line.indexOf(' ');
+            if (sp < 0 || !line.substring(1, sp).equalsIgnoreCase(NodeConfig::instance().getName())) return true;
+            line = line.substring(sp + 1);
+            line.trim();
+        }
+        cmd = line;
+        return true;
+    }
+
 private:
     Telemetry() : m_udpPort(47824), m_udpEnabled(false) {}
     uint16_t m_udpPort;
     bool m_udpEnabled;
     WiFiUDP m_udp;
+    WiFiUDP m_cmdUdp;
+    bool m_cmdOpen = false;
+    char m_replyBuf[768];
+    size_t m_replyLen = 0;
 };

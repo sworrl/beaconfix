@@ -100,10 +100,31 @@ How the desktop hears them:
 - **USB**: plug one in. The `beaconfix-esp32-bridge` user service (`tools/esp32_autolink.py`) finds it.
 - **BLE**: the same service links to up to 4 nodes in Bluetooth range (needs `python3-bleak`; `--no-ble` turns
   it off). The Android app links over BLE too and relays what it hears onto the LAN.
-- **WiFi**: a node on your WiFi broadcasts on UDP 47824. A node that isn't on WiFi still shows up as present
-  when the desktop's WiFi scan sees its access point (the SSID is the node's name).
+- **Phone**: the Android app links to a node over BLE and relays it onto the LAN, both ways. If the desktop has no
+  Bluetooth (or it died on you), the phone covers it.
+- **WiFi**: a node on your WiFi broadcasts on UDP 47824 and takes commands on UDP 47825, so it needs no Bluetooth
+  at all. A node that isn't on WiFi still shows up as present when the desktop's WiFi scan sees its access point
+  (the SSID is the node's name).
 
 A node goes offline after 2 minutes of silence.
+
+Commands from the desktop (Blink, clock sync, OTA, battery, etc) go to the bridge on 127.0.0.1:47825. It hands
+them to its own USB and BLE links, and sends whatever it can't deliver to the nodes and phones it has heard from
+on the LAN. Plenty of WiFi setups (UniFi included) drop broadcasts from wired machines to wireless clients, so it
+sends to each one's address directly. `@NodeName <cmd>` goes to that node only.
+
+#### Putting nodes on WiFi
+
+Nodes > **Put Nodes on WiFi…**, then the network name and password. It goes to every node the desktop can reach
+(USB, BLE, or through the phone) and each one switches to WiFi in its link column once it joins. The network has to
+be 2.4 GHz and on the same LAN as the desktop. WPA2 and WPA3 both work.
+
+For a node nothing can reach yet, join its access point (open, named after the node) and open `http://192.168.4.1`.
+The Home Wi-Fi card on that page does the same thing. Over serial or BLE it's
+`wifi connect "Network Name" password`; the quotes are only needed when the name has spaces.
+
+A node on WiFi only takes commands from that network. Its own access point stays open for setup and signed OTA,
+but UDP commands from it are ignored.
 
 ### The node list
 
@@ -122,7 +143,7 @@ tab and the web dashboard all show the same list. For each node:
 - **Hardware and firmware**: the board and version the node reports, or a dash if it hasn't said yet.
 - **Power**: battery % and voltage with an estimate of runtime left, or "USB / 5V (No Battery)" when there's no
   cell on the ADC. See [Battery](#battery) for the two resistors that make a battery readable.
-- **Link**: USB with its port, BLE, or how many mesh hops away it is and through which node.
+- **Link**: USB with its port, BLE, WiFi, or how many mesh hops away it is and through which node.
 - **Location**: unset until you place it on the map, fixed once placed, or streaming from the device it follows.
 
 Both screenshots are from my own nodes. The desktop one was taken with location turned off (no scan, no fix), and
