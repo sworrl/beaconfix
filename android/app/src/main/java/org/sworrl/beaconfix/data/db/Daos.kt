@@ -206,6 +206,8 @@ interface NodeDetectionDao {
     /** The node's last position at or before [t], within [windowMs] (where it was when the phone left it) */
     @Query("SELECT * FROM node_detections WHERE node = :node AND lat IS NOT NULL AND loc_source != 'node_last' AND time_ms BETWEEN :t - :windowMs AND :t ORDER BY time_ms DESC LIMIT 1")
     suspend fun lastPositioned(node: String, t: Long, windowMs: Long): NodeDetectionEntity?
+    /** For a paired desktop, which keeps its own cursor (the hub has [hubDirty]) */
+    @Query("SELECT * FROM node_detections WHERE id > :afterId ORDER BY id LIMIT :limit") suspend fun after(afterId: Long, limit: Int): List<NodeDetectionEntity>
     @Query("SELECT COUNT(*) FROM node_detections") fun count(): Flow<Int>
     @Query("SELECT COUNT(*) FROM node_detections WHERE hub_dirty = 1") fun countHubDirty(): Flow<Int>
     @Query("SELECT * FROM node_detections ORDER BY time_ms DESC LIMIT :limit") fun recent(limit: Int = 200): Flow<List<NodeDetectionEntity>>

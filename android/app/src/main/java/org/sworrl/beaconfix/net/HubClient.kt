@@ -52,6 +52,9 @@ class HubSecurityException(message: String, cause: Throwable? = null) : IOExcept
                                      val plateEvents: List<org.sworrl.beaconfix.data.api.PlateEventDto>? = null,
                                      val nodeDetections: List<NodeDetectionDto>? = null)
 
+/** What the phone sends a paired desktop's /db/sync: just the node detections. */
+@Serializable data class NodeSyncBody(val device: String, val identity: String?, val nodeDetections: List<NodeDetectionDto>)
+
 /** One node_detections row for the hub (docs/API.md, /db/sync `nodeDetections`); [uid] is the merge key. */
 @Serializable data class NodeDetectionDto(val uid: String, val node: String, val kind: String, val mac: String, val ssid: String,
                                           val rssi: Int, val ch: Int, val detail: String, val timeMs: Long,

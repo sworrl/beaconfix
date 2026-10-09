@@ -38,6 +38,8 @@ interface BeaconFixApi {
     @Streaming @GET("api/v1/db/export") suspend fun export(@Header("Authorization") auth: String): Response<ResponseBody>
     @GET("api/v1/db/changes") suspend fun changes(@Header("Authorization") auth: String, @Query("since") since: String): Response<ChangesDto>
     @POST("api/v1/db/sync") suspend fun sync(@Header("Authorization") auth: String, @Body body: SyncBody): Response<ChangesDto>
+    /** Node detections only (desktops that answer `accepted.nodeDetections`; older ones ignore the field) */
+    @POST("api/v1/db/sync") suspend fun syncNodeDetections(@Header("Authorization") auth: String, @Body body: org.sworrl.beaconfix.net.NodeSyncBody): Response<kotlinx.serialization.json.JsonObject>
     @POST("api/v1/refresh") suspend fun refresh(@Header("Authorization") auth: String): Response<ResponseBody>
     @GET("api/v1/trip") suspend fun trip(@Header("Authorization") auth: String): Response<TripDto>
     @GET("api/v1/events") suspend fun events(@Header("Authorization") auth: String, @Query("since") since: Long): Response<EventsDto>

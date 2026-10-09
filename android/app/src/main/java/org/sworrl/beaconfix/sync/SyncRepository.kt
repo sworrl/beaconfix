@@ -1,5 +1,6 @@
 package org.sworrl.beaconfix.sync
 
+import kotlinx.serialization.json.jsonObject
 import kotlinx.coroutines.flow.first
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.booleanOrNull
@@ -51,6 +52,7 @@ class SyncRepository @Inject constructor(
     private val cache: DesktopCache,
     private val hubSync: HubSync,
     private val plateEvents: org.sworrl.beaconfix.sightings.PlateEventRepository,
+    @dagger.hilt.android.qualifiers.ApplicationContext private val context: android.content.Context,
 ) {
     /**
      * The hub (when this phone is enrolled with one) is the sync target: it holds the master database, and every
@@ -84,6 +86,25 @@ class SyncRepository @Inject constructor(
 
     /** One sync run's view of the home-network list: [dirty] = edited on this phone since the last push. */
     class HomeRun(val dirty: Boolean, val local: Set<String>) { var pushed = false }
+
+    /** Node detections after this desktop's cursor, 500 at a time; the cursor only moves on `accepted.nodeDetections`. */
+    private suspend fun pushNodeDetections(api: org.sworrl.beaconfix.data.api.BeaconFixApi, auth: String, desktopId: String) {
+        val cursors = context.getSharedPreferences("esp_nodes", android.content.Context.MODE_PRIVATE)
+        val key = "desktop_cursor_$desktopId"
+        for (round in 0 until 200) {
+            val rows = db.nodeDetections().after(cursors.getLong(key, 0L), 500)
+            if (rows.isEmpty()) return
+            val body = org.sworrl.beaconfix.net.NodeSyncBody(identity.deviceName, identity.currentNow()?.id, rows.map {
+                org.sworrl.beaconfix.net.NodeDetectionDto(it.uid, it.node, it.kind, it.mac, it.ssid, it.rssi, it.ch, it.detail, it.timeMs,
+                                                         it.lat, it.lon, it.acc, it.locSource, it.stored)
+            })
+            val r = api.syncNodeDetections(auth, body)
+            val accepted = r.body()?.get("accepted")?.let { runCatching { it.jsonObject }.getOrNull() }
+            if (!r.isSuccessful || accepted?.containsKey("nodeDetections") != true) return
+            cursors.edit().putLong(key, rows.last().id).apply()
+            if (rows.size < 500) return
+        }
+    }
 
     suspend fun sync(desktop: DesktopEntity, home: HomeRun? = null): SyncReport {
         var d = desktop                                  // every upsert below builds on the newest row (scopes, cursor)
@@ -142,8 +163,10 @@ class SyncRepository @Inject constructor(
                     fixCursor = fixBatch.last().time
                     if (fixBatch.size < 200) break
                 }
-            }
 
+                // ── push what the ESP32 nodes handed this phone (the desktop keeps them too; the hub has its own queue) ──
+                runCatching { pushNodeDetections(api, auth, d.id) }
+            }
             // ── pull: beacons the desktop knows ──────────────────────────────
             val aps = api.aps(auth)
             when (aps.outcome()) {
