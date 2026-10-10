@@ -237,9 +237,27 @@ files it gives you, and give every board in one mesh the same key.
 
 Back up `tools/keys/firmware_sign.key`. If you lose it, the boards you flashed need USB to take a new one.
 
-OTA without USB: join the node's open access point (its name) and send the signed image to its web server,
-`curl -F update=@firmware.bin -F signature=@firmware.bin.sig http://192.168.4.1/update`, or use `tools/mesh_flash.py`
-through a USB-connected node to reach the rest of the mesh.
+### Updating a node you already flashed
+
+Three ways, best first:
+
+| Way | When | How |
+|---|---|---|
+| **USB** | always works | `tools/flash_esp32.sh` or `tools/flash_heltec_v3.sh` (stops the bridge, builds, signs, flashes, starts the bridge again) |
+| **Its access point** | the node is near a computer with Wi-Fi | join the node's open AP (named after the node), then `curl -F update=@firmware.bin -F signature=@firmware.bin.sig http://192.168.4.1/update` |
+| **The mesh** | the node is in a mesh with a node that is on USB | `tools/mesh_flash.py --firmware <bin> --hardware-type 2` (1 for a Heltec) through the USB node |
+
+Things that bite:
+
+- **The AP upload needs free memory.** It writes the image while it receives it, and a node with less than about
+  30 KB of free heap drops the connection partway through. `curl http://192.168.4.1/api/v1/info` shows `heap`. Restart
+  the node (power, or `reboot` on UDP 47825 when it is on your WiFi) and send it in the first minute after boot.
+- **A dropped upload leaves the update open.** Send the signature on its own once
+  (`curl -F signature=@firmware.bin.sig …/update`, it answers 403) to clear it before trying again.
+- **The mesh only reaches nodes that joined it.** `curl http://192.168.4.1/api/v1/mode` on the node: `"hops":255`
+  means it isn't in a mesh, and `mesh_flash.py` will stream the whole image without it hearing any of it.
+- **Desktop Wi-Fi cards that run the RTT responder can't also join a node's AP.** Stop
+  `beaconfix-rtt-responder` first and start it again after.
 
 ### Battery
 
